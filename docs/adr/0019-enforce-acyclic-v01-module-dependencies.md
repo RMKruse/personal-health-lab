@@ -1,0 +1,3 @@
+# V0.1 erzwingt azyklische Modulabhängigkeiten
+
+Adapter hängen ausschließlich vom Anwendungsmodul ab; das Anwendungsmodul orchestriert `health_import`, `resting_hr_analysis` und `overview`; diese verwenden das interne `storage`-Modul und die kanonischen Typen aus `health_data`. `health_data` hängt von keinem anderen Projektmodul ab, `synthetic_export` bleibt vom realen Import- und Speichercode unabhängig, und neue Abhängigkeiten dürfen keinen Zyklus erzeugen. Jedes Modul veröffentlicht sein Interface ausschließlich über `__init__.py`; modulübergreifende Deep Imports sind verboten. Ein automatischer Architekturtest lehnt verbotene Imports und Abhängigkeitszyklen ab.

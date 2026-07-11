@@ -1,0 +1,3 @@
+# Ein Datenspeicher erlaubt einen Schreiber und parallele Snapshot-Leser
+
+Importe, Migrationen, Wiederherstellungen und die Persistenz eines Modelllaufs verwenden denselben exklusiven Schreib-Lock pro Datenspeicher. Veröffentlichte Snapshots dürfen parallel gelesen werden; ein konkurrierender Schreiber erhält den erwartbaren Status `store_busy`, statt SQLite-, Manifest- und Parquet-Zustände gleichzeitig zu verändern. Der Lock ist betriebssystemverwaltet und wird beim Prozessende freigegeben; alte PID-Dateien lösen keine eigenmächtige Entsperrung aus, während Journal und Staging unvollständige Operationen erkennen.

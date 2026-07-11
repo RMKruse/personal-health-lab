@@ -1,0 +1,3 @@
+# CLI und Streamlit teilen ein Anwendungs-Interface
+
+V0.1 stellt Kernabläufe zuerst über einen CLI-Adapter bereit und ergänzt Streamlit als zweiten Adapter an derselben Anwendungs-Seam. Beide verwenden dasselbe tiefe Modul; Import-, Speicher-, Datenqualitäts- und Analyselogik darf weder im CLI noch in Streamlit dupliziert werden, sodass Interface, Testoberfläche und reproduzierbarer Ablauf zusammenfallen. Der Production-CLI-Adapter bietet zusätzlich ein versioniertes JSON-Ausgabeformat und dokumentierte Exitcodes für Automatisierung. Streamlit hält in `session_state` nur flüchtige UI-Auswahl; persistenter Fachzustand bleibt hinter dem Anwendungs-Interface, und Caches sind an unveränderliche Snapshot- oder Run-IDs gebunden.

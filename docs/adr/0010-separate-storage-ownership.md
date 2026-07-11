@@ -1,0 +1,3 @@
+# Parquet, SQLite und DuckDB haben getrennte Datenhoheit
+
+Parquet besitzt versionierte kanonische Health-Samples und neu berechenbare Analyse-Snapshots, SQLite besitzt veränderliche Metadaten und Auditstatus, und DuckDB dient ausschließlich als Abfrage- und Berechnungsschicht. Dadurch existiert für jede Information genau ein führender Speicher, während DuckDB beide Welten für Analysen verbinden kann. Das interne Speichermodul veröffentlicht ausschließlich absichtsorientierte Operationen für Importveröffentlichung, Snapshot-Auflösung, Analysepersistenz und Overview-Daten; Tabellen-CRUD und generische Repositories bleiben ausgeschlossen.
