@@ -67,13 +67,14 @@ class GenerationOptions:
             self.missing_active_energy_probability,
             self.missing_resting_heart_rate_probability,
         )
-        if any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in probabilities):
-            raise ValueError("Missingness-Wahrscheinlichkeiten müssen zwischen 0 und 1 liegen")
+        if any(not math.isfinite(value) or not 0.0 <= value < 1.0 for value in probabilities):
+            raise ValueError(
+                "Missingness-Wahrscheinlichkeiten müssen zwischen 0 und kleiner als 1 liegen"
+            )
 
 
 @dataclass(frozen=True, slots=True)
 class _ScenarioDefinition:
-    scenario_id: ScenarioId
     signal_description: str
     expected_lag_days: int | None
     association_bpm_per_kcal: float
@@ -81,7 +82,6 @@ class _ScenarioDefinition:
 
 _SCENARIO_DEFINITIONS = {
     ScenarioId.LAG_SIGNAL_V1: _ScenarioDefinition(
-        scenario_id=ScenarioId.LAG_SIGNAL_V1,
         signal_description=(
             "Negative Assoziation der aktiven Energie mit dem Apple-Ruhepuls "
             "des folgenden messlokalen Tages."
@@ -90,7 +90,6 @@ _SCENARIO_DEFINITIONS = {
         association_bpm_per_kcal=-0.009,
     ),
     ScenarioId.NULL_V1: _ScenarioDefinition(
-        scenario_id=ScenarioId.NULL_V1,
         signal_description="Kein eingebautes Verzögerungssignal.",
         expected_lag_days=None,
         association_bpm_per_kcal=0.0,
@@ -201,6 +200,11 @@ def _resting_heart_rates(
     return values
 
 
+def _missing_days(seed: int, stream: str, probability: float) -> set[int]:
+    missing_count = int(probability * _DAY_COUNT)
+    return set(_stable_rng(seed, stream).sample(range(_DAY_COUNT), missing_count))
+
+
 def _scenario_metadata(
     definition: _ScenarioDefinition,
     options: GenerationOptions,
@@ -229,6 +233,10 @@ def _scenario_metadata(
             "resting_heart_rate_noise_standard_deviation": (
                 options.resting_heart_rate_noise_standard_deviation
             ),
+        },
+        "realized_missingness": {
+            "active_energy_missing_days": _DAY_COUNT - active_sample_count // 4,
+            "resting_heart_rate_missing_days": _DAY_COUNT - resting_sample_count,
         },
         "signal": {
             "description": definition.signal_description,
@@ -263,8 +271,16 @@ def _scenario_export(
         active_energy,
         options.resting_heart_rate_noise_standard_deviation,
     )
-    missing_active_rng = _stable_rng(seed, "missing-active-energy")
-    missing_resting_rng = _stable_rng(seed, "missing-resting-heart-rate")
+    missing_active_days = _missing_days(
+        seed,
+        "missing-active-energy",
+        options.missing_active_energy_probability,
+    )
+    missing_resting_days = _missing_days(
+        seed,
+        "missing-resting-heart-rate",
+        options.missing_resting_heart_rate_probability,
+    )
     records: list[str] = []
     active_sample_count = 0
     resting_sample_count = 0
@@ -274,17 +290,8 @@ def _scenario_export(
     for day_index, daily_total in enumerate(active_energy):
         local_day = _START_DATE + timedelta(days=day_index)
         timezone = _timezone_for(local_day)
-        active_present = (
-            missing_active_rng.random() >= options.missing_active_energy_probability
-        )
-        resting_present = (
-            missing_resting_rng.random() >= options.missing_resting_heart_rate_probability
-        )
-        if day_index == 0:
-            active_present = True
-            resting_present = True
-        elif not active_present and not resting_present:
-            active_present = True
+        active_present = day_index not in missing_active_days
+        resting_present = day_index not in missing_resting_days
 
         if active_present:
             for hour, share in zip(sample_hours, shares, strict=True):

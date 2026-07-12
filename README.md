@@ -77,6 +77,10 @@ uv run healthlab-dev generate \
   --missing-resting-heart-rate-probability 0.02
 ```
 
+Missingness-Wahrscheinlichkeiten müssen kleiner als `1` sein. Der Generator wählt daraus pro
+Datentyp und Seed deterministisch `floor(Wahrscheinlichkeit × 365)` fehlende Tage; die tatsächlich
+realisierten Anzahlen stehen zusätzlich in den Szenario-Metadaten.
+
 `healthlab-dev` besitzt keine Produktions- oder Real-Store-Konfiguration und verweigert Ziele
 innerhalb eines bestehenden HealthLab-Datenspeichers.
 

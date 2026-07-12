@@ -1,5 +1,4 @@
 import json
-from datetime import date, timedelta
 from pathlib import Path
 from statistics import correlation
 from xml.etree import ElementTree
@@ -87,7 +86,9 @@ def test_noise_and_missing_values_are_configurable_and_recorded(tmp_path: Path) 
     }
 
 
-def test_missingness_preserves_the_day_range_and_both_healthkit_types(tmp_path: Path) -> None:
+def test_missingness_preserves_the_scenario_period_and_both_healthkit_types(
+    tmp_path: Path,
+) -> None:
     fixture = generate_export(
         "null-v1",
         91,
@@ -101,15 +102,22 @@ def test_missingness_preserves_the_day_range_and_both_healthkit_types(tmp_path: 
     with ZipFile(fixture.export_path) as archive:
         root = ElementTree.fromstring(archive.read("apple_health_export/export.xml"))
     records = root.findall("Record")
+    metadata = json.loads(fixture.metadata_path.read_text(encoding="utf-8"))
 
-    assert {record.attrib["startDate"][:10] for record in records} == {
-        (date(2024, 1, 1) + timedelta(days=day_index)).isoformat()
-        for day_index in range(365)
-    }
+    assert metadata["date_range"]["measurement_local_days"] == 365
     assert {record.attrib["type"] for record in records} == {
         "HKQuantityTypeIdentifierActiveEnergyBurned",
         "HKQuantityTypeIdentifierRestingHeartRate",
     }
+    assert metadata["realized_missingness"] == {
+        "active_energy_missing_days": 364,
+        "resting_heart_rate_missing_days": 364,
+    }
+
+
+def test_missingness_cannot_remove_an_entire_healthkit_type() -> None:
+    with pytest.raises(ValueError, match="kleiner als 1"):
+        GenerationOptions(missing_active_energy_probability=1.0)
 
 
 def test_export_contains_berlin_dst_and_travel_timezone_fixtures(tmp_path: Path) -> None:
