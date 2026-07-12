@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import shutil
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -94,10 +93,6 @@ class LocalStore:
 
         return cls(_root=root, _mode=mode, _metadata=metadata, _query=query)
 
-    def is_empty(self) -> bool:
-        self._require_open()
-        return not any((self._root / _PARQUET_DIRECTORY).rglob("*.parquet"))
-
     def publish_import(
         self,
         *,
@@ -173,8 +168,6 @@ class LocalStore:
                 """,
                 (snapshot_id,),
             )
-        shutil.rmtree(self._root / "staging", ignore_errors=True)
-
     def load_daily_series(
         self, start_date: date | None, end_date: date | None
     ) -> tuple[DailyHealthSeries, ...]:
