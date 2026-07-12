@@ -42,6 +42,7 @@ class Overview:
     snapshot_count: int = 0
     logical_measurement_count: int = 0
     measurement_version_count: int = 0
+    quarantined_import_count: int = 0
     schema_version: Literal["1.0"] = "1.0"
 
 
@@ -71,6 +72,7 @@ class OverviewReader:
                 snapshot_count=counts.snapshot_count,
                 logical_measurement_count=counts.logical_measurement_count,
                 measurement_version_count=counts.measurement_version_count,
+                quarantined_import_count=counts.quarantined_import_count,
             )
         return Overview(
             status=OverviewStatus.READY,
@@ -82,4 +84,5 @@ class OverviewReader:
             snapshot_count=counts.snapshot_count,
             logical_measurement_count=counts.logical_measurement_count,
             measurement_version_count=counts.measurement_version_count,
+            quarantined_import_count=counts.quarantined_import_count,
         )

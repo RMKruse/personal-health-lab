@@ -25,6 +25,7 @@ from personal_health_lab.storage import (
     LocalStore,
     OperationId,
     SnapshotId,
+    StoreBusyError,
     StoreError,
 )
 
@@ -49,7 +50,7 @@ class HealthImportError(Exception):
 class HealthImportResult:
     operation_id: OperationId
     import_id: ImportId
-    status: Literal["committed", "duplicate", "rejected"]
+    status: Literal["committed", "duplicate", "rejected", "store_busy"]
     package_hash: str
     snapshot_id: SnapshotId | None
     record_count: int
@@ -146,37 +147,54 @@ def import_health_export(
 ) -> HealthImportResult:
     operation_id = OperationId(uuid4().hex)
     import_id = ImportId(uuid4().hex)
+    snapshot_id = SnapshotId(uuid4().hex)
     package_hash = ""
     try:
-        with package_path.open("rb") as package:
-            package_hash = hashlib.file_digest(package, "sha256").hexdigest()
-        records = _records(package_path)
-    except (OSError, BadZipFile, KeyError, ParseError, ValueError):
+        store = LocalStore.open_writer(root=root, mode=mode)
+    except StoreBusyError:
         return HealthImportResult(
             operation_id=operation_id,
             import_id=import_id,
-            status="rejected",
+            status="store_busy",
             package_hash=package_hash,
             snapshot_id=None,
             record_count=0,
-            diagnostics=("invalid_health_export",),
+            diagnostics=("store_busy",),
         )
-
-    try:
-        snapshot_id = SnapshotId(uuid4().hex)
-        store = LocalStore.open(root=root, mode=mode)
-        try:
-            published = store.publish_import(
-                operation_id=operation_id,
-                import_id=import_id,
-                package_hash=package_hash,
-                snapshot_id=snapshot_id,
-                records=records,
-            )
-        finally:
-            store.close()
     except StoreError as error:
         raise HealthImportError("Health-Importspeicher ist nicht verfügbar.") from error
+    try:
+        store.start_import(
+            operation_id=operation_id,
+            import_id=import_id,
+            snapshot_id=snapshot_id,
+        )
+        try:
+            with package_path.open("rb") as package:
+                package_hash = hashlib.file_digest(package, "sha256").hexdigest()
+            records = _records(package_path)
+        except (OSError, BadZipFile, KeyError, ParseError, ValueError):
+            store.reject_import(import_id, package_hash)
+            return HealthImportResult(
+                operation_id=operation_id,
+                import_id=import_id,
+                status="rejected",
+                package_hash=package_hash,
+                snapshot_id=None,
+                record_count=0,
+                diagnostics=("invalid_health_export",),
+            )
+        published = store.publish_import(
+            operation_id=operation_id,
+            import_id=import_id,
+            package_hash=package_hash,
+            snapshot_id=snapshot_id,
+            records=records,
+        )
+    except StoreError as error:
+        raise HealthImportError("Health-Importspeicher ist nicht verfügbar.") from error
+    finally:
+        store.close()
     return HealthImportResult(
         operation_id=operation_id,
         import_id=import_id,

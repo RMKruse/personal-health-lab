@@ -9,6 +9,7 @@ from ._store import (
     ProvenanceCounts,
     PublishImportResult,
     SnapshotId,
+    StoreBusyError,
     StoreError,
 )
 
@@ -20,5 +21,6 @@ __all__ = [
     "ProvenanceCounts",
     "PublishImportResult",
     "SnapshotId",
+    "StoreBusyError",
     "StoreError",
 ]

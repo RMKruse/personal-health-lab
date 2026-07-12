@@ -1,4 +1,8 @@
-from datetime import date
+import os
+import signal
+import time
+from datetime import UTC, date, datetime, timedelta
+from multiprocessing import get_context
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -36,6 +40,28 @@ def _record(
         f'creationDate="{end}" startDate="{start}" endDate="{end}" '
         f'value="{value}"/>'
     )
+
+
+def _import_in_process(config: RuntimeConfig, package_path: Path) -> None:
+    while True:
+        with HealthLab.open(config) as health_lab:
+            receipt = health_lab.import_health_export(package_path)
+        if receipt.status is not ImportStatus.STORE_BUSY:
+            return
+
+
+def _large_export(path: Path, count: int = 50_000) -> Path:
+    start = datetime(2024, 1, 2, tzinfo=UTC)
+    records = "".join(
+        _record(
+            "HKQuantityTypeIdentifierActiveEnergyBurned",
+            1,
+            (start + timedelta(seconds=index)).strftime("%Y-%m-%d %H:%M:%S %z"),
+            (start + timedelta(seconds=index + 1)).strftime("%Y-%m-%d %H:%M:%S %z"),
+        )
+        for index in range(count)
+    )
+    return _export(path, records)
 
 
 def test_valid_synthetic_export_is_published_as_daily_health_data(tmp_path: Path) -> None:
@@ -160,3 +186,68 @@ def test_cumulative_exports_are_idempotent_and_preserve_measurement_versions(
         "2024-01-01T06:01:00+00:00",
     )
     assert len(preferred_resting.measurement_version_ids) == 1
+
+
+def test_interrupted_import_keeps_snapshot_and_is_quarantined_on_restart(
+    tmp_path: Path,
+) -> None:
+    base = _export(
+        tmp_path / "base.zip",
+        _record(
+            "HKQuantityTypeIdentifierRestingHeartRate",
+            60,
+            "2024-01-01 07:00:00 +0100",
+            "2024-01-01 07:01:00 +0100",
+        ),
+    )
+    interrupted = _large_export(tmp_path / "interrupted.zip")
+    config = RuntimeConfig(
+        mode=DataMode.SYNTHETIC,
+        synthetic_store=tmp_path / "synthetic-store",
+        real_store=tmp_path / "real-store",
+    )
+    with HealthLab.open(config) as health_lab:
+        committed = health_lab.import_health_export(base)
+        before = health_lab.load_overview(OverviewSelection())
+
+    process = get_context("spawn").Process(
+        target=_import_in_process,
+        args=(config, interrupted),
+    )
+    process.start()
+    deadline = time.monotonic() + 10
+    busy = None
+    before_busy = None
+    while time.monotonic() < deadline:
+        with HealthLab.open(config) as health_lab:
+            before_attempt = health_lab.load_overview(OverviewSelection())
+            candidate = health_lab.import_health_export(base)
+        if candidate.status is ImportStatus.STORE_BUSY:
+            busy = candidate
+            before_busy = before_attempt
+            os.kill(process.pid, signal.SIGSTOP)
+            break
+        time.sleep(0.01)
+    if busy is None and process.is_alive():
+        process.kill()
+        process.join(timeout=5)
+    assert busy is not None
+    assert before_busy is not None
+    try:
+        with HealthLab.open(config) as health_lab:
+            during = health_lab.load_overview(OverviewSelection())
+    finally:
+        os.kill(process.pid, signal.SIGKILL)
+        process.join(timeout=5)
+    assert not process.is_alive()
+    assert busy.status is ImportStatus.STORE_BUSY
+    assert during == before_busy
+
+    with HealthLab.open(config) as health_lab:
+        after = health_lab.load_overview(OverviewSelection())
+
+    assert after.daily_series == before.daily_series
+    assert after.import_count == before_busy.import_count
+    assert after.snapshot_count == before_busy.snapshot_count
+    assert after.quarantined_import_count == before_busy.quarantined_import_count + 1
+    assert committed.snapshot_ref is not None

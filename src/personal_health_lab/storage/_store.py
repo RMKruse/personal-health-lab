@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import fcntl
+import json
+import shutil
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Literal, Self
+from typing import IO, Literal, Self
 
 import duckdb
 
@@ -20,10 +23,16 @@ from personal_health_lab.health_data import (
 
 _METADATA_FILE = "metadata.sqlite3"
 _PARQUET_DIRECTORY = "parquet"
+_QUERY_FILE = "query.duckdb"
+_WRITER_LOCK_FILE = ".writer.lock"
 
 
 class StoreError(ValueError):
     """A local store cannot be opened safely."""
+
+
+class StoreBusyError(StoreError):
+    """Another process owns the store's writer lock."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +79,7 @@ class ProvenanceCounts:
     snapshot_count: int
     logical_measurement_count: int
     measurement_version_count: int
+    quarantined_import_count: int
 
 
 @dataclass(slots=True)
@@ -78,55 +88,114 @@ class LocalStore:
     _mode: DataMode
     _metadata: sqlite3.Connection
     _query: duckdb.DuckDBPyConnection
+    _writer_lock: IO[bytes] | None = None
     _closed: bool = False
 
     @classmethod
     def open(cls, root: Path, mode: DataMode) -> Self:
+        writer_lock = cls._try_writer_lock(root)
+        if writer_lock is None:
+            return cls._open(root, mode, initialize=False)
+        store: Self | None = None
+        try:
+            store = cls._open(root, mode, initialize=True)
+            store._recover_imports()
+            return store
+        except Exception:
+            if store is not None:
+                store.close()
+            raise
+        finally:
+            writer_lock.close()
+
+    @classmethod
+    def open_writer(cls, root: Path, mode: DataMode) -> Self:
+        writer_lock = cls._try_writer_lock(root)
+        if writer_lock is None:
+            raise StoreBusyError("Datenspeicher wird bereits beschrieben.")
+        store: Self | None = None
+        try:
+            store = cls._open(root, mode, initialize=True, writer_lock=writer_lock)
+            store._recover_imports()
+            return store
+        except Exception:
+            if store is None:
+                writer_lock.close()
+            else:
+                store.close()
+            raise
+
+    @classmethod
+    def _open(
+        cls,
+        root: Path,
+        mode: DataMode,
+        *,
+        initialize: bool,
+        writer_lock: IO[bytes] | None = None,
+    ) -> Self:
         if not isinstance(mode, DataMode):
             raise StoreError("Datenmodus muss 'synthetic' oder 'real' sein.")
 
         metadata: sqlite3.Connection | None = None
         try:
-            root.mkdir(parents=True, exist_ok=True)
-            (root / _PARQUET_DIRECTORY).mkdir(exist_ok=True)
-            metadata = sqlite3.connect(root / _METADATA_FILE)
-            metadata.execute(
-                """
-                CREATE TABLE IF NOT EXISTS store_identity (
-                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                    mode TEXT NOT NULL,
-                    schema_version TEXT NOT NULL
+            metadata_path = root / _METADATA_FILE
+            metadata = sqlite3.connect(
+                metadata_path
+                if initialize
+                else f"{metadata_path.resolve().as_uri()}?mode=ro",
+                uri=not initialize,
+            )
+            if initialize:
+                (root / _PARQUET_DIRECTORY).mkdir(exist_ok=True)
+                metadata.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS store_identity (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        mode TEXT NOT NULL,
+                        schema_version TEXT NOT NULL
+                    )
+                    """
                 )
-                """
-            )
-            metadata.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS imports (
-                    import_id TEXT PRIMARY KEY,
-                    operation_id TEXT NOT NULL,
-                    package_hash TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    snapshot_id TEXT NOT NULL,
-                    package_record_count INTEGER NOT NULL,
-                    record_count INTEGER NOT NULL,
-                    committed_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS active_snapshot (
-                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                    snapshot_id TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS import_measurement_versions (
-                    import_id TEXT NOT NULL,
-                    measurement_version_id TEXT NOT NULL,
-                    PRIMARY KEY (import_id, measurement_version_id)
-                );
-                """
-            )
+                metadata.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS imports (
+                        import_id TEXT PRIMARY KEY,
+                        operation_id TEXT NOT NULL,
+                        package_hash TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        snapshot_id TEXT NOT NULL,
+                        package_record_count INTEGER NOT NULL,
+                        record_count INTEGER NOT NULL,
+                        committed_at TEXT NOT NULL,
+                        diagnostics TEXT NOT NULL DEFAULT ''
+                    );
+                    CREATE TABLE IF NOT EXISTS active_snapshot (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        snapshot_id TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS import_measurement_versions (
+                        import_id TEXT NOT NULL,
+                        measurement_version_id TEXT NOT NULL,
+                        PRIMARY KEY (import_id, measurement_version_id)
+                    );
+                    """
+                )
+                columns = {
+                    str(row[1])
+                    for row in metadata.execute("PRAGMA table_info(imports)").fetchall()
+                }
+                if "diagnostics" not in columns:
+                    metadata.execute(
+                        "ALTER TABLE imports ADD COLUMN diagnostics TEXT NOT NULL DEFAULT ''"
+                    )
             identity = metadata.execute(
                 "SELECT mode, schema_version FROM store_identity WHERE singleton = 1"
             ).fetchone()
             expected_identity = (mode.value, "1.0")
             if identity is None:
+                if not initialize:
+                    raise StoreError("Datenspeicher ist noch nicht initialisiert.")
                 metadata.execute(
                     "INSERT INTO store_identity(singleton, mode, schema_version) VALUES (1, ?, ?)",
                     expected_identity,
@@ -134,7 +203,10 @@ class LocalStore:
                 metadata.commit()
             elif identity != expected_identity:
                 raise StoreError("Datenspeicher gehört zu einem anderen Modus oder Schema.")
-            query = duckdb.connect(":memory:")
+            query_path = root / _QUERY_FILE
+            if initialize and not query_path.exists():
+                duckdb.connect(str(query_path)).close()
+            query = duckdb.connect(str(query_path), config={"access_mode": "READ_ONLY"})
         except StoreError:
             if metadata is not None:
                 metadata.close()
@@ -144,7 +216,74 @@ class LocalStore:
                 metadata.close()
             raise StoreError("Datenspeicher konnte nicht geöffnet werden.") from error
 
-        return cls(_root=root, _mode=mode, _metadata=metadata, _query=query)
+        return cls(
+            _root=root,
+            _mode=mode,
+            _metadata=metadata,
+            _query=query,
+            _writer_lock=writer_lock,
+        )
+
+    @staticmethod
+    def _try_writer_lock(root: Path) -> IO[bytes] | None:
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            writer_lock = (root / _WRITER_LOCK_FILE).open("a+b")
+        except OSError as error:
+            raise StoreError("Writer-Lock konnte nicht geöffnet werden.") from error
+        try:
+            fcntl.flock(writer_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            writer_lock.close()
+            return None
+        return writer_lock
+
+    def start_import(
+        self,
+        *,
+        operation_id: OperationId,
+        import_id: ImportId,
+        snapshot_id: SnapshotId,
+    ) -> None:
+        self._require_writer()
+        staging = self._root / "staging" / str(import_id)
+        with self._metadata:
+            self._metadata.execute(
+                "INSERT INTO imports VALUES (?, ?, ?, 'running', ?, 0, 0, ?, '')",
+                (
+                    str(import_id),
+                    str(operation_id),
+                    "",
+                    str(snapshot_id),
+                    datetime.now().astimezone().isoformat(),
+                ),
+            )
+        try:
+            staging.mkdir(parents=True)
+            self._write_manifest(
+                staging,
+                operation_id=operation_id,
+                import_id=import_id,
+                snapshot_id=snapshot_id,
+                status="running",
+            )
+        except OSError as error:
+            raise StoreError("Import-Staging konnte nicht angelegt werden.") from error
+
+    def reject_import(self, import_id: ImportId, package_hash: str) -> None:
+        self._require_writer()
+        with self._metadata:
+            self._metadata.execute(
+                """
+                UPDATE imports
+                SET package_hash = ?, status = 'rejected', diagnostics = 'invalid_health_export'
+                WHERE import_id = ?
+                """,
+                (package_hash, str(import_id)),
+            )
+        staging = self._root / "staging" / str(import_id)
+        if staging.exists():
+            self._remove_tree(staging)
 
     def publish_import(
         self,
@@ -156,6 +295,7 @@ class LocalStore:
         records: tuple[CanonicalHealthRecord, ...],
     ) -> PublishImportResult:
         self._require_open()
+        self._require_writer()
         try:
             return self._publish_import(
                 operation_id=operation_id,
@@ -206,6 +346,7 @@ class LocalStore:
                     record_count=0,
                     records=records,
                 )
+            shutil.rmtree(self._root / "staging" / str(import_id), ignore_errors=True)
             return result
 
         active = self._metadata.execute(
@@ -328,9 +469,9 @@ class LocalStore:
                     record_count=0,
                     records=records,
                 )
+            shutil.rmtree(self._root / "staging" / str(import_id), ignore_errors=True)
             return result
 
-        staging.mkdir(parents=True)
         parquet_path = staging / "samples.parquet"
         escaped_path = str(parquet_path).replace("'", "''")
         self._query.execute(
@@ -338,6 +479,19 @@ class LocalStore:
             COPY (SELECT * EXCLUDE(source_priority) FROM combined_samples)
             TO '{escaped_path}' (FORMAT PARQUET)
             """
+        )
+        validation = self._query.execute(
+            f"SELECT count(*) FROM read_parquet('{escaped_path}')"
+        ).fetchone()
+        if validation is None or int(validation[0]) != version_count:
+            raise StoreError("Staging-Snapshot konnte nicht validiert werden.")
+        self._write_manifest(
+            staging,
+            operation_id=operation_id,
+            import_id=import_id,
+            snapshot_id=snapshot_id,
+            status="published",
+            record_count=version_count,
         )
         snapshot.parent.mkdir(parents=True, exist_ok=True)
         staging.replace(snapshot)
@@ -380,9 +534,13 @@ class LocalStore:
         records: tuple[CanonicalHealthRecord, ...],
     ) -> None:
         self._metadata.execute(
-            "INSERT INTO imports VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            """
+            UPDATE imports
+            SET operation_id = ?, package_hash = ?, status = ?, snapshot_id = ?,
+                package_record_count = ?, record_count = ?, committed_at = ?, diagnostics = ?
+            WHERE import_id = ?
+            """,
             (
-                str(import_id),
                 str(operation_id),
                 package_hash,
                 status,
@@ -390,6 +548,8 @@ class LocalStore:
                 package_record_count,
                 record_count,
                 datetime.now().astimezone().isoformat(),
+                "",
+                str(import_id),
             ),
         )
         self._metadata.executemany(
@@ -521,10 +681,14 @@ class LocalStore:
 
     def load_provenance_counts(self) -> ProvenanceCounts:
         self._require_open()
-        import_count, package_count, snapshot_count = self._metadata.execute(
+        import_count, package_count, snapshot_count, quarantined_count = self._metadata.execute(
             """
-            SELECT count(*), count(DISTINCT package_hash),
-                   count(DISTINCT CASE WHEN status = 'committed' THEN snapshot_id END)
+            SELECT count(CASE WHEN status IN ('committed', 'duplicate') THEN 1 END),
+                   count(DISTINCT CASE
+                       WHEN status IN ('committed', 'duplicate') THEN package_hash
+                   END),
+                   count(DISTINCT CASE WHEN status = 'committed' THEN snapshot_id END),
+                   count(CASE WHEN status = 'quarantined' THEN 1 END)
             FROM imports
             """
         ).fetchone()
@@ -532,7 +696,9 @@ class LocalStore:
             "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
         ).fetchone()
         if active is None:
-            return ProvenanceCounts(import_count, package_count, snapshot_count, 0, 0)
+            return ProvenanceCounts(
+                import_count, package_count, snapshot_count, 0, 0, quarantined_count
+            )
         result = self._current_import_result(
             status="duplicate",
             snapshot_id=SnapshotId(str(active[0])),
@@ -545,14 +711,130 @@ class LocalStore:
             snapshot_count=snapshot_count,
             logical_measurement_count=result.logical_measurement_count,
             measurement_version_count=result.measurement_version_count,
+            quarantined_import_count=quarantined_count,
         )
 
     def close(self) -> None:
         if not self._closed:
-            self._query.close()
-            self._metadata.close()
-            self._closed = True
+            try:
+                self._query.close()
+                self._metadata.close()
+            finally:
+                if self._writer_lock is not None:
+                    self._writer_lock.close()
+                self._closed = True
 
     def _require_open(self) -> None:
         if self._closed:
             raise RuntimeError("Datenspeicher ist geschlossen.")
+
+    def _require_writer(self) -> None:
+        if self._writer_lock is None:
+            raise RuntimeError("Operation benötigt den exklusiven Writer-Lock.")
+
+    def _recover_imports(self) -> None:
+        try:
+            self._recover_imports_unchecked()
+        except (OSError, sqlite3.Error) as error:
+            raise StoreError("Import-Recovery konnte nicht abgeschlossen werden.") from error
+
+    def _recover_imports_unchecked(self) -> None:
+        active = self._metadata.execute(
+            "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
+        ).fetchone()
+        active_snapshot = None if active is None else str(active[0])
+        running = self._metadata.execute(
+            "SELECT import_id, snapshot_id FROM imports WHERE status = 'running'"
+        ).fetchall()
+        for import_id, snapshot_id in running:
+            staging = self._root / "staging" / str(import_id)
+            if staging.exists():
+                self._remove_tree(staging)
+            if str(snapshot_id) != active_snapshot:
+                snapshot = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
+                if snapshot.exists():
+                    self._remove_tree(snapshot)
+        if running:
+            with self._metadata:
+                self._metadata.execute(
+                    """
+                    UPDATE imports
+                    SET status = 'quarantined', diagnostics = 'interrupted_before_publish'
+                    WHERE status = 'running'
+                    """
+                )
+        staging_root = self._root / "staging"
+        if staging_root.exists():
+            known_imports = {
+                str(row[0]) for row in self._metadata.execute("SELECT import_id FROM imports")
+            }
+            for path in staging_root.iterdir():
+                if path.is_dir():
+                    if path.name not in known_imports:
+                        self._quarantine_orphaned_staging(path)
+                        continue
+                    self._remove_tree(path)
+
+    def _quarantine_orphaned_staging(self, path: Path) -> None:
+        recovered_id = f"recovered-{path.name}"
+        operation_id = snapshot_id = recovered_id
+        try:
+            manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+            if isinstance(manifest, dict):
+                operation_id = str(manifest.get("operation_id", recovered_id))
+                snapshot_id = str(manifest.get("snapshot_id", recovered_id))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pass
+        with self._metadata:
+            self._metadata.execute(
+                "INSERT INTO imports VALUES (?, ?, '', 'running', ?, 0, 0, ?, ?)",
+                (
+                    path.name,
+                    operation_id,
+                    snapshot_id,
+                    datetime.now().astimezone().isoformat(),
+                    "orphaned_staging_detected",
+                ),
+            )
+        self._remove_tree(path)
+        with self._metadata:
+            self._metadata.execute(
+                """
+                UPDATE imports
+                SET status = 'quarantined', diagnostics = 'orphaned_staging'
+                WHERE import_id = ?
+                """,
+                (path.name,),
+            )
+
+    @staticmethod
+    def _remove_tree(path: Path) -> None:
+        try:
+            shutil.rmtree(path)
+        except OSError as error:
+            raise StoreError("Recovery konnte Zwischenzustand nicht bereinigen.") from error
+
+    @staticmethod
+    def _write_manifest(
+        directory: Path,
+        *,
+        operation_id: OperationId,
+        import_id: ImportId,
+        snapshot_id: SnapshotId,
+        status: Literal["running", "published"],
+        record_count: int = 0,
+    ) -> None:
+        (directory / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "operation_id": str(operation_id),
+                    "import_id": str(import_id),
+                    "snapshot_id": str(snapshot_id),
+                    "status": status,
+                    "record_count": record_count,
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
