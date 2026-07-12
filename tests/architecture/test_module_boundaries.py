@@ -17,7 +17,7 @@ MODULES = {
     "synthetic_export",
 }
 ALLOWED_DEPENDENCIES = {
-    "adapters": {"application", "package_root"},
+    "adapters": {"application", "package_root", "synthetic_export"},
     "application": {"health_import", "overview", "package_root", "resting_hr_analysis"},
     "health_data": set(),
     "health_import": {"health_data", "storage"},
@@ -134,3 +134,18 @@ def test_project_module_dependency_graph_is_acyclic() -> None:
 
     for module in MODULES:
         visit(module)
+
+
+def test_only_development_cli_can_reach_the_synthetic_generator() -> None:
+    adapters_root = PACKAGE_ROOT / "adapters"
+    development_cli = (PACKAGE_ROOT / "adapters/dev_cli/_cli.py").read_text(encoding="utf-8")
+    production_imports = [
+        str(path.relative_to(PACKAGE_ROOT))
+        for path in adapters_root.rglob("*.py")
+        if "dev_cli" not in path.parts
+        and "synthetic_export" in path.read_text(encoding="utf-8")
+    ]
+
+    assert production_imports == []
+    assert "personal_health_lab.application" not in development_cli
+    assert "personal_health_lab.storage" not in development_cli

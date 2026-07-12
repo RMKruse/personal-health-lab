@@ -40,6 +40,45 @@ HEALTHLAB_REAL_STORE="$HOME/.local/share/healthlab/real" \
 uv run streamlit run src/personal_health_lab/adapters/streamlit/app.py
 ```
 
+## Reproduzierbare synthetische Health-Exporte
+
+Der getrennte Development-Adapter erzeugt die versionierten Szenarien `lag-signal-v1` und
+`null-v1`. Das erste enthält eine dokumentierte negative Lag-1-Assoziation zwischen aktiver
+Energie und dem Apple-Ruhepuls des folgenden messlokalen Tages; das zweite enthält kein
+eingebautes Verzögerungssignal. Beide Standardexporte decken 365 messlokale Tage ab und enthalten
+Fixtures für die Europe/Berlin-Zeitumstellungen sowie Reisen nach America/New_York und Asia/Tokyo.
+
+```bash
+uv run healthlab-dev generate \
+  --scenario lag-signal-v1 \
+  --seed 42 \
+  --destination .scratch/lag-signal-v1 \
+  --json
+
+uv run healthlab-dev generate \
+  --scenario null-v1 \
+  --seed 42 \
+  --destination .scratch/null-v1 \
+  --json
+```
+
+Jedes Ziel enthält `apple-health-export.zip`, `scenario-metadata.json` und `checksums.sha256`.
+Gleiche Szenarioversion, gleicher Seed und gleiche Optionen erzeugen byte-identische Dateien.
+Rauschen und Missingness lassen sich bei Bedarf explizit setzen:
+
+```bash
+uv run healthlab-dev generate \
+  --scenario lag-signal-v1 \
+  --seed 73 \
+  --destination .scratch/lag-with-missingness \
+  --noise-standard-deviation 0.5 \
+  --missing-active-energy-probability 0.05 \
+  --missing-resting-heart-rate-probability 0.02
+```
+
+`healthlab-dev` besitzt keine Produktions- oder Real-Store-Konfiguration und verweigert Ziele
+innerhalb eines bestehenden HealthLab-Datenspeichers.
+
 Die Qualitätsprüfungen laufen lokal mit:
 
 ```bash

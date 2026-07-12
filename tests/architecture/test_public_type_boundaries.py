@@ -10,7 +10,8 @@ import personal_health_lab as package_root
 import personal_health_lab.application as application
 import personal_health_lab.overview as overview_module
 import personal_health_lab.storage as storage
-from personal_health_lab.adapters import cli
+import personal_health_lab.synthetic_export as synthetic_export
+from personal_health_lab.adapters import cli, dev_cli
 from personal_health_lab.application import (
     ConfigurationError,
     DataMode,
@@ -52,7 +53,15 @@ def _assert_module_exports_are_typed(module: ModuleType) -> None:
 
 
 def test_public_module_exports_are_fully_typed_without_any() -> None:
-    for module in (package_root, application, overview_module, storage, cli):
+    for module in (
+        package_root,
+        application,
+        overview_module,
+        storage,
+        synthetic_export,
+        cli,
+        dev_cli,
+    ):
         _assert_module_exports_are_typed(module)
 
 

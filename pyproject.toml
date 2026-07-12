@@ -16,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 healthlab = "personal_health_lab.adapters.cli:main"
+healthlab-dev = "personal_health_lab.adapters.dev_cli:main"
 
 [dependency-groups]
 dev = [
