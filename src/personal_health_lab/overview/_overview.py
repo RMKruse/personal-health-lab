@@ -82,7 +82,7 @@ class OverviewReader:
             status=(OverviewStatus.PROVISIONAL if analysis is not None else OverviewStatus.READY),
             selection=selection,
             message=(
-                "Das Analyseergebnis ist explorativ."
+                f"Modellreife: {analysis.model_maturity}."
                 if analysis is not None
                 else "Importierte tägliche Gesundheitsdaten sind verfügbar."
             ),

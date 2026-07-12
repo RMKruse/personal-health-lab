@@ -57,6 +57,18 @@ if overview.resting_hr_analysis is not None:
                 "Folgetag": item.lag_days,
                 "Richtung": item.direction.value,
                 "bpm je 100 kcal": item.estimate_per_100_kcal,
+                "Punktweise Untergrenze": item.pointwise_interval.lower_per_100_kcal,
+                "Punktweise Obergrenze": item.pointwise_interval.upper_per_100_kcal,
+                "Simultane Untergrenze": (
+                    item.simultaneous_band.lower_per_100_kcal
+                    if item.simultaneous_band is not None
+                    else None
+                ),
+                "Simultane Obergrenze": (
+                    item.simultaneous_band.upper_per_100_kcal
+                    if item.simultaneous_band is not None
+                    else None
+                ),
                 "bpm je persönliche SD": item.estimate_per_personal_standard_deviation,
             }
             for item in result.lag_associations
@@ -65,4 +77,16 @@ if overview.resting_hr_analysis is not None:
     st.metric(
         "Kumulativer Zusammenhang je 100 kcal",
         f"{result.cumulative_association.estimate_per_100_kcal:.2f} bpm",
+    )
+    st.caption(
+        f"Diagnosen: {result.diagnostics.complete_days} vollständige Tage · "
+        f"Merkmalsabhängigkeit {result.diagnostics.feature_dependency} · "
+        f"Bootstrap {result.diagnostics.bootstrap_successes}/"
+        f"{result.diagnostics.bootstrap_resamples} · "
+        f"Guardrail {result.diagnostics.association_guardrail}"
+    )
+    st.caption(
+        f"Moving-Block-Bootstrap: {result.methodology.resample_count} Resamples, "
+        f"Blocklänge {result.methodology.block_length_days} Tage, "
+        f"Intervallniveau {result.methodology.interval_level:.0%}."
     )

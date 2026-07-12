@@ -11,6 +11,7 @@ from personal_health_lab.adapters._config import load_runtime_config
 from personal_health_lab.application import (
     AnalysisDefinitionId,
     AnalysisStatus,
+    AssociationInterval,
     ConfigurationError,
     DataMode,
     HealthLab,
@@ -44,6 +45,21 @@ def _analysis_json(overview: Overview) -> dict[str, object] | None:
     result = overview.resting_hr_analysis
     if result is None:
         return None
+
+    def interval_json(interval: AssociationInterval | None) -> dict[str, float] | None:
+        if interval is None:
+            return None
+        return {
+            "lower_per_100_kcal": interval.lower_per_100_kcal,
+            "upper_per_100_kcal": interval.upper_per_100_kcal,
+            "lower_per_personal_standard_deviation": (
+                interval.lower_per_personal_standard_deviation
+            ),
+            "upper_per_personal_standard_deviation": (
+                interval.upper_per_personal_standard_deviation
+            ),
+        }
+
     cumulative = result.cumulative_association
     return {
         "analysis_definition_id": str(result.analysis_definition_id),
@@ -53,6 +69,15 @@ def _analysis_json(overview: Overview) -> dict[str, object] | None:
             "estimate_per_personal_standard_deviation": (
                 cumulative.estimate_per_personal_standard_deviation
             ),
+            "pointwise_interval": interval_json(cumulative.pointwise_interval),
+        },
+        "diagnostics": {
+            "association_guardrail": result.diagnostics.association_guardrail,
+            "bootstrap_resamples": result.diagnostics.bootstrap_resamples,
+            "bootstrap_successes": result.diagnostics.bootstrap_successes,
+            "complete_days": result.diagnostics.complete_days,
+            "feature_dependency": result.diagnostics.feature_dependency,
+            "model_readiness": result.diagnostics.model_readiness,
         },
         "lag_associations": [
             {
@@ -64,10 +89,22 @@ def _analysis_json(overview: Overview) -> dict[str, object] | None:
                 "exposure_unit": item.exposure_unit.value,
                 "lag_days": item.lag_days,
                 "outcome_unit": item.outcome_unit.value,
+                "pointwise_interval": interval_json(item.pointwise_interval),
+                "simultaneous_band": interval_json(item.simultaneous_band),
             }
             for item in result.lag_associations
         ],
         "model_maturity": result.model_maturity,
+        "methodology": {
+            "block_length_days": result.methodology.block_length_days,
+            "bootstrap_method": result.methodology.bootstrap_method,
+            "interval_level": result.methodology.interval_level,
+            "minimum_observations": result.methodology.minimum_observations,
+            "random_seed": result.methodology.random_seed,
+            "resample_count": result.methodology.resample_count,
+            "ridge_penalty": result.methodology.ridge_penalty,
+            "robust_observations": result.methodology.robust_observations,
+        },
         "personal_standard_deviation_kcal": result.personal_standard_deviation_kcal,
         "snapshot_ref": str(result.snapshot_id),
     }
@@ -94,7 +131,9 @@ def main(args: Sequence[str] | None = None) -> int:
                         end_date=parsed.end_date,
                     )
                 )
-                overview = health_lab.load_overview(OverviewSelection())
+                overview = health_lab.load_overview(
+                    OverviewSelection(parsed.start_date, parsed.end_date)
+                )
             else:
                 overview = health_lab.load_overview(OverviewSelection())
     except ConfigurationError as error:
@@ -137,9 +176,23 @@ def main(args: Sequence[str] | None = None) -> int:
         )
         if overview.resting_hr_analysis is not None:
             for item in overview.resting_hr_analysis.lag_associations:
-                print(f"Lag {item.lag_days}: {item.estimate_per_100_kcal:.2f} bpm/100 kcal")
+                band = item.simultaneous_band
+                assert band is not None
+                print(
+                    f"Lag {item.lag_days}: {item.estimate_per_100_kcal:.2f} bpm/100 kcal "
+                    f"(punktweise {item.pointwise_interval.lower_per_100_kcal:.2f} bis "
+                    f"{item.pointwise_interval.upper_per_100_kcal:.2f}; simultan "
+                    f"{band.lower_per_100_kcal:.2f} bis {band.upper_per_100_kcal:.2f})"
+                )
             cumulative = overview.resting_hr_analysis.cumulative_association
             print(f"Kumulativ: {cumulative.estimate_per_100_kcal:.2f} bpm/100 kcal")
+            diagnostics = overview.resting_hr_analysis.diagnostics
+            print(
+                f"Diagnosen: {diagnostics.complete_days} vollständige Tage; "
+                f"Merkmalsabhängigkeit {diagnostics.feature_dependency}; "
+                f"Bootstrap {diagnostics.bootstrap_successes}/{diagnostics.bootstrap_resamples}; "
+                f"Guardrail {diagnostics.association_guardrail}"
+            )
     elif parsed.command == "import" and parsed.as_json:
         print(
             json.dumps(

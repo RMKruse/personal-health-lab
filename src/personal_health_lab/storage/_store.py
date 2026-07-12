@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import IO, Literal, Self
+from typing import IO, Literal, Self, cast
 
 import duckdb
 
@@ -85,13 +85,47 @@ class AssociationDirection(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class AssociationInterval:
+    lower_per_100_kcal: float
+    upper_per_100_kcal: float
+    lower_per_personal_standard_deviation: float
+    upper_per_personal_standard_deviation: float
+
+
+@dataclass(frozen=True, slots=True)
 class AssociationEstimate:
     lag_days: int | None
     direction: AssociationDirection
     estimate_per_100_kcal: float
     estimate_per_personal_standard_deviation: float
+    pointwise_interval: AssociationInterval
+    simultaneous_band: AssociationInterval | None
     exposure_unit: CanonicalUnit = CanonicalUnit.KILOCALORIE
     outcome_unit: CanonicalUnit = CanonicalUnit.BEATS_PER_MINUTE
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisMethodology:
+    ridge_penalty: float
+    minimum_observations: int
+    robust_observations: int
+    bootstrap_method: Literal["moving_block"]
+    block_length_days: int
+    resample_count: int
+    random_seed: int
+    interval_level: float
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisDiagnostics:
+    complete_days: int
+    feature_dependency: Literal["acceptable", "high"]
+    bootstrap_successes: int
+    bootstrap_resamples: int
+    model_readiness: Literal["exploratory", "robust"]
+    association_guardrail: Literal[
+        "simultaneous_band_includes_zero", "simultaneous_band_excludes_zero"
+    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,7 +135,9 @@ class RestingHeartRateAnalysisResult:
     personal_standard_deviation_kcal: float
     lag_associations: tuple[AssociationEstimate, ...]
     cumulative_association: AssociationEstimate
-    model_maturity: Literal["exploratory"] = "exploratory"
+    model_maturity: Literal["exploratory", "robust"]
+    diagnostics: AnalysisDiagnostics
+    methodology: AnalysisMethodology
 
 
 @dataclass(frozen=True, slots=True)
@@ -796,13 +832,18 @@ class LocalStore:
                 estimate_per_personal_standard_deviation DOUBLE NOT NULL,
                 exposure_unit TEXT NOT NULL,
                 outcome_unit TEXT NOT NULL,
-                personal_standard_deviation_kcal DOUBLE NOT NULL
+                personal_standard_deviation_kcal DOUBLE NOT NULL,
+                pointwise_interval TEXT NOT NULL,
+                simultaneous_band TEXT,
+                model_maturity TEXT NOT NULL,
+                diagnostics TEXT NOT NULL,
+                methodology TEXT NOT NULL
             )
             """
         )
         estimates = (*result.lag_associations, result.cumulative_association)
         self._query.executemany(
-            "INSERT INTO resting_hr_analysis_result VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO resting_hr_analysis_result VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
                     estimate.lag_days,
@@ -812,6 +853,51 @@ class LocalStore:
                     estimate.exposure_unit.value,
                     estimate.outcome_unit.value,
                     result.personal_standard_deviation_kcal,
+                    json.dumps(
+                        [
+                            estimate.pointwise_interval.lower_per_100_kcal,
+                            estimate.pointwise_interval.upper_per_100_kcal,
+                            estimate.pointwise_interval.lower_per_personal_standard_deviation,
+                            estimate.pointwise_interval.upper_per_personal_standard_deviation,
+                        ]
+                    ),
+                    (
+                        None
+                        if estimate.simultaneous_band is None
+                        else json.dumps(
+                            [
+                                estimate.simultaneous_band.lower_per_100_kcal,
+                                estimate.simultaneous_band.upper_per_100_kcal,
+                                estimate.simultaneous_band.lower_per_personal_standard_deviation,
+                                estimate.simultaneous_band.upper_per_personal_standard_deviation,
+                            ]
+                        )
+                    ),
+                    result.model_maturity,
+                    json.dumps(
+                        {
+                            "complete_days": result.diagnostics.complete_days,
+                            "feature_dependency": result.diagnostics.feature_dependency,
+                            "bootstrap_successes": result.diagnostics.bootstrap_successes,
+                            "bootstrap_resamples": result.diagnostics.bootstrap_resamples,
+                            "model_readiness": result.diagnostics.model_readiness,
+                            "association_guardrail": result.diagnostics.association_guardrail,
+                        },
+                        sort_keys=True,
+                    ),
+                    json.dumps(
+                        {
+                            "ridge_penalty": result.methodology.ridge_penalty,
+                            "minimum_observations": result.methodology.minimum_observations,
+                            "robust_observations": result.methodology.robust_observations,
+                            "bootstrap_method": result.methodology.bootstrap_method,
+                            "block_length_days": result.methodology.block_length_days,
+                            "resample_count": result.methodology.resample_count,
+                            "random_seed": result.methodology.random_seed,
+                            "interval_level": result.methodology.interval_level,
+                        },
+                        sort_keys=True,
+                    ),
                 )
                 for estimate in estimates
             ],
@@ -856,11 +942,22 @@ class LocalStore:
             f"""
             SELECT lag_days, direction, estimate_per_100_kcal,
                    estimate_per_personal_standard_deviation, exposure_unit, outcome_unit,
-                   personal_standard_deviation_kcal
+                   personal_standard_deviation_kcal, pointwise_interval, simultaneous_band,
+                   model_maturity, diagnostics, methodology
             FROM read_parquet('{escaped_path}')
             ORDER BY lag_days NULLS LAST
             """
         ).fetchall()
+
+        def interval(value: str) -> AssociationInterval:
+            values = cast(list[float], json.loads(value))
+            return AssociationInterval(
+                lower_per_100_kcal=float(values[0]),
+                upper_per_100_kcal=float(values[1]),
+                lower_per_personal_standard_deviation=float(values[2]),
+                upper_per_personal_standard_deviation=float(values[3]),
+            )
+
         estimates = tuple(
             AssociationEstimate(
                 lag_days=None if lag_days is None else int(lag_days),
@@ -869,16 +966,61 @@ class LocalStore:
                 estimate_per_personal_standard_deviation=float(per_sd),
                 exposure_unit=CanonicalUnit(exposure_unit),
                 outcome_unit=CanonicalUnit(outcome_unit),
+                pointwise_interval=interval(str(pointwise)),
+                simultaneous_band=(None if simultaneous is None else interval(str(simultaneous))),
             )
-            for lag_days, direction, per_100, per_sd, exposure_unit, outcome_unit, _ in rows
+            for (
+                lag_days,
+                direction,
+                per_100,
+                per_sd,
+                exposure_unit,
+                outcome_unit,
+                _,
+                pointwise,
+                simultaneous,
+                _,
+                _,
+                _,
+            ) in rows
         )
         assert estimates and estimates[-1].lag_days is None
+        diagnostic_values = cast(dict[str, object], json.loads(str(rows[0][10])))
+        methodology_values = cast(dict[str, object], json.loads(str(rows[0][11])))
         return RestingHeartRateAnalysisResult(
             snapshot_id=SnapshotId(snapshot_id),
             analysis_definition_id=AnalysisDefinitionId(definition_id),
-            personal_standard_deviation_kcal=float(rows[0][-1]),
+            personal_standard_deviation_kcal=float(rows[0][6]),
             lag_associations=estimates[:-1],
             cumulative_association=estimates[-1],
+            model_maturity=cast(Literal["exploratory", "robust"], rows[0][9]),
+            diagnostics=AnalysisDiagnostics(
+                complete_days=cast(int, diagnostic_values["complete_days"]),
+                feature_dependency=cast(
+                    Literal["acceptable", "high"], diagnostic_values["feature_dependency"]
+                ),
+                bootstrap_successes=cast(int, diagnostic_values["bootstrap_successes"]),
+                bootstrap_resamples=cast(int, diagnostic_values["bootstrap_resamples"]),
+                model_readiness=cast(
+                    Literal["exploratory", "robust"], diagnostic_values["model_readiness"]
+                ),
+                association_guardrail=cast(
+                    Literal["simultaneous_band_includes_zero", "simultaneous_band_excludes_zero"],
+                    diagnostic_values["association_guardrail"],
+                ),
+            ),
+            methodology=AnalysisMethodology(
+                ridge_penalty=cast(float, methodology_values["ridge_penalty"]),
+                minimum_observations=cast(int, methodology_values["minimum_observations"]),
+                robust_observations=cast(int, methodology_values["robust_observations"]),
+                bootstrap_method=cast(
+                    Literal["moving_block"], methodology_values["bootstrap_method"]
+                ),
+                block_length_days=cast(int, methodology_values["block_length_days"]),
+                resample_count=cast(int, methodology_values["resample_count"]),
+                random_seed=cast(int, methodology_values["random_seed"]),
+                interval_level=cast(float, methodology_values["interval_level"]),
+            ),
         )
 
     def load_provenance_counts(self) -> ProvenanceCounts:

@@ -4,10 +4,13 @@ from personal_health_lab import DataMode
 
 from ._store import (
     AnalysisDefinitionId,
+    AnalysisDiagnostics,
+    AnalysisMethodology,
     AnalysisResultId,
     AnalysisRunId,
     AssociationDirection,
     AssociationEstimate,
+    AssociationInterval,
     ImportId,
     LocalStore,
     OperationId,
@@ -21,10 +24,13 @@ from ._store import (
 
 __all__ = [
     "AnalysisDefinitionId",
+    "AnalysisDiagnostics",
+    "AnalysisMethodology",
     "AnalysisResultId",
     "AnalysisRunId",
     "AssociationDirection",
     "AssociationEstimate",
+    "AssociationInterval",
     "DataMode",
     "ImportId",
     "LocalStore",

@@ -93,8 +93,42 @@ def test_cli_runs_and_exposes_the_built_in_lag_analysis(
     assert receipt["status"] == "completed"
     assert receipt["analysis_definition_id"] == "lag-signal-v1"
     assert len(receipt["result"]["lag_associations"]) == 7
+    assert receipt["result"]["model_maturity"] == "robust"
+    assert receipt["result"]["methodology"]["bootstrap_method"] == "moving_block"
+    assert receipt["result"]["diagnostics"]
+    assert all(
+        item["pointwise_interval"] and item["simultaneous_band"]
+        for item in receipt["result"]["lag_associations"]
+    )
+
+    structured_result = json.dumps(receipt["result"], ensure_ascii=False).lower()
+    assert all(
+        forbidden not in structured_result
+        for forbidden in (
+            "*",
+            "significant",
+            "signifikant",
+            "causal",
+            "kausal",
+            "medical",
+            "medizin",
+            "recommend",
+            "empfehl",
+            "therap",
+        )
+    )
 
     assert main([*common_args, "overview", "--json"]) == 0
     result = json.loads(capsys.readouterr().out)["resting_hr_analysis"]
     assert len(result["lag_associations"]) == 7
     assert result["lag_associations"][0]["direction"] == "negative"
+
+    assert main([*common_args, "analyze"]) == 0
+    human_output = capsys.readouterr().out
+    assert "simultan" in human_output
+    assert "Diagnosen:" in human_output
+
+    assert main([*common_args, "analyze", "--start-date", "2024-12-20", "--json"]) == 3
+    insufficient = json.loads(capsys.readouterr().out)
+    assert insufficient["status"] == "insufficient_data"
+    assert insufficient["result"] is None

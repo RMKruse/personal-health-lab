@@ -3,7 +3,12 @@
 from personal_health_lab import DataMode
 from personal_health_lab.health_import import ImportId, OperationId
 from personal_health_lab.health_import import SnapshotId as SnapshotRef
-from personal_health_lab.overview import Overview, OverviewSelection, OverviewStatus
+from personal_health_lab.overview import (
+    AssociationInterval,
+    Overview,
+    OverviewSelection,
+    OverviewStatus,
+)
 from personal_health_lab.resting_hr_analysis import (
     AnalysisDefinitionId,
     AnalysisRunId,
@@ -32,6 +37,7 @@ __all__ = [
     "AnalysisResultRef",
     "AnalysisRunId",
     "AnalysisStatus",
+    "AssociationInterval",
     "ConfigurationError",
     "DataMode",
     "FeatureNotAvailableError",

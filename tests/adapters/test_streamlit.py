@@ -72,3 +72,7 @@ def test_streamlit_shows_imported_daily_series(
     ]
     assert len(app.get("vega_lite_chart")) == 2
     assert app.metric[0].label == "Kumulativer Zusammenhang je 100 kcal"
+    assert "Punktweise Untergrenze" in app.dataframe[0].value.columns
+    assert "Simultane Obergrenze" in app.dataframe[0].value.columns
+    assert any("Modellreife: robust" in caption.value for caption in app.caption)
+    assert any("Moving-Block-Bootstrap" in caption.value for caption in app.caption)
