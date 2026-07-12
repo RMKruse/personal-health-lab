@@ -17,7 +17,14 @@ from personal_health_lab.health_data import (
     CanonicalUnit,
     HealthProvenance,
 )
-from personal_health_lab.storage import DataMode, LocalStore
+from personal_health_lab.storage import (
+    DataMode,
+    ImportId,
+    LocalStore,
+    OperationId,
+    SnapshotId,
+    StoreError,
+)
 
 _EXPORT_MEMBER = "apple_health_export/export.xml"
 _ACTIVE_ENERGY = "HKQuantityTypeIdentifierActiveEnergyBurned"
@@ -32,13 +39,17 @@ _MAPPINGS = {
 }
 
 
+class HealthImportError(Exception):
+    """The import could not complete because its internal store failed."""
+
+
 @dataclass(frozen=True, slots=True)
 class HealthImportResult:
-    operation_id: str
-    import_id: str
+    operation_id: OperationId
+    import_id: ImportId
     status: Literal["committed", "rejected"]
     package_hash: str
-    snapshot_id: str | None
+    snapshot_id: SnapshotId | None
     record_count: int
     diagnostics: tuple[str, ...] = ()
 
@@ -100,8 +111,8 @@ def _records(package_path: Path) -> tuple[CanonicalHealthRecord, ...]:
 def import_health_export(
     package_path: Path, *, root: Path, mode: DataMode
 ) -> HealthImportResult:
-    operation_id = uuid4().hex
-    import_id = uuid4().hex
+    operation_id = OperationId(uuid4().hex)
+    import_id = ImportId(uuid4().hex)
     package_hash = ""
     try:
         with package_path.open("rb") as package:
@@ -118,18 +129,21 @@ def import_health_export(
             diagnostics=("invalid_health_export",),
         )
 
-    snapshot_id = uuid4().hex
-    store = LocalStore.open(root=root, mode=mode)
     try:
-        store.publish_import(
-            operation_id=operation_id,
-            import_id=import_id,
-            package_hash=package_hash,
-            snapshot_id=snapshot_id,
-            records=records,
-        )
-    finally:
-        store.close()
+        snapshot_id = SnapshotId(uuid4().hex)
+        store = LocalStore.open(root=root, mode=mode)
+        try:
+            store.publish_import(
+                operation_id=operation_id,
+                import_id=import_id,
+                package_hash=package_hash,
+                snapshot_id=snapshot_id,
+                records=records,
+            )
+        finally:
+            store.close()
+    except StoreError as error:
+        raise HealthImportError("Health-Importspeicher ist nicht verfügbar.") from error
     return HealthImportResult(
         operation_id=operation_id,
         import_id=import_id,
@@ -140,4 +154,11 @@ def import_health_export(
     )
 
 
-__all__ = ["HealthImportResult", "import_health_export"]
+__all__ = [
+    "HealthImportError",
+    "HealthImportResult",
+    "ImportId",
+    "OperationId",
+    "SnapshotId",
+    "import_health_export",
+]

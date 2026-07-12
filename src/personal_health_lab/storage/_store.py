@@ -25,6 +25,33 @@ class StoreError(ValueError):
     """A local store cannot be opened safely."""
 
 
+@dataclass(frozen=True, slots=True)
+class _OpaqueStoreId:
+    _value: str
+
+    def __post_init__(self) -> None:
+        if not self._value:
+            raise ValueError("ID darf nicht leer sein.")
+
+    def __str__(self) -> str:
+        return self._value
+
+
+@dataclass(frozen=True, slots=True)
+class OperationId(_OpaqueStoreId):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class ImportId(_OpaqueStoreId):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotId(_OpaqueStoreId):
+    pass
+
+
 @dataclass(slots=True)
 class LocalStore:
     _root: Path
@@ -96,15 +123,35 @@ class LocalStore:
     def publish_import(
         self,
         *,
-        operation_id: str,
-        import_id: str,
+        operation_id: OperationId,
+        import_id: ImportId,
         package_hash: str,
-        snapshot_id: str,
+        snapshot_id: SnapshotId,
         records: tuple[CanonicalHealthRecord, ...],
     ) -> None:
         self._require_open()
-        staging = self._root / "staging" / import_id
-        snapshot = self._root / _PARQUET_DIRECTORY / "snapshots" / snapshot_id
+        try:
+            self._publish_import(
+                operation_id=operation_id,
+                import_id=import_id,
+                package_hash=package_hash,
+                snapshot_id=snapshot_id,
+                records=records,
+            )
+        except (OSError, sqlite3.Error, duckdb.Error) as error:
+            raise StoreError("Health-Import konnte nicht veröffentlicht werden.") from error
+
+    def _publish_import(
+        self,
+        *,
+        operation_id: OperationId,
+        import_id: ImportId,
+        package_hash: str,
+        snapshot_id: SnapshotId,
+        records: tuple[CanonicalHealthRecord, ...],
+    ) -> None:
+        staging = self._root / "staging" / str(import_id)
+        snapshot = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
         staging.mkdir(parents=True)
         parquet_path = staging / "samples.parquet"
         self._query.execute(
@@ -153,10 +200,10 @@ class LocalStore:
                 INSERT INTO imports VALUES (?, ?, ?, 'committed', ?, ?, ?)
                 """,
                 (
-                    import_id,
-                    operation_id,
+                    str(import_id),
+                    str(operation_id),
                     package_hash,
-                    snapshot_id,
+                    str(snapshot_id),
                     len(records),
                     datetime.now().astimezone().isoformat(),
                 ),
@@ -166,8 +213,9 @@ class LocalStore:
                 INSERT INTO active_snapshot(singleton, snapshot_id) VALUES (1, ?)
                 ON CONFLICT(singleton) DO UPDATE SET snapshot_id = excluded.snapshot_id
                 """,
-                (snapshot_id,),
+                (str(snapshot_id),),
             )
+
     def load_daily_series(
         self, start_date: date | None, end_date: date | None
     ) -> tuple[DailyHealthSeries, ...]:

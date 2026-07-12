@@ -8,10 +8,17 @@ from types import TracebackType
 from typing import Self
 
 from personal_health_lab import DataMode
-from personal_health_lab.health_import import import_health_export
+from personal_health_lab.health_import import (
+    HealthImportError,
+    ImportId,
+    OperationId,
+    SnapshotId,
+    import_health_export,
+)
 from personal_health_lab.overview import Overview, OverviewReader, OverviewSelection
 
 logger = logging.getLogger("personal_health_lab")
+SnapshotRef = SnapshotId
 
 
 class HealthLabError(Exception):
@@ -36,21 +43,6 @@ class _OpaqueId:
 
     def __str__(self) -> str:
         return self._value
-
-
-@dataclass(frozen=True, slots=True)
-class OperationId(_OpaqueId):
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class ImportId(_OpaqueId):
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class SnapshotRef(_OpaqueId):
-    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,17 +185,20 @@ class HealthLab:
 
     def import_health_export(self, package_path: Path) -> ImportReceipt:
         self._require_open()
-        result = import_health_export(
-            package_path,
-            root=self._config.active_store,
-            mode=self._config.mode,
-        )
+        try:
+            result = import_health_export(
+                package_path,
+                root=self._config.active_store,
+                mode=self._config.mode,
+            )
+        except HealthImportError as error:
+            raise HealthLabError("Health-Export konnte nicht importiert werden.") from error
         return ImportReceipt(
-            operation_id=OperationId(result.operation_id),
-            import_id=ImportId(result.import_id),
+            operation_id=result.operation_id,
+            import_id=result.import_id,
             status=ImportStatus(result.status),
             package_hash=result.package_hash,
-            snapshot_ref=SnapshotRef(result.snapshot_id) if result.snapshot_id else None,
+            snapshot_ref=result.snapshot_id,
             record_count=result.record_count,
             anomaly_count=0,
             diagnostics=result.diagnostics,
