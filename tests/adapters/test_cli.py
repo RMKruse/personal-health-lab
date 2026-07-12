@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from personal_health_lab.adapters.cli import main
+from personal_health_lab.synthetic_export import generate_export
 
 
 def test_cli_prints_empty_overview_as_versioned_json(
@@ -25,6 +26,7 @@ def test_cli_prints_empty_overview_as_versioned_json(
     output = json.loads(capsys.readouterr().out)
     assert exit_code == 0
     assert output == {
+        "daily_series": [],
         "message": "Keine Gesundheitsdaten vorhanden.",
         "runtime_config": {
             "mode": "synthetic",
@@ -34,3 +36,30 @@ def test_cli_prints_empty_overview_as_versioned_json(
         "schema_version": "1.0",
         "status": "empty",
     }
+
+
+def test_cli_imports_export_and_prints_daily_series(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fixture = generate_export("lag-signal-v1", 42, tmp_path / "fixture")
+    common_args = [
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(tmp_path / "synthetic"),
+        "--real-store",
+        str(tmp_path / "real"),
+    ]
+
+    assert main([*common_args, "import", str(fixture.export_path), "--json"]) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["status"] == "committed"
+    assert receipt["record_count"] == 1_825
+
+    assert main([*common_args, "overview", "--json"]) == 0
+    overview = json.loads(capsys.readouterr().out)
+    assert [(series["data_type"], series["unit"]) for series in overview["daily_series"]] == [
+        ("active_energy", "kcal"),
+        ("apple_resting_heart_rate", "count/min"),
+    ]
+    assert len(overview["daily_series"][0]["values"]) == 365

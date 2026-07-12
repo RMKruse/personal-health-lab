@@ -8,6 +8,7 @@ from types import TracebackType
 from typing import Self
 
 from personal_health_lab import DataMode
+from personal_health_lab.health_import import import_health_export
 from personal_health_lab.overview import Overview, OverviewReader, OverviewSelection
 
 logger = logging.getLogger("personal_health_lab")
@@ -191,9 +192,22 @@ class HealthLab:
         logger.info("healthlab_closed mode=%s", self._config.mode.value)
 
     def import_health_export(self, package_path: Path) -> ImportReceipt:
-        del package_path
         self._require_open()
-        raise FeatureNotAvailableError("Health-Exportimport folgt in einem späteren Ticket.")
+        result = import_health_export(
+            package_path,
+            root=self._config.active_store,
+            mode=self._config.mode,
+        )
+        return ImportReceipt(
+            operation_id=OperationId(result.operation_id),
+            import_id=ImportId(result.import_id),
+            status=ImportStatus(result.status),
+            package_hash=result.package_hash,
+            snapshot_ref=SnapshotRef(result.snapshot_id) if result.snapshot_id else None,
+            record_count=result.record_count,
+            anomaly_count=0,
+            diagnostics=result.diagnostics,
+        )
 
     def run_resting_hr_analysis(
         self, config: RestingHeartRateAnalysisConfig

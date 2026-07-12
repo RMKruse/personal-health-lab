@@ -22,3 +22,17 @@ st.title("HealthLab Übersicht")
 st.caption(f"Datenmodus: {config.mode.value}")
 st.write(f"Status: {overview.status.value}")
 st.info(overview.message)
+titles = {
+    "active_energy": "Aktive Energie",
+    "apple_resting_heart_rate": "Apple-Ruhepuls",
+}
+for series in overview.daily_series:
+    st.subheader(f"{titles[series.data_type.value]} ({series.unit.value})")
+    st.line_chart(
+        {
+            "Datum": [value.day for value in series.values],
+            "Wert": [value.value for value in series.values],
+        },
+        x="Datum",
+        y="Wert",
+    )

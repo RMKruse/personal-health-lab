@@ -21,7 +21,7 @@ ALLOWED_DEPENDENCIES = {
     "application": {"health_import", "overview", "package_root", "resting_hr_analysis"},
     "health_data": set(),
     "health_import": {"health_data", "storage"},
-    "overview": {"package_root", "storage"},
+    "overview": {"health_data", "package_root", "storage"},
     "package_root": {"runtime"},
     "resting_hr_analysis": {"health_data", "storage"},
     "runtime": set(),

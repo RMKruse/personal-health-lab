@@ -24,6 +24,9 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     overview = commands.add_parser("overview", help="Aktuelle Übersicht laden")
     overview.add_argument("--json", action="store_true", dest="as_json")
+    import_command = commands.add_parser("import", help="Apple-Health-Export importieren")
+    import_command.add_argument("package", type=Path)
+    import_command.add_argument("--json", action="store_true", dest="as_json")
     return parser
 
 
@@ -38,14 +41,48 @@ def main(args: Sequence[str] | None = None) -> int:
             config_file=parsed.config,
         )
         with HealthLab.open(config) as health_lab:
-            overview = health_lab.load_overview(OverviewSelection())
+            if parsed.command == "import":
+                receipt = health_lab.import_health_export(parsed.package)
+            else:
+                overview = health_lab.load_overview(OverviewSelection())
     except ConfigurationError as error:
         _parser().error(str(error))
 
-    if parsed.as_json:
+    if parsed.command == "import" and parsed.as_json:
         print(
             json.dumps(
                 {
+                    "diagnostics": receipt.diagnostics,
+                    "import_id": str(receipt.import_id),
+                    "operation_id": str(receipt.operation_id),
+                    "package_hash": receipt.package_hash,
+                    "record_count": receipt.record_count,
+                    "schema_version": "1.0",
+                    "snapshot_ref": str(receipt.snapshot_ref) if receipt.snapshot_ref else None,
+                    "status": receipt.status.value,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    elif parsed.command == "import":
+        print(f"Health-Exportimport: {receipt.status.value}")
+        print(f"Importierte Records: {receipt.record_count}")
+    elif parsed.as_json:
+        print(
+            json.dumps(
+                {
+                    "daily_series": [
+                        {
+                            "data_type": series.data_type.value,
+                            "unit": series.unit.value,
+                            "values": [
+                                {"day": value.day.isoformat(), "value": value.value}
+                                for value in series.values
+                            ],
+                        }
+                        for series in overview.daily_series
+                    ],
                     "message": overview.message,
                     "runtime_config": {
                         "mode": config.mode.value,

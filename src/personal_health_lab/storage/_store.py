@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import shutil
 import sqlite3
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from typing import Self
 
 import duckdb
 
 from personal_health_lab import DataMode
+from personal_health_lab.health_data import (
+    CanonicalHealthRecord,
+    CanonicalHealthType,
+    CanonicalUnit,
+    DailyHealthSeries,
+    DailyHealthValue,
+)
 
 _METADATA_FILE = "metadata.sqlite3"
 _PARQUET_DIRECTORY = "parquet"
@@ -44,6 +53,23 @@ class LocalStore:
                 )
                 """
             )
+            metadata.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS imports (
+                    import_id TEXT PRIMARY KEY,
+                    operation_id TEXT NOT NULL,
+                    package_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    snapshot_id TEXT NOT NULL,
+                    record_count INTEGER NOT NULL,
+                    committed_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS active_snapshot (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    snapshot_id TEXT NOT NULL
+                );
+                """
+            )
             identity = metadata.execute(
                 "SELECT mode, schema_version FROM store_identity WHERE singleton = 1"
             ).fetchone()
@@ -71,6 +97,134 @@ class LocalStore:
     def is_empty(self) -> bool:
         self._require_open()
         return not any((self._root / _PARQUET_DIRECTORY).rglob("*.parquet"))
+
+    def publish_import(
+        self,
+        *,
+        operation_id: str,
+        import_id: str,
+        package_hash: str,
+        snapshot_id: str,
+        records: tuple[CanonicalHealthRecord, ...],
+    ) -> None:
+        self._require_open()
+        staging = self._root / "staging" / import_id
+        snapshot = self._root / _PARQUET_DIRECTORY / "snapshots" / snapshot_id
+        staging.mkdir(parents=True)
+        parquet_path = staging / "samples.parquet"
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE staged_samples (
+                data_type VARCHAR,
+                canonical_unit VARCHAR,
+                canonical_value DOUBLE,
+                measurement_local_date DATE,
+                source_start VARCHAR,
+                source_end VARCHAR,
+                source_name VARCHAR,
+                source_version VARCHAR,
+                device VARCHAR,
+                original_value DOUBLE,
+                original_unit VARCHAR
+            )
+            """
+        )
+        self._query.executemany(
+            "INSERT INTO staged_samples VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    record.data_type.value,
+                    record.unit.value,
+                    record.value,
+                    record.measurement_local_day,
+                    record.source_start.isoformat(),
+                    record.source_end.isoformat(),
+                    record.provenance.source_name,
+                    record.provenance.source_version,
+                    record.provenance.device,
+                    record.provenance.original_value,
+                    record.provenance.original_unit,
+                )
+                for record in records
+            ],
+        )
+        escaped_path = str(parquet_path).replace("'", "''")
+        self._query.execute(f"COPY staged_samples TO '{escaped_path}' (FORMAT PARQUET)")
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        staging.replace(snapshot)
+        with self._metadata:
+            self._metadata.execute(
+                """
+                INSERT INTO imports VALUES (?, ?, ?, 'committed', ?, ?, ?)
+                """,
+                (
+                    import_id,
+                    operation_id,
+                    package_hash,
+                    snapshot_id,
+                    len(records),
+                    datetime.now().astimezone().isoformat(),
+                ),
+            )
+            self._metadata.execute(
+                """
+                INSERT INTO active_snapshot(singleton, snapshot_id) VALUES (1, ?)
+                ON CONFLICT(singleton) DO UPDATE SET snapshot_id = excluded.snapshot_id
+                """,
+                (snapshot_id,),
+            )
+        shutil.rmtree(self._root / "staging", ignore_errors=True)
+
+    def load_daily_series(
+        self, start_date: date | None, end_date: date | None
+    ) -> tuple[DailyHealthSeries, ...]:
+        self._require_open()
+        row = self._metadata.execute(
+            "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            return ()
+        parquet_path = (
+            self._root / _PARQUET_DIRECTORY / "snapshots" / str(row[0]) / "samples.parquet"
+        )
+        clauses: list[str] = []
+        parameters: list[date] = []
+        if start_date is not None:
+            clauses.append("measurement_local_date >= ?")
+            parameters.append(start_date)
+        if end_date is not None:
+            clauses.append("measurement_local_date <= ?")
+            parameters.append(end_date)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        escaped_path = str(parquet_path).replace("'", "''")
+        rows = self._query.execute(
+            f"""
+            SELECT data_type, canonical_unit, measurement_local_date,
+                   SUM(canonical_value),
+                   list(source_start ORDER BY source_start),
+                   list(DISTINCT source_name ORDER BY source_name)
+            FROM read_parquet('{escaped_path}')
+            {where}
+            GROUP BY data_type, canonical_unit, measurement_local_date
+            ORDER BY data_type, measurement_local_date
+            """,
+            parameters,
+        ).fetchall()
+        grouped: dict[tuple[CanonicalHealthType, CanonicalUnit], list[DailyHealthValue]] = {}
+        for data_type, unit, day, value, source_starts, source_names in rows:
+            key = (CanonicalHealthType(data_type), CanonicalUnit(unit))
+            grouped.setdefault(key, []).append(
+                DailyHealthValue(
+                    day=day,
+                    value=value,
+                    source_starts=tuple(datetime.fromisoformat(item) for item in source_starts),
+                    source_names=tuple(source_names),
+                )
+            )
+        return tuple(
+            DailyHealthSeries(data_type=data_type, unit=unit, values=tuple(values))
+            for (data_type, unit), values in grouped.items()
+        )
 
     def close(self) -> None:
         if not self._closed:

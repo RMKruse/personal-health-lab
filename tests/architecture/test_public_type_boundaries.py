@@ -8,6 +8,8 @@ import pytest
 
 import personal_health_lab as package_root
 import personal_health_lab.application as application
+import personal_health_lab.health_data as health_data
+import personal_health_lab.health_import as health_import
 import personal_health_lab.overview as overview_module
 import personal_health_lab.storage as storage
 import personal_health_lab.synthetic_export as synthetic_export
@@ -56,6 +58,8 @@ def test_public_module_exports_are_fully_typed_without_any() -> None:
     for module in (
         package_root,
         application,
+        health_data,
+        health_import,
         overview_module,
         storage,
         synthetic_export,

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Literal, Self
 
 from personal_health_lab import DataMode
+from personal_health_lab.health_data import DailyHealthSeries
 from personal_health_lab.storage import LocalStore
 
 
@@ -35,6 +36,7 @@ class Overview:
     status: OverviewStatus
     selection: OverviewSelection
     message: str
+    daily_series: tuple[DailyHealthSeries, ...] = ()
     schema_version: Literal["1.0"] = "1.0"
 
 
@@ -52,10 +54,16 @@ class OverviewReader:
         self._store.close()
 
     def load(self, selection: OverviewSelection) -> Overview:
-        if self._store.is_empty():
+        daily_series = self._store.load_daily_series(selection.start_date, selection.end_date)
+        if not daily_series:
             return Overview(
                 status=OverviewStatus.EMPTY,
                 selection=selection,
                 message="Keine Gesundheitsdaten vorhanden.",
             )
-        raise RuntimeError("Nicht-leere Übersichten folgen in einem späteren Ticket.")
+        return Overview(
+            status=OverviewStatus.READY,
+            selection=selection,
+            message="Importierte tägliche Gesundheitsdaten sind verfügbar.",
+            daily_series=daily_series,
+        )
