@@ -92,6 +92,17 @@ uv run mypy
 uv run pytest
 ```
 
+## Sicherheitsgrenzen für Health-Importe
+
+`RuntimeConfig` begrenzt jedes nicht vertrauenswürdige ZIP vor dem XML-Import. Die versionierten
+Standardwerte sind `512 MiB` für Paket-, Eintrags- und gesamte entpackte Größe, `8` Einträge sowie
+ein maximales Kompressionsverhältnis von `200`. Sie lassen sich pro Lauf über
+`max_import_package_bytes`, `max_import_entries`, `max_import_entry_bytes`,
+`max_import_uncompressed_bytes` und `max_import_compression_ratio` verkleinern oder vergrößern.
+Größen und Anzahlen müssen positive Ganzzahlen sein; das Verhältnis muss endlich und mindestens
+`1` sein. Überschreitungen sowie Traversal, Symlinks, unerwartete Dateien, NUL-/UTF-16-XML, DTDs
+und XML-Entitäten werden einheitlich mit `invalid_health_export` abgewiesen.
+
 ## Dokumentation
 
 - [Architektur und versionierte Roadmap](./HEALTH_ANALYTICS_ARCHITECTURE.md)

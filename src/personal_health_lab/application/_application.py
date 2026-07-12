@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -66,6 +67,11 @@ class RuntimeConfig:
     synthetic_store: Path
     real_store: Path
     schema_version: str = "1.0"
+    max_import_package_bytes: int = 512 * 1024 * 1024
+    max_import_entries: int = 8
+    max_import_entry_bytes: int = 512 * 1024 * 1024
+    max_import_uncompressed_bytes: int = 512 * 1024 * 1024
+    max_import_compression_ratio: float = 200.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, DataMode):
@@ -79,6 +85,17 @@ class RuntimeConfig:
 
         if self.schema_version != "1.0":
             raise ConfigurationError("Unbekannte RuntimeConfig-Schemaversion.")
+        limits = (
+            self.max_import_package_bytes,
+            self.max_import_entries,
+            self.max_import_entry_bytes,
+            self.max_import_uncompressed_bytes,
+        )
+        if any(type(limit) is not int or limit <= 0 for limit in limits):
+            raise ConfigurationError("Importgrenzen müssen positive Ganzzahlen sein.")
+        ratio = self.max_import_compression_ratio
+        if type(ratio) not in (int, float) or not math.isfinite(ratio) or ratio < 1:
+            raise ConfigurationError("Kompressionsverhältnis muss mindestens 1 sein.")
         if synthetic_store == real_store:
             raise ConfigurationError("Synthetischer und realer Datenspeicher müssen getrennt sein.")
         if synthetic_store in real_store.parents or real_store in synthetic_store.parents:
@@ -193,6 +210,11 @@ class HealthLab:
                 package_path,
                 root=self._config.active_store,
                 mode=self._config.mode,
+                max_package_bytes=self._config.max_import_package_bytes,
+                max_entries=self._config.max_import_entries,
+                max_entry_bytes=self._config.max_import_entry_bytes,
+                max_uncompressed_bytes=self._config.max_import_uncompressed_bytes,
+                max_compression_ratio=self._config.max_import_compression_ratio,
             )
         except HealthImportError as error:
             raise HealthLabError("Health-Export konnte nicht importiert werden.") from error

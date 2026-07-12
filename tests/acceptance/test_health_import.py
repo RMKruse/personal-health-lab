@@ -1,10 +1,13 @@
 import os
 import signal
+import stat
 import time
 from datetime import UTC, date, datetime, timedelta
 from multiprocessing import get_context
 from pathlib import Path
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
+
+import pytest
 
 from personal_health_lab.application import (
     DataMode,
@@ -62,6 +65,135 @@ def _large_export(path: Path, count: int = 50_000) -> Path:
         for index in range(count)
     )
     return _export(path, records)
+
+
+def _negative_export_v1(path: Path, case: str, valid_xml: str) -> Path:
+    compression = ZIP_STORED if case == "package_size" else ZIP_DEFLATED
+    with ZipFile(path, "w", compression) as archive:
+        if case == "symlink":
+            link = ZipInfo("apple_health_export/export.xml")
+            link.create_system = 3
+            link.external_attr = (stat.S_IFLNK | 0o777) << 16
+            archive.writestr(link, valid_xml)
+            return path
+        utf16_entity = valid_xml.replace(
+            "?>",
+            '?><!DOCTYPE HealthData [<!ENTITY private "private-health-value">]>',
+            1,
+        ).replace("Test Watch", "&private;").encode("utf-16")
+        xml: str | bytes = {
+            "xxe": (
+                '<!DOCTYPE HealthData [<!ENTITY secret SYSTEM "file:///etc/passwd">]>'
+                '<HealthData><Record sourceName="&secret;"/></HealthData>'
+            ),
+            "utf16_entity": utf16_entity,
+            "invalid_xml": "<HealthData><Record></HealthData>",
+            "entry_size": valid_xml + " " * 1_024,
+            "uncompressed_size": valid_xml + " " * 1_024,
+            "compression_ratio": valid_xml + " " * 10_000,
+        }.get(case, valid_xml)
+        archive.writestr("apple_health_export/export.xml", xml)
+        if case == "traversal":
+            archive.writestr("../escaped.txt", "health data")
+        elif case == "unsupported_type":
+            archive.writestr("apple_health_export/notes.txt", "health data")
+        elif case == "entry_count":
+            archive.writestr("apple_health_export/", "")
+    return path
+
+
+@pytest.mark.parametrize(
+    ("case", "limits"),
+    [
+        ("traversal", {}),
+        ("symlink", {}),
+        ("unsupported_type", {}),
+        ("xxe", {}),
+        ("utf16_entity", {}),
+        ("invalid_xml", {}),
+        ("package_size", {"max_import_package_bytes": 100}),
+        ("entry_count", {"max_import_entries": 1}),
+        ("entry_size", {"max_import_entry_bytes": 512}),
+        ("uncompressed_size", {"max_import_uncompressed_bytes": 512}),
+        ("compression_ratio", {"max_import_compression_ratio": 2.0}),
+    ],
+)
+def test_negative_exports_v1_are_rejected_without_changing_the_snapshot(
+    case: str,
+    limits: dict[str, int | float],
+    tmp_path: Path,
+) -> None:
+    base = _export(
+        tmp_path / "base.zip",
+        _record(
+            "HKQuantityTypeIdentifierRestingHeartRate",
+            60,
+            "2024-01-01 07:00:00 +0100",
+            "2024-01-01 07:01:00 +0100",
+        ),
+    )
+    valid_xml = (
+        '<?xml version="1.0"?><HealthData>'
+        + _record(
+            "HKQuantityTypeIdentifierRestingHeartRate",
+            61,
+            "2024-01-02 07:00:00 +0100",
+            "2024-01-02 07:01:00 +0100",
+        )
+        + "</HealthData>"
+    )
+    malicious = _negative_export_v1(tmp_path / f"{case}.zip", case, valid_xml)
+    original = malicious.read_bytes()
+    base_config = RuntimeConfig(
+        mode=DataMode.SYNTHETIC,
+        synthetic_store=tmp_path / "synthetic-store",
+        real_store=tmp_path / "real-store",
+    )
+    config = RuntimeConfig(
+        mode=DataMode.SYNTHETIC,
+        synthetic_store=base_config.synthetic_store,
+        real_store=base_config.real_store,
+        **limits,  # type: ignore[arg-type]
+    )
+
+    with HealthLab.open(base_config) as health_lab:
+        committed = health_lab.import_health_export(base)
+    with HealthLab.open(config) as health_lab:
+        before = health_lab.load_overview(OverviewSelection())
+        rejected = health_lab.import_health_export(malicious)
+        after = health_lab.load_overview(OverviewSelection())
+
+    assert committed.status is ImportStatus.COMMITTED
+    assert rejected.status is ImportStatus.REJECTED
+    assert rejected.diagnostics == ("invalid_health_export",)
+    assert rejected.snapshot_ref is None
+    assert after.daily_series == before.daily_series
+    assert after.snapshot_count == before.snapshot_count
+    assert not (tmp_path / "escaped.txt").exists()
+    assert malicious.read_bytes() == original
+    assert not any((config.active_store / "staging").iterdir())
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_import_package_bytes", 0),
+        ("max_import_entries", True),
+        ("max_import_entry_bytes", -1),
+        ("max_import_uncompressed_bytes", 1.5),
+        ("max_import_compression_ratio", float("inf")),
+    ],
+)
+def test_import_security_limits_are_validated(
+    field: str, value: int | float | bool, tmp_path: Path
+) -> None:
+    with pytest.raises(ValueError):
+        RuntimeConfig(
+            mode=DataMode.SYNTHETIC,
+            synthetic_store=tmp_path / "synthetic-store",
+            real_store=tmp_path / "real-store",
+            **{field: value},  # type: ignore[arg-type]
+        )
 
 
 def test_valid_synthetic_export_is_published_as_daily_health_data(tmp_path: Path) -> None:
