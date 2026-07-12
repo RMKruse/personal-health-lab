@@ -37,6 +37,11 @@ class Overview:
     selection: OverviewSelection
     message: str
     daily_series: tuple[DailyHealthSeries, ...] = ()
+    import_count: int = 0
+    package_count: int = 0
+    snapshot_count: int = 0
+    logical_measurement_count: int = 0
+    measurement_version_count: int = 0
     schema_version: Literal["1.0"] = "1.0"
 
 
@@ -55,15 +60,26 @@ class OverviewReader:
 
     def load(self, selection: OverviewSelection) -> Overview:
         daily_series = self._store.load_daily_series(selection.start_date, selection.end_date)
+        counts = self._store.load_provenance_counts()
         if not daily_series:
             return Overview(
                 status=OverviewStatus.EMPTY,
                 selection=selection,
                 message="Keine Gesundheitsdaten vorhanden.",
+                import_count=counts.import_count,
+                package_count=counts.package_count,
+                snapshot_count=counts.snapshot_count,
+                logical_measurement_count=counts.logical_measurement_count,
+                measurement_version_count=counts.measurement_version_count,
             )
         return Overview(
             status=OverviewStatus.READY,
             selection=selection,
             message="Importierte tägliche Gesundheitsdaten sind verfügbar.",
             daily_series=daily_series,
+            import_count=counts.import_count,
+            package_count=counts.package_count,
+            snapshot_count=counts.snapshot_count,
+            logical_measurement_count=counts.logical_measurement_count,
+            measurement_version_count=counts.measurement_version_count,
         )

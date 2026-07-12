@@ -56,7 +56,10 @@ def main(args: Sequence[str] | None = None) -> int:
                     "import_id": str(receipt.import_id),
                     "operation_id": str(receipt.operation_id),
                     "package_hash": receipt.package_hash,
+                    "package_record_count": receipt.package_record_count,
                     "record_count": receipt.record_count,
+                    "logical_measurement_count": receipt.logical_measurement_count,
+                    "measurement_version_count": receipt.measurement_version_count,
                     "schema_version": "1.0",
                     "snapshot_ref": str(receipt.snapshot_ref) if receipt.snapshot_ref else None,
                     "status": receipt.status.value,
@@ -77,13 +80,32 @@ def main(args: Sequence[str] | None = None) -> int:
                             "data_type": series.data_type.value,
                             "unit": series.unit.value,
                             "values": [
-                                {"day": value.day.isoformat(), "value": value.value}
+                                {
+                                    "day": value.day.isoformat(),
+                                    "measurement_version_ids": [
+                                        str(version_id)
+                                        for version_id in value.measurement_version_ids
+                                    ],
+                                    "source_updated_ats": [
+                                        timestamp.isoformat()
+                                        for timestamp in value.source_updated_ats
+                                    ],
+                                    "source_versions": value.source_versions,
+                                    "value": value.value,
+                                }
                                 for value in series.values
                             ],
                         }
                         for series in overview.daily_series
                     ],
                     "message": overview.message,
+                    "provenance": {
+                        "import_count": overview.import_count,
+                        "logical_measurement_count": overview.logical_measurement_count,
+                        "measurement_version_count": overview.measurement_version_count,
+                        "package_count": overview.package_count,
+                        "snapshot_count": overview.snapshot_count,
+                    },
                     "runtime_config": {
                         "mode": config.mode.value,
                         "real_store": "<redacted>",

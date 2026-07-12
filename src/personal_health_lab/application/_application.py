@@ -108,6 +108,9 @@ class ImportReceipt:
     snapshot_ref: SnapshotRef | None
     record_count: int
     anomaly_count: int
+    package_record_count: int = 0
+    logical_measurement_count: int = 0
+    measurement_version_count: int = 0
     diagnostics: tuple[str, ...] = ()
 
 
@@ -201,6 +204,9 @@ class HealthLab:
             snapshot_ref=result.snapshot_id,
             record_count=result.record_count,
             anomaly_count=0,
+            package_record_count=result.package_record_count,
+            logical_measurement_count=result.logical_measurement_count,
+            measurement_version_count=result.measurement_version_count,
             diagnostics=result.diagnostics,
         )
 

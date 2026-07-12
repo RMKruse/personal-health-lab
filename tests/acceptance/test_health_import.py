@@ -1,5 +1,6 @@
 from datetime import date
 from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from personal_health_lab.application import (
     DataMode,
@@ -11,6 +12,30 @@ from personal_health_lab.application import (
 )
 from personal_health_lab.health_data import CanonicalHealthType, CanonicalUnit
 from personal_health_lab.synthetic_export import generate_export
+
+
+def _export(path: Path, records: str) -> Path:
+    xml = f'<?xml version="1.0"?><HealthData>{records}</HealthData>'
+    with ZipFile(path, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("apple_health_export/export.xml", xml)
+    return path
+
+
+def _record(
+    data_type: str,
+    value: float,
+    start: str,
+    end: str,
+    *,
+    source_version: str = "1",
+) -> str:
+    unit = "kcal" if data_type.endswith("ActiveEnergyBurned") else "count/min"
+    return (
+        f'<Record type="{data_type}" sourceName="Test Watch" '
+        f'sourceVersion="{source_version}" device="Test Device" unit="{unit}" '
+        f'creationDate="{end}" startDate="{start}" endDate="{end}" '
+        f'value="{value}"/>'
+    )
 
 
 def test_valid_synthetic_export_is_published_as_daily_health_data(tmp_path: Path) -> None:
@@ -64,3 +89,74 @@ def test_valid_synthetic_export_is_published_as_daily_health_data(tmp_path: Path
     assert tokyo_value.value == 62.68
     assert tokyo_value.source_starts[0].utcoffset().total_seconds() == 32_400.0
     assert new_york_value.source_names == ("HealthLab Synthetic Apple Watch",)
+
+
+def test_cumulative_exports_are_idempotent_and_preserve_measurement_versions(
+    tmp_path: Path,
+) -> None:
+    active_type = "HKQuantityTypeIdentifierActiveEnergyBurned"
+    resting_type = "HKQuantityTypeIdentifierRestingHeartRate"
+    active = _record(
+        active_type,
+        100,
+        "2024-01-01 08:00:00 +0100",
+        "2024-01-01 08:30:00 +0100",
+    )
+    resting_v1 = _record(
+        resting_type,
+        60,
+        "2024-01-01 07:00:00 +0100",
+        "2024-01-01 07:01:00 +0100",
+    )
+    resting_v2 = _record(
+        resting_type,
+        61,
+        "2024-01-01 07:00:00 +0100",
+        "2024-01-01 07:01:00 +0100",
+        source_version="2",
+    )
+    new_active = _record(
+        active_type,
+        50,
+        "2024-01-01 12:00:00 +0100",
+        "2024-01-01 12:30:00 +0100",
+    )
+    base = _export(tmp_path / "base.zip", active + resting_v1)
+    expanded = _export(tmp_path / "expanded.zip", active + resting_v2 + new_active)
+    config = RuntimeConfig(
+        mode=DataMode.SYNTHETIC,
+        synthetic_store=tmp_path / "synthetic-store",
+        real_store=tmp_path / "real-store",
+    )
+
+    with HealthLab.open(config) as health_lab:
+        first = health_lab.import_health_export(base)
+        duplicate = health_lab.import_health_export(base)
+        cumulative = health_lab.import_health_export(expanded)
+        overview = health_lab.load_overview(OverviewSelection())
+
+    assert first.status is ImportStatus.COMMITTED
+    assert duplicate.status is ImportStatus.DUPLICATE
+    assert duplicate.snapshot_ref == first.snapshot_ref
+    assert duplicate.record_count == 0
+    assert cumulative.status is ImportStatus.COMMITTED
+    assert cumulative.snapshot_ref != first.snapshot_ref
+    assert cumulative.record_count == 2
+    assert cumulative.package_record_count == 3
+    assert cumulative.logical_measurement_count == 3
+    assert cumulative.measurement_version_count == 4
+    assert overview.import_count == 3
+    assert overview.package_count == 2
+    assert overview.snapshot_count == 2
+    assert overview.logical_measurement_count == 3
+    assert overview.measurement_version_count == 4
+
+    values = {series.data_type: series.values[0] for series in overview.daily_series}
+    assert values[CanonicalHealthType.ACTIVE_ENERGY].value == 150
+    preferred_resting = values[CanonicalHealthType.APPLE_RESTING_HEART_RATE]
+    assert preferred_resting.value == 61
+    assert preferred_resting.source_versions == ("2",)
+    assert tuple(timestamp.isoformat() for timestamp in preferred_resting.source_updated_ats) == (
+        "2024-01-01T06:01:00+00:00",
+    )
+    assert len(preferred_resting.measurement_version_ids) == 1

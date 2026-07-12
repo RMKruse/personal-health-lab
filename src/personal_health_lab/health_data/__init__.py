@@ -19,6 +19,28 @@ class CanonicalUnit(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class _MeasurementId:
+    value: str
+
+    def __post_init__(self) -> None:
+        if not self.value:
+            raise ValueError("Messungs-ID darf nicht leer sein.")
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalMeasurementId(_MeasurementId):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class MeasurementVersionId(_MeasurementId):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
 class HealthProvenance:
     source_name: str
     source_version: str
@@ -29,11 +51,14 @@ class HealthProvenance:
 
 @dataclass(frozen=True, slots=True)
 class CanonicalHealthRecord:
+    logical_measurement_id: LogicalMeasurementId
+    measurement_version_id: MeasurementVersionId
     data_type: CanonicalHealthType
     unit: CanonicalUnit
     value: float
     source_start: datetime
     source_end: datetime
+    source_updated_at: datetime
     measurement_local_day: date
     provenance: HealthProvenance
 
@@ -44,7 +69,10 @@ class CanonicalHealthRecord:
         }[self.data_type]
         if self.unit is not expected_unit or not math.isfinite(self.value):
             raise ValueError("Ungültiger kanonischer Gesundheitswert.")
-        if self.source_start.tzinfo is None or self.source_end.tzinfo is None:
+        if any(
+            timestamp.tzinfo is None
+            for timestamp in (self.source_start, self.source_end, self.source_updated_at)
+        ):
             raise ValueError("Quellzeitpunkte müssen eine Zeitzone enthalten.")
         if self.measurement_local_day != self.source_start.date():
             raise ValueError("Messlokaler Kalendertag passt nicht zum Quellzeitpunkt.")
@@ -56,6 +84,9 @@ class DailyHealthValue:
     value: float
     source_starts: tuple[datetime, ...]
     source_names: tuple[str, ...]
+    measurement_version_ids: tuple[MeasurementVersionId, ...] = ()
+    source_updated_ats: tuple[datetime, ...] = ()
+    source_versions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,4 +103,6 @@ __all__ = [
     "DailyHealthSeries",
     "DailyHealthValue",
     "HealthProvenance",
+    "LogicalMeasurementId",
+    "MeasurementVersionId",
 ]

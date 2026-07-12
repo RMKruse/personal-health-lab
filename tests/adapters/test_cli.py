@@ -28,6 +28,13 @@ def test_cli_prints_empty_overview_as_versioned_json(
     assert output == {
         "daily_series": [],
         "message": "Keine Gesundheitsdaten vorhanden.",
+        "provenance": {
+            "import_count": 0,
+            "logical_measurement_count": 0,
+            "measurement_version_count": 0,
+            "package_count": 0,
+            "snapshot_count": 0,
+        },
         "runtime_config": {
             "mode": "synthetic",
             "real_store": "<redacted>",

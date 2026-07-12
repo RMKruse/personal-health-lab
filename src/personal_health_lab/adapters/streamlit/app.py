@@ -22,6 +22,12 @@ st.title("HealthLab Übersicht")
 st.caption(f"Datenmodus: {config.mode.value}")
 st.write(f"Status: {overview.status.value}")
 st.info(overview.message)
+st.caption(
+    f"Importe: {overview.import_count} · Pakete: {overview.package_count} · "
+    f"Messungen: {overview.logical_measurement_count} · "
+    f"Quellversionen: {overview.measurement_version_count} · "
+    f"Snapshots: {overview.snapshot_count}"
+)
 titles = {
     "active_energy": "Aktive Energie",
     "apple_resting_heart_rate": "Apple-Ruhepuls",

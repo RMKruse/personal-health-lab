@@ -16,6 +16,8 @@ from personal_health_lab.health_data import (
     CanonicalHealthType,
     CanonicalUnit,
     HealthProvenance,
+    LogicalMeasurementId,
+    MeasurementVersionId,
 )
 from personal_health_lab.storage import (
     DataMode,
@@ -47,10 +49,13 @@ class HealthImportError(Exception):
 class HealthImportResult:
     operation_id: OperationId
     import_id: ImportId
-    status: Literal["committed", "rejected"]
+    status: Literal["committed", "duplicate", "rejected"]
     package_hash: str
     snapshot_id: SnapshotId | None
     record_count: int
+    package_record_count: int = 0
+    logical_measurement_count: int = 0
+    measurement_version_count: int = 0
     diagnostics: tuple[str, ...] = ()
 
 
@@ -59,6 +64,10 @@ def _source_datetime(value: str) -> datetime:
     if timestamp.tzinfo is None:
         raise ValueError("missing timezone")
     return timestamp
+
+
+def _id(*parts: object) -> str:
+    return hashlib.sha256("\x1f".join(map(str, parts)).encode()).hexdigest()
 
 
 def _records(package_path: Path) -> tuple[CanonicalHealthRecord, ...]:
@@ -85,18 +94,42 @@ def _records(package_path: Path) -> tuple[CanonicalHealthRecord, ...]:
                     value = float(element.attrib["value"])
                     source_start = _source_datetime(element.attrib["startDate"])
                     source_end = _source_datetime(element.attrib["endDate"])
+                    source_updated_at = _source_datetime(element.attrib["creationDate"])
+                    source_name = element.attrib["sourceName"]
+                    source_version = element.attrib.get("sourceVersion", "")
+                    device = element.attrib.get("device", "")
+                    logical_id = LogicalMeasurementId(
+                        _id(
+                            data_type.value,
+                            source_start.isoformat(),
+                            source_end.isoformat(),
+                            source_name,
+                            device,
+                        )
+                    )
                     records.append(
                         CanonicalHealthRecord(
+                            logical_measurement_id=logical_id,
+                            measurement_version_id=MeasurementVersionId(
+                                _id(
+                                    logical_id,
+                                    source_updated_at.isoformat(),
+                                    source_version,
+                                    value,
+                                    source_unit,
+                                )
+                            ),
                             data_type=data_type,
                             unit=canonical_unit,
                             value=value,
                             source_start=source_start,
                             source_end=source_end,
+                            source_updated_at=source_updated_at,
                             measurement_local_day=source_start.date(),
                             provenance=HealthProvenance(
-                                source_name=element.attrib["sourceName"],
-                                source_version=element.attrib.get("sourceVersion", ""),
-                                device=element.attrib.get("device", ""),
+                                source_name=source_name,
+                                source_version=source_version,
+                                device=device,
                                 original_value=value,
                                 original_unit=source_unit,
                             ),
@@ -133,7 +166,7 @@ def import_health_export(
         snapshot_id = SnapshotId(uuid4().hex)
         store = LocalStore.open(root=root, mode=mode)
         try:
-            store.publish_import(
+            published = store.publish_import(
                 operation_id=operation_id,
                 import_id=import_id,
                 package_hash=package_hash,
@@ -147,10 +180,14 @@ def import_health_export(
     return HealthImportResult(
         operation_id=operation_id,
         import_id=import_id,
-        status="committed",
+        status=published.status,
         package_hash=package_hash,
-        snapshot_id=snapshot_id,
-        record_count=len(records),
+        snapshot_id=published.snapshot_id,
+        record_count=published.record_count,
+        package_record_count=len(records),
+        logical_measurement_count=published.logical_measurement_count,
+        measurement_version_count=published.measurement_version_count,
+        diagnostics=published.diagnostics,
     )
 
 
