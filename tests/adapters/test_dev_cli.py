@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -34,6 +35,13 @@ def test_dev_cli_generates_versioned_metadata_and_checksums(
     assert set(output["checksums"]) == {
         "apple-health-export.zip",
         "scenario-metadata.json",
+    }
+    assert output["checksums"] == {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (
+            destination / "apple-health-export.zip",
+            destination / "scenario-metadata.json",
+        )
     }
 
 

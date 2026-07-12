@@ -5,19 +5,18 @@ import json
 from collections.abc import Sequence
 from pathlib import Path
 
-from personal_health_lab.synthetic_export import GenerationOptions, generate_export
-
-_SCENARIOS = ("lag-signal-v1", "null-v1")
+from personal_health_lab.synthetic_export import GenerationOptions, ScenarioId, generate_export
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="healthlab-dev")
     commands = parser.add_subparsers(dest="command", required=True)
     generate = commands.add_parser("generate", help="Synthetisches Health-Exportpaket erzeugen")
-    generate.add_argument("--scenario", required=True, choices=_SCENARIOS)
+    generate.add_argument("--scenario", required=True, type=ScenarioId, choices=tuple(ScenarioId))
     generate.add_argument("--seed", required=True, type=int)
     generate.add_argument("--destination", required=True, type=Path)
-    generate.add_argument("--noise-standard-deviation", type=float, default=0.7)
+    generate.add_argument("--active-energy-noise-standard-deviation", type=float, default=55.0)
+    generate.add_argument("--resting-heart-rate-noise-standard-deviation", type=float, default=0.7)
     generate.add_argument("--missing-active-energy-probability", type=float, default=0.0)
     generate.add_argument("--missing-resting-heart-rate-probability", type=float, default=0.0)
     generate.add_argument("--json", action="store_true", dest="as_json")
@@ -37,7 +36,12 @@ def main(args: Sequence[str] | None = None) -> int:
     parsed = parser.parse_args(args)
     try:
         options = GenerationOptions(
-            noise_standard_deviation=parsed.noise_standard_deviation,
+            active_energy_noise_standard_deviation=(
+                parsed.active_energy_noise_standard_deviation
+            ),
+            resting_heart_rate_noise_standard_deviation=(
+                parsed.resting_heart_rate_noise_standard_deviation
+            ),
             missing_active_energy_probability=parsed.missing_active_energy_probability,
             missing_resting_heart_rate_probability=(
                 parsed.missing_resting_heart_rate_probability

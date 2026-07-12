@@ -1,4 +1,5 @@
 import json
+from datetime import date, timedelta
 from pathlib import Path
 from statistics import correlation
 from xml.etree import ElementTree
@@ -56,7 +57,8 @@ def test_noise_and_missing_values_are_configurable_and_recorded(tmp_path: Path) 
         73,
         tmp_path,
         options=GenerationOptions(
-            noise_standard_deviation=0.0,
+            active_energy_noise_standard_deviation=0.0,
+            resting_heart_rate_noise_standard_deviation=0.0,
             missing_active_energy_probability=0.5,
         ),
     )
@@ -78,9 +80,35 @@ def test_noise_and_missing_values_are_configurable_and_recorded(tmp_path: Path) 
     assert 0 < len(active_records) < 4 * 365
     assert set(resting_values) == {"62.00"}
     assert metadata["generation_options"] == {
+        "active_energy_noise_standard_deviation": 0.0,
         "missing_active_energy_probability": 0.5,
         "missing_resting_heart_rate_probability": 0.0,
-        "noise_standard_deviation": 0.0,
+        "resting_heart_rate_noise_standard_deviation": 0.0,
+    }
+
+
+def test_missingness_preserves_the_day_range_and_both_healthkit_types(tmp_path: Path) -> None:
+    fixture = generate_export(
+        "null-v1",
+        91,
+        tmp_path,
+        options=GenerationOptions(
+            missing_active_energy_probability=0.999,
+            missing_resting_heart_rate_probability=0.999,
+        ),
+    )
+
+    with ZipFile(fixture.export_path) as archive:
+        root = ElementTree.fromstring(archive.read("apple_health_export/export.xml"))
+    records = root.findall("Record")
+
+    assert {record.attrib["startDate"][:10] for record in records} == {
+        (date(2024, 1, 1) + timedelta(days=day_index)).isoformat()
+        for day_index in range(365)
+    }
+    assert {record.attrib["type"] for record in records} == {
+        "HKQuantityTypeIdentifierActiveEnergyBurned",
+        "HKQuantityTypeIdentifierRestingHeartRate",
     }
 
 

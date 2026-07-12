@@ -71,7 +71,8 @@ uv run healthlab-dev generate \
   --scenario lag-signal-v1 \
   --seed 73 \
   --destination .scratch/lag-with-missingness \
-  --noise-standard-deviation 0.5 \
+  --active-energy-noise-standard-deviation 40 \
+  --resting-heart-rate-noise-standard-deviation 0.5 \
   --missing-active-energy-probability 0.05 \
   --missing-resting-heart-rate-probability 0.02
 ```
