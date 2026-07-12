@@ -28,6 +28,7 @@ def test_cli_prints_empty_overview_as_versioned_json(
     assert output == {
         "daily_series": [],
         "message": "Keine Gesundheitsdaten vorhanden.",
+        "resting_hr_analysis": None,
         "provenance": {
             "import_count": 0,
             "logical_measurement_count": 0,
@@ -70,3 +71,30 @@ def test_cli_imports_export_and_prints_daily_series(
         ("apple_resting_heart_rate", "count/min"),
     ]
     assert len(overview["daily_series"][0]["values"]) == 365
+
+
+def test_cli_runs_and_exposes_the_built_in_lag_analysis(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fixture = generate_export("lag-signal-v1", 42, tmp_path / "fixture")
+    common_args = [
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(tmp_path / "synthetic"),
+        "--real-store",
+        str(tmp_path / "real"),
+    ]
+    assert main([*common_args, "import", str(fixture.export_path)]) == 0
+    capsys.readouterr()
+
+    assert main([*common_args, "analyze", "--json"]) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["status"] == "completed"
+    assert receipt["analysis_definition_id"] == "lag-signal-v1"
+    assert len(receipt["result"]["lag_associations"]) == 7
+
+    assert main([*common_args, "overview", "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)["resting_hr_analysis"]
+    assert len(result["lag_associations"]) == 7
+    assert result["lag_associations"][0]["direction"] == "negative"

@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import IO, Literal, Self
 
@@ -60,6 +61,47 @@ class ImportId(_OpaqueStoreId):
 @dataclass(frozen=True, slots=True)
 class SnapshotId(_OpaqueStoreId):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisRunId(_OpaqueStoreId):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisDefinitionId(_OpaqueStoreId):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisResultId(_OpaqueStoreId):
+    pass
+
+
+class AssociationDirection(StrEnum):
+    NEGATIVE = "negative"
+    ZERO = "zero"
+    POSITIVE = "positive"
+
+
+@dataclass(frozen=True, slots=True)
+class AssociationEstimate:
+    lag_days: int | None
+    direction: AssociationDirection
+    estimate_per_100_kcal: float
+    estimate_per_personal_standard_deviation: float
+    exposure_unit: CanonicalUnit = CanonicalUnit.KILOCALORIE
+    outcome_unit: CanonicalUnit = CanonicalUnit.BEATS_PER_MINUTE
+
+
+@dataclass(frozen=True, slots=True)
+class RestingHeartRateAnalysisResult:
+    snapshot_id: SnapshotId
+    analysis_definition_id: AnalysisDefinitionId
+    personal_standard_deviation_kcal: float
+    lag_associations: tuple[AssociationEstimate, ...]
+    cumulative_association: AssociationEstimate
+    model_maturity: Literal["exploratory"] = "exploratory"
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,9 +183,7 @@ class LocalStore:
         try:
             metadata_path = root / _METADATA_FILE
             metadata = sqlite3.connect(
-                metadata_path
-                if initialize
-                else f"{metadata_path.resolve().as_uri()}?mode=ro",
+                metadata_path if initialize else f"{metadata_path.resolve().as_uri()}?mode=ro",
                 uri=not initialize,
             )
             if initialize:
@@ -182,13 +222,40 @@ class LocalStore:
                     """
                 )
                 columns = {
-                    str(row[1])
-                    for row in metadata.execute("PRAGMA table_info(imports)").fetchall()
+                    str(row[1]) for row in metadata.execute("PRAGMA table_info(imports)").fetchall()
                 }
                 if "diagnostics" not in columns:
                     metadata.execute(
                         "ALTER TABLE imports ADD COLUMN diagnostics TEXT NOT NULL DEFAULT ''"
                     )
+                analysis_table = metadata.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'analysis_runs'"
+                ).fetchone()
+                if analysis_table is None:
+                    metadata.execute(
+                        """
+                        CREATE TABLE analysis_runs (
+                            analysis_run_id TEXT PRIMARY KEY,
+                            operation_id TEXT NOT NULL,
+                            result_id TEXT NOT NULL UNIQUE,
+                            snapshot_id TEXT NOT NULL,
+                            analysis_definition_id TEXT NOT NULL,
+                            analysis_start_date TEXT,
+                            analysis_end_date TEXT,
+                            status TEXT NOT NULL,
+                            completed_at TEXT NOT NULL
+                        )
+                        """
+                    )
+                    metadata.commit()
+                else:
+                    analysis_columns = {
+                        str(row[1]) for row in metadata.execute("PRAGMA table_info(analysis_runs)")
+                    }
+                    for column in ("analysis_start_date", "analysis_end_date"):
+                        if column not in analysis_columns:
+                            metadata.execute(f"ALTER TABLE analysis_runs ADD COLUMN {column} TEXT")
+                    metadata.commit()
             identity = metadata.execute(
                 "SELECT mode, schema_version FROM store_identity WHERE singleton = 1"
             ).fetchone()
@@ -416,11 +483,7 @@ class LocalStore:
             previous_count = 0
         else:
             current_path = (
-                self._root
-                / _PARQUET_DIRECTORY
-                / "snapshots"
-                / str(active[0])
-                / "samples.parquet"
+                self._root / _PARQUET_DIRECTORY / "snapshots" / str(active[0]) / "samples.parquet"
             )
             escaped_current = str(current_path).replace("'", "''")
             previous_row = self._query.execute(
@@ -554,10 +617,7 @@ class LocalStore:
         )
         self._metadata.executemany(
             "INSERT OR IGNORE INTO import_measurement_versions VALUES (?, ?)",
-            {
-                (str(import_id), str(record.measurement_version_id))
-                for record in records
-            },
+            {(str(import_id), str(record.measurement_version_id)) for record in records},
         )
 
     def _current_import_result(
@@ -679,6 +739,148 @@ class LocalStore:
             for (data_type, unit), values in grouped.items()
         )
 
+    def load_analysis_input(
+        self, start_date: date | None, end_date: date | None
+    ) -> tuple[SnapshotId | None, tuple[DailyHealthSeries, ...]]:
+        self._require_open()
+        row = self._metadata.execute(
+            "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            return None, ()
+        return SnapshotId(str(row[0])), self.load_daily_series(start_date, end_date)
+
+    def persist_resting_hr_analysis(
+        self,
+        *,
+        operation_id: OperationId,
+        analysis_run_id: AnalysisRunId,
+        result_id: AnalysisResultId,
+        result: RestingHeartRateAnalysisResult,
+        start_date: date | None,
+        end_date: date | None,
+    ) -> None:
+        self._require_open()
+        self._require_writer()
+        staging = self._root / "analysis-staging" / str(analysis_run_id)
+        destination = self._root / _PARQUET_DIRECTORY / "analyses" / str(result_id)
+        with self._metadata:
+            self._metadata.execute(
+                """
+                INSERT INTO analysis_runs(
+                    analysis_run_id, operation_id, result_id, snapshot_id,
+                    analysis_definition_id, analysis_start_date, analysis_end_date,
+                    status, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)
+                """,
+                (
+                    str(analysis_run_id),
+                    str(operation_id),
+                    str(result_id),
+                    str(result.snapshot_id),
+                    str(result.analysis_definition_id),
+                    start_date.isoformat() if start_date else None,
+                    end_date.isoformat() if end_date else None,
+                    datetime.now().astimezone().isoformat(),
+                ),
+            )
+        staging.mkdir(parents=True)
+        path = staging / "result.parquet"
+        escaped_path = str(path).replace("'", "''")
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE resting_hr_analysis_result (
+                lag_days INTEGER,
+                direction TEXT NOT NULL,
+                estimate_per_100_kcal DOUBLE NOT NULL,
+                estimate_per_personal_standard_deviation DOUBLE NOT NULL,
+                exposure_unit TEXT NOT NULL,
+                outcome_unit TEXT NOT NULL,
+                personal_standard_deviation_kcal DOUBLE NOT NULL
+            )
+            """
+        )
+        estimates = (*result.lag_associations, result.cumulative_association)
+        self._query.executemany(
+            "INSERT INTO resting_hr_analysis_result VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    estimate.lag_days,
+                    estimate.direction.value,
+                    estimate.estimate_per_100_kcal,
+                    estimate.estimate_per_personal_standard_deviation,
+                    estimate.exposure_unit.value,
+                    estimate.outcome_unit.value,
+                    result.personal_standard_deviation_kcal,
+                )
+                for estimate in estimates
+            ],
+        )
+        self._query.execute(f"COPY resting_hr_analysis_result TO '{escaped_path}' (FORMAT PARQUET)")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        staging.replace(destination)
+        with self._metadata:
+            self._metadata.execute(
+                "UPDATE analysis_runs SET status = 'completed', completed_at = ? "
+                "WHERE analysis_run_id = ?",
+                (datetime.now().astimezone().isoformat(), str(analysis_run_id)),
+            )
+
+    def load_latest_resting_hr_analysis(
+        self, start_date: date | None, end_date: date | None
+    ) -> RestingHeartRateAnalysisResult | None:
+        self._require_open()
+        row = self._metadata.execute(
+            """
+            SELECT analysis_runs.result_id, analysis_runs.snapshot_id,
+                   analysis_runs.analysis_definition_id
+            FROM analysis_runs, active_snapshot
+            WHERE analysis_runs.status = 'completed'
+              AND analysis_runs.snapshot_id = active_snapshot.snapshot_id
+              AND analysis_runs.analysis_start_date IS ?
+              AND analysis_runs.analysis_end_date IS ?
+            ORDER BY analysis_runs.completed_at DESC, analysis_runs.rowid DESC
+            LIMIT 1
+            """,
+            (
+                start_date.isoformat() if start_date else None,
+                end_date.isoformat() if end_date else None,
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        result_id, snapshot_id, definition_id = map(str, row)
+        path = self._root / _PARQUET_DIRECTORY / "analyses" / result_id / "result.parquet"
+        escaped_path = str(path).replace("'", "''")
+        rows = self._query.execute(
+            f"""
+            SELECT lag_days, direction, estimate_per_100_kcal,
+                   estimate_per_personal_standard_deviation, exposure_unit, outcome_unit,
+                   personal_standard_deviation_kcal
+            FROM read_parquet('{escaped_path}')
+            ORDER BY lag_days NULLS LAST
+            """
+        ).fetchall()
+        estimates = tuple(
+            AssociationEstimate(
+                lag_days=None if lag_days is None else int(lag_days),
+                direction=AssociationDirection(direction),
+                estimate_per_100_kcal=float(per_100),
+                estimate_per_personal_standard_deviation=float(per_sd),
+                exposure_unit=CanonicalUnit(exposure_unit),
+                outcome_unit=CanonicalUnit(outcome_unit),
+            )
+            for lag_days, direction, per_100, per_sd, exposure_unit, outcome_unit, _ in rows
+        )
+        assert estimates and estimates[-1].lag_days is None
+        return RestingHeartRateAnalysisResult(
+            snapshot_id=SnapshotId(snapshot_id),
+            analysis_definition_id=AnalysisDefinitionId(definition_id),
+            personal_standard_deviation_kcal=float(rows[0][-1]),
+            lag_associations=estimates[:-1],
+            cumulative_association=estimates[-1],
+        )
+
     def load_provenance_counts(self) -> ProvenanceCounts:
         self._require_open()
         import_count, package_count, snapshot_count, quarantined_count = self._metadata.execute(
@@ -739,6 +941,38 @@ class LocalStore:
             raise StoreError("Import-Recovery konnte nicht abgeschlossen werden.") from error
 
     def _recover_imports_unchecked(self) -> None:
+        running_analyses = self._metadata.execute(
+            "SELECT analysis_run_id, result_id FROM analysis_runs WHERE status = 'running'"
+        ).fetchall()
+        for analysis_run_id, result_id in running_analyses:
+            for path in (
+                self._root / "analysis-staging" / str(analysis_run_id),
+                self._root / _PARQUET_DIRECTORY / "analyses" / str(result_id),
+            ):
+                if path.exists():
+                    self._remove_tree(path)
+        if running_analyses:
+            with self._metadata:
+                self._metadata.execute(
+                    "UPDATE analysis_runs SET status = 'interrupted' WHERE status = 'running'"
+                )
+        analysis_staging = self._root / "analysis-staging"
+        if analysis_staging.exists():
+            for path in analysis_staging.iterdir():
+                if path.is_dir():
+                    self._remove_tree(path)
+        analyses = self._root / _PARQUET_DIRECTORY / "analyses"
+        if analyses.exists():
+            published = {
+                str(row[0])
+                for row in self._metadata.execute(
+                    "SELECT result_id FROM analysis_runs WHERE status = 'completed'"
+                )
+            }
+            for path in analyses.iterdir():
+                if path.is_dir() and path.name not in published:
+                    self._remove_tree(path)
+
         active = self._metadata.execute(
             "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
         ).fetchone()

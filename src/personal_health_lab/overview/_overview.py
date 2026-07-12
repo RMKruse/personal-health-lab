@@ -8,7 +8,7 @@ from typing import Literal, Self
 
 from personal_health_lab import DataMode
 from personal_health_lab.health_data import DailyHealthSeries
-from personal_health_lab.storage import LocalStore
+from personal_health_lab.storage import LocalStore, RestingHeartRateAnalysisResult
 
 
 class OverviewStatus(StrEnum):
@@ -37,6 +37,7 @@ class Overview:
     selection: OverviewSelection
     message: str
     daily_series: tuple[DailyHealthSeries, ...] = ()
+    resting_hr_analysis: RestingHeartRateAnalysisResult | None = None
     import_count: int = 0
     package_count: int = 0
     snapshot_count: int = 0
@@ -62,6 +63,9 @@ class OverviewReader:
     def load(self, selection: OverviewSelection) -> Overview:
         daily_series = self._store.load_daily_series(selection.start_date, selection.end_date)
         counts = self._store.load_provenance_counts()
+        analysis = self._store.load_latest_resting_hr_analysis(
+            selection.start_date, selection.end_date
+        )
         if not daily_series:
             return Overview(
                 status=OverviewStatus.EMPTY,
@@ -75,10 +79,15 @@ class OverviewReader:
                 quarantined_import_count=counts.quarantined_import_count,
             )
         return Overview(
-            status=OverviewStatus.READY,
+            status=(OverviewStatus.PROVISIONAL if analysis is not None else OverviewStatus.READY),
             selection=selection,
-            message="Importierte tägliche Gesundheitsdaten sind verfügbar.",
+            message=(
+                "Das Analyseergebnis ist explorativ."
+                if analysis is not None
+                else "Importierte tägliche Gesundheitsdaten sind verfügbar."
+            ),
             daily_series=daily_series,
+            resting_hr_analysis=analysis,
             import_count=counts.import_count,
             package_count=counts.package_count,
             snapshot_count=counts.snapshot_count,

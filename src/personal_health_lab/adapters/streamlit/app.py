@@ -42,3 +42,27 @@ for series in overview.daily_series:
         x="Datum",
         y="Wert",
     )
+
+if overview.resting_hr_analysis is not None:
+    result = overview.resting_hr_analysis
+    st.subheader("Verzögerungsprofil")
+    st.caption(
+        "Assoziation zwischen aktiver Energie und Apple-Ruhepuls; "
+        "keine kausale oder medizinische Aussage."
+    )
+    st.caption(f"Modellreife: {result.model_maturity}")
+    st.dataframe(
+        [
+            {
+                "Folgetag": item.lag_days,
+                "Richtung": item.direction.value,
+                "bpm je 100 kcal": item.estimate_per_100_kcal,
+                "bpm je persönliche SD": item.estimate_per_personal_standard_deviation,
+            }
+            for item in result.lag_associations
+        ]
+    )
+    st.metric(
+        "Kumulativer Zusammenhang je 100 kcal",
+        f"{result.cumulative_association.estimate_per_100_kcal:.2f} bpm",
+    )

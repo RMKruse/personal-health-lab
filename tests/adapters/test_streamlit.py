@@ -3,7 +3,13 @@ from pathlib import Path
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from personal_health_lab.application import DataMode, HealthLab, RuntimeConfig
+from personal_health_lab.application import (
+    AnalysisDefinitionId,
+    DataMode,
+    HealthLab,
+    RestingHeartRateAnalysisConfig,
+    RuntimeConfig,
+)
 from personal_health_lab.synthetic_export import generate_export
 
 
@@ -13,10 +19,7 @@ def test_streamlit_shows_the_same_empty_overview(
     monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
     monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(tmp_path / "synthetic"))
     monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(tmp_path / "real"))
-    app_path = (
-        Path(__file__).parents[2]
-        / "src/personal_health_lab/adapters/streamlit/app.py"
-    )
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
 
     app = AppTest.from_file(str(app_path)).run()
 
@@ -30,10 +33,7 @@ def test_streamlit_translates_invalid_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("HEALTHLAB_MODE", "mixed")
-    app_path = (
-        Path(__file__).parents[2]
-        / "src/personal_health_lab/adapters/streamlit/app.py"
-    )
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
 
     app = AppTest.from_file(str(app_path)).run()
 
@@ -54,6 +54,9 @@ def test_streamlit_shows_imported_daily_series(
     )
     with HealthLab.open(config) as health_lab:
         health_lab.import_health_export(fixture.export_path)
+        health_lab.run_resting_hr_analysis(
+            RestingHeartRateAnalysisConfig(AnalysisDefinitionId("lag-signal-v1"))
+        )
     monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
     monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(config.synthetic_store))
     monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(config.real_store))
@@ -65,5 +68,7 @@ def test_streamlit_shows_imported_daily_series(
     assert [heading.value for heading in app.subheader] == [
         "Aktive Energie (kcal)",
         "Apple-Ruhepuls (count/min)",
+        "Verzögerungsprofil",
     ]
     assert len(app.get("vega_lite_chart")) == 2
+    assert app.metric[0].label == "Kumulativer Zusammenhang je 100 kcal"
