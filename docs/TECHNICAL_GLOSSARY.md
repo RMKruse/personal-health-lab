@@ -145,18 +145,21 @@ Eine konkrete, in einem Import beobachtete Version einer logischen Quellmessung.
 Die Quellmessungsversion einer logischen Quellmessung, die für nachfolgend aufgelöste Datensatz-Snapshots gilt. Ohne Konflikt ist es die im geltenden Export beobachtete Version; offene Löschvermutungen und fachlich ungeordnete Exporte ändern sie nicht.
 
 **Quellmessungskonflikt**:
-Mehrere abweichende Exportvorkommen teilen denselben heuristischen Identitätskandidaten, ohne sich durch Exportdatum oder starke Quellen-ID eindeutig ordnen zu lassen. Bis zur ausdrücklichen Benutzerentscheidung bleibt die zuletzt eindeutig bevorzugte Quellmessungsversion wirksam; die Entscheidung wählt entweder eine bevorzugte Version oder trennt die Kandidaten in mehrere wirksame logische Quellmessungen. Die Wahl pinnt keine Version dauerhaft: Eine später eindeutig zuordenbare Version aus einem fachlich neueren geltenden Export wird automatisch bevorzugt.
+Mehrere abweichende Exportvorkommen teilen denselben heuristischen Identitätskandidaten, ohne sich durch Exportdatum oder starke Quellen-ID eindeutig ordnen zu lassen. Bis zur ausdrücklichen Benutzerentscheidung bleibt die zuletzt eindeutig bevorzugte Quellmessungsversion wirksam; die Entscheidung wählt entweder eine bevorzugte Version oder trennt die Kandidaten in mehrere wirksame logische Quellmessungen. Die Wahl pinnt keine Version dauerhaft: Eine später eindeutig zuordenbare Version aus einem fachlich neueren geltenden Export wird automatisch bevorzugt. Ein Widerruf öffnet den Konflikt erneut, stellt für nachfolgende Snapshots den letzten vor dem Konflikt eindeutig bevorzugten Zustand wieder her und lässt Entscheidungen an dadurch inaktiven Kandidaten ruhen, ohne eine ältere Konfliktauflösung zu reaktivieren.
 
 **Vermutete Quellenlöschung**:
-Eine Prüfauffälligkeit, wenn eine früher bekannte logische Quellmessung im geltenden, vergleichbaren Vollexport fehlt. Solange sie offen ist, bleibt die bisher bevorzugte Quellmessungsversion wirksam; erst eine ausdrückliche Bestätigung darf den wirksamen Datenbestand ändern.
+Ein Datenprüffall, wenn eine früher bekannte logische Quellmessung im geltenden, vergleichbaren Vollexport fehlt. Solange er offen ist, bleibt die bisher bevorzugte Quellmessungsversion wirksam; erst eine ausdrückliche Bestätigung darf den wirksamen Datenbestand ändern.
 
 **Bestätigte Quellenlöschung**:
-Die bewusste Benutzerentscheidung, eine vermutete Quellenlöschung für nachfolgend aufgelöste Datensatz-Snapshots wirksam zu machen. Bereits bestehende Snapshots und Analysen bleiben unverändert reproduzierbar; erscheint die Quellmessung in einem fachlich neueren geltenden Export wieder, wird sie automatisch wieder wirksam und die Bestätigung bleibt als Audit-Historie erhalten.
+Die bewusste Benutzerentscheidung, eine vermutete Quellenlöschung für nachfolgend aufgelöste Datensatz-Snapshots wirksam zu machen; die ausgeschlossene logische Quellmessung besitzt dann keinen wirksamen Analysewert, während versionsgebundene Bestätigungen, Korrekturen und lokale Messungsausschlüsse ruhen. Bereits bestehende Snapshots und Analysen bleiben unverändert reproduzierbar; ein Widerruf nimmt dieselbe Quellmessungsversion samt ihrer noch gültigen Entscheidungen wieder auf, während bei einer fachlich neueren wiedererschienenen Version der Prüfablauf für neue Quellmessungsversionen gilt.
 
 **Verworfene Quellenlöschung**:
 Die bewusste Benutzerentscheidung, eine vermutete Quellenlöschung nicht wirksam zu machen. Die Quellmessung bleibt wirksam und dieselbe fortdauernde Abwesenheit löst keine erneute Prüfung aus; erst Wiedererscheinen und späteres erneutes Verschwinden begründen eine neue Vermutung.
 
 ## Prüfworkflow
+
+**Prüfzyklus**:
+Die unveränderlich abgegrenzte Prüfung aus genau einem Auslöser wie Import, Regeländerung oder historischer Rückprüfung. Prüfzyklen dürfen unabhängig voneinander gleichzeitig offen sein und schließen sich jeweils ohne wirksamen offenen Datenprüffall automatisch ab; der gesamte Datenstand bleibt vorläufig, solange irgendein Prüfzyklus einen aktuell wirksamen offenen Datenprüffall enthält.
 
 **Initialer Plausibilitätsregelsatz**:
 Die versioniert mit der Software bereitgestellte Regelsammlung, die für einen neuen Datenspeicher oder einen neu unterstützten kanonischen Datentyp die erste Regelversion erzeugt. In V0.2 verwendet Apple-Ruhepuls den einschließlich gültigen festen Bereich von 20 bis 250 bpm sowie den persönlichen Referenzbereich; ein Aktive-Energie-Quellsample verwendet die feste Untergrenze 0 kcal ohne Obergrenze oder persönlichen Referenzbereich. Nur strikt außerhalb einer konfigurierten Grenze liegende Werte werden auffällig. Diese anpassbaren Werte sind Plausibilitätsheuristiken und keine medizinischen Grenzen. Bekannte initiale Datentypen werden nicht erstmals ohne Regelbasis geprüft. Ein Softwareupdate ersetzt weder eine aktive noch eine bewusst deaktivierte Regel; eine neue ausgelieferte Empfehlung wird erst durch ausdrückliche Übernahme zu einer neuen gültigen Regelversion.
@@ -177,13 +180,13 @@ Ein eigener Prüfzyklus für einen festgehaltenen Zeitraum, eine festgehaltene P
 Der eigene Prüfzyklus, der nach einer neuen Plausibilitätsregelversion alle derzeit wirksamen Quellmessungsversionen seit dem Gültigkeitsbeginn in der laufenden Woche neu bewertet. Auffälligkeiten der abgelösten Regelversion bleiben im Audit, bestimmen aber nicht mehr den aktuellen Prüfstatus; Auffälligkeiten der neuen Version beginnen offen.
 
 **Importprüfung**:
-Der Prüfzyklus für genau einen Import und dessen Plausibilitätsauffälligkeiten, Bestätigungen und Korrekturen.
+Der Prüfzyklus für genau einen Import und dessen Datenprüffälle, Plausibilitätsauffälligkeiten sowie zugehörige Benutzerentscheidungen.
 
 **Abgeschlossene Datenprüfung**:
-Der Zustand nach der bewussten Aktion „Prüfung abschließen und neu berechnen“, wenn alle Auffälligkeiten des aktuellen Prüfzyklus bestätigt oder korrigiert wurden.
+Der automatisch eintretende Zustand eines Prüfzyklus, sobald er keine wirksamen offenen Datenprüffälle enthält; das kann bereits bei seiner Anlage oder nach der letzten Benutzerentscheidung der Fall sein. Grund und Zeitpunkt des Übergangs bleiben im Audit, während die Neuberechnung von Analysen eine getrennte bewusste Operation bleibt.
 
 **Sammelbestätigung**:
-Die Bestätigung einer gefilterten Menge von Plausibilitätsauffälligkeiten, beispielsweise nach Zeitraum oder Wertebereich. Filterkriterien und betroffene Werte bleiben nachvollziehbar; Korrekturen bleiben Einzelaktionen.
+Die atomare Bestätigung einer zuvor angezeigten, gefilterten Menge offener Plausibilitätsauffälligkeiten, beispielsweise nach Zeitraum oder Wertebereich. Die Vorschau materialisiert Filter, Treffer und Anzahl; ändert sich diese Menge vor der Bestätigung, scheitert die Aktion ohne Teilwirkung. Filterkriterien, die exakte Treffermenge und eine gemeinsame Sammelaktions-ID bleiben nachvollziehbar; jede betroffene Auffälligkeit erhält eine eigene, separat widerrufbare Datenbestätigung, während ein Widerruf der Sammelaktion nur ihre noch wirksamen Bestätigungen und keine späteren Entscheidungen aufhebt.
 
 ## Speicherung, Sicherung und Migration
 
