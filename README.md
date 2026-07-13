@@ -31,6 +31,16 @@ uv run healthlab \
   overview --json
 ```
 
+Die drei Produktionsbefehle sind `import <export.zip>`, `analyze` und `overview`; jeder
+akzeptiert `--json`. Ihre JSON-Ausgaben folgen dem mitinstallierten Schema
+`personal_health_lab/adapters/cli/schemas/output-1.0.schema.json`. Effektive Speicherpfade
+erscheinen darin ausschließlich als `<redacted>`.
+
+Exit-Code `0` bedeutet Erfolg oder No-op (`duplicate`, `reused`), `3` ein erwartbar
+unvollständiges Ergebnis (`rejected`, `quarantined`, `store_busy`, `insufficient_data`,
+`unstable`), `2` einen Verwendungs- oder Konfigurationsfehler und `1` einen technischen
+Fehler.
+
 Streamlit verwendet dieselbe `HealthLab`-Schnittstelle und dieselben Speicherorte:
 
 ```bash

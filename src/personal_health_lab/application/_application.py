@@ -185,6 +185,8 @@ class HealthLab:
             )
         except ValueError as error:
             raise ConfigurationError(str(error)) from error
+        except RuntimeError as error:
+            raise HealthLabError("Datenspeicher konnte nicht geöffnet werden.") from error
         logger.info("healthlab_opened mode=%s", self._config.mode.value)
         return self
 

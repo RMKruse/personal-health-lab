@@ -30,8 +30,12 @@ _STORE_SCHEMA_VERSION = "1.1"
 _WRITER_LOCK_FILE = ".writer.lock"
 
 
-class StoreError(ValueError):
+class StoreError(RuntimeError):
     """A local store cannot be opened safely."""
+
+
+class StoreConfigurationError(StoreError, ValueError):
+    """A local store conflicts with its requested runtime configuration."""
 
 
 class StoreBusyError(StoreError):
@@ -253,7 +257,7 @@ class LocalStore:
         writer_lock: IO[bytes] | None = None,
     ) -> Self:
         if not isinstance(mode, DataMode):
-            raise StoreError("Datenmodus muss 'synthetic' oder 'real' sein.")
+            raise StoreConfigurationError("Datenmodus muss 'synthetic' oder 'real' sein.")
 
         metadata: sqlite3.Connection | None = None
         try:
@@ -275,10 +279,14 @@ class LocalStore:
             if existing_identity is not None:
                 existing_mode, existing_schema = map(str, existing_identity)
                 if existing_mode != mode.value or existing_schema not in {"1.0", "1.1"}:
-                    raise StoreError("Datenspeicher gehört zu einem anderen Modus oder Schema.")
+                    raise StoreConfigurationError(
+                        "Datenspeicher gehört zu einem anderen Modus oder Schema."
+                    )
                 if existing_schema == "1.0":
                     if not initialize:
-                        raise StoreError("Datenspeicher benötigt eine Schema-Migration.")
+                        raise StoreConfigurationError(
+                            "Datenspeicher benötigt eine Schema-Migration."
+                        )
                     backup_directory = root / "migration-backups"
                     backup_directory.mkdir(exist_ok=True)
                     backup_path = backup_directory / (
@@ -409,14 +417,18 @@ class LocalStore:
             expected_identity = (mode.value, _STORE_SCHEMA_VERSION)
             if identity is None:
                 if not initialize:
-                    raise StoreError("Datenspeicher ist noch nicht initialisiert.")
+                    raise StoreConfigurationError(
+                        "Datenspeicher ist noch nicht initialisiert."
+                    )
                 metadata.execute(
                     "INSERT INTO store_identity(singleton, mode, schema_version) VALUES (1, ?, ?)",
                     expected_identity,
                 )
                 metadata.commit()
             elif identity != expected_identity:
-                raise StoreError("Datenspeicher gehört zu einem anderen Modus oder Schema.")
+                raise StoreConfigurationError(
+                    "Datenspeicher gehört zu einem anderen Modus oder Schema."
+                )
             query_path = root / _QUERY_FILE
             if initialize and not query_path.exists():
                 duckdb.connect(str(query_path)).close()

@@ -1,0 +1,376 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:personal-health-lab:cli-output:1.0",
+  "title": "HealthLab production CLI output 1.0",
+  "oneOf": [
+    {"$ref": "#/$defs/importOutput"},
+    {"$ref": "#/$defs/analysisOutput"},
+    {"$ref": "#/$defs/overviewOutput"}
+  ],
+  "$defs": {
+    "nullableString": {
+      "type": ["string", "null"]
+    },
+    "runtimeConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_import_compression_ratio",
+        "max_import_entries",
+        "max_import_entry_bytes",
+        "max_import_package_bytes",
+        "max_import_uncompressed_bytes",
+        "mode",
+        "real_store",
+        "schema_version",
+        "synthetic_store"
+      ],
+      "properties": {
+        "max_import_compression_ratio": {"type": "number", "minimum": 1},
+        "max_import_entries": {"type": "integer", "minimum": 1},
+        "max_import_entry_bytes": {"type": "integer", "minimum": 1},
+        "max_import_package_bytes": {"type": "integer", "minimum": 1},
+        "max_import_uncompressed_bytes": {"type": "integer", "minimum": 1},
+        "mode": {"enum": ["synthetic", "real"]},
+        "real_store": {"const": "<redacted>"},
+        "schema_version": {"const": "1.0"},
+        "synthetic_store": {"const": "<redacted>"}
+      }
+    },
+    "selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["end_date", "start_date"],
+      "properties": {
+        "end_date": {"$ref": "#/$defs/nullableString"},
+        "start_date": {"$ref": "#/$defs/nullableString"}
+      }
+    },
+    "analysisProvenance": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": [
+        "analysis_definition_id",
+        "analysis_run_id",
+        "code_commit",
+        "code_diff_hash",
+        "code_dirty",
+        "config_hash",
+        "config_schema_version",
+        "environment_lock_hash",
+        "result_ref",
+        "snapshot_ref"
+      ],
+      "properties": {
+        "analysis_definition_id": {"type": "string"},
+        "analysis_run_id": {"type": "string"},
+        "code_commit": {"type": "string"},
+        "code_diff_hash": {"$ref": "#/$defs/nullableString"},
+        "code_dirty": {"type": "boolean"},
+        "config_hash": {"type": "string"},
+        "config_schema_version": {"type": "string"},
+        "environment_lock_hash": {"type": "string"},
+        "result_ref": {"$ref": "#/$defs/nullableString"},
+        "snapshot_ref": {"type": "string"}
+      }
+    },
+    "interval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lower_per_100_kcal",
+        "lower_per_personal_standard_deviation",
+        "upper_per_100_kcal",
+        "upper_per_personal_standard_deviation"
+      ],
+      "properties": {
+        "lower_per_100_kcal": {"type": "number"},
+        "lower_per_personal_standard_deviation": {"type": "number"},
+        "upper_per_100_kcal": {"type": "number"},
+        "upper_per_personal_standard_deviation": {"type": "number"}
+      }
+    },
+    "analysisDiagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "association_guardrail",
+        "bootstrap_resamples",
+        "bootstrap_successes",
+        "complete_days",
+        "feature_dependency",
+        "model_readiness"
+      ],
+      "properties": {
+        "association_guardrail": {
+          "enum": [
+            "simultaneous_band_includes_zero",
+            "simultaneous_band_excludes_zero"
+          ]
+        },
+        "bootstrap_resamples": {"type": "integer", "minimum": 0},
+        "bootstrap_successes": {"type": "integer", "minimum": 0},
+        "complete_days": {"type": "integer", "minimum": 0},
+        "feature_dependency": {"enum": ["acceptable", "high"]},
+        "model_readiness": {"enum": ["exploratory", "robust"]}
+      }
+    },
+    "methodology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "block_length_days",
+        "bootstrap_method",
+        "interval_level",
+        "minimum_observations",
+        "random_seed",
+        "resample_count",
+        "ridge_penalty",
+        "robust_observations"
+      ],
+      "properties": {
+        "block_length_days": {"type": "integer"},
+        "bootstrap_method": {"const": "moving_block"},
+        "interval_level": {"type": "number"},
+        "minimum_observations": {"type": "integer"},
+        "random_seed": {"type": "integer"},
+        "resample_count": {"type": "integer"},
+        "ridge_penalty": {"type": "number"},
+        "robust_observations": {"type": "integer"}
+      }
+    },
+    "cumulativeAssociation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "direction",
+        "estimate_per_100_kcal",
+        "estimate_per_personal_standard_deviation",
+        "pointwise_interval"
+      ],
+      "properties": {
+        "direction": {"enum": ["negative", "zero", "positive"]},
+        "estimate_per_100_kcal": {"type": "number"},
+        "estimate_per_personal_standard_deviation": {"type": "number"},
+        "pointwise_interval": {"$ref": "#/$defs/interval"}
+      }
+    },
+    "lagAssociation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "direction",
+        "estimate_per_100_kcal",
+        "estimate_per_personal_standard_deviation",
+        "exposure_unit",
+        "lag_days",
+        "outcome_unit",
+        "pointwise_interval",
+        "simultaneous_band"
+      ],
+      "properties": {
+        "direction": {"enum": ["negative", "zero", "positive"]},
+        "estimate_per_100_kcal": {"type": "number"},
+        "estimate_per_personal_standard_deviation": {"type": "number"},
+        "exposure_unit": {"type": "string"},
+        "lag_days": {"type": "integer"},
+        "outcome_unit": {"type": "string"},
+        "pointwise_interval": {"$ref": "#/$defs/interval"},
+        "simultaneous_band": {
+          "oneOf": [
+            {"$ref": "#/$defs/interval"},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "analysisResult": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": [
+        "analysis_definition_id",
+        "cumulative_association",
+        "diagnostics",
+        "lag_associations",
+        "methodology",
+        "model_maturity",
+        "personal_standard_deviation_kcal",
+        "provenance",
+        "snapshot_ref"
+      ],
+      "properties": {
+        "analysis_definition_id": {"type": "string"},
+        "cumulative_association": {"$ref": "#/$defs/cumulativeAssociation"},
+        "diagnostics": {"$ref": "#/$defs/analysisDiagnostics"},
+        "lag_associations": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/lagAssociation"}
+        },
+        "methodology": {"$ref": "#/$defs/methodology"},
+        "model_maturity": {"enum": ["exploratory", "robust"]},
+        "personal_standard_deviation_kcal": {"type": "number"},
+        "provenance": {"$ref": "#/$defs/analysisProvenance"},
+        "snapshot_ref": {"type": "string"}
+      }
+    },
+    "dailyValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "day",
+        "measurement_version_ids",
+        "source_updated_ats",
+        "source_versions",
+        "value"
+      ],
+      "properties": {
+        "day": {"type": "string", "format": "date"},
+        "measurement_version_ids": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "source_updated_ats": {
+          "type": "array",
+          "items": {"type": "string", "format": "date-time"}
+        },
+        "source_versions": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "value": {"type": "number"}
+      }
+    },
+    "dailySeries": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["data_type", "unit", "values"],
+      "properties": {
+        "data_type": {"type": "string"},
+        "unit": {"type": "string"},
+        "values": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/dailyValue"}
+        }
+      }
+    },
+    "importOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "anomaly_count",
+        "diagnostics",
+        "import_id",
+        "logical_measurement_count",
+        "measurement_version_count",
+        "operation_id",
+        "package_hash",
+        "package_record_count",
+        "record_count",
+        "runtime_config",
+        "schema_version",
+        "snapshot_ref",
+        "status"
+      ],
+      "properties": {
+        "anomaly_count": {"type": "integer", "minimum": 0},
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "import_id": {"type": "string"},
+        "logical_measurement_count": {"type": "integer", "minimum": 0},
+        "measurement_version_count": {"type": "integer", "minimum": 0},
+        "operation_id": {"type": "string"},
+        "package_hash": {"type": "string"},
+        "package_record_count": {"type": "integer", "minimum": 0},
+        "record_count": {"type": "integer", "minimum": 0},
+        "runtime_config": {"$ref": "#/$defs/runtimeConfig"},
+        "schema_version": {"const": "1.0"},
+        "snapshot_ref": {"$ref": "#/$defs/nullableString"},
+        "status": {
+          "enum": ["committed", "duplicate", "rejected", "quarantined", "store_busy"]
+        }
+      }
+    },
+    "analysisOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "analysis_definition_id",
+        "analysis_run_id",
+        "diagnostics",
+        "model_maturity",
+        "operation_id",
+        "provenance",
+        "result",
+        "result_ref",
+        "runtime_config",
+        "schema_version",
+        "snapshot_ref",
+        "status"
+      ],
+      "properties": {
+        "analysis_definition_id": {"type": "string"},
+        "analysis_run_id": {"type": "string"},
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "model_maturity": {
+          "type": ["string", "null"],
+          "enum": ["exploratory", "robust", null]
+        },
+        "operation_id": {"type": "string"},
+        "provenance": {"$ref": "#/$defs/analysisProvenance"},
+        "result": {"$ref": "#/$defs/analysisResult"},
+        "result_ref": {"$ref": "#/$defs/nullableString"},
+        "runtime_config": {"$ref": "#/$defs/runtimeConfig"},
+        "schema_version": {"const": "1.0"},
+        "snapshot_ref": {"$ref": "#/$defs/nullableString"},
+        "status": {
+          "enum": ["completed", "reused", "insufficient_data", "unstable", "store_busy"]
+        }
+      }
+    },
+    "overviewOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "daily_series",
+        "message",
+        "provenance",
+        "resting_hr_analysis",
+        "runtime_config",
+        "schema_version",
+        "selection",
+        "status"
+      ],
+      "properties": {
+        "daily_series": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/dailySeries"}
+        },
+        "message": {"type": "string"},
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "import_count",
+            "logical_measurement_count",
+            "measurement_version_count",
+            "package_count",
+            "quarantined_import_count",
+            "snapshot_count"
+          ],
+          "properties": {
+            "import_count": {"type": "integer", "minimum": 0},
+            "logical_measurement_count": {"type": "integer", "minimum": 0},
+            "measurement_version_count": {"type": "integer", "minimum": 0},
+            "package_count": {"type": "integer", "minimum": 0},
+            "quarantined_import_count": {"type": "integer", "minimum": 0},
+            "snapshot_count": {"type": "integer", "minimum": 0}
+          }
+        },
+        "resting_hr_analysis": {"$ref": "#/$defs/analysisResult"},
+        "runtime_config": {"$ref": "#/$defs/runtimeConfig"},
+        "schema_version": {"const": "1.0"},
+        "selection": {"$ref": "#/$defs/selection"},
+        "status": {"enum": ["empty", "ready", "provisional"]}
+      }
+    }
+  }
+}

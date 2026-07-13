@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
@@ -16,6 +17,7 @@ from personal_health_lab.application import (
     ConfigurationError,
     DataMode,
     HealthLab,
+    ImportStatus,
     Overview,
     OverviewSelection,
     RestingHeartRateAnalysisConfig,
@@ -131,7 +133,7 @@ def _analysis_json(overview: Overview) -> dict[str, object] | None:
 
 def main(args: Sequence[str] | None = None) -> int:
     parsed = _parser().parse_args(args)
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
     try:
         config = load_runtime_config(
             explicit_mode=parsed.mode,
@@ -157,7 +159,27 @@ def main(args: Sequence[str] | None = None) -> int:
                 overview = health_lab.load_overview(OverviewSelection())
     except ConfigurationError as error:
         _parser().error(str(error))
+    except Exception as error:
+        logging.error("healthlab_failed error_class=%s", type(error).__name__)
+        print("Technischer HealthLab-Fehler.", file=sys.stderr)
+        return 1
 
+    runtime_config = {
+        "max_import_compression_ratio": config.max_import_compression_ratio,
+        "max_import_entries": config.max_import_entries,
+        "max_import_entry_bytes": config.max_import_entry_bytes,
+        "max_import_package_bytes": config.max_import_package_bytes,
+        "max_import_uncompressed_bytes": config.max_import_uncompressed_bytes,
+        "mode": config.mode.value,
+        "real_store": "<redacted>",
+        "schema_version": config.schema_version,
+        "synthetic_store": "<redacted>",
+    }
+    if not parsed.as_json:
+        print(
+            "Konfiguration: "
+            + json.dumps(runtime_config, ensure_ascii=False, sort_keys=True)
+        )
     if parsed.command == "analyze" and parsed.as_json:
         print(
             json.dumps(
@@ -176,6 +198,7 @@ def main(args: Sequence[str] | None = None) -> int:
                         str(analysis_receipt.result_ref) if analysis_receipt.result_ref else None
                     ),
                     "result": _analysis_json(overview),
+                    "runtime_config": runtime_config,
                     "schema_version": "1.0",
                     "snapshot_ref": (
                         str(analysis_receipt.snapshot_ref)
@@ -217,6 +240,7 @@ def main(args: Sequence[str] | None = None) -> int:
         print(
             json.dumps(
                 {
+                    "anomaly_count": import_receipt.anomaly_count,
                     "diagnostics": import_receipt.diagnostics,
                     "import_id": str(import_receipt.import_id),
                     "operation_id": str(import_receipt.operation_id),
@@ -225,6 +249,7 @@ def main(args: Sequence[str] | None = None) -> int:
                     "record_count": import_receipt.record_count,
                     "logical_measurement_count": import_receipt.logical_measurement_count,
                     "measurement_version_count": import_receipt.measurement_version_count,
+                    "runtime_config": runtime_config,
                     "schema_version": "1.0",
                     "snapshot_ref": (
                         str(import_receipt.snapshot_ref) if import_receipt.snapshot_ref else None
@@ -272,14 +297,23 @@ def main(args: Sequence[str] | None = None) -> int:
                         "logical_measurement_count": overview.logical_measurement_count,
                         "measurement_version_count": overview.measurement_version_count,
                         "package_count": overview.package_count,
+                        "quarantined_import_count": overview.quarantined_import_count,
                         "snapshot_count": overview.snapshot_count,
                     },
-                    "runtime_config": {
-                        "mode": config.mode.value,
-                        "real_store": "<redacted>",
-                        "synthetic_store": "<redacted>",
-                    },
+                    "runtime_config": runtime_config,
                     "schema_version": overview.schema_version,
+                    "selection": {
+                        "end_date": (
+                            overview.selection.end_date.isoformat()
+                            if overview.selection.end_date
+                            else None
+                        ),
+                        "start_date": (
+                            overview.selection.start_date.isoformat()
+                            if overview.selection.start_date
+                            else None
+                        ),
+                    },
                     "status": overview.status.value,
                 },
                 ensure_ascii=False,
@@ -295,6 +329,11 @@ def main(args: Sequence[str] | None = None) -> int:
     if parsed.command == "analyze" and analysis_receipt.status not in {
         AnalysisStatus.COMPLETED,
         AnalysisStatus.REUSED,
+    }:
+        return 3
+    if parsed.command == "import" and import_receipt.status not in {
+        ImportStatus.COMMITTED,
+        ImportStatus.DUPLICATE,
     }:
         return 3
     return 0
