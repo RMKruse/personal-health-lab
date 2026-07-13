@@ -159,19 +159,22 @@ Die bewusste Benutzerentscheidung, eine vermutete Quellenlöschung nicht wirksam
 ## Prüfworkflow
 
 **Initialer Plausibilitätsregelsatz**:
-Die vor dem ersten Gesundheitsdatenimport bereitgestellte Regelsammlung. Bekannte initiale Datentypen werden nicht erstmals ohne Regelbasis geprüft.
+Die versioniert mit der Software bereitgestellte Regelsammlung, die für einen neuen Datenspeicher oder einen neu unterstützten kanonischen Datentyp die erste Regelversion erzeugt. In V0.2 verwendet Apple-Ruhepuls den einschließlich gültigen festen Bereich von 20 bis 250 bpm sowie den persönlichen Referenzbereich; ein Aktive-Energie-Quellsample verwendet die feste Untergrenze 0 kcal ohne Obergrenze oder persönlichen Referenzbereich. Nur strikt außerhalb einer konfigurierten Grenze liegende Werte werden auffällig. Diese anpassbaren Werte sind Plausibilitätsheuristiken und keine medizinischen Grenzen. Bekannte initiale Datentypen werden nicht erstmals ohne Regelbasis geprüft. Ein Softwareupdate ersetzt weder eine aktive noch eine bewusst deaktivierte Regel; eine neue ausgelieferte Empfehlung wird erst durch ausdrückliche Übernahme zu einer neuen gültigen Regelversion.
 
 **Unbekannter Datentyp**:
 Ein erstmals auftretender Datentyp ohne Plausibilitätsregel. Er wird importiert, kann ohne Regel keine Regelverletzung erzeugen und löst einmalig die Frage nach einer Regeldefinition aus.
 
 **Bewusst ungeregelter Datentyp**:
-Ein Datentyp, für den der Benutzer ausdrücklich keine Regel definiert. Diese Entscheidung unterdrückt weitere Nachfragen, kann aber manuell aufgehoben werden.
+Ein Datentyp, für den der Benutzer ausdrücklich keine aktive Regel definiert oder eine bestehende Regel durch eine unveränderliche Regelversion ohne aktive Prüfbestandteile deaktiviert hat. Die Deaktivierung gilt ab dem üblichen Wochenbeginn; Auffälligkeiten der abgelösten Version bleiben im Audit, bestimmen aber nicht mehr den aktuellen Prüfstatus. Messzeiten im deaktivierten Intervall bleiben ungeregelt. Eine spätere Reaktivierung erzeugt eine neue Regelversion und prüft das deaktivierte Intervall nur durch eine ausdrücklich gestartete historische Rückprüfung.
 
 **Erstregel-Rückprüfung**:
-Die einmalige Prüfung der vollständigen vorhandenen Historie eines bewusst ungeregelten Datentyps, sobald seine erste Regel angelegt wird.
+Die einmalige Prüfung der vollständigen vorhandenen Historie eines bewusst ungeregelten Datentyps, sobald seine erste Regel angelegt wird. Diese erste Regelversion gilt ohne untere Zeitgrenze; später importierte ältere Messungen verwenden sie ebenfalls, werden jedoch im jeweiligen Importprüfzyklus geprüft.
 
 **Historische Rückprüfung**:
-Ein eigener Prüfzyklus, der Auffälligkeiten einer Erstregel-Rückprüfung bündelt, ohne frühere Importprüfungen wieder zu öffnen.
+Ein eigener Prüfzyklus für einen festgehaltenen Zeitraum, eine festgehaltene Plausibilitätsregelversion und den bei Prüfungsbeginn aktuell wirksamen Datensatz-Snapshot, der Auffälligkeiten einer Erstregel-Rückprüfung oder einer bewusst ausgelösten erneuten Prüfung bündelt, ohne frühere Prüfzyklen zu verändern. Standardmäßig verwendet eine bewusst ausgelöste historische Rückprüfung die aktuell gültige Regelversion. Ein persönlicher Referenzbereich wird für jeden Wert ausschließlich aus dessen vorheriger Historie im festgehaltenen Snapshot berechnet. Eine vorhandene Datenbestätigung gilt weiter, wenn Quellmessungsversion, Regelversion und Art der Auffälligkeit identisch sind; andernfalls entsteht ein neuer offener Prüffall. Frühere Auffälligkeiten und Bestätigungen bleiben als Audit-Historie erhalten.
+
+**Regeländerungsprüfung**:
+Der eigene Prüfzyklus, der nach einer neuen Plausibilitätsregelversion alle derzeit wirksamen Quellmessungsversionen seit dem Gültigkeitsbeginn in der laufenden Woche neu bewertet. Auffälligkeiten der abgelösten Regelversion bleiben im Audit, bestimmen aber nicht mehr den aktuellen Prüfstatus; Auffälligkeiten der neuen Version beginnen offen.
 
 **Importprüfung**:
 Der Prüfzyklus für genau einen Import und dessen Plausibilitätsauffälligkeiten, Bestätigungen und Korrekturen.

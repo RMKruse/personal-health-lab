@@ -207,23 +207,23 @@ _Avoid_: eigenständige Messung, einziges Energiemerkmal des Modells
 ### Datenqualität und Ergebnisstatus
 
 **Plausibilitätsauffälligkeit**:
-Ein durch eine Regel markierter Messwert oder Zeitraum, der möglicherweise unvollständig oder fehlerhaft ist und eine Benutzerprüfung benötigt. Eine Auffälligkeit ist kein Beweis für einen Datenfehler.
+Ein durch eine Regel markierter Messwert oder Zeitraum, der möglicherweise unvollständig oder fehlerhaft ist und eine Benutzerprüfung benötigt. Pro Quellmessungsversion und Plausibilitätsregelversion entsteht höchstens eine Auffälligkeit; sie hält alle verletzten Regelbestandteile, verwendeten Grenzen und den Historienstichtag als Begründungen fest. Eine veränderte Menge von Begründungen ist eine andere Art der Auffälligkeit. Eine Auffälligkeit ist kein Beweis für einen Datenfehler.
 _Avoid_: automatisch erkannter Fehler, automatisch zu löschender Wert
 
 **Plausibilitätsregel**:
-Eine versionierte Regel, die feste, vom Benutzer anpassbare Unter- oder Obergrenzen und/oder einen aus der persönlichen Datenhistorie abgeleiteten Referenzbereich verwendet. Sie erzeugt Plausibilitätsauffälligkeiten, aber keine medizinischen Warnungen.
+Eine pro kanonischem Datentyp unveränderlich versionierte vollständige Regelkonfiguration, die feste, vom Benutzer anpassbare Unter- oder Obergrenzen und/oder einen aus der persönlichen Datenhistorie abgeleiteten Referenzbereich verwendet. Der Benutzer kann feste Grenzen sowie die aktiven Regelbestandteile ändern; Grenzen sind endlich, stehen in der kanonischen Einheit und steigen bei beidseitiger Angabe von unten nach oben. Die Parameter und Sonderfälle der persönlichen Methodik bleiben versionierte eingebaute Methodik. Änderungen an Grenzen, aktivierten Regelbestandteilen oder Algorithmusparametern erzeugen eine neue Version. Der mit wachsender Historie neu berechnete persönliche Referenzbereich ist dagegen ein Auswertungsergebnis und keine neue Regelversion; jede erzeugte Auffälligkeit hält die tatsächlich verwendeten Grenzen und den Historienstichtag fest. Plausibilitätsregeln erzeugen Plausibilitätsauffälligkeiten, aber keine medizinischen Warnungen.
 _Avoid_: Sicherheitsgrenze, Diagnosegrenze
 
 **Persönlicher Referenzbereich**:
-Ein aus der bisherigen persönlichen Datenhistorie abgeleiteter Bereich typischer Werte, der sich mit wachsender Datenbasis aktualisieren darf. Er ergänzt feste Plausibilitätsgrenzen und ist kein populationsbezogener medizinischer Referenzbereich.
+Ein aus der bisherigen persönlichen Datenhistorie abgeleiteter Bereich typischer Werte, der sich mit wachsender Datenbasis aktualisieren darf. Jeder Prüfzyklus hält dafür den bei seinem Start aktuell wirksamen Datensatz-Snapshot fest und verwendet je Messwert ausschließlich die darin enthaltene frühere Historie. Korrekturen und verspätete Importe können deshalb in späteren Prüfzyklen andere Grenzen ergeben; frühere Auffälligkeiten bleiben mit ihren damals verwendeten Grenzen reproduzierbar. Der persönliche Referenzbereich ergänzt feste Plausibilitätsgrenzen und ist kein populationsbezogener medizinischer Referenzbereich.
 _Avoid_: medizinischer Normbereich, feste Grenze
 
 **Regelgültigkeit**:
-Der Zeitraum, in dem eine Version einer Plausibilitätsregel anhand des Messzeitpunkts angewendet wird. Änderungen gelten ab Beginn der aktuellen lokalen Kalenderwoche und für zukünftige Messzeitpunkte; bereits bestätigte Werte der laufenden Woche dürfen erneut zur Prüfung geöffnet werden, abgeschlossene Wochen werden nicht neu bewertet. Verspätet importierte Daten werden mit der am Messzeitpunkt gültigen Regel geprüft.
+Der Zeitraum, in dem eine Version einer Plausibilitätsregel anhand des Messzeitpunkts angewendet wird. Die erste Regelversion eines zuvor bewusst ungeregelten Datentyps gilt ohne untere Zeitgrenze. Für spätere Änderungen ist der Gültigkeitsbeginn Montag 00:00 der bei der Änderung aktiven lokalen ISO-Kalenderwoche; Zeitzone und Offset werden mit der Regelversion festgehalten und bestimmen einen einzigen Zeitpunkt. Messungen werden anhand ihres tatsächlichen Zeitpunkts damit verglichen, sodass Reisen keine unterschiedlichen Gültigkeitsgrenzen erzeugen. Eine Regeländerung bewertet alle derzeit wirksamen Quellmessungsversionen seit diesem Wochenbeginn unter der neuen Version in einem eigenen Prüfzyklus neu. Frühere Auffälligkeiten bleiben im Audit, sind für den aktuellen Prüfstatus aber abgelöst; ältere abgeschlossene Wochen werden nicht neu bewertet. Eine verspätet importierte Quellmessungsversion wird mit der am Messzeitpunkt gültigen Regel geprüft und erzeugt eine mögliche Auffälligkeit im aktuellen Importprüfzyklus. Frühere Prüfzyklen und bereits vorhandene Messungen desselben Zeitraums bleiben unverändert.
 _Avoid_: globale rückwirkende Neuberechnung
 
 **Datenbestätigung**:
-Die bewusste Benutzerangabe, dass ein angezeigter auffälliger Wert oder Zeitraum nach Prüfung für die Analyse verwendet werden darf. Sie dokumentiert die Prüfung, garantiert aber nicht die objektive Richtigkeit der Daten.
+Die bewusste Benutzerangabe, dass ein angezeigter auffälliger Wert oder Zeitraum nach Prüfung für die Analyse verwendet werden darf. Sie gilt genau für die geprüfte Quellmessungsversion, die erzeugende Plausibilitätsregelversion und die Art der Auffälligkeit. Eine neue Quellmessungs- oder Regelversion kann daher einen neuen offenen Prüffall erzeugen; die frühere Bestätigung bleibt als Audit-Historie erhalten. Die Bestätigung dokumentiert die Prüfung, garantiert aber nicht die objektive Richtigkeit der Daten.
 _Avoid_: automatische Freigabe, Wahrheitsnachweis
 
 **Datenkorrektur**:
