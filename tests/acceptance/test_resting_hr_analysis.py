@@ -10,6 +10,7 @@ from personal_health_lab.application import (
     HealthLab,
     ModelMaturityStatus,
     OverviewSelection,
+    OverviewStatus,
     RestingHeartRateAnalysisConfig,
     RuntimeConfig,
 )
@@ -57,6 +58,7 @@ def test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis(tmp_path: P
     second_result = second_overview.resting_hr_analysis
     assert first_result is not None
     assert second_result is not None
+    assert first_overview.status is OverviewStatus.READY
     assert first_result.provenance == first.provenance
     assert second_result.provenance == second.provenance
     assert first_result.model_maturity == "robust"
@@ -95,17 +97,25 @@ def test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis(tmp_path: P
     )
 
     with HealthLab.open(runtime) as health_lab:
+        provisional_selection = OverviewSelection(
+            start_date=date(2024, 1, 1), end_date=date(2024, 6, 30)
+        )
         changed_config = health_lab.run_resting_hr_analysis(
             RestingHeartRateAnalysisConfig(
                 analysis_definition_id=analysis.analysis_definition_id,
-                start_date=date(2024, 2, 1),
+                start_date=provisional_selection.start_date,
+                end_date=provisional_selection.end_date,
             )
         )
+        provisional_overview = health_lab.load_overview(provisional_selection)
         newer_import = health_lab.import_health_export(newer_package.export_path)
         newer_overview = health_lab.load_overview(OverviewSelection())
         changed_snapshot = health_lab.run_resting_hr_analysis(analysis)
 
     assert changed_config.status is AnalysisStatus.COMPLETED
+    assert changed_config.model_maturity is ModelMaturityStatus.EXPLORATORY
+    assert provisional_overview.status is OverviewStatus.PROVISIONAL
+    assert provisional_overview.last_ready_analysis_provenance == first.provenance
     assert changed_config.analysis_run_id != first.analysis_run_id
     assert changed_config.provenance is not None
     assert changed_config.provenance.config_hash != first.provenance.config_hash

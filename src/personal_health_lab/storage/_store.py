@@ -417,9 +417,7 @@ class LocalStore:
             expected_identity = (mode.value, _STORE_SCHEMA_VERSION)
             if identity is None:
                 if not initialize:
-                    raise StoreConfigurationError(
-                        "Datenspeicher ist noch nicht initialisiert."
-                    )
+                    raise StoreConfigurationError("Datenspeicher ist noch nicht initialisiert.")
                 metadata.execute(
                     "INSERT INTO store_identity(singleton, mode, schema_version) VALUES (1, ?, ?)",
                     expected_identity,
@@ -1289,6 +1287,34 @@ class LocalStore:
                     environment_lock_hash=str(environment_lock_hash),
                 )
             ),
+        )
+
+    def load_latest_robust_analysis_provenance(self) -> AnalysisProvenance | None:
+        self._require_open()
+        row = self._metadata.execute(
+            """
+            SELECT analysis_run_id, result_id, snapshot_id, analysis_definition_id,
+                   config_hash, config_schema_version, code_commit, code_dirty,
+                   code_diff_hash, environment_lock_hash
+            FROM analysis_runs
+            WHERE status = 'completed' AND model_maturity = 'robust'
+            ORDER BY completed_at DESC, rowid DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            return None
+        return AnalysisProvenance(
+            analysis_run_id=AnalysisRunId(str(row[0])),
+            result_id=AnalysisResultId(str(row[1])),
+            snapshot_id=SnapshotId(str(row[2])),
+            analysis_definition_id=AnalysisDefinitionId(str(row[3])),
+            config_hash=str(row[4]),
+            config_schema_version=str(row[5]),
+            code_commit=str(row[6]),
+            code_dirty=bool(row[7]),
+            code_diff_hash=None if row[8] is None else str(row[8]),
+            environment_lock_hash=str(row[9]),
         )
 
     def load_provenance_counts(self) -> ProvenanceCounts:
