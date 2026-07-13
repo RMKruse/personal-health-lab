@@ -1,14 +1,26 @@
 # personal-health-lab
 A privacy-first platform for exploring, modeling, and visualizing longitudinal personal health data.
 
-## V0.1-Grundgerüst starten
+## V0.1 aus einem frischen Checkout nachweisen
 
 Voraussetzung ist Python 3.12 oder neuer sowie [`uv`](https://docs.astral.sh/uv/). Ein frischer
-Checkout wird mitsamt Entwicklungswerkzeugen so installiert:
+Checkout braucht keine vorbereiteten lokalen Daten. Dieser eine Ablauf installiert die gesperrte
+Umgebung und führt die vollständige V0.1-Akzeptanz aus:
 
 ```bash
 uv sync --locked --all-groups
+uv run ruff check .
+uv run mypy
+uv run pytest
 ```
+
+Die Suite erzeugt, importiert und analysiert `lag-signal-v1` und `null-v1` ausschließlich in
+temporären Datenspeichern. Sie prüft Signal-Recovery samt Unsicherheit, den Null-Guardrail,
+idempotenten Reimport, wiederverwendete Analyseläufe, sämtliche feindlichen Import-Fixtures ohne
+neuen Snapshot oder Staging-Reste sowie Datenmodus-, Architektur-, Typ- und Adapterverträge. CI
+führt dieselben drei Qualitätsbefehle aus.
+
+## V0.1 lokal starten
 
 Die leere Übersicht lässt sich im synthetischen Modus über das Production-CLI laden. Synthetische
 und reale Daten erhalten bewusst zwei verschiedene Speicherorte:
@@ -94,13 +106,26 @@ realisierten Anzahlen stehen zusätzlich in den Szenario-Metadaten.
 `healthlab-dev` besitzt keine Produktions- oder Real-Store-Konfiguration und verweigert Ziele
 innerhalb eines bestehenden HealthLab-Datenspeichers.
 
-Die Qualitätsprüfungen laufen lokal mit:
+## V0.1-Betrieb und Methodik
 
-```bash
-uv run ruff check .
-uv run mypy
-uv run pytest
-```
+`healthlab-dev` erzeugt synthetische Pakete; `healthlab` importiert und analysiert sie über dieselbe
+`HealthLab`-Schnittstelle wie Streamlit. Der beim Start gebundene Datenmodus bleibt unveränderlich,
+und synthetische und reale Daten verwenden physisch getrennte Speicherorte. Imports werden atomar
+aus Staging veröffentlicht; identische Pakete liefern `duplicate`, identische erfolgreiche
+Analyseläufe `reused`.
+
+Die eingebaute Analysedefinition `lag-signal-v1` modelliert alle sieben Verzögerungen gemeinsam als
+regularisiertes lineares Modell. Sie benötigt mindestens 30 vollständige Tage, stuft Ergebnisse ab
+180 vollständigen Tagen und akzeptabler Merkmalsabhängigkeit als `robust` ein und verwendet einen
+Moving-Block-Bootstrap mit 7-Tage-Blöcken, 250 Resamples, festem Seed und 95%-Intervallen. Angezeigt
+werden punktweise Intervalle, ein simultanes Band über das Verzögerungsprofil sowie Schätzungen pro
+100 aktive kcal und pro persönliche Standardabweichung. Schließt das simultane Band überall null
+ein, verhindert der Guardrail eine stabile Zusammenhangsbehauptung. Das sind Assoziationen, keine
+kausalen oder medizinischen Aussagen.
+
+Jeder Lauf speichert Snapshot-, Konfigurations-, Analysedefinitions-, Code- und Environment-Lock-
+Identität. Nur eine vollständig identische Reproduktionsidentität darf ein vorhandenes Ergebnis
+wiederverwenden.
 
 ## Sicherheitsgrenzen für Health-Importe
 
@@ -126,6 +151,7 @@ und XML-Entitäten werden einheitlich mit `invalid_health_export` abgewiesen.
 flowchart LR
     CLI["CLI-Adapter"] --> APP["application"]
     UI["Streamlit-Adapter"] --> APP
+    TEST["Akzeptanztests"] --> APP
     APP --> IMP["health_import"]
     APP --> ANA["resting_hr_analysis"]
     APP --> OVR["overview"]
