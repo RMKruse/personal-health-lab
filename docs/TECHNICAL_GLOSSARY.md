@@ -126,14 +126,35 @@ Die Zuordnung von Apple-spezifischen Typbezeichnern, XML-Attributen und Einheite
 **Importquarantäne**:
 Der geschützte, analytisch unsichtbare Bereich für eine fehlgeschlagene Importtransaktion und ihren Fehlerbericht. Sie bleibt bis zu einem ausdrücklichen erneuten Versuch oder ihrer Löschung erhalten.
 
+**Exportvorkommen**:
+Die Beobachtung eines vollständig normalisierten Quellsamples in genau einem erfolgreich verarbeiteten Export. Ein in mehreren Exporten inhaltlich identisches Sample erzeugt mehrere Exportvorkommen, aber keine neue Quellmessungsversion.
+
+**Exportdatum**:
+Der im Exportpaket enthaltene Zeitpunkt, der seine fachliche Reihenfolge gegenüber anderen Exporten bestimmt. Importzeitpunkt und Dateisystemzeit ändern diese Reihenfolge nicht; fehlt eine eindeutige Einordnung, bleibt der Export fachlich ungeordnet.
+
+**Geltender Export**:
+Der erfolgreich und vollständig verarbeitete Export mit dem eindeutig fachlich neuesten Exportdatum. Ein später importierter, aber älterer oder fachlich ungeordneter Export verdrängt ihn nicht; ein älterer vergleichbarer Export darf jedoch frühere Anwesenheit belegen und dadurch eine Löschvermutung gegenüber dem geltenden Export begründen.
+
 **Logische Quellmessung**:
 Die Identität eines Quellsamples über kumulative Exporte hinweg. Eine stabile Quell-ID wird bevorzugt; andernfalls definiert jeder unterstützte Datentyp eine natürliche Identität aus Quelle, Zeit und typabhängigen Merkmalen.
 
 **Quellmessungsversion**:
 Eine konkrete, in einem Import beobachtete Version einer logischen Quellmessung. Eine geänderte spätere Version wird für zukünftige Analysen bevorzugt, während frühere Versionen reproduzierbar bleiben.
 
+**Bevorzugte Quellmessungsversion**:
+Die Quellmessungsversion einer logischen Quellmessung, die für nachfolgend aufgelöste Datensatz-Snapshots gilt. Ohne Konflikt ist es die im geltenden Export beobachtete Version; offene Löschvermutungen und fachlich ungeordnete Exporte ändern sie nicht.
+
+**Quellmessungskonflikt**:
+Mehrere abweichende Exportvorkommen teilen denselben heuristischen Identitätskandidaten, ohne sich durch Exportdatum oder starke Quellen-ID eindeutig ordnen zu lassen. Bis zur ausdrücklichen Benutzerentscheidung bleibt die zuletzt eindeutig bevorzugte Quellmessungsversion wirksam; die Entscheidung wählt entweder eine bevorzugte Version oder trennt die Kandidaten in mehrere wirksame logische Quellmessungen. Die Wahl pinnt keine Version dauerhaft: Eine später eindeutig zuordenbare Version aus einem fachlich neueren geltenden Export wird automatisch bevorzugt.
+
 **Vermutete Quellenlöschung**:
-Eine Prüfauffälligkeit, wenn eine früher bekannte logische Quellmessung in einem späteren vollständigen Export fehlt. Das Fehlen allein entfernt nichts; eine Löschung benötigt Bestätigung.
+Eine Prüfauffälligkeit, wenn eine früher bekannte logische Quellmessung im geltenden, vergleichbaren Vollexport fehlt. Solange sie offen ist, bleibt die bisher bevorzugte Quellmessungsversion wirksam; erst eine ausdrückliche Bestätigung darf den wirksamen Datenbestand ändern.
+
+**Bestätigte Quellenlöschung**:
+Die bewusste Benutzerentscheidung, eine vermutete Quellenlöschung für nachfolgend aufgelöste Datensatz-Snapshots wirksam zu machen. Bereits bestehende Snapshots und Analysen bleiben unverändert reproduzierbar; erscheint die Quellmessung in einem fachlich neueren geltenden Export wieder, wird sie automatisch wieder wirksam und die Bestätigung bleibt als Audit-Historie erhalten.
+
+**Verworfene Quellenlöschung**:
+Die bewusste Benutzerentscheidung, eine vermutete Quellenlöschung nicht wirksam zu machen. Die Quellmessung bleibt wirksam und dieselbe fortdauernde Abwesenheit löst keine erneute Prüfung aus; erst Wiedererscheinen und späteres erneutes Verschwinden begründen eine neue Vermutung.
 
 ## Prüfworkflow
 
