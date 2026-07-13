@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import stat
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal
 from uuid import uuid4
 from xml.etree.ElementTree import ParseError, iterparse
@@ -16,6 +17,8 @@ from personal_health_lab.health_data import (
     CanonicalHealthType,
     CanonicalUnit,
     HealthProvenance,
+    LogicalMeasurementId,
+    MeasurementVersionId,
 )
 from personal_health_lab.storage import (
     DataMode,
@@ -23,6 +26,7 @@ from personal_health_lab.storage import (
     LocalStore,
     OperationId,
     SnapshotId,
+    StoreBusyError,
     StoreError,
 )
 
@@ -47,10 +51,13 @@ class HealthImportError(Exception):
 class HealthImportResult:
     operation_id: OperationId
     import_id: ImportId
-    status: Literal["committed", "rejected"]
+    status: Literal["committed", "duplicate", "rejected", "store_busy"]
     package_hash: str
     snapshot_id: SnapshotId | None
     record_count: int
+    package_record_count: int = 0
+    logical_measurement_count: int = 0
+    measurement_version_count: int = 0
     diagnostics: tuple[str, ...] = ()
 
 
@@ -61,13 +68,61 @@ def _source_datetime(value: str) -> datetime:
     return timestamp
 
 
-def _records(package_path: Path) -> tuple[CanonicalHealthRecord, ...]:
+def _id(*parts: object) -> str:
+    return hashlib.sha256("\x1f".join(map(str, parts)).encode()).hexdigest()
+
+
+def _records(
+    package_path: Path,
+    *,
+    max_package_bytes: int,
+    max_entries: int,
+    max_entry_bytes: int,
+    max_uncompressed_bytes: int,
+    max_compression_ratio: float,
+) -> tuple[CanonicalHealthRecord, ...]:
     if not package_path.is_file() or not is_zipfile(package_path):
         raise ValueError("invalid zip")
+    if package_path.stat().st_size > max_package_bytes:
+        raise ValueError("package too large")
     records: list[CanonicalHealthRecord] = []
     with ZipFile(package_path) as archive:
-        if _EXPORT_MEMBER not in archive.namelist():
-            raise ValueError("missing export.xml")
+        entries = archive.infolist()
+        if len(entries) > max_entries:
+            raise ValueError("too many entries")
+        total_size = 0
+        export_count = 0
+        for entry in entries:
+            path = PurePosixPath(entry.filename)
+            mode = entry.external_attr >> 16
+            total_size += entry.file_size
+            if (
+                not entry.filename
+                or "\\" in entry.filename
+                or path.is_absolute()
+                or ".." in path.parts
+                or entry.flag_bits & 1
+                or stat.S_ISLNK(mode)
+                or (stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR))
+                or entry.file_size > max_entry_bytes
+                or total_size > max_uncompressed_bytes
+                or entry.file_size / max(entry.compress_size, 1) > max_compression_ratio
+            ):
+                raise ValueError("unsafe archive entry")
+            if entry.is_dir():
+                continue
+            if entry.filename != _EXPORT_MEMBER:
+                raise ValueError("unsupported archive entry")
+            export_count += 1
+        if export_count != 1:
+            raise ValueError("missing or duplicate export.xml")
+        with archive.open(_EXPORT_MEMBER) as source:
+            tail = b""
+            while chunk := source.read(64 * 1024):
+                probe = (tail + chunk).upper()
+                if b"\0" in probe or b"<!DOCTYPE" in probe or b"<!ENTITY" in probe:
+                    raise ValueError("unsafe xml declaration")
+                tail = probe[-8:]
         with archive.open(_EXPORT_MEMBER) as source:
             root_seen = False
             for event, element in iterparse(source, events=("start", "end")):
@@ -85,18 +140,42 @@ def _records(package_path: Path) -> tuple[CanonicalHealthRecord, ...]:
                     value = float(element.attrib["value"])
                     source_start = _source_datetime(element.attrib["startDate"])
                     source_end = _source_datetime(element.attrib["endDate"])
+                    source_updated_at = _source_datetime(element.attrib["creationDate"])
+                    source_name = element.attrib["sourceName"]
+                    source_version = element.attrib.get("sourceVersion", "")
+                    device = element.attrib.get("device", "")
+                    logical_id = LogicalMeasurementId(
+                        _id(
+                            data_type.value,
+                            source_start.isoformat(),
+                            source_end.isoformat(),
+                            source_name,
+                            device,
+                        )
+                    )
                     records.append(
                         CanonicalHealthRecord(
+                            logical_measurement_id=logical_id,
+                            measurement_version_id=MeasurementVersionId(
+                                _id(
+                                    logical_id,
+                                    source_updated_at.isoformat(),
+                                    source_version,
+                                    value,
+                                    source_unit,
+                                )
+                            ),
                             data_type=data_type,
                             unit=canonical_unit,
                             value=value,
                             source_start=source_start,
                             source_end=source_end,
+                            source_updated_at=source_updated_at,
                             measurement_local_day=source_start.date(),
                             provenance=HealthProvenance(
-                                source_name=element.attrib["sourceName"],
-                                source_version=element.attrib.get("sourceVersion", ""),
-                                device=element.attrib.get("device", ""),
+                                source_name=source_name,
+                                source_version=source_version,
+                                device=device,
                                 original_value=value,
                                 original_unit=source_unit,
                             ),
@@ -109,48 +188,94 @@ def _records(package_path: Path) -> tuple[CanonicalHealthRecord, ...]:
 
 
 def import_health_export(
-    package_path: Path, *, root: Path, mode: DataMode
+    package_path: Path,
+    *,
+    root: Path,
+    mode: DataMode,
+    max_package_bytes: int,
+    max_entries: int,
+    max_entry_bytes: int,
+    max_uncompressed_bytes: int,
+    max_compression_ratio: float,
 ) -> HealthImportResult:
     operation_id = OperationId(uuid4().hex)
     import_id = ImportId(uuid4().hex)
+    snapshot_id = SnapshotId(uuid4().hex)
     package_hash = ""
     try:
-        with package_path.open("rb") as package:
-            package_hash = hashlib.file_digest(package, "sha256").hexdigest()
-        records = _records(package_path)
-    except (OSError, BadZipFile, KeyError, ParseError, ValueError):
+        store = LocalStore.open_writer(root=root, mode=mode)
+    except StoreBusyError:
         return HealthImportResult(
             operation_id=operation_id,
             import_id=import_id,
-            status="rejected",
+            status="store_busy",
             package_hash=package_hash,
             snapshot_id=None,
             record_count=0,
-            diagnostics=("invalid_health_export",),
+            diagnostics=("store_busy",),
         )
-
-    try:
-        snapshot_id = SnapshotId(uuid4().hex)
-        store = LocalStore.open(root=root, mode=mode)
-        try:
-            store.publish_import(
-                operation_id=operation_id,
-                import_id=import_id,
-                package_hash=package_hash,
-                snapshot_id=snapshot_id,
-                records=records,
-            )
-        finally:
-            store.close()
     except StoreError as error:
         raise HealthImportError("Health-Importspeicher ist nicht verfügbar.") from error
+    try:
+        store.start_import(
+            operation_id=operation_id,
+            import_id=import_id,
+            snapshot_id=snapshot_id,
+        )
+        try:
+            if package_path.stat().st_size > max_package_bytes:
+                raise ValueError("package too large")
+            with package_path.open("rb") as package:
+                package_hash = hashlib.file_digest(package, "sha256").hexdigest()
+            records = _records(
+                package_path,
+                max_package_bytes=max_package_bytes,
+                max_entries=max_entries,
+                max_entry_bytes=max_entry_bytes,
+                max_uncompressed_bytes=max_uncompressed_bytes,
+                max_compression_ratio=max_compression_ratio,
+            )
+        except (
+            OSError,
+            BadZipFile,
+            KeyError,
+            NotImplementedError,
+            ParseError,
+            RuntimeError,
+            ValueError,
+        ):
+            store.reject_import(import_id, package_hash)
+            return HealthImportResult(
+                operation_id=operation_id,
+                import_id=import_id,
+                status="rejected",
+                package_hash=package_hash,
+                snapshot_id=None,
+                record_count=0,
+                diagnostics=("invalid_health_export",),
+            )
+        published = store.publish_import(
+            operation_id=operation_id,
+            import_id=import_id,
+            package_hash=package_hash,
+            snapshot_id=snapshot_id,
+            records=records,
+        )
+    except StoreError as error:
+        raise HealthImportError("Health-Importspeicher ist nicht verfügbar.") from error
+    finally:
+        store.close()
     return HealthImportResult(
         operation_id=operation_id,
         import_id=import_id,
-        status="committed",
+        status=published.status,
         package_hash=package_hash,
-        snapshot_id=snapshot_id,
-        record_count=len(records),
+        snapshot_id=published.snapshot_id,
+        record_count=published.record_count,
+        package_record_count=len(records),
+        logical_measurement_count=published.logical_measurement_count,
+        measurement_version_count=published.measurement_version_count,
+        diagnostics=published.diagnostics,
     )
 
 

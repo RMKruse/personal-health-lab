@@ -17,7 +17,7 @@ def _read_local_config(path: Path) -> Mapping[str, object]:
         return {}
     try:
         parsed = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ConfigurationError("Lokale HealthLab-Konfiguration ist nicht lesbar.") from error
     if not isinstance(parsed, dict):
         raise ConfigurationError("Lokale HealthLab-Konfiguration muss ein JSON-Objekt sein.")
@@ -44,6 +44,10 @@ def load_runtime_config(
     selected_config_file = config_file or Path(
         environment.get("HEALTHLAB_CONFIG", _DEFAULT_CONFIG_FILE)
     )
+    if (
+        config_file is not None or "HEALTHLAB_CONFIG" in environment
+    ) and not selected_config_file.expanduser().exists():
+        raise ConfigurationError("Lokale HealthLab-Konfiguration ist nicht lesbar.")
     local = _read_local_config(selected_config_file.expanduser())
 
     mode_value: object = (

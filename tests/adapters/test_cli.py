@@ -1,10 +1,194 @@
+import fcntl
 import json
+import subprocess
+import sys
+from importlib.resources import files
 from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from personal_health_lab.adapters.cli import main
-from personal_health_lab.synthetic_export import generate_export
+from personal_health_lab.synthetic_export import GenerationOptions, generate_export
+
+_EXPECTED_RUNTIME_CONFIG = {
+    "max_import_compression_ratio": 200.0,
+    "max_import_entries": 8,
+    "max_import_entry_bytes": 512 * 1024 * 1024,
+    "max_import_package_bytes": 512 * 1024 * 1024,
+    "max_import_uncompressed_bytes": 512 * 1024 * 1024,
+    "mode": "synthetic",
+    "real_store": "<redacted>",
+    "schema_version": "1.0",
+    "synthetic_store": "<redacted>",
+}
+
+
+def _assert_json_contract(output: object) -> None:
+    schema = json.loads(
+        files("personal_health_lab.adapters.cli")
+        .joinpath("schemas/output-1.0.schema.json")
+        .read_text(encoding="utf-8")
+    )
+    Draft202012Validator(schema).validate(output)
+
+
+def test_cli_returns_expected_incomplete_for_rejected_import(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    package = tmp_path / "unsafe.zip"
+    with ZipFile(package, "w") as archive:
+        archive.writestr("apple_health_export/export.xml", "<HealthData/>")
+        archive.writestr("../private-health-value", "181")
+
+    exit_code = main(
+        [
+            "--mode",
+            "synthetic",
+            "--synthetic-store",
+            str(tmp_path / "synthetic"),
+            "--real-store",
+            str(tmp_path / "real"),
+            "import",
+            str(package),
+            "--json",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    output = json.loads(captured.out)
+    assert exit_code == 3
+    _assert_json_contract(output)
+    assert output["status"] == "rejected"
+    assert captured.err == ""
+
+
+def test_cli_returns_expected_incomplete_while_store_is_busy(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    common_args = [
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(tmp_path / "synthetic"),
+        "--real-store",
+        str(tmp_path / "real"),
+    ]
+    assert main([*common_args, "overview"]) == 0
+    capsys.readouterr()
+
+    with (tmp_path / "synthetic" / ".writer.lock").open("a+b") as writer_lock:
+        fcntl.flock(writer_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert main([*common_args, "import", str(tmp_path / "missing.zip"), "--json"]) == 3
+        import_receipt = json.loads(capsys.readouterr().out)
+        assert main([*common_args, "analyze", "--json"]) == 3
+        analysis_receipt = json.loads(capsys.readouterr().out)
+
+    _assert_json_contract(import_receipt)
+    _assert_json_contract(analysis_receipt)
+    assert import_receipt["status"] == "store_busy"
+    assert analysis_receipt["status"] == "store_busy"
+
+
+def test_cli_returns_expected_incomplete_for_unstable_analysis(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fixture = generate_export(
+        "null-v1",
+        42,
+        tmp_path / "fixture",
+        options=GenerationOptions(resting_heart_rate_noise_standard_deviation=0.0),
+    )
+    common_args = [
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(tmp_path / "synthetic"),
+        "--real-store",
+        str(tmp_path / "real"),
+    ]
+    assert main([*common_args, "import", str(fixture.export_path)]) == 0
+    capsys.readouterr()
+
+    assert main([*common_args, "analyze", "--json"]) == 3
+    receipt = json.loads(capsys.readouterr().out)
+    _assert_json_contract(receipt)
+    assert receipt["status"] == "unstable"
+
+
+def test_installed_cli_contracts_streams_and_redacts_technical_errors(tmp_path: Path) -> None:
+    executable = Path(sys.executable).with_name("healthlab")
+    common_args = [
+        str(executable),
+        "--mode",
+        "synthetic",
+        "--real-store",
+        str(tmp_path / "real"),
+    ]
+
+    success = subprocess.run(
+        [
+            *common_args,
+            "--synthetic-store",
+            str(tmp_path / "synthetic"),
+            "overview",
+            "--json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert success.returncode == 0
+    _assert_json_contract(json.loads(success.stdout))
+    assert success.stderr == ""
+
+    sensitive_store = tmp_path / "resting-heart-rate-181"
+    sensitive_store.write_text("not a directory", encoding="utf-8")
+
+    failure = subprocess.run(
+        [
+            *common_args,
+            "--synthetic-store",
+            str(sensitive_store),
+            "overview",
+            "--json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert failure.returncode == 1
+    assert failure.stdout == ""
+    assert failure.stderr == (
+        "ERROR healthlab_failed error_class=HealthLabError\n"
+        "Technischer HealthLab-Fehler.\n"
+    )
+
+
+def test_cli_returns_usage_error_for_unknown_arguments_and_invalid_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    invalid_config = tmp_path / "config.json"
+    invalid_config.write_text('{"mode": "unsupported"}', encoding="utf-8")
+    invalid_utf8 = tmp_path / "invalid-utf8.json"
+    invalid_utf8.write_bytes(b"\xff")
+
+    for args in (
+        ["--unknown"],
+        ["--config", str(invalid_config), "overview"],
+        ["--config", str(invalid_utf8), "overview"],
+        ["--config", str(tmp_path / "missing.json"), "overview"],
+    ):
+        with pytest.raises(SystemExit) as exit_info:
+            main(args)
+
+        captured = capsys.readouterr()
+        assert exit_info.value.code == 2
+        assert captured.out == ""
+        assert captured.err.startswith("usage: healthlab")
 
 
 def test_cli_prints_empty_overview_as_versioned_json(
@@ -25,15 +209,22 @@ def test_cli_prints_empty_overview_as_versioned_json(
 
     output = json.loads(capsys.readouterr().out)
     assert exit_code == 0
+    _assert_json_contract(output)
     assert output == {
         "daily_series": [],
         "message": "Keine Gesundheitsdaten vorhanden.",
-        "runtime_config": {
-            "mode": "synthetic",
-            "real_store": "<redacted>",
-            "synthetic_store": "<redacted>",
+        "resting_hr_analysis": None,
+        "provenance": {
+            "import_count": 0,
+            "logical_measurement_count": 0,
+            "measurement_version_count": 0,
+            "package_count": 0,
+            "quarantined_import_count": 0,
+            "snapshot_count": 0,
         },
+        "runtime_config": _EXPECTED_RUNTIME_CONFIG,
         "schema_version": "1.0",
+        "selection": {"end_date": None, "start_date": None},
         "status": "empty",
     }
 
@@ -53,13 +244,121 @@ def test_cli_imports_export_and_prints_daily_series(
 
     assert main([*common_args, "import", str(fixture.export_path), "--json"]) == 0
     receipt = json.loads(capsys.readouterr().out)
+    _assert_json_contract(receipt)
     assert receipt["status"] == "committed"
+    assert receipt["anomaly_count"] == 0
     assert receipt["record_count"] == 1_825
+    assert receipt["runtime_config"] == _EXPECTED_RUNTIME_CONFIG
+
+    assert main([*common_args, "import", str(fixture.export_path), "--json"]) == 0
+    duplicate = json.loads(capsys.readouterr().out)
+    _assert_json_contract(duplicate)
+    assert duplicate["status"] == "duplicate"
 
     assert main([*common_args, "overview", "--json"]) == 0
     overview = json.loads(capsys.readouterr().out)
+    _assert_json_contract(overview)
     assert [(series["data_type"], series["unit"]) for series in overview["daily_series"]] == [
         ("active_energy", "kcal"),
         ("apple_resting_heart_rate", "count/min"),
     ]
     assert len(overview["daily_series"][0]["values"]) == 365
+    assert overview["provenance"]["quarantined_import_count"] == 0
+
+
+def test_cli_runs_and_exposes_the_built_in_lag_analysis(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fixture = generate_export("lag-signal-v1", 42, tmp_path / "fixture")
+    common_args = [
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(tmp_path / "synthetic"),
+        "--real-store",
+        str(tmp_path / "real"),
+    ]
+    assert main([*common_args, "import", str(fixture.export_path)]) == 0
+    human_import = capsys.readouterr().out
+    assert "Konfiguration:" in human_import
+    assert str(tmp_path) not in human_import
+
+    assert main([*common_args, "analyze", "--json"]) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    _assert_json_contract(receipt)
+    assert receipt["status"] == "completed"
+    assert receipt["analysis_definition_id"] == "lag-signal-v1"
+    assert len(receipt["result"]["lag_associations"]) == 7
+    assert receipt["result"]["model_maturity"] == "robust"
+    assert receipt["result"]["methodology"]["bootstrap_method"] == "moving_block"
+    assert receipt["result"]["diagnostics"]
+    provenance = receipt["provenance"]
+    assert provenance == receipt["result"]["provenance"]
+    assert set(provenance) == {
+        "analysis_definition_id",
+        "analysis_run_id",
+        "code_commit",
+        "code_diff_hash",
+        "code_dirty",
+        "config_hash",
+        "config_schema_version",
+        "environment_lock_hash",
+        "result_ref",
+        "snapshot_ref",
+    }
+    assert len(provenance["config_hash"]) == 64
+    assert len(provenance["environment_lock_hash"]) == 64
+    assert all(
+        item["pointwise_interval"] and item["simultaneous_band"]
+        for item in receipt["result"]["lag_associations"]
+    )
+
+    structured_result = json.dumps(receipt["result"], ensure_ascii=False).lower()
+    assert all(
+        forbidden not in structured_result
+        for forbidden in (
+            "*",
+            "significant",
+            "signifikant",
+            "causal",
+            "kausal",
+            "medical",
+            "medizin",
+            "recommend",
+            "empfehl",
+            "therap",
+        )
+    )
+
+    assert main([*common_args, "overview", "--json"]) == 0
+    overview = json.loads(capsys.readouterr().out)
+    _assert_json_contract(overview)
+    result = overview["resting_hr_analysis"]
+    assert len(result["lag_associations"]) == 7
+    assert result["lag_associations"][0]["direction"] == "negative"
+    assert result["provenance"] == provenance
+
+    assert main([*common_args, "overview"]) == 0
+    human_overview = capsys.readouterr().out
+    assert "Konfiguration:" in human_overview
+    assert str(tmp_path) not in human_overview
+
+    assert main([*common_args, "analyze", "--json"]) == 0
+    reused = json.loads(capsys.readouterr().out)
+    _assert_json_contract(reused)
+    assert reused["status"] == "reused"
+
+    assert main([*common_args, "analyze"]) == 0
+    human_output = capsys.readouterr().out
+    assert "Konfiguration:" in human_output
+    assert str(tmp_path) not in human_output
+    assert "simultan" in human_output
+    assert "Diagnosen:" in human_output
+
+    assert main([*common_args, "analyze", "--start-date", "2024-12-20", "--json"]) == 3
+    insufficient = json.loads(capsys.readouterr().out)
+    _assert_json_contract(insufficient)
+    assert insufficient["status"] == "insufficient_data"
+    assert insufficient["result"] is None
+    assert insufficient["provenance"]["snapshot_ref"] == provenance["snapshot_ref"]
+    assert insufficient["provenance"]["result_ref"] is None

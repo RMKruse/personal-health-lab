@@ -2,7 +2,7 @@
 
 ## Projektvision, Zielarchitektur und MVP-Plan
 
-> **Status:** Konzeptphase  
+> **Status:** V0.1-Akzeptanzumfang implementiert und durch den dokumentierten Ablauf nachgewiesen
 > **Primäre Plattform im MVP:** macOS / lokaler Browser  
 > **Analytischer Kern:** Python  
 > **Langfristige Apple-Integration:** Swift, SwiftUI und HealthKit  
@@ -300,10 +300,12 @@ Analysekonfigurationen sind unveränderliche, typisierte und versionierte Objekt
 ### Beispiel einer Analyseschnittstelle
 
 ```python
+from datetime import date
+
 config = RestingHeartRateAnalysisConfig(
-    start_date="2025-01-01",
-    end_date="2026-01-01",
-    analysis_definition_id="resting-heart-rate-active-energy-v1",
+    analysis_definition_id=AnalysisDefinitionId("lag-signal-v1"),
+    start_date=date(2025, 1, 1),
+    end_date=date(2026, 1, 1),
 )
 
 receipt = app.run_resting_hr_analysis(config)
@@ -759,10 +761,10 @@ diagnostics_location
 
 - Git für Versionskontrolle,
 - `uv` für Python-Paket- und Umgebungsmanagement,
-- Pydantic für Konfigurationen,
+- unveränderliche Dataclasses und Enums für typisierte Konfigurationen,
 - eingebaute typisierte und versionierte Analysedefinitionen,
 - pytest für Tests,
-- Ruff für Linting und Formatierung,
+- Ruff für Linting,
 - mypy für statische Typprüfung,
 - feste Zufalls-Seeds, sofern methodisch sinnvoll.
 
@@ -1034,33 +1036,33 @@ Der Kern-MVP wird nicht als horizontaler Big Bang umgesetzt. Die erste ausführb
 
 ### V0.1: Vertikaler Durchstich
 
-- [ ] Python-Projekt, Tests, datensparsame Protokollierung und Startkonfiguration aufsetzen.
-- [ ] CLI-Adapter für den vollständigen reproduzierbaren V0.1-Ablauf implementieren.
-- [ ] Getrennten `healthlab-dev`-Adapter ausschließlich für synthetische Fixtures implementieren.
-- [ ] Physisch getrennte Datenmodi `synthetic` und `real` anlegen.
-- [ ] Synthetisches Health-Exportpaket mit Apple-Ruhepuls und aktiver Energie erzeugen.
-- [ ] Eine versionierte bekannte Ground-Truth-Verzögerungsstruktur mit Rauschen und Missingness in den synthetischen Daten hinterlegen.
-- [ ] Ein versioniertes Nullszenario ohne Ground-Truth-Zusammenhang erzeugen.
-- [ ] `lag-signal-v1` und `null-v1` mit jeweils 365 messlokalen Tagen, granularen aktiven Energie-Samples und täglichen Ruhepulsschätzungen erzeugen.
-- [ ] Typisierte numerische Samples mit Quelle, Gerät, Einheit, Zeitstempel und Zeitzone modellieren.
-- [ ] Health-Export-ZIP per XML-Streaming in einen isolierten Staging-Bereich importieren.
-- [ ] Import gegen Pfadtraversal, Dekompressionsbomben, unerlaubte Einträge und XML-External-Entities härten.
-- [ ] Negative Security-Fixtures für Pfadtraversal, Größen-/Eintragslimits, unerlaubte Archiveinträge und XML-External-Entities testen.
-- [ ] Import atomar veröffentlichen oder mit Fehlerbericht quarantänisieren.
-- [ ] Wiederholte identische Imports idempotent behandeln.
+- [x] Python-Projekt, Tests, datensparsame Protokollierung und Startkonfiguration aufsetzen.
+- [x] CLI-Adapter für den vollständigen reproduzierbaren V0.1-Ablauf implementieren.
+- [x] Getrennten `healthlab-dev`-Adapter ausschließlich für synthetische Fixtures implementieren.
+- [x] Physisch getrennte Datenmodi `synthetic` und `real` anlegen.
+- [x] Synthetisches Health-Exportpaket mit Apple-Ruhepuls und aktiver Energie erzeugen.
+- [x] Eine versionierte bekannte Ground-Truth-Verzögerungsstruktur mit Rauschen und Missingness in den synthetischen Daten hinterlegen.
+- [x] Ein versioniertes Nullszenario ohne Ground-Truth-Zusammenhang erzeugen.
+- [x] `lag-signal-v1` und `null-v1` mit jeweils 365 messlokalen Tagen, granularen aktiven Energie-Samples und täglichen Ruhepulsschätzungen erzeugen.
+- [x] Typisierte numerische Samples mit Quelle, Gerät, Einheit, Zeitstempel und Zeitzone modellieren.
+- [x] Health-Export-ZIP per XML-Streaming in einen isolierten Staging-Bereich importieren.
+- [x] Import gegen Pfadtraversal, Dekompressionsbomben, unerlaubte Einträge und XML-External-Entities härten.
+- [x] Negative Security-Fixtures für Pfadtraversal, Größen-/Eintragslimits, unerlaubte Archiveinträge und XML-External-Entities testen.
+- [x] Import atomar veröffentlichen oder mit Fehlerbericht quarantänisieren.
+- [x] Wiederholte identische Imports idempotent behandeln.
 - [ ] Einfache feste Plausibilitätsregeln und sichtbare Auffälligkeiten implementieren.
-- [ ] Messlokale Tagesaggregate für Apple-Ruhepuls und aktive Energie erzeugen.
-- [ ] Erstes Verzögerungsprofil für Tag 1 bis 7 berechnen und mit Unsicherheit anzeigen.
-- [ ] Regularisiertes lineares Distributed-Lag-Referenzmodell mit einzelnen und kumulativen Assoziationen implementieren.
-- [ ] Moving-Block-Bootstrap mit versionierter Blocklängenregel, Resample-Anzahl und Seeds implementieren.
-- [ ] Modelllauf mit Datensatz-Snapshot, Konfiguration und Codeversion reproduzierbar speichern.
-- [ ] Minimale Streamlit-Ansicht für Importstatus, Zeitreihe, Verzögerungsprofil und Methodik bereitstellen.
-- [ ] Streamlit als zweiten Adapter auf dasselbe Anwendungs-Interface setzen.
-- [ ] Interface-zentrierte End-to-End-Tests mit temporärem realem Speicheradapter implementieren.
+- [x] Messlokale Tagesaggregate für Apple-Ruhepuls und aktive Energie erzeugen.
+- [x] Erstes Verzögerungsprofil für Tag 1 bis 7 berechnen und mit Unsicherheit anzeigen.
+- [x] Regularisiertes lineares Distributed-Lag-Referenzmodell mit einzelnen und kumulativen Assoziationen implementieren.
+- [x] Moving-Block-Bootstrap mit versionierter Blocklängenregel, Resample-Anzahl und Seeds implementieren.
+- [x] Modelllauf mit Datensatz-Snapshot, Konfiguration und Codeversion reproduzierbar speichern.
+- [x] Minimale Streamlit-Ansicht für Importstatus, Zeitreihe, Verzögerungsprofil und Methodik bereitstellen.
+- [x] Streamlit als zweiten Adapter auf dasselbe Anwendungs-Interface setzen.
+- [x] Interface-zentrierte End-to-End-Tests mit temporärem realem Speicheradapter implementieren.
 - [ ] Gezielte interne Tests für Zeitgrenzen, Messidentität und Bootstrap ergänzen.
-- [ ] Zeitgrenzentests über Sommer-/Winterzeit in `Europe/Berlin` und einen kontrollierten Zeitzonenwechsel ergänzen.
-- [ ] Architekturtest für erlaubte Modulimporte und Zyklusfreiheit implementieren.
-- [ ] Strikte Typprüfung der Modul-Interfaces und Laufzeitvalidierung externer Strukturen einrichten.
+- [x] Zeitgrenzentests über Sommer-/Winterzeit in `Europe/Berlin` und einen kontrollierten Zeitzonenwechsel ergänzen.
+- [x] Architekturtest für erlaubte Modulimporte und Zyklusfreiheit implementieren.
+- [x] Strikte Typprüfung der Modul-Interfaces und Laufzeitvalidierung externer Strukturen einrichten.
 
 **Definition of Done:** Ein frischer Projektstand kann die versionierten synthetischen Health-Exportpakete selbst erzeugen, erfolgreich importieren, unmittelbar erneut ohne Duplikate importieren und denselben Analysemodelllauf aus Datensatz-Snapshot, Konfiguration und gesperrter Umgebung reproduzieren. Das Modell findet Richtung und zeitliche Struktur des bekannten synthetischen Verzögerungssignals innerhalb der zur Modellversion gehörenden Toleranzen wieder und weist im Nullszenario keinen stabilen Zusammenhang aus. Negative Security-Fixtures liefern `rejected`, veröffentlichen keinen Snapshot und hinterlassen keine extrahierten Staging-Artefakte.
 

@@ -1,5 +1,13 @@
-from datetime import date
+import os
+import signal
+import stat
+import time
+from datetime import UTC, date, datetime, timedelta
+from multiprocessing import get_context
 from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
+
+import pytest
 
 from personal_health_lab.application import (
     DataMode,
@@ -11,6 +19,181 @@ from personal_health_lab.application import (
 )
 from personal_health_lab.health_data import CanonicalHealthType, CanonicalUnit
 from personal_health_lab.synthetic_export import generate_export
+
+
+def _export(path: Path, records: str) -> Path:
+    xml = f'<?xml version="1.0"?><HealthData>{records}</HealthData>'
+    with ZipFile(path, "w", ZIP_DEFLATED) as archive:
+        archive.writestr("apple_health_export/export.xml", xml)
+    return path
+
+
+def _record(
+    data_type: str,
+    value: float,
+    start: str,
+    end: str,
+    *,
+    source_version: str = "1",
+) -> str:
+    unit = "kcal" if data_type.endswith("ActiveEnergyBurned") else "count/min"
+    return (
+        f'<Record type="{data_type}" sourceName="Test Watch" '
+        f'sourceVersion="{source_version}" device="Test Device" unit="{unit}" '
+        f'creationDate="{end}" startDate="{start}" endDate="{end}" '
+        f'value="{value}"/>'
+    )
+
+
+def _import_in_process(config: RuntimeConfig, package_path: Path) -> None:
+    while True:
+        with HealthLab.open(config) as health_lab:
+            receipt = health_lab.import_health_export(package_path)
+        if receipt.status is not ImportStatus.STORE_BUSY:
+            return
+
+
+def _large_export(path: Path, count: int = 50_000) -> Path:
+    start = datetime(2024, 1, 2, tzinfo=UTC)
+    records = "".join(
+        _record(
+            "HKQuantityTypeIdentifierActiveEnergyBurned",
+            1,
+            (start + timedelta(seconds=index)).strftime("%Y-%m-%d %H:%M:%S %z"),
+            (start + timedelta(seconds=index + 1)).strftime("%Y-%m-%d %H:%M:%S %z"),
+        )
+        for index in range(count)
+    )
+    return _export(path, records)
+
+
+def _negative_export_v1(path: Path, case: str, valid_xml: str) -> Path:
+    compression = ZIP_STORED if case == "package_size" else ZIP_DEFLATED
+    with ZipFile(path, "w", compression) as archive:
+        if case == "symlink":
+            link = ZipInfo("apple_health_export/export.xml")
+            link.create_system = 3
+            link.external_attr = (stat.S_IFLNK | 0o777) << 16
+            archive.writestr(link, valid_xml)
+            return path
+        utf16_entity = valid_xml.replace(
+            "?>",
+            '?><!DOCTYPE HealthData [<!ENTITY private "private-health-value">]>',
+            1,
+        ).replace("Test Watch", "&private;").encode("utf-16")
+        xml: str | bytes = {
+            "xxe": (
+                '<!DOCTYPE HealthData [<!ENTITY secret SYSTEM "file:///etc/passwd">]>'
+                '<HealthData><Record sourceName="&secret;"/></HealthData>'
+            ),
+            "utf16_entity": utf16_entity,
+            "invalid_xml": "<HealthData><Record></HealthData>",
+            "entry_size": valid_xml + " " * 1_024,
+            "uncompressed_size": valid_xml + " " * 1_024,
+            "compression_ratio": valid_xml + " " * 10_000,
+        }.get(case, valid_xml)
+        archive.writestr("apple_health_export/export.xml", xml)
+        if case == "traversal":
+            archive.writestr("../escaped.txt", "health data")
+        elif case == "unsupported_type":
+            archive.writestr("apple_health_export/notes.txt", "health data")
+        elif case == "entry_count":
+            archive.writestr("apple_health_export/", "")
+    return path
+
+
+@pytest.mark.parametrize(
+    ("case", "limits"),
+    [
+        ("traversal", {}),
+        ("symlink", {}),
+        ("unsupported_type", {}),
+        ("xxe", {}),
+        ("utf16_entity", {}),
+        ("invalid_xml", {}),
+        ("package_size", {"max_import_package_bytes": 100}),
+        ("entry_count", {"max_import_entries": 1}),
+        ("entry_size", {"max_import_entry_bytes": 512}),
+        ("uncompressed_size", {"max_import_uncompressed_bytes": 512}),
+        ("compression_ratio", {"max_import_compression_ratio": 2.0}),
+    ],
+)
+def test_negative_exports_v1_are_rejected_without_changing_the_snapshot(
+    case: str,
+    limits: dict[str, int | float],
+    tmp_path: Path,
+) -> None:
+    base = _export(
+        tmp_path / "base.zip",
+        _record(
+            "HKQuantityTypeIdentifierRestingHeartRate",
+            60,
+            "2024-01-01 07:00:00 +0100",
+            "2024-01-01 07:01:00 +0100",
+        ),
+    )
+    valid_xml = (
+        '<?xml version="1.0"?><HealthData>'
+        + _record(
+            "HKQuantityTypeIdentifierRestingHeartRate",
+            61,
+            "2024-01-02 07:00:00 +0100",
+            "2024-01-02 07:01:00 +0100",
+        )
+        + "</HealthData>"
+    )
+    malicious = _negative_export_v1(tmp_path / f"{case}.zip", case, valid_xml)
+    original = malicious.read_bytes()
+    base_config = RuntimeConfig(
+        mode=DataMode.SYNTHETIC,
+        synthetic_store=tmp_path / "synthetic-store",
+        real_store=tmp_path / "real-store",
+    )
+    config = RuntimeConfig(
+        mode=DataMode.SYNTHETIC,
+        synthetic_store=base_config.synthetic_store,
+        real_store=base_config.real_store,
+        **limits,  # type: ignore[arg-type]
+    )
+
+    with HealthLab.open(base_config) as health_lab:
+        committed = health_lab.import_health_export(base)
+    with HealthLab.open(config) as health_lab:
+        before = health_lab.load_overview(OverviewSelection())
+        rejected = health_lab.import_health_export(malicious)
+        after = health_lab.load_overview(OverviewSelection())
+
+    assert committed.status is ImportStatus.COMMITTED
+    assert rejected.status is ImportStatus.REJECTED
+    assert rejected.diagnostics == ("invalid_health_export",)
+    assert rejected.snapshot_ref is None
+    assert after.daily_series == before.daily_series
+    assert after.snapshot_count == before.snapshot_count
+    assert not (tmp_path / "escaped.txt").exists()
+    assert malicious.read_bytes() == original
+    assert not any((config.active_store / "staging").iterdir())
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_import_package_bytes", 0),
+        ("max_import_entries", True),
+        ("max_import_entry_bytes", -1),
+        ("max_import_uncompressed_bytes", 1.5),
+        ("max_import_compression_ratio", float("inf")),
+    ],
+)
+def test_import_security_limits_are_validated(
+    field: str, value: int | float | bool, tmp_path: Path
+) -> None:
+    with pytest.raises(ValueError):
+        RuntimeConfig(
+            mode=DataMode.SYNTHETIC,
+            synthetic_store=tmp_path / "synthetic-store",
+            real_store=tmp_path / "real-store",
+            **{field: value},  # type: ignore[arg-type]
+        )
 
 
 def test_valid_synthetic_export_is_published_as_daily_health_data(tmp_path: Path) -> None:
@@ -64,3 +247,139 @@ def test_valid_synthetic_export_is_published_as_daily_health_data(tmp_path: Path
     assert tokyo_value.value == 62.68
     assert tokyo_value.source_starts[0].utcoffset().total_seconds() == 32_400.0
     assert new_york_value.source_names == ("HealthLab Synthetic Apple Watch",)
+
+
+def test_cumulative_exports_are_idempotent_and_preserve_measurement_versions(
+    tmp_path: Path,
+) -> None:
+    active_type = "HKQuantityTypeIdentifierActiveEnergyBurned"
+    resting_type = "HKQuantityTypeIdentifierRestingHeartRate"
+    active = _record(
+        active_type,
+        100,
+        "2024-01-01 08:00:00 +0100",
+        "2024-01-01 08:30:00 +0100",
+    )
+    resting_v1 = _record(
+        resting_type,
+        60,
+        "2024-01-01 07:00:00 +0100",
+        "2024-01-01 07:01:00 +0100",
+    )
+    resting_v2 = _record(
+        resting_type,
+        61,
+        "2024-01-01 07:00:00 +0100",
+        "2024-01-01 07:01:00 +0100",
+        source_version="2",
+    )
+    new_active = _record(
+        active_type,
+        50,
+        "2024-01-01 12:00:00 +0100",
+        "2024-01-01 12:30:00 +0100",
+    )
+    base = _export(tmp_path / "base.zip", active + resting_v1)
+    expanded = _export(tmp_path / "expanded.zip", active + resting_v2 + new_active)
+    config = RuntimeConfig(
+        mode=DataMode.SYNTHETIC,
+        synthetic_store=tmp_path / "synthetic-store",
+        real_store=tmp_path / "real-store",
+    )
+
+    with HealthLab.open(config) as health_lab:
+        first = health_lab.import_health_export(base)
+        duplicate = health_lab.import_health_export(base)
+        cumulative = health_lab.import_health_export(expanded)
+        overview = health_lab.load_overview(OverviewSelection())
+
+    assert first.status is ImportStatus.COMMITTED
+    assert duplicate.status is ImportStatus.DUPLICATE
+    assert duplicate.snapshot_ref == first.snapshot_ref
+    assert duplicate.record_count == 0
+    assert cumulative.status is ImportStatus.COMMITTED
+    assert cumulative.snapshot_ref != first.snapshot_ref
+    assert cumulative.record_count == 2
+    assert cumulative.package_record_count == 3
+    assert cumulative.logical_measurement_count == 3
+    assert cumulative.measurement_version_count == 4
+    assert overview.import_count == 3
+    assert overview.package_count == 2
+    assert overview.snapshot_count == 2
+    assert overview.logical_measurement_count == 3
+    assert overview.measurement_version_count == 4
+
+    values = {series.data_type: series.values[0] for series in overview.daily_series}
+    assert values[CanonicalHealthType.ACTIVE_ENERGY].value == 150
+    preferred_resting = values[CanonicalHealthType.APPLE_RESTING_HEART_RATE]
+    assert preferred_resting.value == 61
+    assert preferred_resting.source_versions == ("2",)
+    assert tuple(timestamp.isoformat() for timestamp in preferred_resting.source_updated_ats) == (
+        "2024-01-01T06:01:00+00:00",
+    )
+    assert len(preferred_resting.measurement_version_ids) == 1
+
+
+def test_interrupted_import_keeps_snapshot_and_is_quarantined_on_restart(
+    tmp_path: Path,
+) -> None:
+    base = _export(
+        tmp_path / "base.zip",
+        _record(
+            "HKQuantityTypeIdentifierRestingHeartRate",
+            60,
+            "2024-01-01 07:00:00 +0100",
+            "2024-01-01 07:01:00 +0100",
+        ),
+    )
+    interrupted = _large_export(tmp_path / "interrupted.zip")
+    config = RuntimeConfig(
+        mode=DataMode.SYNTHETIC,
+        synthetic_store=tmp_path / "synthetic-store",
+        real_store=tmp_path / "real-store",
+    )
+    with HealthLab.open(config) as health_lab:
+        committed = health_lab.import_health_export(base)
+        before = health_lab.load_overview(OverviewSelection())
+
+    process = get_context("spawn").Process(
+        target=_import_in_process,
+        args=(config, interrupted),
+    )
+    process.start()
+    deadline = time.monotonic() + 10
+    busy = None
+    before_busy = None
+    while time.monotonic() < deadline:
+        with HealthLab.open(config) as health_lab:
+            before_attempt = health_lab.load_overview(OverviewSelection())
+            candidate = health_lab.import_health_export(base)
+        if candidate.status is ImportStatus.STORE_BUSY:
+            busy = candidate
+            before_busy = before_attempt
+            os.kill(process.pid, signal.SIGSTOP)
+            break
+        time.sleep(0.01)
+    if busy is None and process.is_alive():
+        process.kill()
+        process.join(timeout=5)
+    assert busy is not None
+    assert before_busy is not None
+    try:
+        with HealthLab.open(config) as health_lab:
+            during = health_lab.load_overview(OverviewSelection())
+    finally:
+        os.kill(process.pid, signal.SIGKILL)
+        process.join(timeout=5)
+    assert not process.is_alive()
+    assert busy.status is ImportStatus.STORE_BUSY
+    assert during == before_busy
+
+    with HealthLab.open(config) as health_lab:
+        after = health_lab.load_overview(OverviewSelection())
+
+    assert after.daily_series == before.daily_series
+    assert after.import_count == before_busy.import_count
+    assert after.snapshot_count == before_busy.snapshot_count
+    assert after.quarantined_import_count == before_busy.quarantined_import_count + 1
+    assert committed.snapshot_ref is not None

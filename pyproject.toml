@@ -20,6 +20,7 @@ healthlab-dev = "personal_health_lab.adapters.dev_cli:main"
 
 [dependency-groups]
 dev = [
+    "jsonschema>=4.26",
     "mypy>=1.17",
     "pytest>=8.4",
     "ruff>=0.12",

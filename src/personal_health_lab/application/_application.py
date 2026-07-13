@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
+from datetime import date
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
@@ -16,6 +18,16 @@ from personal_health_lab.health_import import (
     import_health_export,
 )
 from personal_health_lab.overview import Overview, OverviewReader, OverviewSelection
+from personal_health_lab.resting_hr_analysis import (
+    AnalysisDefinitionId,
+    AnalysisError,
+    AnalysisProvenance,
+    AnalysisResultId,
+    AnalysisRunId,
+)
+from personal_health_lab.resting_hr_analysis import (
+    run_resting_hr_analysis as execute_analysis,
+)
 
 logger = logging.getLogger("personal_health_lab")
 SnapshotRef = SnapshotId
@@ -33,31 +45,7 @@ class FeatureNotAvailableError(HealthLabError):
     """The requested operation is part of the interface but not this tracer bullet."""
 
 
-@dataclass(frozen=True, slots=True)
-class _OpaqueId:
-    _value: str
-
-    def __post_init__(self) -> None:
-        if not self._value:
-            raise ValueError("ID darf nicht leer sein.")
-
-    def __str__(self) -> str:
-        return self._value
-
-
-@dataclass(frozen=True, slots=True)
-class AnalysisRunId(_OpaqueId):
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class AnalysisDefinitionId(_OpaqueId):
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class AnalysisResultRef(_OpaqueId):
-    pass
+AnalysisResultRef = AnalysisResultId
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +54,11 @@ class RuntimeConfig:
     synthetic_store: Path
     real_store: Path
     schema_version: str = "1.0"
+    max_import_package_bytes: int = 512 * 1024 * 1024
+    max_import_entries: int = 8
+    max_import_entry_bytes: int = 512 * 1024 * 1024
+    max_import_uncompressed_bytes: int = 512 * 1024 * 1024
+    max_import_compression_ratio: float = 200.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, DataMode):
@@ -79,6 +72,17 @@ class RuntimeConfig:
 
         if self.schema_version != "1.0":
             raise ConfigurationError("Unbekannte RuntimeConfig-Schemaversion.")
+        limits = (
+            self.max_import_package_bytes,
+            self.max_import_entries,
+            self.max_import_entry_bytes,
+            self.max_import_uncompressed_bytes,
+        )
+        if any(type(limit) is not int or limit <= 0 for limit in limits):
+            raise ConfigurationError("Importgrenzen müssen positive Ganzzahlen sein.")
+        ratio = self.max_import_compression_ratio
+        if type(ratio) not in (int, float) or not math.isfinite(ratio) or ratio < 1:
+            raise ConfigurationError("Kompressionsverhältnis muss mindestens 1 sein.")
         if synthetic_store == real_store:
             raise ConfigurationError("Synthetischer und realer Datenspeicher müssen getrennt sein.")
         if synthetic_store in real_store.parents or real_store in synthetic_store.parents:
@@ -108,6 +112,9 @@ class ImportReceipt:
     snapshot_ref: SnapshotRef | None
     record_count: int
     anomaly_count: int
+    package_record_count: int = 0
+    logical_measurement_count: int = 0
+    measurement_version_count: int = 0
     diagnostics: tuple[str, ...] = ()
 
 
@@ -127,6 +134,8 @@ class ModelMaturityStatus(StrEnum):
 @dataclass(frozen=True, slots=True)
 class RestingHeartRateAnalysisConfig:
     analysis_definition_id: AnalysisDefinitionId
+    start_date: date | None = None
+    end_date: date | None = None
     schema_version: str = "1.0"
 
     def __post_init__(self) -> None:
@@ -134,6 +143,12 @@ class RestingHeartRateAnalysisConfig:
             raise ConfigurationError("analysis_definition_id hat einen ungültigen Typ.")
         if self.schema_version != "1.0":
             raise ConfigurationError("Unbekannte Analyseschemaversion.")
+        if (
+            self.start_date is not None
+            and self.end_date is not None
+            and self.start_date > self.end_date
+        ):
+            raise ConfigurationError("Startdatum darf nicht nach dem Enddatum liegen.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,11 +156,12 @@ class AnalysisReceipt:
     operation_id: OperationId
     analysis_run_id: AnalysisRunId
     status: AnalysisStatus
-    snapshot_ref: SnapshotRef
+    snapshot_ref: SnapshotRef | None
     analysis_definition_id: AnalysisDefinitionId
     model_maturity: ModelMaturityStatus | None
     result_ref: AnalysisResultRef | None
     diagnostics: tuple[str, ...] = ()
+    provenance: AnalysisProvenance | None = None
 
 
 class HealthLab:
@@ -169,6 +185,8 @@ class HealthLab:
             )
         except ValueError as error:
             raise ConfigurationError(str(error)) from error
+        except RuntimeError as error:
+            raise HealthLabError("Datenspeicher konnte nicht geöffnet werden.") from error
         logger.info("healthlab_opened mode=%s", self._config.mode.value)
         return self
 
@@ -190,6 +208,11 @@ class HealthLab:
                 package_path,
                 root=self._config.active_store,
                 mode=self._config.mode,
+                max_package_bytes=self._config.max_import_package_bytes,
+                max_entries=self._config.max_import_entries,
+                max_entry_bytes=self._config.max_import_entry_bytes,
+                max_uncompressed_bytes=self._config.max_import_uncompressed_bytes,
+                max_compression_ratio=self._config.max_import_compression_ratio,
             )
         except HealthImportError as error:
             raise HealthLabError("Health-Export konnte nicht importiert werden.") from error
@@ -201,15 +224,42 @@ class HealthLab:
             snapshot_ref=result.snapshot_id,
             record_count=result.record_count,
             anomaly_count=0,
+            package_record_count=result.package_record_count,
+            logical_measurement_count=result.logical_measurement_count,
+            measurement_version_count=result.measurement_version_count,
             diagnostics=result.diagnostics,
         )
 
-    def run_resting_hr_analysis(
-        self, config: RestingHeartRateAnalysisConfig
-    ) -> AnalysisReceipt:
-        del config
+    def run_resting_hr_analysis(self, config: RestingHeartRateAnalysisConfig) -> AnalysisReceipt:
         self._require_open()
-        raise FeatureNotAvailableError("Ruhepulsanalyse folgt in einem späteren Ticket.")
+        try:
+            result = execute_analysis(
+                root=self._config.active_store,
+                mode=self._config.mode,
+                analysis_definition_id=config.analysis_definition_id,
+                start_date=config.start_date,
+                end_date=config.end_date,
+                config_schema_version=config.schema_version,
+            )
+        except ValueError as error:
+            raise ConfigurationError(str(error)) from error
+        except AnalysisError as error:
+            raise HealthLabError(str(error)) from error
+        return AnalysisReceipt(
+            operation_id=result.operation_id,
+            analysis_run_id=result.analysis_run_id,
+            status=AnalysisStatus(result.status),
+            snapshot_ref=result.snapshot_id,
+            analysis_definition_id=result.analysis_definition_id,
+            model_maturity=(
+                None
+                if result.model_maturity is None
+                else ModelMaturityStatus(result.model_maturity)
+            ),
+            result_ref=result.result_id,
+            diagnostics=result.diagnostics,
+            provenance=result.provenance,
+        )
 
     def load_overview(self, selection: OverviewSelection) -> Overview:
         reader = self._require_open()

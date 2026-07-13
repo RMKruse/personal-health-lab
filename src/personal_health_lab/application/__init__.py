@@ -3,13 +3,23 @@
 from personal_health_lab import DataMode
 from personal_health_lab.health_import import ImportId, OperationId
 from personal_health_lab.health_import import SnapshotId as SnapshotRef
-from personal_health_lab.overview import Overview, OverviewSelection, OverviewStatus
+from personal_health_lab.overview import (
+    AssociationInterval,
+    Overview,
+    OverviewSelection,
+    OverviewStatus,
+)
+from personal_health_lab.resting_hr_analysis import (
+    AnalysisDefinitionId,
+    AnalysisProvenance,
+    AnalysisRunId,
+)
+from personal_health_lab.resting_hr_analysis import (
+    AnalysisResultId as AnalysisResultRef,
+)
 
 from ._application import (
-    AnalysisDefinitionId,
     AnalysisReceipt,
-    AnalysisResultRef,
-    AnalysisRunId,
     AnalysisStatus,
     ConfigurationError,
     FeatureNotAvailableError,
@@ -24,10 +34,12 @@ from ._application import (
 
 __all__ = [
     "AnalysisDefinitionId",
+    "AnalysisProvenance",
     "AnalysisReceipt",
     "AnalysisResultRef",
     "AnalysisRunId",
     "AnalysisStatus",
+    "AssociationInterval",
     "ConfigurationError",
     "DataMode",
     "FeatureNotAvailableError",
