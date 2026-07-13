@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import json
+import os
+import subprocess
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from pathlib import Path
 from random import Random
@@ -18,6 +22,7 @@ from personal_health_lab.storage import (
 from personal_health_lab.storage import (
     AnalysisDiagnostics,
     AnalysisMethodology,
+    AnalysisProvenance,
     AssociationDirection,
     AssociationEstimate,
     AssociationInterval,
@@ -36,6 +41,7 @@ from personal_health_lab.storage import (
 )
 
 type _AnalysisRow = tuple[date, list[float], float]
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,12 +74,24 @@ _DEFINITIONS = MappingProxyType(
 class AnalysisExecution:
     operation_id: OperationId
     analysis_run_id: AnalysisRunId
-    status: Literal["completed", "insufficient_data", "unstable", "store_busy"]
+    status: Literal["completed", "reused", "insufficient_data", "unstable", "store_busy"]
     snapshot_id: SnapshotId | None
     analysis_definition_id: AnalysisDefinitionId
     model_maturity: Literal["exploratory", "robust"] | None
     result_id: AnalysisResultId | None
     diagnostics: tuple[str, ...] = ()
+    provenance: AnalysisProvenance | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ReproductionContext:
+    config_json: str
+    config_hash: str
+    config_schema_version: str
+    code_commit: str
+    code_dirty: bool
+    code_diff_hash: str | None
+    environment_lock_hash: str
 
 
 class AnalysisError(RuntimeError):
@@ -86,6 +104,60 @@ class _InsufficientData(RuntimeError):
 
 class _Unstable(RuntimeError):
     pass
+
+
+def _reproduction_context(
+    analysis_definition_id: AnalysisDefinitionId,
+    start_date: date | None,
+    end_date: date | None,
+    config_schema_version: str,
+) -> _ReproductionContext:
+    config_json = json.dumps(
+        {
+            "analysis_definition_id": str(analysis_definition_id),
+            "end_date": end_date.isoformat() if end_date else None,
+            "schema_version": config_schema_version,
+            "start_date": start_date.isoformat() if start_date else None,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    def git(*arguments: str) -> bytes:
+        return subprocess.run(
+            ("git", *arguments),
+            cwd=_PROJECT_ROOT,
+            check=True,
+            capture_output=True,
+        ).stdout
+
+    try:
+        code_commit = git("rev-parse", "HEAD").decode("ascii").strip()
+        tracked_diff = git("diff", "--binary", "HEAD")
+        untracked = git("ls-files", "--others", "--exclude-standard", "-z")
+        diff_hasher = hashlib.sha256(tracked_diff)
+        for relative in sorted(path for path in untracked.split(b"\0") if path):
+            diff_hasher.update(b"\0" + relative + b"\0")
+            path = _PROJECT_ROOT / os.fsdecode(relative)
+            if path.is_symlink():
+                diff_hasher.update(os.readlink(path).encode())
+            else:
+                with path.open("rb") as untracked_file:
+                    while chunk := untracked_file.read(1024 * 1024):
+                        diff_hasher.update(chunk)
+        environment_lock = (_PROJECT_ROOT / "uv.lock").read_bytes()
+    except (OSError, subprocess.CalledProcessError, UnicodeError) as error:
+        raise AnalysisError("Analyseidentitäten konnten nicht sicher erfasst werden.") from error
+
+    return _ReproductionContext(
+        config_json=config_json,
+        config_hash=hashlib.sha256(config_json.encode()).hexdigest(),
+        config_schema_version=config_schema_version,
+        code_commit=code_commit,
+        code_dirty=bool(tracked_diff or untracked),
+        code_diff_hash=diff_hasher.hexdigest() if tracked_diff or untracked else None,
+        environment_lock_hash=hashlib.sha256(environment_lock).hexdigest(),
+    )
 
 
 def _solve(matrix: list[list[float]], values: list[float]) -> list[float]:
@@ -320,12 +392,20 @@ def run_resting_hr_analysis(
     analysis_definition_id: AnalysisDefinitionId,
     start_date: date | None,
     end_date: date | None,
+    config_schema_version: str,
 ) -> AnalysisExecution:
     definition = _DEFINITIONS.get(analysis_definition_id)
     if definition is None:
         raise ValueError("Unbekannte eingebaute Analysedefinition.")
+    context = _reproduction_context(
+        analysis_definition_id,
+        start_date,
+        end_date,
+        config_schema_version,
+    )
     operation_id = OperationId(str(uuid4()))
     run_id = AnalysisRunId(str(uuid4()))
+    result_id = AnalysisResultId(str(uuid4()))
     try:
         store = LocalStore.open_writer(root, mode)
     except StoreBusyError:
@@ -338,6 +418,14 @@ def run_resting_hr_analysis(
         input_start = None if start_date is None else start_date - timedelta(days=7)
         snapshot_id, series = store.load_analysis_input(input_start, end_date)
         if snapshot_id is None:
+            store.persist_analysis_receipt(
+                operation_id=operation_id,
+                analysis_run_id=run_id,
+                status="insufficient_data",
+                provenance=None,
+                config_json=context.config_json,
+                diagnostics=("no_snapshot",),
+            )
             return AnalysisExecution(
                 operation_id,
                 run_id,
@@ -348,6 +436,40 @@ def run_resting_hr_analysis(
                 None,
                 ("no_snapshot",),
             )
+        candidate = AnalysisProvenance(
+            analysis_run_id=run_id,
+            result_id=result_id,
+            snapshot_id=snapshot_id,
+            analysis_definition_id=analysis_definition_id,
+            config_hash=context.config_hash,
+            config_schema_version=context.config_schema_version,
+            code_commit=context.code_commit,
+            code_dirty=context.code_dirty,
+            code_diff_hash=context.code_diff_hash,
+            environment_lock_hash=context.environment_lock_hash,
+        )
+        reusable = store.find_reusable_resting_hr_analysis(candidate)
+        if reusable is not None:
+            provenance = reusable.provenance
+            store.persist_analysis_receipt(
+                operation_id=operation_id,
+                analysis_run_id=provenance.analysis_run_id,
+                status="reused",
+                provenance=provenance,
+                config_json=context.config_json,
+                diagnostics=reusable.diagnostics,
+            )
+            return AnalysisExecution(
+                operation_id,
+                provenance.analysis_run_id,
+                "reused",
+                provenance.snapshot_id,
+                provenance.analysis_definition_id,
+                reusable.model_maturity,
+                provenance.result_id,
+                reusable.diagnostics,
+                provenance,
+            )
         result = _fit(
             series,
             snapshot_id,
@@ -356,14 +478,26 @@ def run_resting_hr_analysis(
             start_date,
             end_date,
         )
-        result_id = AnalysisResultId(str(uuid4()))
+        result = replace(result, provenance=candidate)
+        receipt_diagnostics = (
+            f"model_readiness_{result.model_maturity}",
+            result.diagnostics.association_guardrail,
+        )
         store.persist_resting_hr_analysis(
             operation_id=operation_id,
-            analysis_run_id=run_id,
-            result_id=result_id,
             result=result,
             start_date=start_date,
             end_date=end_date,
+            config_json=context.config_json,
+            receipt_diagnostics=receipt_diagnostics,
+        )
+        store.persist_analysis_receipt(
+            operation_id=operation_id,
+            analysis_run_id=run_id,
+            status="completed",
+            provenance=candidate,
+            config_json=context.config_json,
+            diagnostics=receipt_diagnostics,
         )
         return AnalysisExecution(
             operation_id,
@@ -373,9 +507,20 @@ def run_resting_hr_analysis(
             analysis_definition_id,
             result.model_maturity,
             result_id,
-            (f"model_readiness_{result.model_maturity}", result.diagnostics.association_guardrail),
+            receipt_diagnostics,
+            candidate,
         )
     except _InsufficientData as error:
+        diagnostics = (str(error),)
+        failed_provenance = replace(candidate, result_id=None)
+        store.persist_analysis_receipt(
+            operation_id=operation_id,
+            analysis_run_id=run_id,
+            status="insufficient_data",
+            provenance=failed_provenance,
+            config_json=context.config_json,
+            diagnostics=diagnostics,
+        )
         return AnalysisExecution(
             operation_id,
             run_id,
@@ -384,9 +529,20 @@ def run_resting_hr_analysis(
             analysis_definition_id,
             None,
             None,
-            (str(error),),
+            diagnostics,
+            failed_provenance,
         )
     except _Unstable as error:
+        diagnostics = (str(error),)
+        failed_provenance = replace(candidate, result_id=None)
+        store.persist_analysis_receipt(
+            operation_id=operation_id,
+            analysis_run_id=run_id,
+            status="unstable",
+            provenance=failed_provenance,
+            config_json=context.config_json,
+            diagnostics=diagnostics,
+        )
         return AnalysisExecution(
             operation_id,
             run_id,
@@ -395,7 +551,8 @@ def run_resting_hr_analysis(
             analysis_definition_id,
             None,
             None,
-            (str(error),),
+            diagnostics,
+            failed_provenance,
         )
     except Exception as error:
         raise AnalysisError("Ruhepulsanalyse konnte nicht abgeschlossen werden.") from error
@@ -407,6 +564,7 @@ __all__ = [
     "AnalysisDefinitionId",
     "AnalysisError",
     "AnalysisExecution",
+    "AnalysisProvenance",
     "AnalysisResultId",
     "AnalysisRunId",
     "run_resting_hr_analysis",

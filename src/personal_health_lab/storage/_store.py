@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import shutil
 import sqlite3
@@ -25,6 +26,7 @@ from personal_health_lab.health_data import (
 _METADATA_FILE = "metadata.sqlite3"
 _PARQUET_DIRECTORY = "parquet"
 _QUERY_FILE = "query.duckdb"
+_STORE_SCHEMA_VERSION = "1.1"
 _WRITER_LOCK_FILE = ".writer.lock"
 
 
@@ -76,6 +78,36 @@ class AnalysisDefinitionId(_OpaqueStoreId):
 @dataclass(frozen=True, slots=True)
 class AnalysisResultId(_OpaqueStoreId):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisProvenance:
+    analysis_run_id: AnalysisRunId
+    result_id: AnalysisResultId | None
+    snapshot_id: SnapshotId
+    analysis_definition_id: AnalysisDefinitionId
+    config_hash: str
+    config_schema_version: str
+    code_commit: str
+    code_dirty: bool
+    code_diff_hash: str | None
+    environment_lock_hash: str
+
+    @property
+    def reuse_key(self) -> str:
+        values = {
+            "analysis_definition_id": str(self.analysis_definition_id),
+            "code_commit": self.code_commit,
+            "code_diff_hash": self.code_diff_hash,
+            "code_dirty": self.code_dirty,
+            "config_hash": self.config_hash,
+            "config_schema_version": self.config_schema_version,
+            "environment_lock_hash": self.environment_lock_hash,
+            "snapshot_id": str(self.snapshot_id),
+        }
+        return hashlib.sha256(
+            json.dumps(values, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
 
 
 class AssociationDirection(StrEnum):
@@ -138,6 +170,14 @@ class RestingHeartRateAnalysisResult:
     model_maturity: Literal["exploratory", "robust"]
     diagnostics: AnalysisDiagnostics
     methodology: AnalysisMethodology
+    provenance: AnalysisProvenance | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisRunRecord:
+    provenance: AnalysisProvenance
+    model_maturity: Literal["exploratory", "robust"]
+    diagnostics: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +262,30 @@ class LocalStore:
                 metadata_path if initialize else f"{metadata_path.resolve().as_uri()}?mode=ro",
                 uri=not initialize,
             )
+            identity_table = metadata.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_identity'"
+            ).fetchone()
+            existing_identity = (
+                None
+                if identity_table is None
+                else metadata.execute(
+                    "SELECT mode, schema_version FROM store_identity WHERE singleton = 1"
+                ).fetchone()
+            )
+            if existing_identity is not None:
+                existing_mode, existing_schema = map(str, existing_identity)
+                if existing_mode != mode.value or existing_schema not in {"1.0", "1.1"}:
+                    raise StoreError("Datenspeicher gehört zu einem anderen Modus oder Schema.")
+                if existing_schema == "1.0":
+                    if not initialize:
+                        raise StoreError("Datenspeicher benötigt eine Schema-Migration.")
+                    backup_directory = root / "migration-backups"
+                    backup_directory.mkdir(exist_ok=True)
+                    backup_path = backup_directory / (
+                        f"metadata-v1.0-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}.sqlite3"
+                    )
+                    with sqlite3.connect(backup_path) as backup:
+                        metadata.backup(backup)
             if initialize:
                 (root / _PARQUET_DIRECTORY).mkdir(exist_ok=True)
                 metadata.execute(
@@ -255,6 +319,23 @@ class LocalStore:
                         measurement_version_id TEXT NOT NULL,
                         PRIMARY KEY (import_id, measurement_version_id)
                     );
+                    CREATE TABLE IF NOT EXISTS analysis_receipts (
+                        operation_id TEXT PRIMARY KEY,
+                        analysis_run_id TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        result_id TEXT,
+                        snapshot_id TEXT,
+                        analysis_definition_id TEXT,
+                        config_json TEXT NOT NULL,
+                        config_hash TEXT,
+                        config_schema_version TEXT,
+                        code_commit TEXT,
+                        code_dirty INTEGER,
+                        code_diff_hash TEXT,
+                        environment_lock_hash TEXT,
+                        diagnostics TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
                     """
                 )
                 columns = {
@@ -278,24 +359,54 @@ class LocalStore:
                             analysis_definition_id TEXT NOT NULL,
                             analysis_start_date TEXT,
                             analysis_end_date TEXT,
+                            config_json TEXT NOT NULL,
+                            config_hash TEXT NOT NULL,
+                            config_schema_version TEXT NOT NULL,
+                            code_commit TEXT NOT NULL,
+                            code_dirty INTEGER NOT NULL,
+                            code_diff_hash TEXT,
+                            environment_lock_hash TEXT NOT NULL,
+                            reuse_key TEXT NOT NULL,
+                            model_maturity TEXT NOT NULL,
+                            diagnostics TEXT NOT NULL,
                             status TEXT NOT NULL,
                             completed_at TEXT NOT NULL
                         )
                         """
                     )
-                    metadata.commit()
                 else:
                     analysis_columns = {
                         str(row[1]) for row in metadata.execute("PRAGMA table_info(analysis_runs)")
                     }
-                    for column in ("analysis_start_date", "analysis_end_date"):
+                    analysis_column_migrations = {
+                        "analysis_start_date": "TEXT",
+                        "analysis_end_date": "TEXT",
+                        "config_json": "TEXT NOT NULL DEFAULT '{}'",
+                        "config_hash": "TEXT NOT NULL DEFAULT ''",
+                        "config_schema_version": "TEXT NOT NULL DEFAULT '1.0'",
+                        "code_commit": "TEXT NOT NULL DEFAULT ''",
+                        "code_dirty": "INTEGER NOT NULL DEFAULT 0",
+                        "code_diff_hash": "TEXT",
+                        "environment_lock_hash": "TEXT NOT NULL DEFAULT ''",
+                        "reuse_key": "TEXT NOT NULL DEFAULT ''",
+                        "model_maturity": "TEXT",
+                        "diagnostics": "TEXT NOT NULL DEFAULT '[]'",
+                    }
+                    for column, declaration in analysis_column_migrations.items():
                         if column not in analysis_columns:
-                            metadata.execute(f"ALTER TABLE analysis_runs ADD COLUMN {column} TEXT")
-                    metadata.commit()
+                            metadata.execute(
+                                f"ALTER TABLE analysis_runs ADD COLUMN {column} {declaration}"
+                            )
+                if existing_identity is not None and str(existing_identity[1]) == "1.0":
+                    metadata.execute(
+                        "UPDATE store_identity SET schema_version = ? WHERE singleton = 1",
+                        (_STORE_SCHEMA_VERSION,),
+                    )
+                metadata.commit()
             identity = metadata.execute(
                 "SELECT mode, schema_version FROM store_identity WHERE singleton = 1"
             ).fetchone()
-            expected_identity = (mode.value, "1.0")
+            expected_identity = (mode.value, _STORE_SCHEMA_VERSION)
             if identity is None:
                 if not initialize:
                     raise StoreError("Datenspeicher ist noch nicht initialisiert.")
@@ -786,19 +897,118 @@ class LocalStore:
             return None, ()
         return SnapshotId(str(row[0])), self.load_daily_series(start_date, end_date)
 
-    def persist_resting_hr_analysis(
+    def find_reusable_resting_hr_analysis(
+        self, candidate: AnalysisProvenance
+    ) -> AnalysisRunRecord | None:
+        self._require_open()
+        row = self._metadata.execute(
+            """
+            SELECT analysis_run_id, result_id, snapshot_id, analysis_definition_id,
+                   config_hash, config_schema_version, code_commit, code_dirty,
+                   code_diff_hash, environment_lock_hash, model_maturity, diagnostics
+            FROM analysis_runs
+            WHERE status = 'completed'
+              AND reuse_key = ?
+            ORDER BY completed_at DESC, rowid DESC
+            LIMIT 1
+            """,
+            (candidate.reuse_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        (
+            analysis_run_id,
+            result_id,
+            snapshot_id,
+            definition_id,
+            config_hash,
+            config_schema_version,
+            code_commit,
+            code_dirty,
+            code_diff_hash,
+            environment_lock_hash,
+            model_maturity,
+            diagnostics,
+        ) = row
+        return AnalysisRunRecord(
+            provenance=AnalysisProvenance(
+                analysis_run_id=AnalysisRunId(str(analysis_run_id)),
+                result_id=AnalysisResultId(str(result_id)),
+                snapshot_id=SnapshotId(str(snapshot_id)),
+                analysis_definition_id=AnalysisDefinitionId(str(definition_id)),
+                config_hash=str(config_hash),
+                config_schema_version=str(config_schema_version),
+                code_commit=str(code_commit),
+                code_dirty=bool(code_dirty),
+                code_diff_hash=None if code_diff_hash is None else str(code_diff_hash),
+                environment_lock_hash=str(environment_lock_hash),
+            ),
+            model_maturity=cast(Literal["exploratory", "robust"], model_maturity),
+            diagnostics=tuple(cast(list[str], json.loads(str(diagnostics)))),
+        )
+
+    def persist_analysis_receipt(
         self,
         *,
         operation_id: OperationId,
         analysis_run_id: AnalysisRunId,
-        result_id: AnalysisResultId,
-        result: RestingHeartRateAnalysisResult,
-        start_date: date | None,
-        end_date: date | None,
+        status: Literal["completed", "reused", "insufficient_data", "unstable"],
+        provenance: AnalysisProvenance | None,
+        config_json: str,
+        diagnostics: tuple[str, ...],
     ) -> None:
         self._require_open()
         self._require_writer()
-        staging = self._root / "analysis-staging" / str(analysis_run_id)
+        with self._metadata:
+            self._metadata.execute(
+                """
+                INSERT INTO analysis_receipts(
+                    operation_id, analysis_run_id, status, result_id, snapshot_id,
+                    analysis_definition_id, config_json, config_hash, config_schema_version,
+                    code_commit, code_dirty, code_diff_hash, environment_lock_hash,
+                    diagnostics, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(operation_id),
+                    str(analysis_run_id),
+                    status,
+                    (
+                        None
+                        if provenance is None or provenance.result_id is None
+                        else str(provenance.result_id)
+                    ),
+                    None if provenance is None else str(provenance.snapshot_id),
+                    None if provenance is None else str(provenance.analysis_definition_id),
+                    config_json,
+                    None if provenance is None else provenance.config_hash,
+                    None if provenance is None else provenance.config_schema_version,
+                    None if provenance is None else provenance.code_commit,
+                    None if provenance is None else provenance.code_dirty,
+                    None if provenance is None else provenance.code_diff_hash,
+                    None if provenance is None else provenance.environment_lock_hash,
+                    json.dumps(diagnostics),
+                    datetime.now().astimezone().isoformat(),
+                ),
+            )
+
+    def persist_resting_hr_analysis(
+        self,
+        *,
+        operation_id: OperationId,
+        result: RestingHeartRateAnalysisResult,
+        start_date: date | None,
+        end_date: date | None,
+        config_json: str,
+        receipt_diagnostics: tuple[str, ...],
+    ) -> None:
+        self._require_open()
+        self._require_writer()
+        provenance = result.provenance
+        if provenance is None or provenance.result_id is None:
+            raise StoreError("Analyseprovenienz fehlt.")
+        result_id = provenance.result_id
+        staging = self._root / "analysis-staging" / str(provenance.analysis_run_id)
         destination = self._root / _PARQUET_DIRECTORY / "analyses" / str(result_id)
         with self._metadata:
             self._metadata.execute(
@@ -806,17 +1016,30 @@ class LocalStore:
                 INSERT INTO analysis_runs(
                     analysis_run_id, operation_id, result_id, snapshot_id,
                     analysis_definition_id, analysis_start_date, analysis_end_date,
+                    config_json, config_hash, config_schema_version,
+                    code_commit, code_dirty, code_diff_hash, environment_lock_hash, reuse_key,
+                    model_maturity, diagnostics,
                     status, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
                 """,
                 (
-                    str(analysis_run_id),
+                    str(provenance.analysis_run_id),
                     str(operation_id),
                     str(result_id),
                     str(result.snapshot_id),
                     str(result.analysis_definition_id),
                     start_date.isoformat() if start_date else None,
                     end_date.isoformat() if end_date else None,
+                    config_json,
+                    provenance.config_hash,
+                    provenance.config_schema_version,
+                    provenance.code_commit,
+                    provenance.code_dirty,
+                    provenance.code_diff_hash,
+                    provenance.environment_lock_hash,
+                    provenance.reuse_key,
+                    result.model_maturity,
+                    json.dumps(receipt_diagnostics),
                     datetime.now().astimezone().isoformat(),
                 ),
             )
@@ -909,7 +1132,7 @@ class LocalStore:
             self._metadata.execute(
                 "UPDATE analysis_runs SET status = 'completed', completed_at = ? "
                 "WHERE analysis_run_id = ?",
-                (datetime.now().astimezone().isoformat(), str(analysis_run_id)),
+                (datetime.now().astimezone().isoformat(), str(provenance.analysis_run_id)),
             )
 
     def load_latest_resting_hr_analysis(
@@ -918,8 +1141,11 @@ class LocalStore:
         self._require_open()
         row = self._metadata.execute(
             """
-            SELECT analysis_runs.result_id, analysis_runs.snapshot_id,
-                   analysis_runs.analysis_definition_id
+            SELECT analysis_runs.analysis_run_id, analysis_runs.result_id,
+                   analysis_runs.snapshot_id, analysis_runs.analysis_definition_id,
+                   analysis_runs.config_hash, analysis_runs.config_schema_version,
+                   analysis_runs.code_commit, analysis_runs.code_dirty,
+                   analysis_runs.code_diff_hash, analysis_runs.environment_lock_hash
             FROM analysis_runs, active_snapshot
             WHERE analysis_runs.status = 'completed'
               AND analysis_runs.snapshot_id = active_snapshot.snapshot_id
@@ -935,7 +1161,21 @@ class LocalStore:
         ).fetchone()
         if row is None:
             return None
-        result_id, snapshot_id, definition_id = map(str, row)
+        (
+            analysis_run_id,
+            result_id,
+            snapshot_id,
+            definition_id,
+            config_hash,
+            config_schema_version,
+            code_commit,
+            code_dirty,
+            code_diff_hash,
+            environment_lock_hash,
+        ) = row
+        result_id = str(result_id)
+        snapshot_id = str(snapshot_id)
+        definition_id = str(definition_id)
         path = self._root / _PARQUET_DIRECTORY / "analyses" / result_id / "result.parquet"
         escaped_path = str(path).replace("'", "''")
         rows = self._query.execute(
@@ -1020,6 +1260,22 @@ class LocalStore:
                 resample_count=cast(int, methodology_values["resample_count"]),
                 random_seed=cast(int, methodology_values["random_seed"]),
                 interval_level=cast(float, methodology_values["interval_level"]),
+            ),
+            provenance=(
+                None
+                if not config_hash or not code_commit or not environment_lock_hash
+                else AnalysisProvenance(
+                    analysis_run_id=AnalysisRunId(str(analysis_run_id)),
+                    result_id=AnalysisResultId(result_id),
+                    snapshot_id=SnapshotId(snapshot_id),
+                    analysis_definition_id=AnalysisDefinitionId(definition_id),
+                    config_hash=str(config_hash),
+                    config_schema_version=str(config_schema_version),
+                    code_commit=str(code_commit),
+                    code_dirty=bool(code_dirty),
+                    code_diff_hash=None if code_diff_hash is None else str(code_diff_hash),
+                    environment_lock_hash=str(environment_lock_hash),
+                )
             ),
         )
 

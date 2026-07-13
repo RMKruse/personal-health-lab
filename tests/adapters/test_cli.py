@@ -96,6 +96,22 @@ def test_cli_runs_and_exposes_the_built_in_lag_analysis(
     assert receipt["result"]["model_maturity"] == "robust"
     assert receipt["result"]["methodology"]["bootstrap_method"] == "moving_block"
     assert receipt["result"]["diagnostics"]
+    provenance = receipt["provenance"]
+    assert provenance == receipt["result"]["provenance"]
+    assert set(provenance) == {
+        "analysis_definition_id",
+        "analysis_run_id",
+        "code_commit",
+        "code_diff_hash",
+        "code_dirty",
+        "config_hash",
+        "config_schema_version",
+        "environment_lock_hash",
+        "result_ref",
+        "snapshot_ref",
+    }
+    assert len(provenance["config_hash"]) == 64
+    assert len(provenance["environment_lock_hash"]) == 64
     assert all(
         item["pointwise_interval"] and item["simultaneous_band"]
         for item in receipt["result"]["lag_associations"]
@@ -122,6 +138,7 @@ def test_cli_runs_and_exposes_the_built_in_lag_analysis(
     result = json.loads(capsys.readouterr().out)["resting_hr_analysis"]
     assert len(result["lag_associations"]) == 7
     assert result["lag_associations"][0]["direction"] == "negative"
+    assert result["provenance"] == provenance
 
     assert main([*common_args, "analyze"]) == 0
     human_output = capsys.readouterr().out
@@ -132,3 +149,5 @@ def test_cli_runs_and_exposes_the_built_in_lag_analysis(
     insufficient = json.loads(capsys.readouterr().out)
     assert insufficient["status"] == "insufficient_data"
     assert insufficient["result"] is None
+    assert insufficient["provenance"]["snapshot_ref"] == provenance["snapshot_ref"]
+    assert insufficient["provenance"]["result_ref"] is None

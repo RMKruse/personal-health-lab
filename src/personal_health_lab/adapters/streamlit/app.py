@@ -45,12 +45,27 @@ for series in overview.daily_series:
 
 if overview.resting_hr_analysis is not None:
     result = overview.resting_hr_analysis
+    provenance = result.provenance
     st.subheader("Verzögerungsprofil")
     st.caption(
         "Assoziation zwischen aktiver Energie und Apple-Ruhepuls; "
         "keine kausale oder medizinische Aussage."
     )
     st.caption(f"Modellreife: {result.model_maturity}")
+    if provenance is not None:
+        st.caption(
+            f"Run {provenance.analysis_run_id} · Snapshot {provenance.snapshot_id} · "
+            f"Ergebnis {provenance.result_id} · Definition {provenance.analysis_definition_id}"
+        )
+        st.caption(
+            f"Konfiguration {provenance.config_hash} (Schema "
+            f"{provenance.config_schema_version}) · Environment "
+            f"{provenance.environment_lock_hash}"
+        )
+        st.caption(
+            f"Commit {provenance.code_commit} · Dirty {str(provenance.code_dirty).lower()} · "
+            f"Diff {provenance.code_diff_hash or '-'}"
+        )
     st.dataframe(
         [
             {

@@ -11,6 +11,7 @@ from personal_health_lab.overview import (
 )
 from personal_health_lab.resting_hr_analysis import (
     AnalysisDefinitionId,
+    AnalysisProvenance,
     AnalysisRunId,
 )
 from personal_health_lab.resting_hr_analysis import (
@@ -33,6 +34,7 @@ from ._application import (
 
 __all__ = [
     "AnalysisDefinitionId",
+    "AnalysisProvenance",
     "AnalysisReceipt",
     "AnalysisResultRef",
     "AnalysisRunId",

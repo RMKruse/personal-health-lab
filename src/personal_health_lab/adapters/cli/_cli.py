@@ -10,6 +10,7 @@ from pathlib import Path
 from personal_health_lab.adapters._config import load_runtime_config
 from personal_health_lab.application import (
     AnalysisDefinitionId,
+    AnalysisProvenance,
     AnalysisStatus,
     AssociationInterval,
     ConfigurationError,
@@ -19,6 +20,23 @@ from personal_health_lab.application import (
     OverviewSelection,
     RestingHeartRateAnalysisConfig,
 )
+
+
+def _provenance_json(provenance: AnalysisProvenance | None) -> dict[str, object] | None:
+    if provenance is None:
+        return None
+    return {
+        "analysis_definition_id": str(provenance.analysis_definition_id),
+        "analysis_run_id": str(provenance.analysis_run_id),
+        "code_commit": provenance.code_commit,
+        "code_diff_hash": provenance.code_diff_hash,
+        "code_dirty": provenance.code_dirty,
+        "config_hash": provenance.config_hash,
+        "config_schema_version": provenance.config_schema_version,
+        "environment_lock_hash": provenance.environment_lock_hash,
+        "result_ref": None if provenance.result_id is None else str(provenance.result_id),
+        "snapshot_ref": str(provenance.snapshot_id),
+    }
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -106,6 +124,7 @@ def _analysis_json(overview: Overview) -> dict[str, object] | None:
             "robust_observations": result.methodology.robust_observations,
         },
         "personal_standard_deviation_kcal": result.personal_standard_deviation_kcal,
+        "provenance": _provenance_json(result.provenance),
         "snapshot_ref": str(result.snapshot_id),
     }
 
@@ -152,6 +171,7 @@ def main(args: Sequence[str] | None = None) -> int:
                         else analysis_receipt.model_maturity.value
                     ),
                     "operation_id": str(analysis_receipt.operation_id),
+                    "provenance": _provenance_json(analysis_receipt.provenance),
                     "result_ref": (
                         str(analysis_receipt.result_ref) if analysis_receipt.result_ref else None
                     ),

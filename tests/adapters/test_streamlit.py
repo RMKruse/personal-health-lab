@@ -75,4 +75,10 @@ def test_streamlit_shows_imported_daily_series(
     assert "Punktweise Untergrenze" in app.dataframe[0].value.columns
     assert "Simultane Obergrenze" in app.dataframe[0].value.columns
     assert any("Modellreife: robust" in caption.value for caption in app.caption)
+    assert any("Run " in caption.value and "Ergebnis " in caption.value for caption in app.caption)
+    assert any(
+        "Konfiguration " in caption.value and "Environment " in caption.value
+        for caption in app.caption
+    )
+    assert any("Commit " in caption.value and "Diff " in caption.value for caption in app.caption)
     assert any("Moving-Block-Bootstrap" in caption.value for caption in app.caption)

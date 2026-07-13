@@ -1,3 +1,4 @@
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,8 @@ def test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis(tmp_path: P
         imported = health_lab.import_health_export(package.export_path)
         first = health_lab.run_resting_hr_analysis(analysis)
         first_overview = health_lab.load_overview(OverviewSelection())
+
+    with HealthLab.open(runtime) as health_lab:
         second = health_lab.run_resting_hr_analysis(analysis)
         second_overview = health_lab.load_overview(OverviewSelection())
 
@@ -39,13 +42,23 @@ def test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis(tmp_path: P
     assert first.analysis_definition_id == analysis.analysis_definition_id
     assert first.model_maturity is ModelMaturityStatus.ROBUST
     assert first.result_ref is not None
-    assert second.status is AnalysisStatus.COMPLETED
+    assert first.provenance is not None
+    assert len(first.provenance.config_hash) == 64
+    assert len(first.provenance.code_commit) >= 40
+    assert len(first.provenance.environment_lock_hash) == 64
+    assert (first.provenance.code_diff_hash is not None) == first.provenance.code_dirty
+    assert second.status is AnalysisStatus.REUSED
+    assert second.analysis_run_id == first.analysis_run_id
+    assert second.result_ref == first.result_ref
     assert second.snapshot_ref == first.snapshot_ref
+    assert second.provenance == first.provenance
 
     first_result = first_overview.resting_hr_analysis
     second_result = second_overview.resting_hr_analysis
     assert first_result is not None
     assert second_result is not None
+    assert first_result.provenance == first.provenance
+    assert second_result.provenance == second.provenance
     assert first_result.model_maturity == "robust"
     assert first_result.methodology.bootstrap_method == "moving_block"
     assert first_result.methodology.block_length_days == 7
@@ -82,11 +95,46 @@ def test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis(tmp_path: P
     )
 
     with HealthLab.open(runtime) as health_lab:
+        changed_config = health_lab.run_resting_hr_analysis(
+            RestingHeartRateAnalysisConfig(
+                analysis_definition_id=analysis.analysis_definition_id,
+                start_date=date(2024, 2, 1),
+            )
+        )
         newer_import = health_lab.import_health_export(newer_package.export_path)
         newer_overview = health_lab.load_overview(OverviewSelection())
+        changed_snapshot = health_lab.run_resting_hr_analysis(analysis)
+
+    assert changed_config.status is AnalysisStatus.COMPLETED
+    assert changed_config.analysis_run_id != first.analysis_run_id
+    assert changed_config.provenance is not None
+    assert changed_config.provenance.config_hash != first.provenance.config_hash
+    assert changed_config.provenance.snapshot_id == first.provenance.snapshot_id
+    assert (
+        changed_config.provenance.analysis_definition_id == first.provenance.analysis_definition_id
+    )
+    assert changed_config.provenance.code_commit == first.provenance.code_commit
+    assert changed_config.provenance.code_dirty == first.provenance.code_dirty
+    assert changed_config.provenance.code_diff_hash == first.provenance.code_diff_hash
+    assert changed_config.provenance.environment_lock_hash == first.provenance.environment_lock_hash
 
     assert newer_import.snapshot_ref != first.snapshot_ref
     assert newer_overview.resting_hr_analysis is None
+    assert changed_snapshot.status is AnalysisStatus.COMPLETED
+    assert changed_snapshot.analysis_run_id != first.analysis_run_id
+    assert changed_snapshot.provenance is not None
+    assert changed_snapshot.provenance.snapshot_id != first.provenance.snapshot_id
+    assert changed_snapshot.provenance.config_hash == first.provenance.config_hash
+    assert (
+        changed_snapshot.provenance.analysis_definition_id
+        == first.provenance.analysis_definition_id
+    )
+    assert changed_snapshot.provenance.code_commit == first.provenance.code_commit
+    assert changed_snapshot.provenance.code_dirty == first.provenance.code_dirty
+    assert changed_snapshot.provenance.code_diff_hash == first.provenance.code_diff_hash
+    assert (
+        changed_snapshot.provenance.environment_lock_hash == first.provenance.environment_lock_hash
+    )
 
 
 def test_null_scenario_does_not_present_a_stable_association(tmp_path: Path) -> None:
@@ -162,8 +210,14 @@ def test_analysis_reports_insufficient_and_unstable_inputs_with_stable_diagnosti
 
     assert receipts[0].status is AnalysisStatus.INSUFFICIENT_DATA
     assert receipts[0].diagnostics == ("insufficient_complete_days",)
+    assert receipts[0].provenance is not None
+    assert receipts[0].provenance.snapshot_id == receipts[0].snapshot_ref
+    assert receipts[0].provenance.result_id is None
     assert receipts[1].status is AnalysisStatus.UNSTABLE
     assert receipts[1].diagnostics == ("constant_outcome",)
+    assert receipts[1].provenance is not None
+    assert receipts[1].provenance.snapshot_id == receipts[1].snapshot_ref
+    assert receipts[1].provenance.result_id is None
     assert receipts[2].status is AnalysisStatus.COMPLETED
     assert receipts[2].model_maturity is ModelMaturityStatus.EXPLORATORY
     assert "model_readiness_exploratory" in receipts[2].diagnostics

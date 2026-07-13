@@ -21,6 +21,7 @@ from personal_health_lab.overview import Overview, OverviewReader, OverviewSelec
 from personal_health_lab.resting_hr_analysis import (
     AnalysisDefinitionId,
     AnalysisError,
+    AnalysisProvenance,
     AnalysisResultId,
     AnalysisRunId,
 )
@@ -160,6 +161,7 @@ class AnalysisReceipt:
     model_maturity: ModelMaturityStatus | None
     result_ref: AnalysisResultRef | None
     diagnostics: tuple[str, ...] = ()
+    provenance: AnalysisProvenance | None = None
 
 
 class HealthLab:
@@ -235,6 +237,7 @@ class HealthLab:
                 analysis_definition_id=config.analysis_definition_id,
                 start_date=config.start_date,
                 end_date=config.end_date,
+                config_schema_version=config.schema_version,
             )
         except ValueError as error:
             raise ConfigurationError(str(error)) from error
@@ -253,6 +256,7 @@ class HealthLab:
             ),
             result_ref=result.result_id,
             diagnostics=result.diagnostics,
+            provenance=result.provenance,
         )
 
     def load_overview(self, selection: OverviewSelection) -> Overview:
