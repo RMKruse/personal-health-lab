@@ -114,6 +114,21 @@ class AnalysisProvenance:
         ).hexdigest()
 
 
+def _analysis_provenance(row: tuple[object, ...]) -> AnalysisProvenance:
+    return AnalysisProvenance(
+        analysis_run_id=AnalysisRunId(str(row[0])),
+        result_id=None if row[1] is None else AnalysisResultId(str(row[1])),
+        snapshot_id=SnapshotId(str(row[2])),
+        analysis_definition_id=AnalysisDefinitionId(str(row[3])),
+        config_hash=str(row[4]),
+        config_schema_version=str(row[5]),
+        code_commit=str(row[6]),
+        code_dirty=bool(row[7]),
+        code_diff_hash=None if row[8] is None else str(row[8]),
+        environment_lock_hash=str(row[9]),
+    )
+
+
 class AssociationDirection(StrEnum):
     NEGATIVE = "negative"
     ZERO = "zero"
@@ -1171,21 +1186,9 @@ class LocalStore:
         ).fetchone()
         if row is None:
             return None
-        (
-            analysis_run_id,
-            result_id,
-            snapshot_id,
-            definition_id,
-            config_hash,
-            config_schema_version,
-            code_commit,
-            code_dirty,
-            code_diff_hash,
-            environment_lock_hash,
-        ) = row
-        result_id = str(result_id)
-        snapshot_id = str(snapshot_id)
-        definition_id = str(definition_id)
+        result_id = str(row[1])
+        snapshot_id = str(row[2])
+        definition_id = str(row[3])
         path = self._root / _PARQUET_DIRECTORY / "analyses" / result_id / "result.parquet"
         escaped_path = str(path).replace("'", "''")
         rows = self._query.execute(
@@ -1272,20 +1275,7 @@ class LocalStore:
                 interval_level=cast(float, methodology_values["interval_level"]),
             ),
             provenance=(
-                None
-                if not config_hash or not code_commit or not environment_lock_hash
-                else AnalysisProvenance(
-                    analysis_run_id=AnalysisRunId(str(analysis_run_id)),
-                    result_id=AnalysisResultId(result_id),
-                    snapshot_id=SnapshotId(snapshot_id),
-                    analysis_definition_id=AnalysisDefinitionId(definition_id),
-                    config_hash=str(config_hash),
-                    config_schema_version=str(config_schema_version),
-                    code_commit=str(code_commit),
-                    code_dirty=bool(code_dirty),
-                    code_diff_hash=None if code_diff_hash is None else str(code_diff_hash),
-                    environment_lock_hash=str(environment_lock_hash),
-                )
+                None if not row[4] or not row[6] or not row[9] else _analysis_provenance(row)
             ),
         )
 
@@ -1304,18 +1294,7 @@ class LocalStore:
         ).fetchone()
         if row is None:
             return None
-        return AnalysisProvenance(
-            analysis_run_id=AnalysisRunId(str(row[0])),
-            result_id=AnalysisResultId(str(row[1])),
-            snapshot_id=SnapshotId(str(row[2])),
-            analysis_definition_id=AnalysisDefinitionId(str(row[3])),
-            config_hash=str(row[4]),
-            config_schema_version=str(row[5]),
-            code_commit=str(row[6]),
-            code_dirty=bool(row[7]),
-            code_diff_hash=None if row[8] is None else str(row[8]),
-            environment_lock_hash=str(row[9]),
-        )
+        return _analysis_provenance(row)
 
     def load_provenance_counts(self) -> ProvenanceCounts:
         self._require_open()

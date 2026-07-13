@@ -74,9 +74,7 @@ def test_streamlit_shows_imported_daily_series(
     ]
     assert len(app.get("vega_lite_chart")) == 3
     assert app.metric[0].label == "Kumulativer Zusammenhang je 100 kcal"
-    assert any(
-        "punktweises Intervall und simultanes Band" in caption.value for caption in app.caption
-    )
+    assert any("Dunkelblau: punktweises Intervall" in caption.value for caption in app.caption)
     assert any("Modellreife: robust" in caption.value for caption in app.caption)
     assert any("Run " in caption.value and "Ergebnis " in caption.value for caption in app.caption)
     assert any(
@@ -92,4 +90,4 @@ def test_streamlit_shows_imported_daily_series(
 
     assert not app.exception
     assert app.markdown[0].value == "Status: provisional"
-    assert any("Letztes robustes Ergebnis" in item.value for item in app.warning)
+    assert any("Letztes belastbares Ergebnis" in item.value for item in app.warning)

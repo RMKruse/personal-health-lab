@@ -11,10 +11,13 @@ import streamlit as st
 from personal_health_lab.adapters._config import load_runtime_config
 from personal_health_lab.application import (
     AnalysisDefinitionId,
+    AnalysisStatus,
     ConfigurationError,
     HealthLab,
     HealthLabError,
+    ImportStatus,
     OverviewSelection,
+    OverviewStatus,
     RestingHeartRateAnalysisConfig,
 )
 
@@ -42,7 +45,7 @@ if st.button("Health-Export importieren", disabled=uploaded is None):
             package.flush()
             with HealthLab.open(config) as health_lab:
                 import_receipt = health_lab.import_health_export(Path(package.name))
-        st.session_state["last_import_status"] = import_receipt.status.value
+        st.session_state["last_import_status"] = import_receipt.status
         st.session_state["last_import_snapshot"] = str(import_receipt.snapshot_ref or "-")
         st.session_state["last_import_diagnostics"] = ", ".join(import_receipt.diagnostics) or "-"
         st.rerun()
@@ -67,7 +70,7 @@ if st.button("Zeitraum analysieren"):
                     end_date=selection.end_date,
                 )
             )
-        st.session_state["last_analysis_status"] = analysis_receipt.status.value
+        st.session_state["last_analysis_status"] = analysis_receipt.status
         st.session_state["last_analysis_diagnostics"] = (
             ", ".join(analysis_receipt.diagnostics) or "-"
         )
@@ -89,7 +92,7 @@ if import_status is not None:
         f"{st.session_state.pop('last_import_snapshot')} · "
         f"Diagnosen: {st.session_state.pop('last_import_diagnostics')}"
     )
-    if import_status in {"committed", "duplicate"}:
+    if import_status in {ImportStatus.COMMITTED, ImportStatus.DUPLICATE}:
         st.success(import_message)
     else:
         st.warning(import_message)
@@ -100,7 +103,7 @@ if analysis_status is not None:
         f"Analysestatus: {analysis_status} · "
         f"Diagnosen: {st.session_state.pop('last_analysis_diagnostics')}"
     )
-    if analysis_status in {"completed", "reused"}:
+    if analysis_status in {AnalysisStatus.COMPLETED, AnalysisStatus.REUSED}:
         st.success(analysis_message)
     else:
         st.warning(analysis_message)
@@ -142,13 +145,13 @@ for series in overview.daily_series:
         use_container_width=True,
     )
 
-if overview.status.value == "provisional":
+if overview.status is OverviewStatus.PROVISIONAL:
     previous = overview.last_ready_analysis_provenance
     if previous is None:
-        st.warning("Dieses Ergebnis ist provisorisch; ein früheres robustes Ergebnis fehlt.")
+        st.warning("Dieses Analyseergebnis ist vorläufig; ein belastbares Ergebnis fehlt.")
     else:
         st.warning(
-            f"Dieses Ergebnis ist provisorisch. Letztes robustes Ergebnis: "
+            f"Dieses Analyseergebnis ist vorläufig. Letztes belastbares Ergebnis: "
             f"Run {previous.analysis_run_id} · Snapshot {previous.snapshot_id} · "
             f"Ergebnis {previous.result_id}."
         )
@@ -226,6 +229,26 @@ if overview.resting_hr_analysis is not None:
                             "type": "quantitative",
                             "title": "bpm je 100 kcal",
                         },
+                        "tooltip": [
+                            {"field": "Folgetag", "type": "ordinal"},
+                            {"field": "Schätzung", "type": "quantitative"},
+                            {
+                                "field": "Punktweise Untergrenze",
+                                "type": "quantitative",
+                            },
+                            {
+                                "field": "Punktweise Obergrenze",
+                                "type": "quantitative",
+                            },
+                            {
+                                "field": "Simultane Untergrenze",
+                                "type": "quantitative",
+                            },
+                            {
+                                "field": "Simultane Obergrenze",
+                                "type": "quantitative",
+                            },
+                        ],
                     },
                 },
             ],
@@ -233,7 +256,7 @@ if overview.resting_hr_analysis is not None:
         use_container_width=True,
     )
     st.caption(
-        "Das Diagramm zeigt Schätzung, punktweises Intervall und simultanes Band; "
+        "Dunkelblau: punktweises Intervall · Hellblau: simultanes Band · "
         "Detailwerte erscheinen im Tooltip."
     )
     cumulative = result.cumulative_association
