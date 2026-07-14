@@ -10,6 +10,9 @@ Ein Teil des Systems mit genau einem Interface und einer verborgenen Implementie
 **Interface**:
 Alles, was ein Aufrufer über ein Modul wissen muss: Operationen, Invarianten, Reihenfolge, Fehlerfälle, Konfiguration und relevante Leistungsmerkmale.
 
+**Leseprojektion**:
+Ein unveränderliches, vollständig typisiertes und präsentationsneutrales Ansichtsmodell für genau einen fachlichen Lesezweck. V0.2 veröffentlicht über `application` die Projektionen Arbeitsbereichsstatus, Overview, Datenprüfung, Datenprüffalldetail, Plausibilitätsregeln, Sicherung und Wiederherstellung sowie Migration und Diagnose; Adapter formatieren Werte und Codes, ergänzen aber weder Zulässigkeits- noch Auswahl- oder Interpretationslogik. Frei strukturierte Dictionaries, DataFrames, SQL-Zeilen, Speicherpfade und fertige UI-Texte gehören nicht in eine Leseprojektion.
+
 **Öffentlicher Modulexport**:
 Die ausschließlich über das `__init__.py` eines Moduls veröffentlichte Python-Oberfläche. Andere Module dürfen keine Implementierungsdateien per Deep Import umgehen.
 
@@ -29,10 +32,10 @@ Die Datenspeicherinvariante, dass genau eine schreibende Operation gleichzeitig 
 Die Stelle, an der das Interface eines Moduls liegt und Verhalten durch einen anderen Adapter ausgetauscht werden kann, ohne den Aufrufer zu ändern.
 
 **Adapter**:
-Eine konkrete Anbindung an einer Seam. CLI und Streamlit sind zwei Adapter für dasselbe V0.1-Anwendungsmodul.
+Eine konkrete Anbindung an einer Seam. CLI und Streamlit sind zwei Adapter für dasselbe Anwendungsmodul und importieren dessen öffentliche Requests, Projektionen, IDs, Enums und Ausnahmen ausschließlich über `personal_health_lab.application`.
 
 **Production-CLI-Adapter**:
-Der Einstiegspunkt `healthlab` für Import, Analyse und Overview. Er kennt den synthetischen Exportgenerator nicht und bietet menschenlesbare Ausgabe sowie `--json` mit versioniertem Schema. Exitcodes: `0` Erfolg oder No-op, `2` Verwendungsfehler, `3` erwartbar nicht abgeschlossen, `1` technischer Defekt.
+Der Einstiegspunkt `healthlab` für die fachlichen Schreibaufträge und Leseprojektionen. Er kennt den synthetischen Exportgenerator nicht und bietet menschenlesbare Ausgabe sowie `--json` mit versioniertem Schema. Exitcodes: `0` Erfolg oder No-op, `2` Verwendungsfehler, `3` erwartbar nicht abgeschlossen, `1` technischer Defekt.
 
 **Development-CLI-Adapter**:
 Der getrennte Einstiegspunkt `healthlab-dev` für Repository-sichere synthetische Fixtures. Er darf keinen realen Datenspeicher öffnen.
@@ -41,10 +44,19 @@ Der getrennte Einstiegspunkt `healthlab-dev` für Repository-sichere synthetisch
 Der einzige Ort, an dem ein Adapter Konfigurationsquellen liest, validiert und die Module von `HealthLab` zusammensetzt. Interne Module lesen keine Umgebungsvariablen oder globalen Settings.
 
 **Receipt**:
-Das unveränderliche Ergebnis einer schreibenden Interface-Operation mit stabiler ID, typisiertem Status und datensparsamen Diagnosen. Erwartbare Zustände werden als Receipt-Status und nicht als technische Ausnahme ausgedrückt.
+Das unveränderliche Ergebnis der ausdrücklichen Ausführung eines Schreibauftrags mit stabiler Operations-ID, bestätigtem Plan-Fingerprint, typisiertem Ergebnis, finalem Preflight und datensparsamen Diagnosen. `WriteReceipt.result` ist eine geschlossene Union aus nicht gestarteten und operationsspezifischen Ergebnissen; erwartbare Zustände werden darin und nicht als technische Ausnahme ausgedrückt.
+
+**Schreibauftrag**:
+Ein unveränderlicher, vollständig typisierter fachlicher Eingabewert der geschlossenen V0.2-Union `WriteRequest`. `HealthLab.preview_write` erzeugt daraus eine Schreibvorschau; `HealthLab.execute_write` erhält denselben Auftrag und den erwarteten Plan-Fingerprint, berechnet den Plan neu und führt nur den unveränderten Plan aus. Ein separates Bestätigungsargument existiert nicht: Die ausdrückliche fingerprint-gebundene Ausführung bestätigt alle im Plan aufgeführten Gründe gemeinsam.
+
+**Arbeitsbereichsstatus**:
+Die globale schreibgeschützte Leseprojektion eines geöffneten `HealthLab` mit Datenmodus, Datenspeicher-ID, Betriebszustand und den fachlich zulässigen Lese- und Schreiboperationen. Mindestens `ready`, `migration_required` und `restore_pending` sind erwartbare Zustände; das Öffnen migriert niemals implizit und lässt in eingeschränkten Zuständen die benötigten Status- und Diagnosezugriffe zu.
+
+**Projektionsunverfügbarkeit**:
+Das typisierte erwartbare Ergebnis `ProjectionUnavailable`, wenn eine Leseprojektion im aktuellen Arbeitsbereichszustand oder Datenmodus nicht zulässig oder nicht vorhanden ist. Es enthält einen Code und datensparsame Diagnosen; nur ein beschädigter oder technisch nicht diagnostizierbarer Speicher löst eine Ausnahme aus.
 
 **Overview**:
-Das präsentationsneutrale Ansichtsmodell mit dem Zustand `empty`, `ready` oder `provisional`, Zeitreihen, Trends, Unsicherheit, Qualitäts- und Quellenstatus, Analyseverweisen sowie Methodik und Provenienz. Sein aktueller Ergebnisplatz enthält ausschließlich ein Ergebnis des aktiven Datensatz-Snapshots. Fehlt ein solcher Modelllauf, meldet das Overview ausdrücklich, dass kein aktuelles Ergebnis vorhanden ist, und darf das jüngste frühere Ergebnis nur in einem getrennten historischen Platz samt `stale`, Snapshot- und Run-ID sowie Ausführungszeitpunkt anbieten. Bei einem aktuellen vorläufigen Ergebnis darf es zusätzlich getrennt auf das letzte geprüfte historische Ergebnis verweisen. Adapter formatieren diese Trennung, ergänzen aber keine fachliche Logik.
+Das präsentationsneutrale Ansichtsmodell mit dem Zustand `empty`, `ready` oder `provisional`, Zeitreihen, Trends, Unsicherheit, Qualitäts- und Quellenstatus, Analyseverweisen sowie Methodik und Provenienz. Sein aktueller Ergebnisplatz enthält ausschließlich ein Ergebnis des aktiven Datensatz-Snapshots. Fehlt ein solcher Modelllauf, kennzeichnet das Overview dies typisiert und darf das jüngste frühere Ergebnis nur in einem getrennten historischen Platz samt `stale`, Snapshot- und Run-ID sowie Ausführungszeitpunkt anbieten. Bei einem aktuellen vorläufigen Ergebnis darf es zusätzlich getrennt auf das letzte geprüfte historische Ergebnis verweisen. Adapter formatieren Codes und Werte, ergänzen aber weder fertige Anwendungstexte noch fachliche Logik.
 
 **Analyseergebnisstatus**:
 Die typisierte Kennzeichnung eines berechneten Analyseergebnisses durch drei unabhängige Enum-Dimensionen: Aktualität (`current`, `stale`), Datenstatus (`provisional`, `reviewed`) und Modellreife (`exploratory`, `robust`). Sie werden weder als Booleans noch als ein gemeinsames Kreuzprodukt-Enum dargestellt. Nur die Aktualität wird aus der aktiven Snapshot-Referenz abgeleitet und darf zwischen `current` und `stale` wechseln. Der unveränderliche Datenstatus hält zusätzlich typisierte Gründe und Beleg-IDs fest; die unveränderliche Modellreife hält jedes versionierte Kriterium mit Ergebnis, beobachtetem Wert und Schwelle fest. Neue Grund- oder Kriterientypen deuten frühere Ergebnisse nicht um. Der getrennte `AnalysisStatus` beschreibt weiterhin den Ausgang des Modelllaufs und nicht diese Ergebnisdimensionen.
@@ -139,7 +151,7 @@ Die Behandlung jedes Exportpakets als nicht vertrauenswürdige Eingabe mit Schut
 Das tiefe interne Modul, das Snapshot-Auflösung, Tagesmerkmale, Modellreifeprüfung, Distributed-Lag-Fit, Moving-Block-Bootstrap, Diagnostik und Ergebnispersistenz hinter einer Analyseoperation verbirgt.
 
 **Overview-Modul**:
-Das tiefe interne Lesemodul, das Snapshot- und Ergebniswahl, Statusmarker, Zeitreihen, Provenienz und Methodik zu genau einem präsentationsneutralen `Overview` zusammensetzt.
+Das tiefe interne Lesemodul, das Snapshot- und Ergebniswahl, Statusmarker, Zeitreihen, Provenienz und Methodik zu einem präsentationsneutralen `Overview` zusammensetzt. `Overview` bleibt eine fokussierte V0.2-Leseprojektion unter mehreren; ausschließlich `application` veröffentlicht diese Projektionen an Adapter, während ihre interne Modulzuordnung eine getrennte Architekturentscheidung ist.
 
 **Health-Data-Modul**:
 Der gemeinsame Besitzer kanonischer Health-Sample-, Provenienz-, Einheiten- und Zeittypen samt ihren Invarianten. Es enthält weder Import- noch Persistenzlogik und ist kein allgemeiner `domain`-Sammelplatz.

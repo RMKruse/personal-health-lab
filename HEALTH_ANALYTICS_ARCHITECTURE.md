@@ -285,21 +285,59 @@ Die Exitcode-Klassen sind: `0` für Erfolg oder idempotenten No-op, `2` für ung
 
 Jede V0.2-Schreiboperation verwendet unabhängig vom aktuellen Schutz- und Freigabestatus denselben zweistufigen Anwendungsvertrag: eine nebenwirkungsfreie typisierte Schreibvorschau und deren ausdrückliche Ausführung. Sämtliche fachlichen Eingaben sind vor der Vorschau festgelegt und im Plan-Fingerprint gebunden; Bearbeiten verwirft den Plan. Die menschenlesbare CLI zeigt Vorschau und Bestätigung innerhalb eines Aufrufs. Im JSON-Modus liefert der erste Aufruf den vollständigen Plan; der zweite wiederholt dieselben Argumente und führt nur bei neu berechnetem identischem Fingerprint aus. Angezeigte Pläne werden nicht persistiert.
 
+Die öffentliche V0.2-Seam ersetzt die benannten schreibenden V0.1-Methoden durch genau zwei Methoden:
+
+```python
+with HealthLab.open(runtime_config) as app:
+    plan = app.preview_write(request)
+    receipt = app.execute_write(request, expected_plan=plan.fingerprint)
+
+# Interface:
+# preview_write(request: WriteRequest) -> WritePlan
+# execute_write(
+#     request: WriteRequest,
+#     *,
+#     expected_plan: PlanFingerprint,
+# ) -> WriteReceipt
+```
+
+`WriteRequest` ist eine geschlossene Union aus `ImportHealthExport`, `RunRestingHeartRateAnalysis`, `ResolveDataReviewCase`, `ConfirmDataReviewBatch`, `RevokeDataReviewDecision`, `CreatePlausibilityRuleVersion`, `RunHistoricalReview`, `CreateMetadataBackup`, `BeginMetadataRestore`, `AbortMetadataRestore`, `MigrateStore` und `RollbackMigration`. Der Widerrufsauftrag adressiert typisiert entweder eine einzelne Entscheidungs-ID oder eine Sammelaktions-ID. `ResolveDataReviewCase.resolution` ist selbst eine geschlossene Union für Datenbestätigung, Datenkorrektur, lokalen Messungsausschluss, Quellwertübernahme, Quellenlöschungsentscheidung und Konfliktauflösung. Eine neue vollständige Plausibilitätsregelversion deckt Erstanlage, Änderung, Deaktivierung, Reaktivierung und die ausdrückliche Übernahme einer ausgelieferten Empfehlung ab.
+
+`WritePlan` und `WriteReceipt` sind unveränderliche gemeinsame Hüllen. Operationsspezifische Plandetails und Ergebnisse bleiben geschlossene typisierte Unions statt öffentlicher Generics, Protocols oder Vererbungshierarchien. Der Plan enthält Fingerprint, `WriteApproval` mit `ready`, `confirmation_required` oder `blocked`, typisierte Bestätigungsgründe, Details und Diagnosen. Die ausdrückliche Ausführung des identischen Fingerprints bestätigt sämtliche Gründe gemeinsam; ein separates Bestätigungsargument gibt es nicht. Das Receipt enthält Operations-ID, Plan-Fingerprint, operationsspezifisches oder `WriteNotStarted`-Ergebnis, finalen Preflight und Diagnosen. `plan_changed`, `blocked` und `store_busy` sind typisierte nicht gestartete Ergebnisse; nur unerwartete technische Defekte verlassen die Seam als Ausnahme.
+
+`ImportHealthExport` ist im Zustand `restore_pending` weiterhin derselbe öffentliche Auftrag, rekonstruiert intern aber ausschließlich die benötigten Quellenidentitäten. Sobald der letzte benötigte Export alle Referenzen schließt, aktiviert dieselbe Operation das bereits gemeinsam bestätigte Overlay atomar; ein zusätzlicher `CompleteRestore`-Auftrag existiert nicht. Sicherungsschema-Migrationen bleiben Bestandteil von `BeginMetadataRestore`, und einzelne Migrationsschritte werden nicht öffentlich. Bei synchroner Ausführung bedeutet Abbruch vor der Migration lediglich, nicht auszuführen; ein fehlgeschlagener erneuter Versuch beginnt über `MigrateStore` frisch.
+
 Eine Sammelbestätigung macht Filter, Anzahl, stabile Fall-IDs und entscheidungsrelevante Werte der vollständigen materialisierten Treffermenge prüfbar. Streamlit darf dafür eine paginierte Tabelle und die CLI den nativen Pager verwenden; JSON enthält die vollständige Liste. Kein Adapter kürzt still oder rekonstruiert die Treffermenge selbst.
 
-Streamlit verwendet `session_state` ausschließlich für flüchtige UI-Auswahl und Navigation. Import-, Prüf- und Analysezustände bleiben hinter dem Anwendungs-Interface persistent. Caches dürfen nur unveränderliche Overview-Daten halten und müssen Snapshot- oder Run-IDs im Cache-Key führen.
+Streamlit verwendet `session_state` ausschließlich für flüchtige UI-Auswahl und Navigation. Import-, Prüf- und Analysezustände bleiben hinter dem Anwendungs-Interface persistent. Caches dürfen nur unveränderliche Leseprojektionsdaten halten und müssen die jeweils relevanten Snapshot-, Run-, Regel-, Audit- oder Sicherungs-IDs im Cache-Key führen.
 
 V0.2-Schreibvorschauen erscheinen inline auf der jeweils zuständigen Fachseite. Ein Seitenwechsel verwirft sie; global bleibt nur ein schreibgeschützter Workspace-Status, keine Operationswarteschlange. `migration_required` fokussiert ausschließlich „Migration und Diagnose“, `restore_pending` ausschließlich „Sicherung und Wiederherstellung“; die übrigen Seitennamen bleiben zur Orientierung sichtbar, sind aber deaktiviert. Diese Navigation ist Präsentationslogik, während zulässige Operationen, Plan, Freigabestatus, Diagnosen und Ausführung vollständig aus dem gemeinsamen Anwendungs-Interface stammen.
 
-`load_overview(selection)` liefert ein präsentationsneutrales `Overview` mit Zeitreihen, Trends, Unsicherheit, Qualitäts- und Quellenstatus, Analyseverweisen, Methodik und Provenienz. CLI serialisiert dieses Modell als Tabelle oder JSON; Streamlit visualisiert es. Adapter dürfen keine fachliche Daten- oder Interpretationslogik ergänzen.
+`application` ist die einzige öffentliche Lese-Seam für CLI und Streamlit, veröffentlicht in V0.2 aber mehrere kleine benannte Projektionen statt eines anwachsenden Gesamt-`Overview` oder eines generischen Query-Bus:
 
-Das interne `overview`-Modul ist die einzige Leseprojektion für CLI und Streamlit. Es verbirgt Snapshot- und Ergebniswahl, Statusmarker, Zeitreihen-, Provenienz- und Methodikabfragen; Adapter greifen niemals direkt auf das Speichermodul zu.
+```python
+app.load_workspace_status() -> WorkspaceStatus
+app.load_overview(selection) -> Overview | ProjectionUnavailable
+app.load_data_review(selection) -> DataReview | ProjectionUnavailable
+app.load_data_review_case(case_id) -> DataReviewCaseDetail | ProjectionUnavailable
+app.load_plausibility_rules() -> PlausibilityRules | ProjectionUnavailable
+app.load_recovery_status() -> RecoveryStatus | ProjectionUnavailable
+app.load_migration_diagnostics() -> MigrationDiagnostics | ProjectionUnavailable
+```
+
+`HealthLab.open` verändert den Datenspeicher niemals und öffnet auch bei `migration_required`, `restore_pending` oder einem unbekannten neueren Schema eine eingeschränkte Sitzung, solange der Speicher noch sicher diagnostizierbar ist. `WorkspaceStatus` enthält Datenmodus, Datenspeicher-ID, Betriebszustand sowie die fachlich zulässigen Lese- und Schreiboperationen. Die Anwendung erzwingt diese Zulässigkeit zusätzlich; ein unzulässiger oder nicht vorhandener Lesezugriff liefert `ProjectionUnavailable` mit typisiertem Code und datensparsamer Diagnose statt einer erwartbaren Ausnahme. Beschädigte oder technisch nicht diagnostizierbare Speicher bleiben technische Fehler.
+
+`load_overview(selection)` liefert ein präsentationsneutrales `Overview` mit Zeitreihen, Trends, Unsicherheit, Qualitäts- und Quellenstatus, Analyseverweisen, Methodik und Provenienz. `load_data_review` liefert die vollständige unveränderliche Trefferliste für seinen typisierten Filter; Streamlit paginiert nur visuell, während die CLI den nativen Pager verwendet. `ConfirmDataReviewBatch` verwendet denselben Filtertyp, materialisiert die exakte Menge erneut und bindet sie vollständig in den Plan-Fingerprint. Cursor, Storage-Paging und eine künstliche V0.2-Mengenobergrenze existieren nicht.
+
+Projektionen liefern typisierte Werte, Begründungscodes und fachlich zulässige Aktionen, aber keine fertigen UI-Texte. Benutzertexte wie Notizen und Pflichtbegründungen bleiben Fachdatum. Produktionsadapter importieren sämtliche Requests, Pläne, Receipts, Projektionen, IDs, Enums und Ausnahmen ausschließlich über `personal_health_lab.application`; sie greifen niemals direkt auf Speicher- oder interne Lesemodule zu. Benutzerausgewählte Paket-, Sicherungs- und Zielpfade dürfen Eingaben sein, interne oder unredigierte Speicherpfade und konkrete SQLite-, Parquet-, DuckDB-, Staging- oder Tabellenformen erscheinen weder in Projektionen noch in Receipts.
+
+Das interne `overview`-Modul verbirgt weiterhin Snapshot- und Ergebniswahl, Statusmarker, Zeitreihen-, Provenienz- und Methodikabfragen für `Overview`. Die interne Eigentümerschaft der weiteren Projektionen wird getrennt festgelegt und ist kein Grund, ihre Orchestrierung in Adapter zu verlagern.
 
 `OverviewSelection` enthält ausschließlich den gewünschten Zeitraum beziehungsweise eines der festen Zeitfenster. Das Modul wählt aktuelle wirksame Analyseergebnisse selbst und liefert Qualitäts-, Quellen- und Provenienzstatus immer vollständig; rein visuelles Ein- und Ausblenden bleibt Sache des Adapters.
 
 `Overview` zeigt immer das neueste Ergebnis. Ist es vorläufig oder veraltet, verweist das Ansichtsmodell zusätzlich auf das letzte nicht vorläufige Ergebnis; ein stilles Zurückfallen auf einen älteren Stand ist ausgeschlossen.
 
-Ohne vorhandene Daten liefert `load_overview` ein gültiges `Overview` mit typisiertem Zustand `empty`; weitere erwartbare Zustände sind `ready` und `provisional`. Nur technische Defekte lösen eine Ausnahme aus.
+Ohne vorhandene Daten liefert `load_overview` ein gültiges `Overview` mit typisiertem Zustand `empty`; weitere erwartbare Zustände sind `ready` und `provisional`. Das bisherige freie `Overview.message` entfällt zugunsten typisierter Status- und Begründungscodes.
 
 Analysekonfigurationen sind unveränderliche, typisierte und versionierte Objekte. Das externe Objekt enthält nur benutzerrelevante Angaben wie Zeitraum und `analysis_definition_id`. Lag-Fenster, Skalierung, Regularisierung, Bootstrap-Regel, Diagnostik und Seeds gehören zur versionierten internen Analysedefinition und werden in der Methodikansicht transparent dargestellt. Eine methodische Änderung erzeugt eine neue Analysedefinition statt einer stillen Parameteränderung.
 
@@ -314,7 +352,9 @@ config = RestingHeartRateAnalysisConfig(
     end_date=date(2026, 1, 1),
 )
 
-receipt = app.run_resting_hr_analysis(config)
+request = RunRestingHeartRateAnalysis(config=config)
+plan = app.preview_write(request)
+receipt = app.execute_write(request, expected_plan=plan.fingerprint)
 ```
 
 ---
