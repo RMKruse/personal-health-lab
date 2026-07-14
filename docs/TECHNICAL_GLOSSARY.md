@@ -71,7 +71,28 @@ Die beim Anwendungsstart festgelegte Betriebsart `synthetic` oder `real`, die w�
 Die genau eine Person, deren Gesundheitsdaten in einem realen Datenspeicher enthalten sind. Der Kern-MVP besitzt weder Benutzerkonten noch Mehrpersonenanalysen.
 
 **Datenspeicher-ID**:
-Die stabile, nicht personenbezogene Identität eines realen Datenspeichers und seiner Metadatensicherungen. Ein leerer Speicher darf eine Backup-ID übernehmen; ein nicht leerer Speicher lehnt eine Wiederherstellung mit abweichender ID ab.
+Die stabile, nicht personenbezogene Identität eines realen Datenspeichers und seiner Metadatensicherungen. Ein leerer Speicher darf die gesicherte Datenspeicher-ID übernehmen; ein nicht leerer Speicher lehnt eine Wiederherstellung mit abweichender ID ab.
+
+**Metadatensicherung**:
+Ein manuell erzeugtes, portables Overlay der nicht aus Quellexporten und versioniertem Code reproduzierbaren Zustände eines realen Datenspeichers. Seine geschlossene V0.2-Positivliste umfasst Manifest und Datenspeicher-ID, Plausibilitätsregelversionen, vollständige Prüf- und Begründungsfakten, alle Benutzer- und Sammelentscheidungen samt Treffermengen sowie Notizen, Gründe, Zeitpunkte, Ablösungen, Widerrufe, Sicherungslöschmarkierungen und die für diese Auditkette benötigten Import- und Quellenfakten. Quellexportpakete, vollständige Rohmessungen, Datensatz-Snapshots, Analyseartefakte, aktive Snapshot-Zeiger, Caches, Staging, Quarantäneinhalt, Logs, Laufzeitkonfiguration, Pfade und Secrets gehören nicht dazu; spätere Metadaten benötigen eine versionierte Schemaerweiterung. Da der Sicherungsinhalt Gesundheitsdaten und Freitext enthalten kann, benötigt er denselben Schutz wie der reale Datenspeicher.
+
+**Sicherungs-ID**:
+Die einmalige Identität einer vollständig und eigenständig wiederherstellbaren Metadatensicherung. Ihr Manifest bindet sie an Datenspeicher-ID, Sicherungs- und Speicherschemaversion, Erstellungszeit, Audit-Höchststand und Hash des kanonischen Inhalts; dieselbe Sicherungs-ID mit demselben Hash erneut anzuwenden ist ein No-op, mit anderem Inhalt wird sie abgelehnt. V0.2 kennt keine inkrementellen Sicherungsketten.
+
+**Sicherungsschema-Vorwärtsmigration**:
+Die lückenlose und getestete Umwandlung einer älteren unterstützten Metadatensicherung in einer Staging-Arbeitskopie auf das aktuelle Sicherungsschema. Originaldatei, ursprüngliche Sicherungs-ID und ursprünglicher Hash bleiben dokumentiert; die migrierte Arbeitskopie erhält einen eigenen Hash und darf erst nach vollständiger Integritäts-, Referenz- und Inhaltsvalidierung aktiviert werden. Neuere unbekannte Versionen, fehlende Migrationsschritte, Downgrades und Best-effort-Importe werden abgelehnt.
+
+**Sicherungslöschmarkierung**:
+Ein unveränderliches Auditereignis mit eigener ID, das die exakte ID eines gelöschten, widerrufenen, abgelösten oder deaktivierten Metadatenobjekts dauerhaft unwirksam hält. Metadaten-IDs werden nie wiederverwendet; eine spätere fachliche Neuerstellung erhält eine neue ID. Gleiche IDs mit gleichem Inhalt werden idempotent zusammengeführt, bei abweichendem Inhalt liegt ein harter Konflikt vor. Die Sicherungslöschmarkierung ist keine vermutete Quellenlöschung.
+
+**Auditposition**:
+Die vom einzigen Schreiber transaktional vergebene, streng steigende Reihenfolge unveränderlicher Auditereignisse eines Datenspeichers. Ziel-IDs beschreiben die fachliche Beziehung, während ausschließlich die Auditposition „später“ bestimmt; Zeitstempel bleiben informativ. Eine Metadatensicherung enthält die lückenlose Folge bis zu ihrem Audit-Höchststand, und nach Wiederherstellung wird sie dahinter fortgesetzt; Lücken, doppelte Positionen, Vorwärtsreferenzen und widersprüchliche Ereignisse blockieren die Aktivierung.
+
+**Metadatenwiederherstellung**:
+Die zweiphasige Punkt-in-Zeit-Anwendung einer Metadatensicherung auf einen neuen realen Datenspeicher. Vor bewusster Bestätigung weist sie Erstellungszeit und Audit-Höchststand aus; spätere ungesicherte Entscheidungen gelten nach Totalverlust als verloren. Der noch leere Speicher übernimmt zuerst die gesicherte Datenspeicher-ID und hält das Overlay ausstehend; in diesem Zustand sind nur benötigte Quellimporte, Statusprüfung und der vollständige Abbruch mit Verwerfen des neuen Speichers zulässig. Diese Importe rekonstruieren zunächst nur Exportvorkommen, Quellmessungen und Quellmessungsversionen, ohne einen aktiven Datensatz-Snapshot oder fachliche Prüffälle zu veröffentlichen. Sind alle referenzierten Fachobjekt-IDs mit ihren unveränderlichen Inhaltsfingerabdrücken vorhanden und sämtliche internen Referenzen geschlossen, werden Overlay und Regelversionen vollständig und atomar aktiviert; danach werden von der Sicherung nicht abgedeckte neuere Quellmessungsversionen regulär geprüft und genau ein aktiver Snapshot aufgelöst. Andernfalls bleibt das Overlay mit Diagnose ausstehend; Teilaktivierung, konkurrierende Benutzerentscheidungen, Analysen und das Einmischen einer weiteren abweichenden Sicherung finden nicht statt.
+
+**Wiederherstellungsidentität**:
+Die deterministische Rekonstruktion von Quellmessungs- und Quellmessungsversion-IDs mit der in der Metadatensicherung gebundenen versionierten Quellenidentitäts- und Mappingregel. Heuristisches Neuverknüpfen ähnlicher Messungen ist unzulässig; Benutzer- und Auditobjekte übernehmen ihre gesicherten typisierten IDs unverändert, und spätere Migrationen bewahren bestehende Fachobjekt-IDs oder dokumentieren eine explizite auditierte Zuordnung.
 
 **MVP-Zugriffsgrenze**:
 Der reale Datenmodus ist im MVP ausschließlich direkt auf dem Mac über `localhost` erreichbar. Netzwerkzugriff wartet auf eine authentifizierte native App; iCloud dient dem Datenaustausch und nicht der Freigabe des lokalen Dashboards.
