@@ -80,7 +80,7 @@ Ein manuell erzeugtes, portables Overlay der nicht aus Quellexporten und version
 Die einmalige Identität einer vollständig und eigenständig wiederherstellbaren Metadatensicherung. Ihr Manifest bindet sie an Datenspeicher-ID, Sicherungs- und Speicherschemaversion, Erstellungszeit, Audit-Höchststand und Hash des kanonischen Inhalts; dieselbe Sicherungs-ID mit demselben Hash erneut anzuwenden ist ein No-op, mit anderem Inhalt wird sie abgelehnt. V0.2 kennt keine inkrementellen Sicherungsketten.
 
 **Sicherungsschema-Vorwärtsmigration**:
-Die lückenlose und getestete Umwandlung einer älteren unterstützten Metadatensicherung in einer Staging-Arbeitskopie auf das aktuelle Sicherungsschema. Originaldatei, ursprüngliche Sicherungs-ID und ursprünglicher Hash bleiben dokumentiert; die migrierte Arbeitskopie erhält einen eigenen Hash und darf erst nach vollständiger Integritäts-, Referenz- und Inhaltsvalidierung aktiviert werden. Neuere unbekannte Versionen, fehlende Migrationsschritte, Downgrades und Best-effort-Importe werden abgelehnt.
+Die lückenlose und getestete Umwandlung einer älteren unterstützten Metadatensicherung in einer Staging-Arbeitskopie auf das aktuelle Sicherungsschema. Originaldatei, ursprüngliche Sicherungs-ID und ursprünglicher Hash bleiben dokumentiert; die migrierte Arbeitskopie erhält einen eigenen Hash und darf erst nach vollständiger Integritäts-, Referenz- und Inhaltsvalidierung verwendet werden. Die Migrationskette erscheint im Wiederherstellungsplan und wird durch dessen eine Bestätigung abgedeckt; sie verlangt keine zweite Bestätigung. Neuere unbekannte Versionen, fehlende Migrationsschritte, Downgrades und Best-effort-Importe werden abgelehnt.
 
 **Sicherungslöschmarkierung**:
 Ein unveränderliches Auditereignis mit eigener ID, das die exakte ID eines gelöschten, widerrufenen, abgelösten oder deaktivierten Metadatenobjekts dauerhaft unwirksam hält. Metadaten-IDs werden nie wiederverwendet; eine spätere fachliche Neuerstellung erhält eine neue ID. Gleiche IDs mit gleichem Inhalt werden idempotent zusammengeführt, bei abweichendem Inhalt liegt ein harter Konflikt vor. Die Sicherungslöschmarkierung ist keine vermutete Quellenlöschung.
@@ -217,14 +217,29 @@ Die atomare Bestätigung einer zuvor angezeigten, gefilterten Menge offener Plau
 **Realer Datenspeicher**:
 Der lokale Speicher außerhalb des Repositorys für reale Exportpakete, abgeleitete Gesundheitsdaten und Metadaten. Der MVP verlässt sich auf macOS-Kontenschutz und FileVault und warnt vor einem unverschlüsselten Ziel-Datenträger.
 
-**Metadatensicherung**:
-Eine manuelle Sicherung lokaler Zustände, die nicht aus einem Health-Export rekonstruiert werden können, darunter Korrekturen, Bestätigungen, Regelversionen, Medikamentenpläne, Kontextzeiträume und benutzerdefinierte Kategorien.
+**Schema-Version**:
+Eine pro Artefaktart getrennte, monoton steigende positive Ganzzahl für Datenspeicher, Datensatz-Snapshot oder Metadatensicherung. Ausführbar sind ausschließlich mit der Software ausgelieferte und getestete Schritte zwischen unmittelbar benachbarten Versionen; Kompatibilitätsbereiche, Versionssprünge, Plugins und benutzerdefinierte Migrationsskripte gehören nicht zu V0.2.
+
+**Datenspeicherschema-Vorwärtsmigration**:
+Die lückenlose und getestete Umwandlung eines unterstützten älteren Datenspeicherschemas auf die aktuelle Version. Das Öffnen eines älteren Datenspeichers verändert ihn nicht: CLI und Streamlit zeigen zuerst Migrationsplan, Migrationssicherung und Speicherbedarf und verlangen eine ausdrückliche Bestätigung. Bis zum erfolgreichen Abschluss sind sämtliche fachlichen Lese- und Schreiboperationen gesperrt; zulässig bleiben nur Versionsdiagnose, Migrationsplan, Migration und Abbruch. Eine bestätigte Migration über mehrere Versionen ist genau eine Schreiboperation mit einer Migrationssicherung; ihre registrierten Einzelschritte laufen gemeinsam im Staging, und erst das vollständig validierte Zielschema wird einmal aktiviert. Neuere unbekannte Versionen, fehlende Migrationsschritte, Downgrades und Best-effort-Öffnungen werden abgelehnt.
+
+**Gemeinsamer Migrationsvertrag**:
+Der einzige Ablauf für Vorwärtsmigrationen von Datenspeichern, Datensatz-Snapshots und Metadatensicherungen: Schema-Version erkennen, lückenlose registrierte Schrittkette planen, Vorschau und gegebenenfalls Bestätigung einholen, erforderliche Sicherung und Speicherplatz prüfen, ausschließlich im Staging umwandeln, das Ziel vollständig validieren und genau einmal aktivieren oder als neue Arbeitskopie übergeben. Die drei Artefaktarten besitzen getrennte Schema-Versionen, aber keine konkurrierenden Migrationsmechanismen.
+
+**Migrationszielvalidierung**:
+Das harte Aktivierungstor nach einer Vorwärtsmigration. Es prüft mindestens Manifest und Inhalts-Hashes, SQLite-Integrität und Fremdschlüssel, erwartete Parquet-Schemas und Zeilenzahlen, geschlossene typisierte IDs und Referenzen sowie das vollständige Öffnen durch den aktuellen Leser. Jeder Verstoß verhindert die Aktivierung; es gibt keinen Warnungs- oder Best-effort-Modus, und Diagnosen enthalten keine Gesundheitswerte.
+
+**Datensatzmanifest**:
+Die unveränderliche, versionierte Beschreibung genau eines Datensatz-Snapshots mit Schema-Version, enthaltenen Dateien, Inhalts-Hashes und Validierungsangaben. Eine Copy-on-write-Schema-Migration erzeugt einen neuen Snapshot mit neuer Snapshot-ID; der alte Snapshot und seine Analyseverweise bleiben unverändert. Ein Datensatzmanifest aktiviert keinen Snapshot.
+
+**Snapshot-Aktivierung**:
+Der atomare Wechsel der aktiven Snapshot-Referenz im führenden SQLite-Katalog. Nur diese Referenz bestimmt den aktiven Datensatz-Snapshot; Dateien und Datensatzmanifeste neben dem Katalog sind keine konkurrierenden Aktivierungsquellen.
 
 **Migrationssicherung**:
-Eine unmittelbar vor einer Schema-Migration automatisch erzeugte lokale Sicherheitskopie. Sie ist die einzige automatische Backup-Ausnahme im MVP und wird nicht automatisch gelöscht.
+Eine unmittelbar vor einer bestätigten Datenspeicherschema-Vorwärtsmigration automatisch erzeugte lokale Sicherheitskopie des führenden SQLite-Katalogs einschließlich der zuvor aktiven Snapshot-Referenz. Die unveränderten alten Parquet-Dateien werden nicht dupliziert, sondern bis zur ausdrücklichen Bereinigung erhalten. Die Migrationssicherung ist die einzige automatische Backup-Ausnahme im MVP und wird nicht automatisch gelöscht.
 
-**Metadatenwiederherstellung**:
-Ein in einer Vorschau gezeigter und bestätigter ID-basierter Abgleich. Gleiche Eintrags-IDs übernehmen die Backup-Version, nur im Backup vorhandene Einträge werden ergänzt und nur lokal vorhandene Einträge bleiben erhalten; die Datenspeicher-IDs müssen übereinstimmen, sofern der lokale Speicher nicht leer ist.
+**Migrationsrollback**:
+Die ausdrücklich bestätigte Wiederherstellung des durch eine Migrationssicherung festgehaltenen SQLite-Katalogs und der früheren aktiven Snapshot-Referenz. V0.2 erlaubt sie nur, solange seit der zugehörigen Migration keine weitere Schreiboperation erfolgreich abgeschlossen wurde; andernfalls wird sie abgelehnt, statt spätere Zustände zu verwerfen oder eine Rückwärtsmigration zu versuchen.
 
-**Löschmarkierung**:
-Der versionierte Zustand, dass ein lokaler Metadateneintrag bewusst gelöscht oder deaktiviert wurde. Die Audit-Historie bleibt erhalten und wird mitgesichert und wiederhergestellt.
+**Migrationsquarantäne**:
+Der geschützte, analytisch unsichtbare Bereich für Staging-Artefakte und datensparsame Diagnosen einer fehlgeschlagenen oder unterbrochenen Migration. Der zuvor aktive Zustand bleibt unverändert; ein neuer Versuch beginnt frisch und setzt die quarantänisierte Migration nicht fort.
