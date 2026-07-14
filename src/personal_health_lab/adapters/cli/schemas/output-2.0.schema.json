@@ -82,8 +82,16 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["case_id", "detail", "evidence_fingerprint", "kind", "logical_measurement_id", "measurement_version_id", "rule_version_id"],
+            "required": ["allowed_actions", "candidate_version_ids", "case_id", "detail", "evidence_fingerprint", "kind", "logical_measurement_id", "measurement_version_id", "rule_version_id"],
             "properties": {
+              "allowed_actions": {
+                "type": "array",
+                "items": {"enum": ["confirm", "reject", "prefer", "split"]}
+              },
+              "candidate_version_ids": {
+                "type": "array",
+                "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+              },
               "case_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
               "detail": {
                 "type": "object",

@@ -391,6 +391,8 @@
             "additionalProperties": false,
             "required": [
               "case_id",
+              "allowed_actions",
+              "candidate_version_ids",
               "evidence_fingerprint",
               "kind",
               "logical_measurement_id",
@@ -399,9 +401,17 @@
             ],
             "properties": {
               "case_id": {"type": "string"},
+              "allowed_actions": {
+                "type": "array",
+                "items": {"enum": ["confirm", "reject", "prefer", "split"]}
+              },
+              "candidate_version_ids": {
+                "type": "array",
+                "items": {"type": "string"}
+              },
               "evidence_fingerprint": {"type": "string"},
               "kind": {
-                "const": "source_conflict"
+                "enum": ["source_conflict", "suspected_source_deletion", "plausibility", "rule_definition"]
               },
               "logical_measurement_id": {"$ref": "#/$defs/nullableString"},
               "measurement_version_id": {"$ref": "#/$defs/nullableString"},

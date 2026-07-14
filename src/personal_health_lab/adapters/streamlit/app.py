@@ -226,16 +226,27 @@ if data_review.cases:
     st.caption(f"Datenstatus: {data_review.status.value}")
     for detail in data_review_details:
         case = detail.case
+        reasons = (
+            ", ".join(
+                f"{reason.code.value} [{reason.lower_bound}, {reason.upper_bound}] {reason.unit}"
+                for reason in detail.reasons
+            )
+            or "-"
+        )
         st.warning(
-            f"Prüffall: {case.kind.value} · "
-            f"Messung {case.logical_measurement_id or case.measurement_version_id or '-'}"
+            f"Prüffall {case.case_id}: {case.kind.value} · "
+            f"Messung {case.logical_measurement_id or case.measurement_version_id or '-'} · "
+            f"Regel {case.rule_version_id or '-'} · Evidenz {case.evidence_fingerprint} · "
+            f"Aktionen {', '.join(case.allowed_actions) or '-'} · "
+            f"Kandidaten {', '.join(map(str, case.candidate_version_ids)) or '-'}"
         )
         st.caption(
             "Details: "
-            f"Typ {detail.source_type or '-'} · Wert {detail.effective_value} · "
+            f"Typ {detail.source_type or '-'} · Zeitpunkt {detail.measured_at or '-'} · "
+            f"Wert {detail.effective_value} · "
             "Quelle "
             f"{detail.effective_value_source.value if detail.effective_value_source else '-'} · "
-            f"Begründungen {', '.join(reason.code.value for reason in detail.reasons) or '-'}"
+            f"Begründungen {reasons}"
         )
 if overview.quarantined_import_count:
     st.warning("Mindestens ein unterbrochener Import wurde sicher quarantänisiert.")

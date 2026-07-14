@@ -1268,3 +1268,162 @@ level = "application"
 expected_result = "old snapshot remains active"
 expected_effect = "at most quarantine remainder"
 forbidden_side_effects = ["partial SQLite state"]
+
+[[contract]]
+id = "V02-C-SRC-004"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Only absence between comparable complete exports creates a reversible deletion suspicion."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V02-C-SRC-005"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Deletion and conflict decisions affect only subsequently resolved snapshots."
+evidence = ["positive", "transition"]
+
+[[contract]]
+id = "V02-C-SRC-006"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Earlier snapshots and analyses remain reproducible after source decisions."
+evidence = ["positive", "transition"]
+
+[[fixture]]
+id = "V02-F-DOM-SOURCE-DECISIONS-V1"
+kind = "domain"
+generator = "v02-source-decisions-v1"
+seed = 0
+parameters = "comparable exports, absence phases, conflicts, decisions, revocation, and reappearance"
+platform = "all"
+sha256 = "ec4d59f4b43d40ba6f96c4aef1f997d675e4af5d97f7c273f50bc7e56394f76e"
+
+[[case]]
+id = "V02-A-SRC-011"
+contracts = ["V02-C-SRC-004"]
+fixtures = ["V02-F-DOM-SOURCE-DECISIONS-V1"]
+runner = "test_comparable_exports_open_one_deletion_case_per_absence_phase"
+initial_state = "measurement present in a comparable governing full export"
+operation = "import a newer comparable export without the measurement"
+level = "application"
+expected_result = "one open suspected_source_deletion case"
+expected_effect = "previous source version remains effective"
+forbidden_side_effects = ["automatic exclusion"]
+
+[[case]]
+id = "V02-A-SRC-012"
+contracts = ["V02-C-SRC-004"]
+fixtures = ["V02-F-DOM-SOURCE-DECISIONS-V1"]
+runner = "test_comparable_exports_open_one_deletion_case_per_absence_phase"
+initial_state = "measurement present in an ordered export"
+operation = "import an unordered or differently covered export without it"
+level = "application"
+expected_result = "no deletion case"
+expected_effect = "none"
+forbidden_side_effects = ["deletion suspicion"]
+
+[[case]]
+id = "V02-A-SRC-013"
+contracts = ["V02-C-SRC-004"]
+fixtures = ["V02-F-DOM-SOURCE-DECISIONS-V1"]
+runner = "test_comparable_exports_open_one_deletion_case_per_absence_phase"
+initial_state = "one open deletion suspicion"
+operation = "import another comparable export with continued absence"
+level = "application"
+expected_result = "the same single case remains open"
+expected_effect = "no second case"
+forbidden_side_effects = ["duplicate absence phase"]
+
+[[case]]
+id = "V02-A-SRC-014"
+contracts = ["V02-C-SRC-005"]
+fixtures = ["V02-F-DOM-SOURCE-DECISIONS-V1"]
+runner = "test_deletion_decisions_and_reappearance_are_forward_only"
+initial_state = "open deletion suspicion"
+operation = "confirm source deletion"
+level = "application"
+expected_result = "committed decision"
+expected_effect = "measurement excluded in the next snapshot"
+forbidden_side_effects = ["old snapshot mutation"]
+
+[[case]]
+id = "V02-A-SRC-015"
+contracts = ["V02-C-SRC-005"]
+fixtures = ["V02-F-DOM-SOURCE-DECISIONS-V1"]
+runner = "test_deletion_decisions_and_reappearance_are_forward_only"
+initial_state = "open deletion suspicion"
+operation = "reject source deletion"
+level = "application"
+expected_result = "committed decision"
+expected_effect = "continued absence remains suppressed"
+forbidden_side_effects = ["repeated prompt in same phase"]
+
+[[case]]
+id = "V02-A-SRC-016"
+contracts = ["V02-C-SRC-005"]
+fixtures = ["V02-F-DOM-SOURCE-DECISIONS-V1"]
+runner = "test_deletion_decisions_and_reappearance_are_forward_only"
+initial_state = "confirmed source deletion"
+operation = "import reappearance followed by a new absence"
+level = "application"
+expected_result = "automatic inclusion then a new phase"
+expected_effect = "new absence can open a new case"
+forbidden_side_effects = ["permanent exclusion"]
+
+[[case]]
+id = "V02-A-SRC-017"
+contracts = ["V02-C-SRC-005"]
+fixtures = ["V02-F-DOM-SOURCE-DECISIONS-V1"]
+runner = "test_conflicts_can_be_preferred_split_and_revoked"
+initial_state = "open source conflict"
+operation = "prefer one candidate version"
+level = "application"
+expected_result = "committed preference"
+expected_effect = "case closes in a new snapshot"
+forbidden_side_effects = ["old snapshot mutation"]
+
+[[case]]
+id = "V02-A-SRC-018"
+contracts = ["V02-C-SRC-005"]
+fixtures = ["V02-F-DOM-SOURCE-DECISIONS-V1"]
+runner = "test_conflicts_can_be_preferred_split_and_revoked"
+initial_state = "open source conflict"
+operation = "split candidates"
+level = "application"
+expected_result = "committed split"
+expected_effect = "new logical measurement IDs only"
+forbidden_side_effects = ["measurement version rewrite"]
+
+[[case]]
+id = "V02-A-SRC-019"
+contracts = ["V02-C-SRC-005"]
+fixtures = ["V02-F-DOM-SOURCE-DECISIONS-V1"]
+runner = "test_conflicts_can_be_preferred_split_and_revoked"
+initial_state = "effective conflict preference"
+operation = "revoke the decision with a reason"
+level = "application"
+expected_result = "conflict case reopened"
+expected_effect = "pre-decision source state restored"
+forbidden_side_effects = ["older decision reactivation"]
+
+[[case]]
+id = "V02-A-SRC-020"
+contracts = ["V02-C-SRC-005"]
+fixtures = ["V02-F-DOM-SOURCE-DECISIONS-V1"]
+runner = "test_a_newer_unambiguous_version_supersedes_conflict_preference"
+initial_state = "resolved source conflict"
+operation = "import a clearly newer version of the preferred identity"
+level = "application"
+expected_result = "new version automatically preferred"
+expected_effect = "no new conflict prompt"
+forbidden_side_effects = ["pinned old version"]
+
+[[case]]
+id = "V02-A-SRC-021"
+contracts = ["V02-C-SRC-006"]
+fixtures = ["V02-F-DOM-SOURCE-DECISIONS-V1"]
+runner = "test_deletion_decisions_and_reappearance_are_forward_only"
+initial_state = "published snapshots before source decisions"
+operation = "decide, revoke, and import later source states"
+level = "application"
+expected_result = "earlier manifest remains byte-identical"
+expected_effect = "new snapshots only"
+forbidden_side_effects = ["historical snapshot or run mutation"]

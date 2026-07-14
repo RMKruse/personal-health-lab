@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -22,6 +22,16 @@ from personal_health_lab.storage import (
     SourceResolution,
     SourceTypeRuleRequest,
 )
+
+
+def _natural_identity(version: MeasurementVersionFact) -> tuple[str, str, str, str, str]:
+    return (
+        version.canonical_type,
+        version.source_start_utc,
+        version.source_end_utc,
+        version.source_name,
+        version.device,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +132,7 @@ def resolve_sources(
     governing_export_id: str,
     imported_measurement_version_ids: tuple[str, ...] = (),
     unknown_source_types: tuple[str, ...] = (),
+    suppressed_deletion_ids: frozenset[str] = frozenset(),
 ) -> SourceResolution:
     """Resolve effective source values and expose identity contradictions."""
     version_by_id = {item.measurement_version_id: item for item in versions}
@@ -164,15 +175,58 @@ def resolve_sources(
             )
         )
 
+    present_in_governing = {
+        item.logical_measurement_id for item in occurrences if item.export_id == governing_export_id
+    }
+    conflict_overrides: list[ResolvedMeasurement] = []
+    conflict_keys: set[tuple[str, str, str, str, str]] = set()
+    for previous in previous_measurements:
+        if previous.conflict_resolution_decision_id is None:
+            continue
+        selected_version = version_by_id[previous.selected_measurement_version_id]
+        natural_key = _natural_identity(selected_version)
+        conflict_keys.add(natural_key)
+        governing_versions = [
+            version_by_id[item.measurement_version_id]
+            for item in occurrences
+            if item.export_id == governing_export_id
+            and version_by_id[item.measurement_version_id].strong_source_id_hash
+            == selected_version.strong_source_id_hash
+            and selected_version.strong_source_id_hash is not None
+        ]
+        newest = max(
+            governing_versions,
+            key=lambda item: item.measurement_version_id,
+            default=selected_version,
+        )
+        conflict_overrides.append(
+            replace(
+                previous,
+                selected_measurement_version_id=newest.measurement_version_id,
+                effective_value=newest.canonical_value,
+                canonical_unit=newest.canonical_unit,
+            )
+        )
+    current = [
+        item
+        for item in current
+        if _natural_identity(version_by_id[item.selected_measurement_version_id])
+        not in conflict_keys
+    ]
     overrides = {
         item.logical_measurement_id: item
         for item in previous_measurements
         if item.disposition != "included_source"
+        and not (
+            item.disposition == "excluded_source_deletion"
+            and item.logical_measurement_id in present_in_governing
+        )
     }
     measurements = tuple(
         sorted(
             (
                 *overrides.values(),
+                *conflict_overrides,
                 *(item for item in current if item.logical_measurement_id not in overrides),
             ),
             key=lambda item: item.logical_measurement_id,
@@ -180,12 +234,24 @@ def resolve_sources(
     )
 
     generated_cases = (
-        *_source_conflicts(occurrences, version_by_id),
+        *_source_conflicts(occurrences, version_by_id, conflict_keys),
+        *_source_deletions(
+            occurrences,
+            version_by_id,
+            exports,
+            previous_review_cases,
+            governing_export_id,
+            suppressed_deletion_ids,
+        ),
         *_plausibility_cases(version_by_id, imported_measurement_version_ids),
         *(_unknown_rule_case(source_type) for source_type in sorted(set(unknown_source_types))),
     )
     previous_case_ids = {item.review_case_id for item in previous_review_cases}
-    cases_by_id = {item.review_case_id: item for item in previous_review_cases}
+    cases_by_id = {
+        item.review_case_id: item
+        for item in previous_review_cases
+        if item.kind != "suspected_source_deletion"
+    }
     cases_by_id.update((item.review_case_id, item) for item in generated_cases)
     source_type_requests = tuple(
         SourceTypeRuleRequest(
@@ -264,16 +330,95 @@ def _unknown_rule_case(source_type: str) -> OpenDataReviewCase:
     )
 
 
+def _source_deletions(
+    occurrences: tuple[SourceOccurrenceFact, ...],
+    version_by_id: dict[str, MeasurementVersionFact],
+    exports: tuple[ExportFact, ...],
+    previous_review_cases: tuple[OpenDataReviewCase, ...],
+    governing_export_id: str,
+    suppressed_deletion_ids: frozenset[str],
+) -> tuple[OpenDataReviewCase, ...]:
+    export_by_id = {item.export_id: item for item in exports}
+    governing = export_by_id[governing_export_id]
+    governing_date = governing.export_date
+    if governing_date is None:
+        return ()
+    present = {
+        item.logical_measurement_id for item in occurrences if item.export_id == governing_export_id
+    }
+    previous = {
+        str(item.logical_measurement_id): item
+        for item in previous_review_cases
+        if item.kind == "suspected_source_deletion" and item.logical_measurement_id is not None
+    }
+    conflicted_logical_ids: set[str] = set()
+    identities: dict[tuple[str, str, str, str, str], set[str]] = defaultdict(set)
+    for occurrence in occurrences:
+        version = version_by_id[occurrence.measurement_version_id]
+        identities[
+            (
+                version.canonical_type,
+                version.source_start_utc,
+                version.source_end_utc,
+                version.source_name,
+                version.device,
+            )
+        ].add(occurrence.logical_measurement_id)
+    for logical_ids in identities.values():
+        if len(logical_ids) > 1:
+            conflicted_logical_ids.update(logical_ids)
+    missing: list[OpenDataReviewCase] = []
+
+    def is_earlier(export_id: str) -> bool:
+        export_date = export_by_id[export_id].export_date
+        return export_date is not None and export_date < governing_date
+
+    for logical_id in sorted({item.logical_measurement_id for item in occurrences} - present):
+        if logical_id in suppressed_deletion_ids:
+            continue
+        if logical_id in conflicted_logical_ids:
+            continue
+        earlier = [
+            export_by_id[item.export_id]
+            for item in occurrences
+            if item.logical_measurement_id == logical_id and is_earlier(item.export_id)
+        ]
+        if not earlier:
+            continue
+        last_present = max(earlier, key=lambda item: (item.export_date, item.export_id))
+        if last_present.covered_types != governing.covered_types:
+            continue
+        if logical_id in previous:
+            missing.append(previous[logical_id])
+            continue
+        phase = f"suspected_source_deletion:{logical_id}:{governing_export_id}"
+        missing.append(
+            OpenDataReviewCase(
+                review_case_id=hashlib.sha256(phase.encode()).hexdigest()[:32],
+                kind="suspected_source_deletion",
+                logical_measurement_id=LogicalMeasurementId(logical_id),
+                measurement_version_id=None,
+                rule_version_id=None,
+                evidence_fingerprint=hashlib.sha256(f"{phase}:evidence".encode()).hexdigest(),
+            )
+        )
+    return tuple(missing)
+
+
 def _source_conflicts(
     occurrences: tuple[SourceOccurrenceFact, ...],
     version_by_id: dict[str, MeasurementVersionFact],
+    resolved_natural_keys: set[tuple[str, str, str, str, str]],
 ) -> tuple[OpenDataReviewCase, ...]:
     joined = tuple((item, version_by_id[item.measurement_version_id]) for item in occurrences)
     collisions: set[tuple[str, str, str | None]] = set()
 
     natural_groups: dict[tuple[str, str], set[str]] = defaultdict(set)
     for occurrence, version in joined:
-        if version.strong_source_id_hash is None:
+        if (
+            version.strong_source_id_hash is None
+            and _natural_identity(version) not in resolved_natural_keys
+        ):
             natural_groups[(occurrence.logical_measurement_id, occurrence.export_id)].add(
                 occurrence.measurement_version_id
             )
@@ -283,13 +428,9 @@ def _source_conflicts(
 
     identity_groups: dict[tuple[str, str, str, str, str], list[tuple[str, str]]] = defaultdict(list)
     for occurrence, version in joined:
-        natural_key = (
-            version.canonical_type,
-            version.source_start_utc,
-            version.source_end_utc,
-            version.source_name,
-            version.device,
-        )
+        natural_key = _natural_identity(version)
+        if natural_key in resolved_natural_keys:
+            continue
         identity_groups[natural_key].append(
             (
                 occurrence.logical_measurement_id,

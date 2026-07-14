@@ -9,7 +9,7 @@ from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
-from typing import Self
+from typing import Literal, Self
 from uuid import uuid4
 
 from personal_health_lab import DataMode
@@ -166,7 +166,72 @@ class ImportHealthExport:
         object.__setattr__(self, "package_path", self.package_path.expanduser().resolve())
 
 
-WriteRequest = ImportHealthExport
+class SourceDeletionVerdict(StrEnum):
+    CONFIRM = "confirm"
+    REJECT = "reject"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceDeletionResolution:
+    verdict: SourceDeletionVerdict
+    note: str | None = None
+
+
+class SourceConflictStrategy(StrEnum):
+    PREFER = "prefer"
+    SPLIT = "split"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceConflictResolution:
+    strategy: SourceConflictStrategy
+    preferred_version_id: MeasurementVersionId | None = None
+    note: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.strategy is SourceConflictStrategy.PREFER) != (
+            self.preferred_version_id is not None
+        ):
+            raise ConfigurationError("'prefer' verlangt genau eine Quellversion.")
+
+
+DataReviewResolution = SourceDeletionResolution | SourceConflictResolution
+
+
+@dataclass(frozen=True, slots=True)
+class ResolveDataReviewCase:
+    case_id: DataReviewCaseId
+    resolution: DataReviewResolution
+
+
+@dataclass(frozen=True, slots=True)
+class DataReviewDecisionId:
+    _value: str
+
+    def __post_init__(self) -> None:
+        if len(self._value) != 32 or not set(self._value) <= set("0123456789abcdef"):
+            raise ValueError("Entscheidungs-ID muss ein 32-stelliger Hex-Wert sein.")
+
+    def __str__(self) -> str:
+        return self._value
+
+
+@dataclass(frozen=True, slots=True)
+class SingleDecisionTarget:
+    decision_id: DataReviewDecisionId
+
+
+@dataclass(frozen=True, slots=True)
+class RevokeDataReviewDecision:
+    target: SingleDecisionTarget
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ConfigurationError("Widerruf verlangt einen Grund.")
+
+
+WriteRequest = ImportHealthExport | ResolveDataReviewCase | RevokeDataReviewDecision
 
 
 class WriteApprovalStatus(StrEnum):
@@ -196,7 +261,13 @@ class ImportHealthExportPlan:
     record_count: int = 0
 
 
-WritePlanDetails = ImportHealthExportPlan
+@dataclass(frozen=True, slots=True)
+class DataReviewDecisionPlan:
+    case_id: DataReviewCaseId | None
+    active_snapshot_ref: SnapshotRef | None
+
+
+WritePlanDetails = ImportHealthExportPlan | DataReviewDecisionPlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +317,7 @@ class ImportReceipt:
 class DataReviewCaseKind(StrEnum):
     PLAUSIBILITY = "plausibility"
     RULE_DEFINITION = "rule_definition"
+    SUSPECTED_SOURCE_DELETION = "suspected_source_deletion"
     SOURCE_CONFLICT = "source_conflict"
 
 
@@ -327,6 +399,8 @@ class DataReviewCase:
     measurement_version_id: MeasurementVersionId | None
     rule_version_id: str | None
     evidence_fingerprint: str
+    candidate_version_ids: tuple[MeasurementVersionId, ...] = ()
+    allowed_actions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,7 +433,16 @@ class WriteNotStarted:
     diagnostics: tuple[str, ...] = ()
 
 
-WriteResult = ImportReceipt | WriteNotStarted
+@dataclass(frozen=True, slots=True)
+class WriteDecisionReceipt:
+    operation_id: OperationId
+    decision_id: DataReviewDecisionId
+    snapshot_ref: SnapshotRef
+    status: ImportStatus = ImportStatus.COMMITTED
+    diagnostics: tuple[str, ...] = ()
+
+
+WriteResult = ImportReceipt | WriteDecisionReceipt | WriteNotStarted
 
 
 @dataclass(frozen=True, slots=True)
@@ -459,12 +542,75 @@ class HealthLab:
 
     def preview_write(self, request: WriteRequest) -> WritePlan:
         self._require_open()
+        if not isinstance(request, ImportHealthExport):
+            return self._build_data_review_plan(request)
         filevault = (
             probe_filevault(self._config.active_store)
             if self._config.mode is DataMode.REAL
             else None
         )
         return self._build_import_plan(request, filevault)
+
+    def _build_data_review_plan(
+        self, request: ResolveDataReviewCase | RevokeDataReviewDecision
+    ) -> WritePlan:
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        snapshot = self._store.load_active_snapshot_id()
+        if snapshot is None:
+            return WritePlan(
+                PlanFingerprint(hashlib.sha256(b"data_review:no_snapshot").hexdigest()),
+                DataReviewDecisionPlan(None, None),
+                WritePreflight(
+                    WriteApproval(WriteApprovalStatus.BLOCKED), diagnostics=("no_active_snapshot",)
+                ),
+            )
+        if isinstance(request, ResolveDataReviewCase):
+            case_id = request.case_id
+            resolution = request.resolution
+            request_payload: dict[str, object] = {
+                "type": "resolve_data_review_case",
+                "case_id": str(case_id),
+                "resolution": (
+                    {
+                        "type": "source_deletion",
+                        "verdict": resolution.verdict.value,
+                        "note": resolution.note,
+                    }
+                    if isinstance(resolution, SourceDeletionResolution)
+                    else {
+                        "type": "source_conflict",
+                        "strategy": resolution.strategy.value,
+                        "preferred_version_id": (
+                            None
+                            if resolution.preferred_version_id is None
+                            else str(resolution.preferred_version_id)
+                        ),
+                        "note": resolution.note,
+                    }
+                ),
+            }
+        else:
+            case_id = None
+            request_payload = {
+                "type": "revoke_data_review_decision",
+                "decision_id": str(request.target.decision_id),
+                "reason": request.reason,
+            }
+        fingerprint = PlanFingerprint(
+            hashlib.sha256(
+                json.dumps(
+                    {"request": request_payload, "snapshot": str(snapshot), "version": 1},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+        )
+        return WritePlan(
+            fingerprint,
+            DataReviewDecisionPlan(case_id, snapshot),
+            WritePreflight(WriteApproval(WriteApprovalStatus.READY)),
+        )
 
     def _build_import_plan(
         self,
@@ -606,27 +752,27 @@ class HealthLab:
             details=ImportHealthExportPlan(
                 package_hash, package_size, estimate.input_bytes, estimate.record_count
             ),
-            preflight=WritePreflight(
-                approval, confirmations, filevault, diagnostics, capacity
-            ),
+            preflight=WritePreflight(approval, confirmations, filevault, diagnostics, capacity),
         )
 
     @staticmethod
-    def _filevault_allows_execution(
-        expected: FileVaultCheck, actual: FileVaultCheck
-    ) -> bool:
+    def _filevault_allows_execution(expected: FileVaultCheck, actual: FileVaultCheck) -> bool:
         return expected.target_volume == actual.target_volume and (
             expected == actual or actual.status is FileVaultStatus.PROTECTED
         )
 
     def _authorization_plan(
         self,
-        request: ImportHealthExport,
+        request: WriteRequest,
         current_plan: WritePlan,
         expected_plan: PlanFingerprint,
     ) -> WritePlan | None:
         if current_plan.fingerprint == expected_plan:
             return current_plan
+        if not isinstance(request, ImportHealthExport):
+            return None
+        if not isinstance(current_plan.details, ImportHealthExportPlan):
+            return None
         filevault = current_plan.preflight.filevault
         capacity = current_plan.preflight.capacity
         if (
@@ -700,11 +846,18 @@ class HealthLab:
                 current_plan.diagnostics,
                 expected_plan,
             )
+        if not isinstance(request, ImportHealthExport):
+            return self._execute_data_review_write(request, authorization_plan, expected_plan)
+        if not isinstance(authorization_plan.details, ImportHealthExportPlan):
+            return self._not_started(
+                authorization_plan,
+                WriteNotStartedStatus.PLAN_CHANGED,
+                ("plan_changed",),
+                expected_plan,
+            )
         try:
             workspace = self.load_workspace_status()
-            writer = LocalStore.open_writer(
-                root=self._config.active_store, mode=self._config.mode
-            )
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
         except StoreBusyError:
             return self._not_started(
                 authorization_plan,
@@ -840,6 +993,97 @@ class HealthLab:
             diagnostics=result.diagnostics,
         )
 
+    def _execute_data_review_write(
+        self,
+        request: ResolveDataReviewCase | RevokeDataReviewDecision,
+        plan: WritePlan,
+        expected_plan: PlanFingerprint,
+    ) -> WriteReceipt:
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        operation_id = OperationId(uuid4().hex)
+        try:
+            if isinstance(request, ResolveDataReviewCase):
+                review = self.load_data_review(DataReviewSelection())
+                case = next(
+                    (item for item in review.cases if item.case_id == request.case_id), None
+                )
+                if case is None:
+                    return self._not_started(
+                        plan,
+                        WriteNotStartedStatus.PLAN_CHANGED,
+                        ("plan_changed",),
+                        expected_plan,
+                    )
+                resolution = request.resolution
+                action: Literal["confirm", "reject", "prefer", "split"]
+                if isinstance(resolution, SourceDeletionResolution):
+                    if case.kind is not DataReviewCaseKind.SUSPECTED_SOURCE_DELETION:
+                        return self._not_started(
+                            plan,
+                            WriteNotStartedStatus.BLOCKED,
+                            ("resolution_not_allowed",),
+                            expected_plan,
+                        )
+                    action = resolution.verdict.value
+                    selected = None
+                    note = resolution.note
+                else:
+                    if case.kind is not DataReviewCaseKind.SOURCE_CONFLICT:
+                        return self._not_started(
+                            plan,
+                            WriteNotStartedStatus.BLOCKED,
+                            ("resolution_not_allowed",),
+                            expected_plan,
+                        )
+                    action = resolution.strategy.value
+                    selected = (
+                        None
+                        if resolution.preferred_version_id is None
+                        else str(resolution.preferred_version_id)
+                    )
+                    note = resolution.note
+                result = writer.publish_data_review_resolution(
+                    operation_id=operation_id,
+                    snapshot_id=SnapshotId(uuid4().hex),
+                    review_case_id=str(case.case_id),
+                    action=action,
+                    selected_measurement_version_id=selected,
+                    candidate_version_ids=tuple(str(item) for item in case.candidate_version_ids),
+                    note=note,
+                )
+            else:
+                result = writer.revoke_data_review_decision(
+                    operation_id=operation_id,
+                    snapshot_id=SnapshotId(uuid4().hex),
+                    decision_id=str(request.target.decision_id),
+                    reason=request.reason,
+                )
+        except StoreError:
+            return self._not_started(
+                plan,
+                WriteNotStartedStatus.PLAN_CHANGED,
+                ("plan_changed",),
+                expected_plan,
+            )
+        finally:
+            writer.close()
+        receipt = WriteDecisionReceipt(
+            operation_id=result.operation_id,
+            decision_id=DataReviewDecisionId(result.decision_id),
+            snapshot_ref=result.snapshot_id,
+        )
+        return WriteReceipt(
+            operation_id=result.operation_id,
+            plan_fingerprint=expected_plan,
+            result=receipt,
+            final_preflight=plan.preflight,
+        )
+
     @staticmethod
     def _not_started(
         plan: WritePlan,
@@ -931,6 +1175,16 @@ class HealthLab:
                 measurement_version_id=case.measurement_version_id,
                 rule_version_id=case.rule_version_id,
                 evidence_fingerprint=case.evidence_fingerprint,
+                candidate_version_ids=(
+                    self._store.load_source_conflict_candidates(case.logical_measurement_id)
+                    if case.kind == "source_conflict" and case.logical_measurement_id is not None
+                    else ()
+                ),
+                allowed_actions=(
+                    ("confirm", "reject")
+                    if case.kind == "suspected_source_deletion"
+                    else (("prefer", "split") if case.kind == "source_conflict" else ())
+                ),
             )
             for case in stored_cases
             if selection.kind is None or case.kind == selection.kind.value

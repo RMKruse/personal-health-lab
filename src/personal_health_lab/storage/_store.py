@@ -663,6 +663,13 @@ class PublishImportResult:
 
 
 @dataclass(frozen=True, slots=True)
+class PublishDecisionResult:
+    operation_id: OperationId
+    decision_id: str
+    snapshot_id: SnapshotId
+
+
+@dataclass(frozen=True, slots=True)
 class OpenDataReviewCase:
     review_case_id: str
     kind: Literal[
@@ -682,6 +689,7 @@ class OpenDataReviewCase:
 class ExportFact:
     export_id: str
     export_date: datetime | None
+    covered_types: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -806,7 +814,10 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             operation_id TEXT PRIMARY KEY CHECK (
                 length(operation_id) = 32 AND operation_id NOT GLOB '*[^0-9a-f]*'
             ),
-            request_kind TEXT NOT NULL CHECK (request_kind = 'import_health_export'),
+            request_kind TEXT NOT NULL CHECK (
+                request_kind IN ('import_health_export', 'resolve_data_review_case',
+                                 'revoke_data_review_decision')
+            ),
             started_at_utc TEXT NOT NULL CHECK (
                 length(started_at_utc) >= 20 AND substr(started_at_utc, 11, 1) = 'T'
             ),
@@ -838,7 +849,9 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             operation_id TEXT NOT NULL UNIQUE REFERENCES write_operations(operation_id),
             snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(snapshot_id),
             previous_snapshot_id TEXT REFERENCES dataset_snapshots(snapshot_id),
-            activation_kind TEXT NOT NULL CHECK (activation_kind = 'import'),
+            activation_kind TEXT NOT NULL CHECK (
+                activation_kind IN ('import', 'data_review_decision')
+            ),
             activated_at_utc TEXT NOT NULL CHECK (
                 length(activated_at_utc) >= 20 AND substr(activated_at_utc, 11, 1) = 'T'
             )
@@ -913,7 +926,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             ),
             operation_id TEXT NOT NULL REFERENCES write_operations(operation_id),
             event_kind TEXT NOT NULL CHECK (
-                event_kind IN ('import_published', 'metadata_tombstone')
+                event_kind IN ('import_published', 'data_review_decision', 'metadata_tombstone')
             ),
             occurred_at_utc TEXT NOT NULL CHECK (
                 length(occurred_at_utc) >= 20 AND substr(occurred_at_utc, 11, 1) = 'T'
@@ -923,6 +936,28 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
             import_id TEXT NOT NULL UNIQUE REFERENCES imports(import_id),
             snapshot_id TEXT NOT NULL UNIQUE REFERENCES dataset_snapshots(snapshot_id)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS data_review_decisions (
+            audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
+            decision_id TEXT NOT NULL UNIQUE REFERENCES decision_refs(decision_id),
+            review_case_id TEXT NOT NULL,
+            case_kind TEXT NOT NULL CHECK (
+                case_kind IN ('suspected_source_deletion', 'source_conflict')
+            ),
+            logical_measurement_id TEXT NOT NULL,
+            evidence_fingerprint TEXT NOT NULL,
+            action TEXT NOT NULL CHECK (
+                action IN ('confirm', 'reject', 'prefer', 'split')
+            ),
+            selected_measurement_version_id TEXT,
+            previous_measurement_version_id TEXT NOT NULL,
+            candidate_version_ids TEXT NOT NULL,
+            note TEXT
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS source_absence_suppressions (
+            logical_measurement_id TEXT PRIMARY KEY,
+            decision_id TEXT NOT NULL REFERENCES decision_refs(decision_id),
+            active INTEGER NOT NULL CHECK (active IN (0, 1))
         ) STRICT;
         CREATE TABLE IF NOT EXISTS metadata_tombstones (
             tombstone_id TEXT PRIMARY KEY CHECK (
@@ -956,6 +991,11 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
         BEFORE INSERT ON import_publications
         WHEN (SELECT event_kind FROM audit_events WHERE audit_event_id = NEW.audit_event_id)
              != 'import_published'
+        BEGIN SELECT RAISE(ABORT, 'wrong audit payload type'); END;
+        CREATE TRIGGER IF NOT EXISTS data_review_decisions_kind
+        BEFORE INSERT ON data_review_decisions
+        WHEN (SELECT event_kind FROM audit_events WHERE audit_event_id = NEW.audit_event_id)
+             != 'data_review_decision'
         BEGIN SELECT RAISE(ABORT, 'wrong audit payload type'); END;
         CREATE TRIGGER IF NOT EXISTS metadata_tombstones_kind
         BEFORE INSERT ON metadata_tombstones
@@ -1760,6 +1800,12 @@ class LocalStore:
                 "INSERT INTO import_publications VALUES (?, ?, ?)",
                 (audit_event_id, str(import_id), str(snapshot_id)),
             )
+            if governing_export_id == export_id:
+                self._metadata.executemany(
+                    "UPDATE source_absence_suppressions SET active = 0 "
+                    "WHERE logical_measurement_id = ?",
+                    {(str(record.logical_measurement_id),) for record in records},
+                )
             self._bind_person()
             _allocation_checkpoint(self._root, "activated")
             _publication_fault_point(self._root, "import.before_sqlite_commit/v1")
@@ -1946,9 +1992,20 @@ class LocalStore:
             ).fetchall()
         )
         export_facts = tuple(
-            ExportFact(str(row[0]), None if row[1] is None else datetime.fromisoformat(str(row[1])))
+            ExportFact(
+                str(row[0]),
+                None if row[1] is None else datetime.fromisoformat(str(row[1])),
+                tuple(str(item) for item in row[2]),
+            )
             for row in self._query.execute(
-                "SELECT export_id, export_date_utc FROM export_order"
+                """
+                SELECT export_order.export_id, export_date_utc,
+                       list(DISTINCT canonical_type ORDER BY canonical_type)
+                FROM export_order
+                LEFT JOIN source_occurrences USING (export_id)
+                LEFT JOIN measurement_versions USING (measurement_version_id)
+                GROUP BY export_order.export_id, export_date_utc
+                """
             ).fetchall()
         )
         resolution = resolve_sources(
@@ -1962,6 +2019,13 @@ class LocalStore:
                 str(record.measurement_version_id) for record in records
             ),
             unknown_source_types=unknown_source_types,
+            suppressed_deletion_ids=frozenset(
+                str(row[0])
+                for row in self._metadata.execute(
+                    "SELECT logical_measurement_id FROM source_absence_suppressions "
+                    "WHERE active = 1"
+                ).fetchall()
+            ),
         )
         self._query.execute(
             "CREATE OR REPLACE TEMP TABLE resolved_measurements ("
@@ -2128,9 +2192,11 @@ class LocalStore:
                 SELECT count(*), COALESCE(MIN(audit_position), 1),
                        COALESCE(MAX(audit_position), 0),
                        count(import_publications.audit_event_id)
+                       + count(data_review_decisions.audit_event_id)
                        + count(metadata_tombstones.audit_event_id)
                 FROM audit_events
                 LEFT JOIN import_publications USING (audit_event_id)
+                LEFT JOIN data_review_decisions USING (audit_event_id)
                 LEFT JOIN metadata_tombstones USING (audit_event_id)
                 """
             ).fetchone()
@@ -2412,7 +2478,8 @@ class LocalStore:
               + (SELECT count(*) FROM resolved r LEFT JOIN versions v
                    ON v.measurement_version_id = r.selected_measurement_version_id
                    WHERE v.measurement_version_id IS NULL
-                      OR v.identity_candidate_id != r.logical_measurement_id
+                      OR (v.identity_candidate_id != r.logical_measurement_id
+                          AND r.conflict_resolution_decision_id IS NULL)
                       OR r.canonical_unit != v.canonical_unit
                       OR (r.disposition = 'included_source'
                           AND r.effective_value != v.canonical_value))
@@ -2645,6 +2712,465 @@ class LocalStore:
         row = self._query.execute(f"SELECT count(*) FROM read_parquet('{escaped}')").fetchone()
         assert row is not None
         return int(row[0])
+
+    def publish_data_review_resolution(
+        self,
+        *,
+        operation_id: OperationId,
+        snapshot_id: SnapshotId,
+        review_case_id: str,
+        action: Literal["confirm", "reject", "prefer", "split"],
+        selected_measurement_version_id: str | None,
+        candidate_version_ids: tuple[str, ...],
+        note: str | None,
+    ) -> PublishDecisionResult:
+        self._require_open()
+        self._require_writer()
+        active = self.load_active_snapshot_id()
+        if active is None:
+            raise StoreError("Aktiver Snapshot fehlt.")
+        case = next(
+            (
+                item
+                for item in self.load_open_data_review_cases()
+                if item.review_case_id == review_case_id
+            ),
+            None,
+        )
+        if case is None or case.logical_measurement_id is None:
+            raise StoreError("Datenprüffall ist nicht mehr offen.")
+        candidates = candidate_version_ids or self.load_source_conflict_candidates(
+            case.logical_measurement_id
+        )
+        if action == "prefer" and selected_measurement_version_id not in {
+            str(item) for item in candidates
+        }:
+            raise StoreError("Bevorzugte Quellversion gehört nicht zum Prüffall.")
+        decision_id = uuid4().hex
+        audit_event_id = uuid4().hex
+        audit_position = int(
+            self._metadata.execute(
+                "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+            ).fetchone()[0]
+        )
+        previous_version = self._resolved_version(active, str(case.logical_measurement_id))
+        completed_at = datetime.now(UTC).isoformat()
+        with self._metadata:
+            self._metadata.execute(
+                "INSERT INTO write_operations VALUES (?, 'resolve_data_review_case', ?, ?, "
+                "'committed', 1)",
+                (str(operation_id), completed_at, completed_at),
+            )
+            self._metadata.execute(
+                "INSERT INTO decision_refs VALUES (?, ?)",
+                (
+                    decision_id,
+                    "source_deletion"
+                    if case.kind == "suspected_source_deletion"
+                    else "conflict_resolution",
+                ),
+            )
+            self._metadata.execute(
+                "INSERT INTO audit_events VALUES (?, ?, ?, 'data_review_decision', ?)",
+                (audit_position, audit_event_id, str(operation_id), completed_at),
+            )
+            self._metadata.execute(
+                "INSERT INTO data_review_decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    audit_event_id,
+                    decision_id,
+                    review_case_id,
+                    case.kind,
+                    str(case.logical_measurement_id),
+                    case.evidence_fingerprint,
+                    action,
+                    selected_measurement_version_id,
+                    previous_version,
+                    json.dumps([str(item) for item in candidates], separators=(",", ":")),
+                    note,
+                ),
+            )
+            if action in {"confirm", "reject"}:
+                self._metadata.execute(
+                    "INSERT INTO source_absence_suppressions VALUES (?, ?, 1) "
+                    "ON CONFLICT(logical_measurement_id) DO UPDATE SET "
+                    "decision_id = excluded.decision_id, active = 1",
+                    (str(case.logical_measurement_id), decision_id),
+                )
+            manifest_sha256 = self._stage_review_snapshot(
+                parent_snapshot_id=active,
+                snapshot_id=snapshot_id,
+                operation_id=operation_id,
+                audit_position=audit_position,
+                review_case_id=review_case_id,
+                decision_id=decision_id,
+                action=action,
+                selected_measurement_version_id=selected_measurement_version_id,
+                candidate_version_ids=tuple(str(item) for item in candidates),
+            )
+            self._activate_review_snapshot(
+                operation_id, snapshot_id, active, manifest_sha256, completed_at
+            )
+        return PublishDecisionResult(operation_id, decision_id, snapshot_id)
+
+    def revoke_data_review_decision(
+        self,
+        *,
+        operation_id: OperationId,
+        snapshot_id: SnapshotId,
+        decision_id: str,
+        reason: str,
+    ) -> PublishDecisionResult:
+        self._require_open()
+        self._require_writer()
+        active = self.load_active_snapshot_id()
+        if active is None:
+            raise StoreError("Aktiver Snapshot fehlt.")
+        row = self._metadata.execute(
+            """
+            SELECT d.audit_event_id, d.review_case_id, d.case_kind,
+                   d.logical_measurement_id, d.evidence_fingerprint, d.action,
+                   d.previous_measurement_version_id, d.candidate_version_ids
+            FROM data_review_decisions d
+            WHERE d.decision_id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM metadata_tombstones t
+                  WHERE t.target_audit_event_id = d.audit_event_id
+                    AND t.tombstone_kind = 'revoked'
+              )
+            """,
+            (decision_id,),
+        ).fetchone()
+        if row is None:
+            raise StoreError("Entscheidung ist nicht wirksam.")
+        (
+            target_audit_id,
+            review_case_id,
+            case_kind,
+            logical_id,
+            evidence,
+            _action,
+            previous_version,
+            candidates_json,
+        ) = map(str, row)
+        audit_event_id = uuid4().hex
+        audit_position = int(
+            self._metadata.execute(
+                "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+            ).fetchone()[0]
+        )
+        completed_at = datetime.now(UTC).isoformat()
+        with self._metadata:
+            self._metadata.execute(
+                "INSERT INTO write_operations VALUES (?, 'revoke_data_review_decision', ?, ?, "
+                "'committed', 1)",
+                (str(operation_id), completed_at, completed_at),
+            )
+            self._metadata.execute(
+                "INSERT INTO audit_events VALUES (?, ?, ?, 'metadata_tombstone', ?)",
+                (audit_position, audit_event_id, str(operation_id), completed_at),
+            )
+            self._metadata.execute(
+                "INSERT INTO metadata_tombstones VALUES (?, ?, ?, 'revoked', NULL, ?)",
+                (uuid4().hex, audit_event_id, target_audit_id, reason),
+            )
+            self._metadata.execute(
+                "UPDATE source_absence_suppressions SET active = 0 WHERE decision_id = ?",
+                (decision_id,),
+            )
+            manifest_sha256 = self._stage_review_snapshot(
+                parent_snapshot_id=active,
+                snapshot_id=snapshot_id,
+                operation_id=operation_id,
+                audit_position=audit_position,
+                review_case_id=review_case_id,
+                decision_id=decision_id,
+                action="revoke",
+                selected_measurement_version_id=previous_version,
+                candidate_version_ids=tuple(json.loads(candidates_json)),
+                reopened_case=(case_kind, logical_id, evidence),
+            )
+            self._activate_review_snapshot(
+                operation_id, snapshot_id, active, manifest_sha256, completed_at
+            )
+        return PublishDecisionResult(operation_id, decision_id, snapshot_id)
+
+    def _resolved_version(self, snapshot_id: SnapshotId, logical_id: str) -> str:
+        path = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
+        escaped = str(path / "resolved_measurements.parquet").replace("'", "''")
+        row = self._query.execute(
+            f"SELECT selected_measurement_version_id FROM read_parquet('{escaped}') "
+            "WHERE logical_measurement_id = ?",
+            (logical_id,),
+        ).fetchone()
+        if row is None:
+            raise StoreError("Aufgelöste Quellmessung fehlt.")
+        return str(row[0])
+
+    def _stage_review_snapshot(
+        self,
+        *,
+        parent_snapshot_id: SnapshotId,
+        snapshot_id: SnapshotId,
+        operation_id: OperationId,
+        audit_position: int,
+        review_case_id: str,
+        decision_id: str,
+        action: str,
+        selected_measurement_version_id: str | None,
+        candidate_version_ids: tuple[str, ...],
+        reopened_case: tuple[str, str, str] | None = None,
+    ) -> str:
+        parent = self._root / _PARQUET_DIRECTORY / "snapshots" / str(parent_snapshot_id)
+        staging = self._root / "staging" / str(operation_id)
+        shutil.copytree(parent, staging)
+        for filename in _SNAPSHOT_SCHEMAS:
+            table = filename.removesuffix(".parquet")
+            escaped = str(staging / filename).replace("'", "''")
+            self._query.execute(
+                f"CREATE OR REPLACE TEMP TABLE {table} AS SELECT * FROM read_parquet('{escaped}')"
+            )
+        if action == "revoke":
+            self._query.execute(
+                "DELETE FROM resolved_measurements WHERE effective_decision_id = ? "
+                "OR conflict_resolution_decision_id = ?",
+                (decision_id, decision_id),
+            )
+            assert reopened_case is not None and selected_measurement_version_id is not None
+            case_kind, logical_id, evidence = reopened_case
+            self._query.execute(
+                "DELETE FROM resolved_measurements WHERE logical_measurement_id = ?",
+                (logical_id,),
+            )
+            restore_ids = (
+                (selected_measurement_version_id,)
+                if case_kind == "suspected_source_deletion"
+                else candidate_version_ids
+            )
+            restored_identities: set[str] = set()
+            previous_identity = self._query.execute(
+                "SELECT identity_candidate_id FROM measurement_versions "
+                "WHERE measurement_version_id = ?",
+                (selected_measurement_version_id,),
+            ).fetchone()
+            assert previous_identity is not None
+            for candidate_id in (selected_measurement_version_id, *restore_ids):
+                version = self._query.execute(
+                    "SELECT identity_candidate_id, canonical_value, canonical_unit "
+                    "FROM measurement_versions WHERE measurement_version_id = ?",
+                    (candidate_id,),
+                ).fetchone()
+                assert version is not None
+                identity_id = str(version[0])
+                if identity_id in restored_identities:
+                    continue
+                restored_identities.add(identity_id)
+                version_id = (
+                    selected_measurement_version_id
+                    if identity_id == str(previous_identity[0])
+                    else candidate_id
+                )
+                chosen = self._query.execute(
+                    "SELECT canonical_value, canonical_unit FROM measurement_versions "
+                    "WHERE measurement_version_id = ?",
+                    (version_id,),
+                ).fetchone()
+                assert chosen is not None
+                self._query.execute(
+                    "INSERT INTO resolved_measurements VALUES (?, ?, 'included_source', ?, ?, "
+                    "'source', NULL, NULL, NULL, NULL)",
+                    (identity_id, version_id, float(chosen[0]), str(chosen[1])),
+                )
+            self._query.execute(
+                "INSERT INTO open_review_cases VALUES (?, ?, ?, NULL, NULL, ?)",
+                (review_case_id, case_kind, logical_id, evidence),
+            )
+        else:
+            case = self._query.execute(
+                "SELECT case_kind, logical_measurement_id FROM open_review_cases "
+                "WHERE review_case_id = ?",
+                (review_case_id,),
+            ).fetchone()
+            if case is None:
+                raise StoreError("Datenprüffall ist nicht mehr offen.")
+            case_kind, logical_id = map(str, case)
+            self._query.execute(
+                "DELETE FROM open_review_cases WHERE review_case_id = ?", (review_case_id,)
+            )
+            if action == "confirm":
+                self._query.execute(
+                    """
+                    UPDATE resolved_measurements
+                    SET disposition = 'excluded_source_deletion', effective_value = NULL,
+                        effective_value_source = 'none', effective_decision_id = ?,
+                        source_deletion_decision_id = ?
+                    WHERE logical_measurement_id = ?
+                    """,
+                    (decision_id, decision_id, logical_id),
+                )
+            elif action == "prefer":
+                assert selected_measurement_version_id is not None
+                version = self._query.execute(
+                    "SELECT canonical_value, canonical_unit FROM measurement_versions "
+                    "WHERE measurement_version_id = ?",
+                    (selected_measurement_version_id,),
+                ).fetchone()
+                if version is None:
+                    raise StoreError("Bevorzugte Quellversion fehlt.")
+                if candidate_version_ids:
+                    placeholders = ",".join("?" for _ in candidate_version_ids)
+                    self._query.execute(
+                        f"DELETE FROM resolved_measurements "
+                        f"WHERE logical_measurement_id != ? "
+                        f"AND selected_measurement_version_id IN ({placeholders})",
+                        (logical_id, *candidate_version_ids),
+                    )
+                self._query.execute(
+                    """
+                    UPDATE resolved_measurements
+                    SET selected_measurement_version_id = ?, disposition = 'included_source',
+                        effective_value = ?, canonical_unit = ?, effective_value_source = 'source',
+                        effective_decision_id = NULL, conflict_resolution_decision_id = ?
+                    WHERE logical_measurement_id = ?
+                    """,
+                    (
+                        selected_measurement_version_id,
+                        float(version[0]),
+                        str(version[1]),
+                        decision_id,
+                        logical_id,
+                    ),
+                )
+            elif action == "split":
+                placeholders = ",".join("?" for _ in candidate_version_ids)
+                self._query.execute(
+                    f"DELETE FROM resolved_measurements WHERE logical_measurement_id = ? "
+                    f"OR selected_measurement_version_id IN ({placeholders})",
+                    (logical_id, *candidate_version_ids),
+                )
+                for version_id in candidate_version_ids:
+                    version = self._query.execute(
+                        "SELECT canonical_value, canonical_unit FROM measurement_versions "
+                        "WHERE measurement_version_id = ?",
+                        (version_id,),
+                    ).fetchone()
+                    assert version is not None
+                    split_id = hashlib.sha256(f"{decision_id}:{version_id}".encode()).hexdigest()
+                    self._query.execute(
+                        "INSERT INTO resolved_measurements VALUES (?, ?, 'included_source', ?, ?, "
+                        "'source', NULL, NULL, NULL, ?)",
+                        (split_id, version_id, float(version[0]), str(version[1]), decision_id),
+                    )
+        for filename in _SNAPSHOT_SCHEMAS:
+            table = filename.removesuffix(".parquet")
+            path = staging / filename
+            path.unlink()
+            escaped = str(path).replace("'", "''")
+            self._query.execute(f"COPY (SELECT * FROM {table}) TO '{escaped}' (FORMAT PARQUET)")
+        manifest = json.loads((staging / "manifest.json").read_bytes())
+        manifest.update(
+            snapshot_id=str(snapshot_id),
+            created_at_utc=datetime.now(UTC).isoformat(),
+            created_by_operation_id=str(operation_id),
+            parent_snapshot_id=str(parent_snapshot_id),
+        )
+        manifest["resolution_basis"]["audit_max_position"] = audit_position
+        entries = []
+        for filename in sorted(_SNAPSHOT_SCHEMAS):
+            path = staging / filename
+            escaped = str(path).replace("'", "''")
+            description = tuple(
+                (str(row[0]), str(row[1]))
+                for row in self._query.execute(
+                    f"DESCRIBE SELECT * FROM read_parquet('{escaped}')"
+                ).fetchall()
+            )
+            row_count = self._query.execute(
+                f"SELECT count(*) FROM read_parquet('{escaped}')"
+            ).fetchone()
+            assert row_count is not None
+            entries.append(
+                {
+                    "name": filename,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "allocated_bytes": path.stat().st_blocks * 512,
+                    "row_count": int(row_count[0]),
+                    "parquet_schema_fingerprint": hashlib.sha256(
+                        json.dumps(description, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                }
+            )
+        manifest["files"] = entries
+        counts = self._query.execute(
+            """
+            SELECT (SELECT count(DISTINCT export_id) FROM source_occurrences),
+                   (SELECT count(*) FROM source_occurrences),
+                   (SELECT count(*) FROM measurement_versions),
+                   (SELECT count(*) FROM resolved_measurements),
+                   (SELECT count(*) FROM resolved_measurements WHERE disposition LIKE 'included%'),
+                   (SELECT count(*) FROM resolved_measurements WHERE disposition LIKE 'excluded%'),
+                   (SELECT count(*) FROM open_review_cases)
+            """
+        ).fetchone()
+        assert counts is not None
+        manifest["validation_counts"] = dict(
+            zip(
+                (
+                    "exports",
+                    "source_occurrences",
+                    "measurement_versions",
+                    "logical_measurements",
+                    "included",
+                    "excluded",
+                    "open_review_cases",
+                ),
+                map(int, counts),
+                strict=True,
+            )
+        )
+        manifest_bytes = json.dumps(
+            manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode()
+        (staging / "manifest.json").write_bytes(manifest_bytes)
+        digest = hashlib.sha256(manifest_bytes).hexdigest()
+        self._validate_snapshot(staging, str(snapshot_id), digest)
+        return digest
+
+    def _activate_review_snapshot(
+        self,
+        operation_id: OperationId,
+        snapshot_id: SnapshotId,
+        previous_snapshot_id: SnapshotId,
+        manifest_sha256: str,
+        completed_at: str,
+    ) -> None:
+        staging = self._root / "staging" / str(operation_id)
+        snapshot = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
+        staging.replace(snapshot)
+        self._metadata.execute(
+            "INSERT INTO dataset_snapshots VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                str(snapshot_id),
+                _SNAPSHOT_SCHEMA_VERSION,
+                manifest_sha256,
+                str(operation_id),
+                str(previous_snapshot_id),
+                completed_at,
+            ),
+        )
+        self._metadata.execute(
+            "INSERT INTO snapshot_activations VALUES (?, ?, ?, ?, 'data_review_decision', ?)",
+            (
+                uuid4().hex,
+                str(operation_id),
+                str(snapshot_id),
+                str(previous_snapshot_id),
+                completed_at,
+            ),
+        )
+        self._metadata.execute(
+            "UPDATE active_snapshot SET snapshot_id = ? WHERE singleton = 1", (str(snapshot_id),)
+        )
 
     def load_daily_series(
         self, start_date: date | None, end_date: date | None
@@ -2879,6 +3405,39 @@ class LocalStore:
             (review_case_id,),
         ).fetchone()
         return None if row is None else str(row[0])
+
+    def load_source_conflict_candidates(
+        self, logical_measurement_id: LogicalMeasurementId
+    ) -> tuple[MeasurementVersionId, ...]:
+        self._require_open()
+        snapshot_id = self.load_active_snapshot_id()
+        if snapshot_id is None:
+            return ()
+        path = (
+            self._root
+            / _PARQUET_DIRECTORY
+            / "snapshots"
+            / str(snapshot_id)
+            / "measurement_versions.parquet"
+        )
+        escaped = str(path).replace("'", "''")
+        rows = self._query.execute(
+            f"""
+            WITH seed AS (
+                SELECT canonical_type, source_start_utc, source_end_utc, source_name, device
+                FROM read_parquet('{escaped}')
+                WHERE identity_candidate_id = ?
+            )
+            SELECT DISTINCT measurement_version_id
+            FROM read_parquet('{escaped}')
+            WHERE identity_candidate_id = ?
+               OR (canonical_type, source_start_utc, source_end_utc, source_name, device)
+                  IN (SELECT * FROM seed)
+            ORDER BY measurement_version_id
+            """,
+            (str(logical_measurement_id), str(logical_measurement_id)),
+        ).fetchall()
+        return tuple(MeasurementVersionId(str(row[0])) for row in rows)
 
     def load_export_facts(self) -> tuple[ExportFact, ...]:
         self._require_open()
@@ -3443,9 +4002,7 @@ class LocalStore:
         if snapshots.exists():
             known_snapshots = {
                 str(row[0])
-                for row in self._metadata.execute(
-                    "SELECT snapshot_id FROM imports WHERE status IN ('committed', 'duplicate')"
-                )
+                for row in self._metadata.execute("SELECT snapshot_id FROM dataset_snapshots")
             }
             for path in snapshots.iterdir():
                 if path.is_dir() and path.name not in known_snapshots:

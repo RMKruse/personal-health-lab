@@ -101,6 +101,8 @@ def test_cli_projects_source_conflicts_from_the_shared_data_review(
     _assert_json_contract(output)
     assert output["cases"][0]["kind"] == "source_conflict"
     assert output["cases"][0]["logical_measurement_id"] is not None
+    assert output["cases"][0]["allowed_actions"] == ["prefer", "split"]
+    assert len(output["cases"][0]["candidate_version_ids"]) == 2
     assert output["status"] == "provisional"
     assert output["cycles"][0]["status"] == "open"
     assert output["cases"][0]["detail"]["reasons"] == []

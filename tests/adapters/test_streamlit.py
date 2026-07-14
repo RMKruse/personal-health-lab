@@ -167,5 +167,10 @@ def test_streamlit_projects_source_conflicts_from_the_shared_data_review(
     assert not app.exception
     assert any(item.value == "Datenprüfung" for item in app.subheader)
     assert any("Datenstatus: provisional" in item.value for item in app.caption)
-    assert any("source_conflict" in item.value for item in app.warning)
+    assert any(
+        "source_conflict" in item.value
+        and "Aktionen prefer, split" in item.value
+        and "Kandidaten" in item.value
+        for item in app.warning
+    )
     assert any("Details:" in item.value for item in app.caption)

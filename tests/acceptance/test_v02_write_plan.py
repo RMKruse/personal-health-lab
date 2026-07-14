@@ -119,6 +119,22 @@ REGISTERED_CASES.update(
         "V02-A-SRC-010": (
             "test_strong_and_natural_identity_create_only_payload_versions"
         ),
+        **{
+            f"V02-A-SRC-{number:03d}": (
+                "test_comparable_exports_open_one_deletion_case_per_absence_phase"
+            )
+            for number in range(11, 14)
+        },
+        **{
+            f"V02-A-SRC-{number:03d}": ("test_deletion_decisions_and_reappearance_are_forward_only")
+            for number in range(14, 17)
+        },
+        **{
+            f"V02-A-SRC-{number:03d}": "test_conflicts_can_be_preferred_split_and_revoked"
+            for number in range(17, 20)
+        },
+        "V02-A-SRC-020": "test_a_newer_unambiguous_version_supersedes_conflict_preference",
+        "V02-A-SRC-021": "test_deletion_decisions_and_reappearance_are_forward_only",
         "V02-A-STO-001": "test_import_publishes_one_validated_four_file_snapshot",
         "V02-A-STO-002": "test_sqlite_catalog_and_audit_constraints_are_hard",
         "V02-A-STO-003": "test_import_publishes_one_validated_four_file_snapshot",

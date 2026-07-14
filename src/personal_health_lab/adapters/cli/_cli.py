@@ -24,6 +24,7 @@ from personal_health_lab.application import (
     FileVaultCheck,
     HealthLab,
     ImportHealthExport,
+    ImportHealthExportPlan,
     ImportReceipt,
     ImportStatus,
     Overview,
@@ -96,6 +97,8 @@ def _data_review_json(
         "cases": [
             {
                 "case_id": str(case.case_id),
+                "allowed_actions": case.allowed_actions,
+                "candidate_version_ids": tuple(str(item) for item in case.candidate_version_ids),
                 "evidence_fingerprint": case.evidence_fingerprint,
                 "kind": case.kind.value,
                 "logical_measurement_id": (
@@ -255,6 +258,7 @@ def _write_plan_json(
     runtime_config: Mapping[str, object],
     workspace: WorkspaceStatus,
 ) -> dict[str, object]:
+    assert isinstance(plan.details, ImportHealthExportPlan)
     return {
         "approval": {"status": plan.approval.status.value},
         "confirmations": tuple(item.value for item in plan.confirmations),
@@ -305,9 +309,7 @@ def _write_receipt_json(
         "diagnostics": receipt.diagnostics,
         "final_preflight": {
             "approval": {"status": receipt.final_preflight.approval.status.value},
-            "confirmations": tuple(
-                item.value for item in receipt.final_preflight.confirmations
-            ),
+            "confirmations": tuple(item.value for item in receipt.final_preflight.confirmations),
             "diagnostics": receipt.final_preflight.diagnostics,
             "capacity": _capacity_json(receipt.final_preflight.capacity),
             "filevault": _filevault_json(receipt.final_preflight.filevault),
@@ -325,8 +327,7 @@ def _print_write_plan(plan: WritePlan, workspace: WorkspaceStatus) -> None:
     print(f"Schreibvorschau: {plan.approval.status.value}")
     print(f"Plan-Fingerprint: {plan.fingerprint}")
     print(
-        "Datenspeicher-ID: "
-        f"{workspace.store_id or '-'} · Bindung: {workspace.person_binding.value}"
+        f"Datenspeicher-ID: {workspace.store_id or '-'} · Bindung: {workspace.person_binding.value}"
     )
     print("Bestätigungen: " + (", ".join(plan.confirmations) or "-"))
     filevault = plan.preflight.filevault
@@ -523,7 +524,22 @@ def main(args: Sequence[str] | None = None) -> int:
         print(f"Datenstatus: {data_review.status.value}")
         print(f"Offene Datenprüffälle: {len(data_review.cases)}")
         for detail in data_review_details:
-            print(f"{detail.case.case_id}: {detail.case.kind.value} ({detail.source_type or '-'})")
+            case = detail.case
+            source = (
+                detail.effective_value_source.value if detail.effective_value_source else "-"
+            )
+            reasons = ", ".join(reason.code.value for reason in detail.reasons) or "-"
+            print(
+                f"{case.case_id}: {case.kind.value} · "
+                f"Messung {case.logical_measurement_id or case.measurement_version_id or '-'} · "
+                f"Regel {case.rule_version_id or '-'} · Evidenz {case.evidence_fingerprint} · "
+                f"Aktionen {', '.join(case.allowed_actions) or '-'} · "
+                f"Kandidaten {', '.join(map(str, case.candidate_version_ids)) or '-'}"
+            )
+            print(
+                f"  Typ {detail.source_type or '-'} · Zeitpunkt {detail.measured_at or '-'} · "
+                f"Wert {detail.effective_value} · Quelle {source} · Begründungen {reasons}"
+            )
     elif parsed.as_json:
         print(
             json.dumps(
