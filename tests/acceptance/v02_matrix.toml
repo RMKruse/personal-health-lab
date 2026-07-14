@@ -612,3 +612,329 @@ level = "application"
 expected_result = "store_busy and readable old snapshot"
 expected_effect = "none"
 forbidden_side_effects = ["partial import", "reader block"]
+
+[[contract]]
+id = "V02-C-SRC-007"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Health export packages remain untrusted and publish atomically."
+evidence = ["positive", "negative", "fault"]
+
+[[contract]]
+id = "V02-C-STO-001"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "SQLite owns typed operational, activation, and overlay truth."
+evidence = ["positive", "negative"]
+
+[[contract]]
+id = "V02-C-STO-002"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Audit is append-only, contiguous, and strictly ordered."
+evidence = ["positive", "negative", "boundary"]
+
+[[contract]]
+id = "V02-C-STO-003"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Every snapshot contains exactly four closed Parquet files."
+evidence = ["positive", "negative"]
+
+[[contract]]
+id = "V02-C-STO-004"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "The canonical manifest describes but never activates a snapshot."
+evidence = ["positive", "negative"]
+
+[[contract]]
+id = "V02-C-STO-006"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Snapshot publication validates, moves, and activates atomically."
+evidence = ["positive", "fault"]
+
+[[fixture]]
+id = "V02-F-SYS-UNTRUSTED-PACKAGE-V1"
+kind = "system"
+generator = "negative-health-export-v1"
+seed = 0
+parameters = "traversal, limits, unsupported entry types, XXE, and network-free XML"
+platform = "all"
+sha256 = "98e74defc35ad826133d1ef2cdb19747e99360cbf45f837e0c7af1258a0a5ecf"
+
+[[fixture]]
+id = "V02-F-SYS-RECOGNIZED-INVALID-V1"
+kind = "system"
+generator = "recognized-invalid-health-export-v1"
+seed = 0
+parameters = "recognized package with invalid canonical health data"
+platform = "all"
+sha256 = "f69a8febc6ccf406faee3da9ef505e0bdacceb98be9c728c72f1738c6c4c0c25"
+
+[[fixture]]
+id = "V02-F-SYS-SNAPSHOT-CORRUPTION-V1"
+kind = "system"
+generator = "snapshot-corruption-v1"
+seed = 0
+parameters = "hash, schema, count, enum, finiteness, uniqueness, and ID-closure corruptions"
+platform = "all"
+sha256 = "0bde8a82d8d0867429a8a5f65fb1eee50030cee8b89d10ab41f33793ef802f6d"
+
+[[fixture]]
+id = "V02-F-SYS-PUBLICATION-FAULTS-V1"
+kind = "system"
+generator = "snapshot-publication-faults-v1"
+seed = 0
+parameters = "before move, after move, and before SQLite commit"
+platform = "all"
+sha256 = "ee50a5d92a1f1b11d5645330b8136412b8de4d83a94e11586df3ecebb0bdb306"
+
+[[fixture]]
+id = "V02-F-SYS-SQLITE-CONSTRAINTS-V1"
+kind = "system"
+generator = "sqlite-catalog-corruption-v1"
+seed = 0
+parameters = "STRICT, FK, CHECK, append-only, gap, payload, and tombstone violations"
+platform = "all"
+sha256 = "6435a25650e4cc7b0ba14305f1c241350a33b77ea4684377505b280efd1cd680"
+
+[[fault_point]]
+id = "import.before_snapshot_move/v1"
+operation = "import_health_export"
+transition = "validated staging before immutable snapshot move"
+
+[[fault_point]]
+id = "import.after_snapshot_move/v1"
+operation = "import_health_export"
+transition = "immutable snapshot moved before SQLite catalog transaction"
+
+[[fault_point]]
+id = "import.before_sqlite_commit/v1"
+operation = "import_health_export"
+transition = "catalog, audit, activation, and pointer written before commit"
+
+[[case]]
+id = "V02-A-SRC-022"
+contracts = ["V02-C-SRC-007"]
+fixtures = ["V02-F-SYS-UNTRUSTED-PACKAGE-V1"]
+runner = "test_negative_exports_v1_are_rejected_without_changing_the_snapshot"
+initial_state = "active snapshot and untrusted package"
+operation = "execute ImportHealthExport"
+level = "application"
+expected_result = "rejected"
+expected_effect = "none"
+forbidden_side_effects = ["snapshot change", "extracted remainder"]
+
+[[case]]
+id = "V02-A-SRC-023"
+contracts = ["V02-C-SRC-007"]
+fixtures = ["V02-F-SYS-RECOGNIZED-INVALID-V1"]
+runner = "test_recognized_package_validation_failure_is_quarantined"
+initial_state = "active snapshot and recognized invalid package"
+operation = "execute ImportHealthExport"
+level = "application"
+expected_result = "quarantined"
+expected_effect = "one quarantine record"
+forbidden_side_effects = ["snapshot change"]
+
+[[case]]
+id = "V02-A-SRC-024"
+contracts = ["V02-C-SRC-007", "V02-C-STO-006"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_import_publishes_one_validated_four_file_snapshot"
+initial_state = "empty store"
+operation = "execute ImportHealthExport"
+level = "application"
+expected_result = "committed"
+expected_effect = "exactly one validated active snapshot"
+forbidden_side_effects = ["partial publication"]
+
+[[case]]
+id = "V02-A-STO-001"
+contracts = ["V02-C-STO-001"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_import_publishes_one_validated_four_file_snapshot"
+initial_state = "empty store"
+operation = "publish import"
+level = "application"
+expected_result = "STRICT catalog accepted"
+expected_effect = "one catalog row set"
+forbidden_side_effects = ["untyped catalog"]
+
+[[case]]
+id = "V02-A-STO-002"
+contracts = ["V02-C-STO-001"]
+fixtures = ["V02-F-SYS-SQLITE-CONSTRAINTS-V1"]
+runner = "test_sqlite_catalog_and_audit_constraints_are_hard"
+initial_state = "valid published store"
+operation = "attempt invalid enum, bool, ID, time, and reference writes"
+level = "storage"
+expected_result = "hard constraint failure"
+expected_effect = "none"
+forbidden_side_effects = ["invalid row"]
+
+[[case]]
+id = "V02-A-STO-003"
+contracts = ["V02-C-STO-001"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_import_publishes_one_validated_four_file_snapshot"
+initial_state = "published store"
+operation = "inspect SQLite schema"
+level = "storage"
+expected_result = "no canonical measurement payload"
+expected_effect = "none"
+forbidden_side_effects = ["current-state payload table"]
+
+[[case]]
+id = "V02-A-STO-004"
+contracts = ["V02-C-STO-002"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_sqlite_catalog_and_audit_constraints_are_hard"
+initial_state = "one published import"
+operation = "read audit positions"
+level = "storage"
+expected_result = "positions start at one and are contiguous"
+expected_effect = "none"
+forbidden_side_effects = ["gap"]
+
+[[case]]
+id = "V02-A-STO-005"
+contracts = ["V02-C-STO-002"]
+fixtures = ["V02-F-SYS-SQLITE-CONSTRAINTS-V1"]
+runner = "test_sqlite_catalog_and_audit_constraints_are_hard"
+initial_state = "valid audit"
+operation = "attempt mutation, gap, bad payload, and forward tombstone"
+level = "storage"
+expected_result = "hard constraint or open-validation failure"
+expected_effect = "none"
+forbidden_side_effects = ["mutated audit"]
+
+[[case]]
+id = "V02-A-STO-006"
+contracts = ["V02-C-STO-002"]
+fixtures = ["V02-F-SYS-SQLITE-CONSTRAINTS-V1"]
+runner = "test_sqlite_catalog_and_audit_constraints_are_hard"
+initial_state = "audit with attempted forward tombstone"
+operation = "validate overlay ordering"
+level = "storage"
+expected_result = "forward reference rejected"
+expected_effect = "none"
+forbidden_side_effects = ["time-based override"]
+
+[[case]]
+id = "V02-A-STO-007"
+contracts = ["V02-C-STO-003"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_import_publishes_one_validated_four_file_snapshot"
+initial_state = "empty store"
+operation = "publish and open snapshot"
+level = "application"
+expected_result = "four closed Parquet schemas"
+expected_effect = "one snapshot"
+forbidden_side_effects = ["fifth Parquet file"]
+
+[[case]]
+id = "V02-A-STO-008"
+contracts = ["V02-C-STO-003"]
+fixtures = ["V02-F-SYS-SNAPSHOT-CORRUPTION-V1"]
+runner = "test_snapshot_validation_rejects_every_closed_contract_violation"
+initial_state = "published snapshot with consistent manifest and broken ID closure"
+operation = "open HealthLab"
+level = "application"
+expected_result = "store open failure"
+expected_effect = "none"
+forbidden_side_effects = ["corrupt snapshot read"]
+
+[[case]]
+id = "V02-A-STO-009"
+contracts = ["V02-C-STO-003"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_resolved_measurement_disposition_xor_accepts_closed_variants"
+initial_state = "published snapshot rewritten through each closed disposition variant"
+operation = "validate resolved measurements"
+level = "storage"
+expected_result = "every closed disposition satisfies XOR"
+expected_effect = "one resolved row"
+forbidden_side_effects = ["ambiguous effective value source"]
+
+[[case]]
+id = "V02-A-STO-010"
+contracts = ["V02-C-STO-004"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_import_publishes_one_validated_four_file_snapshot"
+initial_state = "published snapshot"
+operation = "read manifest"
+level = "storage"
+expected_result = "canonical four-file hashes, sizes, rows, schemas, and counts"
+expected_effect = "none"
+forbidden_side_effects = ["unsorted manifest"]
+
+[[case]]
+id = "V02-A-STO-011"
+contracts = ["V02-C-STO-004"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_manifest_rejects_nested_non_schema_fields"
+initial_state = "published snapshot"
+operation = "inspect manifest keys"
+level = "storage"
+expected_result = "no active flag or internal path"
+expected_effect = "none"
+forbidden_side_effects = ["manifest activation pointer"]
+
+[[case]]
+id = "V02-A-STO-012"
+contracts = ["V02-C-STO-004"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_import_publishes_one_validated_four_file_snapshot"
+initial_state = "published snapshot"
+operation = "read active snapshot and activation history"
+level = "storage"
+expected_result = "SQLite alone determines activity"
+expected_effect = "one activation history row"
+forbidden_side_effects = ["competing pointer"]
+
+[[case]]
+id = "V02-A-STO-015"
+contracts = ["V02-C-STO-006"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_import_publishes_one_validated_four_file_snapshot"
+initial_state = "parsed import"
+operation = "stage and validate snapshot"
+level = "application"
+expected_result = "validated before move"
+expected_effect = "one committed snapshot"
+forbidden_side_effects = ["unvalidated move"]
+
+[[case]]
+id = "V02-A-STO-016"
+contracts = ["V02-C-STO-006"]
+fixtures = ["V02-F-SYS-PUBLICATION-FAULTS-V1"]
+fault_points = ["import.after_snapshot_move/v1"]
+runner = "test_publication_fault_keeps_old_snapshot_active_and_quarantines_remainder"
+initial_state = "active old snapshot"
+operation = "fail after immutable move"
+level = "application"
+expected_result = "old snapshot remains active"
+expected_effect = "orphan quarantined on open"
+forbidden_side_effects = ["partial activation"]
+
+[[case]]
+id = "V02-A-STO-017"
+contracts = ["V02-C-STO-006"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_import_publishes_one_validated_four_file_snapshot"
+initial_state = "validated moved snapshot"
+operation = "commit publication"
+level = "storage"
+expected_result = "one operation, audit, catalog, activation, and pointer transaction"
+expected_effect = "new snapshot active"
+forbidden_side_effects = ["split catalog transaction"]
+
+[[case]]
+id = "V02-A-STO-018"
+contracts = ["V02-C-STO-006"]
+fixtures = ["V02-F-SYS-PUBLICATION-FAULTS-V1"]
+fault_points = ["import.before_snapshot_move/v1", "import.before_sqlite_commit/v1"]
+runner = "test_publication_fault_keeps_old_snapshot_active_and_quarantines_remainder"
+initial_state = "active old snapshot"
+operation = "fail at every publication transition"
+level = "application"
+expected_result = "old snapshot remains active"
+expected_effect = "at most quarantine remainder"
+forbidden_side_effects = ["partial SQLite state"]

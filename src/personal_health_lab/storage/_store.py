@@ -10,7 +10,7 @@ import shutil
 import sqlite3
 import subprocess
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import IO, Literal, Self, cast
@@ -31,9 +31,64 @@ from personal_health_lab.health_data import (
 _METADATA_FILE = "metadata.sqlite3"
 _PARQUET_DIRECTORY = "parquet"
 _QUERY_FILE = "query.duckdb"
-_STORE_SCHEMA_VERSION = "1.2"
+_STORE_SCHEMA_VERSION = 2
 _WRITER_LOCK_FILE = ".writer.lock"
 _FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
+_SNAPSHOT_SCHEMA_VERSION = 1
+_IDENTITY_RULE_VERSION = "healthkit-natural/v1"
+_MAPPING_RULE_VERSION = "healthkit-canonical/v1"
+_SNAPSHOT_SCHEMAS = {
+    "source_occurrences.parquet": (
+        ("occurrence_id", "VARCHAR"),
+        ("export_id", "VARCHAR"),
+        ("export_ordinal", "BIGINT"),
+        ("identity_candidate_id", "VARCHAR"),
+        ("measurement_version_id", "VARCHAR"),
+        ("mapping_rule_version_id", "VARCHAR"),
+        ("occurrence_fingerprint", "VARCHAR"),
+    ),
+    "measurement_versions.parquet": (
+        ("measurement_version_id", "VARCHAR"),
+        ("identity_candidate_id", "VARCHAR"),
+        ("payload_sha256", "VARCHAR"),
+        ("canonical_type", "VARCHAR"),
+        ("canonical_unit", "VARCHAR"),
+        ("canonical_value", "DOUBLE"),
+        ("source_start_utc", "VARCHAR"),
+        ("source_end_utc", "VARCHAR"),
+        ("source_updated_at_utc", "VARCHAR"),
+        ("source_start_offset_minutes", "INTEGER"),
+        ("source_end_offset_minutes", "INTEGER"),
+        ("source_updated_at_offset_minutes", "INTEGER"),
+        ("measurement_local_date", "DATE"),
+        ("source_name", "VARCHAR"),
+        ("source_version", "VARCHAR"),
+        ("device", "VARCHAR"),
+        ("original_value", "DOUBLE"),
+        ("original_unit", "VARCHAR"),
+        ("strong_source_id_hash", "VARCHAR"),
+    ),
+    "resolved_measurements.parquet": (
+        ("logical_measurement_id", "VARCHAR"),
+        ("selected_measurement_version_id", "VARCHAR"),
+        ("disposition", "VARCHAR"),
+        ("effective_value", "DOUBLE"),
+        ("canonical_unit", "VARCHAR"),
+        ("effective_value_source", "VARCHAR"),
+        ("effective_decision_id", "VARCHAR"),
+        ("correction_decision_id", "VARCHAR"),
+        ("source_deletion_decision_id", "VARCHAR"),
+        ("conflict_resolution_decision_id", "VARCHAR"),
+    ),
+    "open_review_cases.parquet": (
+        ("review_case_id", "VARCHAR"),
+        ("case_kind", "VARCHAR"),
+        ("logical_measurement_id", "VARCHAR"),
+        ("measurement_version_id", "VARCHAR"),
+        ("rule_version_id", "VARCHAR"),
+        ("evidence_fingerprint", "VARCHAR"),
+    ),
+}
 _KIB = 1024
 _MIB = 1024 * _KIB
 _GIB = 1024 * _MIB
@@ -42,7 +97,7 @@ _STORE_IDENTITY_DDL = """
 CREATE TABLE store_identity (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     mode TEXT NOT NULL CHECK (mode IN ('synthetic', 'real')),
-    schema_version TEXT NOT NULL,
+    schema_version INTEGER NOT NULL CHECK (schema_version > 0),
     store_id TEXT CHECK (
         store_id IS NULL OR (
             length(store_id) = 32 AND store_id NOT GLOB '*[^0-9a-f]*'
@@ -50,8 +105,24 @@ CREATE TABLE store_identity (
     ),
     person_binding TEXT NOT NULL DEFAULT 'unbound'
         CHECK (person_binding IN ('unbound', 'bound', 'pending'))
-)
+) STRICT
 """
+
+
+def _is_lower_hex(value: object, length: int) -> bool:
+    return isinstance(value, str) and len(value) == length and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+def _is_timestamp(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
 
 
 class StoreError(RuntimeError):
@@ -131,6 +202,12 @@ def _round_up(value: int, fragment_size: int) -> int:
     return ((value + fragment_size - 1) // fragment_size) * fragment_size
 
 
+def _utc_offset_minutes(value: datetime) -> int:
+    offset = value.utcoffset()
+    assert offset is not None
+    return int(offset.total_seconds() // 60)
+
+
 def full_snapshot_import_estimate(
     input_bytes: int,
     active_snapshot_bytes: int,
@@ -166,6 +243,10 @@ def full_snapshot_import_estimate(
 
 def _allocation_checkpoint(root: Path, phase: str) -> None:
     """Private test seam for measuring the real writer's live allocation."""
+
+
+def _publication_fault_point(root: Path, fault_point_id: str) -> None:
+    """Private test seam for durable import-publication transitions."""
 
 
 def probe_capacity(path: Path, estimate_bytes: int | None) -> CapacityCheck:
@@ -607,25 +688,174 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
     metadata.executescript(
         """
         CREATE TABLE IF NOT EXISTS imports (
-            import_id TEXT PRIMARY KEY,
-            operation_id TEXT NOT NULL,
-            package_hash TEXT NOT NULL,
-            status TEXT NOT NULL,
-            snapshot_id TEXT NOT NULL,
-            package_record_count INTEGER NOT NULL,
-            record_count INTEGER NOT NULL,
-            committed_at TEXT NOT NULL,
+            import_id TEXT PRIMARY KEY CHECK (
+                length(import_id) = 32 AND import_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            operation_id TEXT NOT NULL CHECK (
+                length(operation_id) = 32 AND operation_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            package_hash TEXT NOT NULL CHECK (
+                package_hash = '' OR (
+                    length(package_hash) = 64 AND package_hash NOT GLOB '*[^0-9a-f]*'
+                )
+            ),
+            status TEXT NOT NULL CHECK (
+                status IN ('running', 'committed', 'duplicate', 'rejected', 'quarantined')
+            ),
+            snapshot_id TEXT NOT NULL CHECK (
+                length(snapshot_id) = 32 AND snapshot_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            package_record_count INTEGER NOT NULL CHECK (package_record_count >= 0),
+            record_count INTEGER NOT NULL CHECK (record_count >= 0),
+            committed_at TEXT NOT NULL CHECK (
+                length(committed_at) >= 20 AND substr(committed_at, 11, 1) = 'T'
+            ),
             diagnostics TEXT NOT NULL DEFAULT ''
-        );
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS write_operations (
+            operation_id TEXT PRIMARY KEY CHECK (
+                length(operation_id) = 32 AND operation_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            request_kind TEXT NOT NULL CHECK (request_kind = 'import_health_export'),
+            started_at_utc TEXT NOT NULL CHECK (
+                length(started_at_utc) >= 20 AND substr(started_at_utc, 11, 1) = 'T'
+            ),
+            completed_at_utc TEXT NOT NULL CHECK (
+                length(completed_at_utc) >= 20 AND substr(completed_at_utc, 11, 1) = 'T'
+            ),
+            outcome_code TEXT NOT NULL CHECK (outcome_code = 'committed'),
+            state_changed INTEGER NOT NULL CHECK (state_changed IN (0, 1))
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS dataset_snapshots (
+            snapshot_id TEXT PRIMARY KEY CHECK (
+                length(snapshot_id) = 32 AND snapshot_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            snapshot_schema_version INTEGER NOT NULL CHECK (snapshot_schema_version > 0),
+            manifest_sha256 TEXT NOT NULL UNIQUE CHECK (
+                length(manifest_sha256) = 64
+                AND manifest_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            created_by_operation_id TEXT NOT NULL REFERENCES write_operations(operation_id),
+            parent_snapshot_id TEXT REFERENCES dataset_snapshots(snapshot_id),
+            created_at_utc TEXT NOT NULL CHECK (
+                length(created_at_utc) >= 20 AND substr(created_at_utc, 11, 1) = 'T'
+            )
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS snapshot_activations (
+            activation_id TEXT PRIMARY KEY CHECK (
+                length(activation_id) = 32 AND activation_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            operation_id TEXT NOT NULL UNIQUE REFERENCES write_operations(operation_id),
+            snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(snapshot_id),
+            previous_snapshot_id TEXT REFERENCES dataset_snapshots(snapshot_id),
+            activation_kind TEXT NOT NULL CHECK (activation_kind = 'import'),
+            activated_at_utc TEXT NOT NULL CHECK (
+                length(activated_at_utc) >= 20 AND substr(activated_at_utc, 11, 1) = 'T'
+            )
+        ) STRICT;
         CREATE TABLE IF NOT EXISTS active_snapshot (
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-            snapshot_id TEXT NOT NULL
-        );
+            snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(snapshot_id)
+        ) STRICT;
         CREATE TABLE IF NOT EXISTS import_measurement_versions (
-            import_id TEXT NOT NULL,
-            measurement_version_id TEXT NOT NULL,
+            import_id TEXT NOT NULL REFERENCES imports(import_id),
+            measurement_version_id TEXT NOT NULL CHECK (
+                length(measurement_version_id) = 64
+                AND measurement_version_id NOT GLOB '*[^0-9a-f]*'
+            ),
             PRIMARY KEY (import_id, measurement_version_id)
-        );
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS decision_refs (
+            decision_id TEXT PRIMARY KEY CHECK (
+                length(decision_id) = 32 AND decision_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            decision_kind TEXT NOT NULL CHECK (
+                decision_kind IN (
+                    'correction', 'local_exclusion',
+                    'source_deletion', 'conflict_resolution'
+                )
+            )
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS rule_version_refs (
+            rule_version_id TEXT PRIMARY KEY,
+            rule_kind TEXT NOT NULL CHECK (
+                rule_kind IN ('identity', 'mapping', 'plausibility')
+            )
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS audit_events (
+            audit_position INTEGER PRIMARY KEY CHECK (audit_position > 0),
+            audit_event_id TEXT NOT NULL UNIQUE CHECK (
+                length(audit_event_id) = 32 AND audit_event_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            operation_id TEXT NOT NULL REFERENCES write_operations(operation_id),
+            event_kind TEXT NOT NULL CHECK (
+                event_kind IN ('import_published', 'metadata_tombstone')
+            ),
+            occurred_at_utc TEXT NOT NULL CHECK (
+                length(occurred_at_utc) >= 20 AND substr(occurred_at_utc, 11, 1) = 'T'
+            )
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS import_publications (
+            audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
+            import_id TEXT NOT NULL UNIQUE REFERENCES imports(import_id),
+            snapshot_id TEXT NOT NULL UNIQUE REFERENCES dataset_snapshots(snapshot_id)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS metadata_tombstones (
+            tombstone_id TEXT PRIMARY KEY CHECK (
+                length(tombstone_id) = 32 AND tombstone_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            audit_event_id TEXT NOT NULL UNIQUE REFERENCES audit_events(audit_event_id),
+            target_audit_event_id TEXT NOT NULL REFERENCES audit_events(audit_event_id),
+            tombstone_kind TEXT NOT NULL CHECK (
+                tombstone_kind IN ('superseded', 'revoked', 'deactivated', 'deleted')
+            ),
+            replacement_audit_event_id TEXT REFERENCES audit_events(audit_event_id),
+            mandatory_reason TEXT
+        ) STRICT;
+        CREATE TRIGGER IF NOT EXISTS audit_events_contiguous
+        BEFORE INSERT ON audit_events
+        WHEN NEW.audit_position != COALESCE((SELECT MAX(audit_position) FROM audit_events), 0) + 1
+        BEGIN SELECT RAISE(ABORT, 'audit_position must be contiguous'); END;
+        CREATE TRIGGER IF NOT EXISTS audit_events_no_update
+        BEFORE UPDATE ON audit_events
+        BEGIN SELECT RAISE(ABORT, 'audit is append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS audit_events_no_delete
+        BEFORE DELETE ON audit_events
+        BEGIN SELECT RAISE(ABORT, 'audit is append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS import_publications_no_update
+        BEFORE UPDATE ON import_publications
+        BEGIN SELECT RAISE(ABORT, 'audit payload is append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS import_publications_no_delete
+        BEFORE DELETE ON import_publications
+        BEGIN SELECT RAISE(ABORT, 'audit payload is append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS import_publications_kind
+        BEFORE INSERT ON import_publications
+        WHEN (SELECT event_kind FROM audit_events WHERE audit_event_id = NEW.audit_event_id)
+             != 'import_published'
+        BEGIN SELECT RAISE(ABORT, 'wrong audit payload type'); END;
+        CREATE TRIGGER IF NOT EXISTS metadata_tombstones_kind
+        BEFORE INSERT ON metadata_tombstones
+        WHEN (SELECT event_kind FROM audit_events WHERE audit_event_id = NEW.audit_event_id)
+             != 'metadata_tombstone'
+        BEGIN SELECT RAISE(ABORT, 'wrong audit payload type'); END;
+        CREATE TRIGGER IF NOT EXISTS metadata_tombstones_backward
+        BEFORE INSERT ON metadata_tombstones
+        WHEN ((SELECT audit_position FROM audit_events
+               WHERE audit_event_id = NEW.target_audit_event_id)
+              >= (SELECT audit_position FROM audit_events
+                  WHERE audit_event_id = NEW.audit_event_id))
+          OR (NEW.replacement_audit_event_id IS NOT NULL
+              AND (SELECT audit_position FROM audit_events
+                   WHERE audit_event_id = NEW.replacement_audit_event_id)
+                  >= (SELECT audit_position FROM audit_events
+                      WHERE audit_event_id = NEW.audit_event_id))
+        BEGIN SELECT RAISE(ABORT, 'tombstone target must be earlier'); END;
+        CREATE TRIGGER IF NOT EXISTS metadata_tombstones_no_update
+        BEFORE UPDATE ON metadata_tombstones
+        BEGIN SELECT RAISE(ABORT, 'audit payload is append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS metadata_tombstones_no_delete
+        BEFORE DELETE ON metadata_tombstones
+        BEGIN SELECT RAISE(ABORT, 'audit payload is append-only'); END;
         CREATE TABLE IF NOT EXISTS analysis_receipts (
             operation_id TEXT PRIMARY KEY,
             analysis_run_id TEXT NOT NULL,
@@ -644,6 +874,13 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL
         );
         """
+    )
+    metadata.executemany(
+        "INSERT OR IGNORE INTO rule_version_refs VALUES (?, ?)",
+        (
+            (_IDENTITY_RULE_VERSION, "identity"),
+            (_MAPPING_RULE_VERSION, "mapping"),
+        ),
     )
     import_columns = {
         str(row[1]) for row in metadata.execute("PRAGMA table_info(imports)").fetchall()
@@ -725,23 +962,28 @@ class LocalStore:
         ).fetchone()
         active_bytes = 0
         if active is not None:
-            active_path = (
-                self._root
-                / _PARQUET_DIRECTORY
-                / "snapshots"
-                / str(active[0])
-                / "samples.parquet"
-            )
             try:
-                escaped = str(active_path).replace("'", "''")
-                uncompressed = self._query.execute(
-                    "SELECT sum(total_uncompressed_size) "
-                    f"FROM parquet_metadata('{escaped}')"
-                ).fetchone()
-                active_bytes = max(
-                    active_path.stat().st_blocks * 512,
-                    0 if uncompressed is None or uncompressed[0] is None else int(uncompressed[0]),
-                )
+                for filename in _SNAPSHOT_SCHEMAS:
+                    active_path = (
+                        self._root
+                        / _PARQUET_DIRECTORY
+                        / "snapshots"
+                        / str(active[0])
+                        / filename
+                    )
+                    escaped = str(active_path).replace("'", "''")
+                    uncompressed = self._query.execute(
+                        "SELECT sum(total_uncompressed_size) "
+                        f"FROM parquet_metadata('{escaped}')"
+                    ).fetchone()
+                    active_bytes += max(
+                        active_path.stat().st_blocks * 512,
+                        (
+                            0
+                            if uncompressed is None or uncompressed[0] is None
+                            else int(uncompressed[0])
+                        ),
+                    )
             except (OSError, duckdb.Error):
                 return probe_capacity(self._root, None)
         try:
@@ -798,7 +1040,29 @@ class LocalStore:
             if self._mode is DataMode.REAL and has_personal_data
             else PersonBindingStatus.UNBOUND
         )
-        if identity.schema_version == "1.0":
+        store_id = uuid4().hex
+        active = self._metadata.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'active_snapshot'"
+        ).fetchone()
+        if active is not None:
+            snapshot = self._metadata.execute(
+                "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
+            ).fetchone()
+            if snapshot is not None:
+                try:
+                    candidate = json.loads(
+                        (
+                            self._root
+                            / _PARQUET_DIRECTORY
+                            / "snapshots"
+                            / str(snapshot[0])
+                            / "manifest.json"
+                        ).read_bytes()
+                    )["store_id"]
+                    store_id = str(StoreId(str(candidate)))
+                except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    pass
+        if identity.schema_version in {"1", "1.0"}:
             backup_directory = self._root / "migration-backups"
             backup_directory.mkdir(exist_ok=True)
             backup_path = backup_directory / (
@@ -812,7 +1076,7 @@ class LocalStore:
             self._metadata.execute(_STORE_IDENTITY_DDL)
             self._metadata.execute(
                 "INSERT INTO store_identity VALUES (1, ?, ?, ?, ?)",
-                (self._mode.value, _STORE_SCHEMA_VERSION, uuid4().hex, binding.value),
+                (self._mode.value, _STORE_SCHEMA_VERSION, store_id, binding.value),
             )
             self._metadata.execute("DROP TABLE legacy_store_identity")
         return self.load_identity()
@@ -831,6 +1095,7 @@ class LocalStore:
         try:
             store = cls._open(root, mode, initialize=True)
             store._recover_imports()
+            store._validate_store()
             return store
         except Exception:
             if store is not None:
@@ -848,6 +1113,7 @@ class LocalStore:
         try:
             store = cls._open(root, mode, initialize=True, writer_lock=writer_lock)
             store._recover_imports()
+            store._validate_store()
             return store
         except Exception:
             if store is None:
@@ -875,6 +1141,7 @@ class LocalStore:
                 metadata_path if initialize else f"{metadata_path.resolve().as_uri()}?mode=ro",
                 uri=not initialize,
             )
+            metadata.execute("PRAGMA foreign_keys = ON")
             identity_table = metadata.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_identity'"
             ).fetchone()
@@ -887,13 +1154,19 @@ class LocalStore:
             )
             if existing_identity is not None:
                 existing_mode, existing_schema = map(str, existing_identity)
-                if existing_mode != mode.value or existing_schema not in {"1.0", "1.1", "1.2"}:
+                if existing_mode != mode.value or existing_schema not in {
+                    "1",
+                    "1.0",
+                    "1.1",
+                    "1.2",
+                    str(_STORE_SCHEMA_VERSION),
+                }:
                     raise StoreConfigurationError(
                         "Datenspeicher gehört zu einem anderen Modus oder Schema."
                     )
             legacy_identity = (
                 existing_identity is not None
-                and str(existing_identity[1]) != _STORE_SCHEMA_VERSION
+                and str(existing_identity[1]) != str(_STORE_SCHEMA_VERSION)
             )
             if initialize and not legacy_identity:
                 (root / _PARQUET_DIRECTORY).mkdir(exist_ok=True)
@@ -925,9 +1198,10 @@ class LocalStore:
                 metadata.commit()
             elif (
                 str(identity[0]) != mode.value
-                or str(identity[1]) not in {"1.0", "1.1", "1.2"}
+                or str(identity[1])
+                not in {"1", "1.0", "1.1", "1.2", str(_STORE_SCHEMA_VERSION)}
                 or (
-                    str(identity[1]) == _STORE_SCHEMA_VERSION
+                    str(identity[1]) == str(_STORE_SCHEMA_VERSION)
                     and (identity[2] is None or not str(identity[2]))
                 )
             ):
@@ -1138,48 +1412,70 @@ class LocalStore:
         self._query.execute(
             """
             CREATE OR REPLACE TEMP TABLE staged_samples (
-                logical_measurement_id VARCHAR,
                 measurement_version_id VARCHAR,
-                data_type VARCHAR,
+                identity_candidate_id VARCHAR,
+                payload_sha256 VARCHAR,
+                canonical_type VARCHAR,
                 canonical_unit VARCHAR,
                 canonical_value DOUBLE,
+                source_start_utc VARCHAR,
+                source_end_utc VARCHAR,
+                source_updated_at_utc VARCHAR,
+                source_start_offset_minutes INTEGER,
+                source_end_offset_minutes INTEGER,
+                source_updated_at_offset_minutes INTEGER,
                 measurement_local_date DATE,
-                source_start VARCHAR,
-                source_end VARCHAR,
-                source_updated_at VARCHAR,
                 source_name VARCHAR,
                 source_version VARCHAR,
                 device VARCHAR,
                 original_value DOUBLE,
                 original_unit VARCHAR,
-                first_import_id VARCHAR,
-                first_observed_at VARCHAR
+                strong_source_id_hash VARCHAR
             )
             """
         )
         self._query.executemany(
             """
             INSERT INTO staged_samples
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
-                    str(record.logical_measurement_id),
                     str(record.measurement_version_id),
+                    str(record.logical_measurement_id),
+                    hashlib.sha256(
+                        json.dumps(
+                            {
+                                "type": record.data_type.value,
+                                "unit": record.unit.value,
+                                "value": record.value,
+                                "start": record.source_start.isoformat(),
+                                "end": record.source_end.isoformat(),
+                                "updated": record.source_updated_at.isoformat(),
+                                "source": record.provenance.source_name,
+                                "source_version": record.provenance.source_version,
+                                "device": record.provenance.device,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode()
+                    ).hexdigest(),
                     record.data_type.value,
                     record.unit.value,
                     record.value,
-                    record.measurement_local_day,
-                    record.source_start.isoformat(),
-                    record.source_end.isoformat(),
+                    record.source_start.astimezone(UTC).isoformat(),
+                    record.source_end.astimezone(UTC).isoformat(),
                     record.source_updated_at.astimezone(UTC).isoformat(),
+                    _utc_offset_minutes(record.source_start),
+                    _utc_offset_minutes(record.source_end),
+                    _utc_offset_minutes(record.source_updated_at),
+                    record.measurement_local_day,
                     record.provenance.source_name,
                     record.provenance.source_version,
                     record.provenance.device,
                     record.provenance.original_value,
                     record.provenance.original_unit,
-                    str(import_id),
-                    observed_at.astimezone(UTC).isoformat(),
+                    None,
                 )
                 for record in records
             ],
@@ -1197,7 +1493,11 @@ class LocalStore:
             previous_count = 0
         else:
             current_path = (
-                self._root / _PARQUET_DIRECTORY / "snapshots" / str(active[0]) / "samples.parquet"
+                self._root
+                / _PARQUET_DIRECTORY
+                / "snapshots"
+                / str(active[0])
+                / "measurement_versions.parquet"
             )
             escaped_current = str(current_path).replace("'", "''")
             previous_row = self._query.execute(
@@ -1219,7 +1519,7 @@ class LocalStore:
                 """
             )
         count_row = self._query.execute(
-            "SELECT count(*), count(DISTINCT logical_measurement_id) FROM combined_samples"
+            "SELECT count(*), count(DISTINCT identity_candidate_id) FROM combined_samples"
         ).fetchone()
         _allocation_checkpoint(self._root, "combined")
         assert count_row is not None
@@ -1250,31 +1550,33 @@ class LocalStore:
             shutil.rmtree(self._root / "staging" / str(import_id), ignore_errors=True)
             return result
 
-        parquet_path = staging / "samples.parquet"
-        escaped_path = str(parquet_path).replace("'", "''")
-        self._query.execute(
-            f"""
-            COPY (SELECT * EXCLUDE(source_priority) FROM combined_samples)
-            TO '{escaped_path}' (FORMAT PARQUET)
-            """
+        audit_position = int(
+            self._metadata.execute(
+                "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+            ).fetchone()[0]
         )
-        validation = self._query.execute(
-            f"SELECT count(*) FROM read_parquet('{escaped_path}')"
-        ).fetchone()
-        if validation is None or int(validation[0]) != version_count:
-            raise StoreError("Staging-Snapshot konnte nicht validiert werden.")
-        self._write_manifest(
+        manifest_sha256 = self._stage_snapshot(
             staging,
             operation_id=operation_id,
-            import_id=import_id,
             snapshot_id=snapshot_id,
-            status="published",
-            record_count=version_count,
+            parent_snapshot_id=None if active is None else SnapshotId(str(active[0])),
+            package_hash=package_hash,
+            records=records,
+            audit_position=audit_position,
         )
         _allocation_checkpoint(self._root, "staged")
+        _publication_fault_point(self._root, "import.before_snapshot_move/v1")
         snapshot.parent.mkdir(parents=True, exist_ok=True)
         staging.replace(snapshot)
+        _publication_fault_point(self._root, "import.after_snapshot_move/v1")
+        completed_at = datetime.now(UTC).isoformat()
+        audit_event_id = uuid4().hex
         with self._metadata:
+            self._metadata.execute(
+                "INSERT INTO write_operations VALUES (?, 'import_health_export', ?, ?, "
+                "'committed', 1)",
+                (str(operation_id), observed_at.astimezone(UTC).isoformat(), completed_at),
+            )
             self._record_import(
                 operation_id=operation_id,
                 import_id=import_id,
@@ -1286,14 +1588,44 @@ class LocalStore:
                 records=records,
             )
             self._metadata.execute(
+                "INSERT INTO dataset_snapshots VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    str(snapshot_id),
+                    _SNAPSHOT_SCHEMA_VERSION,
+                    manifest_sha256,
+                    str(operation_id),
+                    None if active is None else str(active[0]),
+                    completed_at,
+                ),
+            )
+            self._metadata.execute(
+                "INSERT INTO snapshot_activations VALUES (?, ?, ?, ?, 'import', ?)",
+                (
+                    uuid4().hex,
+                    str(operation_id),
+                    str(snapshot_id),
+                    None if active is None else str(active[0]),
+                    completed_at,
+                ),
+            )
+            self._metadata.execute(
                 """
                 INSERT INTO active_snapshot(singleton, snapshot_id) VALUES (1, ?)
                 ON CONFLICT(singleton) DO UPDATE SET snapshot_id = excluded.snapshot_id
                 """,
                 (str(snapshot_id),),
             )
+            self._metadata.execute(
+                "INSERT INTO audit_events VALUES (?, ?, ?, 'import_published', ?)",
+                (audit_position, audit_event_id, str(operation_id), completed_at),
+            )
+            self._metadata.execute(
+                "INSERT INTO import_publications VALUES (?, ?, ?)",
+                (audit_event_id, str(import_id), str(snapshot_id)),
+            )
             self._bind_person()
             _allocation_checkpoint(self._root, "activated")
+            _publication_fault_point(self._root, "import.before_sqlite_commit/v1")
         return PublishImportResult(
             status="committed",
             snapshot_id=snapshot_id,
@@ -1301,6 +1633,704 @@ class LocalStore:
             logical_measurement_count=logical_count,
             measurement_version_count=version_count,
         )
+
+    def _stage_snapshot(
+        self,
+        directory: Path,
+        *,
+        operation_id: OperationId,
+        snapshot_id: SnapshotId,
+        parent_snapshot_id: SnapshotId | None,
+        package_hash: str,
+        records: tuple[CanonicalHealthRecord, ...],
+        audit_position: int,
+    ) -> str:
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE staged_occurrences (
+                occurrence_id VARCHAR,
+                export_id VARCHAR,
+                export_ordinal BIGINT,
+                identity_candidate_id VARCHAR,
+                measurement_version_id VARCHAR,
+                mapping_rule_version_id VARCHAR,
+                occurrence_fingerprint VARCHAR
+            )
+            """
+        )
+        self._query.executemany(
+            "INSERT INTO staged_occurrences VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    hashlib.sha256(f"{package_hash}:{ordinal}".encode()).hexdigest(),
+                    package_hash,
+                    ordinal,
+                    str(record.logical_measurement_id),
+                    str(record.measurement_version_id),
+                    _MAPPING_RULE_VERSION,
+                    hashlib.sha256(
+                        f"{package_hash}:{ordinal}:{record.measurement_version_id}".encode()
+                    ).hexdigest(),
+                )
+                for ordinal, record in enumerate(records, start=1)
+            ],
+        )
+        if parent_snapshot_id is None:
+            self._query.execute(
+                "CREATE OR REPLACE TEMP TABLE source_occurrences AS "
+                "SELECT * FROM staged_occurrences"
+            )
+        else:
+            previous = (
+                self._root
+                / _PARQUET_DIRECTORY
+                / "snapshots"
+                / str(parent_snapshot_id)
+                / "source_occurrences.parquet"
+            )
+            escaped_previous = str(previous).replace("'", "''")
+            self._query.execute(
+                f"""
+                CREATE OR REPLACE TEMP TABLE source_occurrences AS
+                SELECT * FROM (
+                    SELECT * FROM read_parquet('{escaped_previous}')
+                    UNION ALL BY NAME
+                    SELECT * FROM staged_occurrences
+                )
+                QUALIFY row_number() OVER (
+                    PARTITION BY occurrence_id ORDER BY export_id, export_ordinal
+                ) = 1
+                """
+            )
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE measurement_versions AS
+            SELECT * EXCLUDE(source_priority) FROM combined_samples
+            """
+        )
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE source_resolutions AS
+            SELECT
+                identity_candidate_id AS logical_measurement_id,
+                measurement_version_id AS selected_measurement_version_id,
+                'included_source'::VARCHAR AS disposition,
+                canonical_value AS effective_value,
+                canonical_unit,
+                'source'::VARCHAR AS effective_value_source,
+                NULL::VARCHAR AS effective_decision_id,
+                NULL::VARCHAR AS correction_decision_id,
+                NULL::VARCHAR AS source_deletion_decision_id,
+                NULL::VARCHAR AS conflict_resolution_decision_id
+            FROM measurement_versions
+            QUALIFY row_number() OVER (
+                PARTITION BY identity_candidate_id
+                ORDER BY source_updated_at_utc DESC, source_version DESC,
+                         measurement_version_id DESC
+            ) = 1
+            """
+        )
+        if parent_snapshot_id is None:
+            self._query.execute(
+                "CREATE OR REPLACE TEMP TABLE resolved_measurements AS "
+                "SELECT * FROM source_resolutions"
+            )
+            self._query.execute(
+                """
+                CREATE OR REPLACE TEMP TABLE open_review_cases AS
+                SELECT NULL::VARCHAR AS review_case_id,
+                       NULL::VARCHAR AS case_kind,
+                       NULL::VARCHAR AS logical_measurement_id,
+                       NULL::VARCHAR AS measurement_version_id,
+                       NULL::VARCHAR AS rule_version_id,
+                       NULL::VARCHAR AS evidence_fingerprint
+                WHERE false
+                """
+            )
+        else:
+            previous_directory = (
+                self._root / _PARQUET_DIRECTORY / "snapshots" / str(parent_snapshot_id)
+            )
+            previous_resolved = str(
+                previous_directory / "resolved_measurements.parquet"
+            ).replace("'", "''")
+            previous_reviews = str(previous_directory / "open_review_cases.parquet").replace(
+                "'", "''"
+            )
+            self._query.execute(
+                f"""
+                CREATE OR REPLACE TEMP TABLE resolved_measurements AS
+                SELECT * FROM read_parquet('{previous_resolved}')
+                WHERE disposition != 'included_source'
+                UNION ALL BY NAME
+                SELECT current.* FROM source_resolutions current
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM read_parquet('{previous_resolved}') previous
+                    WHERE previous.logical_measurement_id = current.logical_measurement_id
+                      AND previous.disposition != 'included_source'
+                )
+                """
+            )
+            self._query.execute(
+                "CREATE OR REPLACE TEMP TABLE open_review_cases AS "
+                f"SELECT * FROM read_parquet('{previous_reviews}')"
+            )
+
+        entries: list[dict[str, int | str]] = []
+        for filename in sorted(_SNAPSHOT_SCHEMAS):
+            table = filename.removesuffix(".parquet")
+            path = directory / filename
+            escaped = str(path).replace("'", "''")
+            self._query.execute(
+                f"COPY (SELECT * FROM {table}) TO '{escaped}' (FORMAT PARQUET)"
+            )
+            description = tuple(
+                (str(row[0]), str(row[1]))
+                for row in self._query.execute(
+                    f"DESCRIBE SELECT * FROM read_parquet('{escaped}')"
+                ).fetchall()
+            )
+            if description != _SNAPSHOT_SCHEMAS[filename]:
+                raise StoreError("Staging-Snapshot besitzt ein unerwartetes Schema.")
+            row = self._query.execute(
+                f"SELECT count(*) FROM read_parquet('{escaped}')"
+            ).fetchone()
+            assert row is not None
+            entries.append(
+                {
+                    "name": filename,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "allocated_bytes": path.stat().st_blocks * 512,
+                    "row_count": int(row[0]),
+                    "parquet_schema_fingerprint": hashlib.sha256(
+                        json.dumps(description, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                }
+            )
+
+        count_row = self._query.execute(
+            """
+            SELECT
+                (SELECT count(DISTINCT export_id) FROM source_occurrences),
+                (SELECT count(*) FROM source_occurrences),
+                (SELECT count(*) FROM measurement_versions),
+                (SELECT count(*) FROM resolved_measurements),
+                (SELECT count(*) FROM resolved_measurements
+                   WHERE disposition LIKE 'included%'),
+                (SELECT count(*) FROM resolved_measurements
+                   WHERE disposition LIKE 'excluded%'),
+                (SELECT count(*) FROM open_review_cases)
+            """
+        ).fetchone()
+        assert count_row is not None
+        (
+            export_count,
+            occurrence_count,
+            version_count,
+            logical_count,
+            included_count,
+            excluded_count,
+            open_count,
+        ) = map(int, count_row)
+        store_row = self._metadata.execute(
+            "SELECT store_id FROM store_identity WHERE singleton = 1"
+        ).fetchone()
+        if store_row is None or store_row[0] is None:
+            raise StoreError("Datenspeicheridentität fehlt.")
+        manifest = {
+            "snapshot_schema_version": _SNAPSHOT_SCHEMA_VERSION,
+            "snapshot_id": str(snapshot_id),
+            "store_id": str(store_row[0]),
+            "created_at_utc": datetime.now(UTC).isoformat(),
+            "created_by_operation_id": str(operation_id),
+            "parent_snapshot_id": (
+                None if parent_snapshot_id is None else str(parent_snapshot_id)
+            ),
+            "resolution_basis": {
+                "audit_max_position": audit_position,
+                "governing_export_id": package_hash,
+                "identity_rule_version_id": _IDENTITY_RULE_VERSION,
+                "mapping_rule_version_id": _MAPPING_RULE_VERSION,
+            },
+            "files": entries,
+            "validation_counts": {
+                "exports": export_count,
+                "source_occurrences": occurrence_count,
+                "measurement_versions": version_count,
+                "logical_measurements": logical_count,
+                "included": included_count,
+                "excluded": excluded_count,
+                "open_review_cases": open_count,
+            },
+        }
+        manifest_bytes = json.dumps(
+            manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode()
+        (directory / "manifest.json").write_bytes(manifest_bytes)
+        manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+        self._validate_snapshot(directory, str(snapshot_id), manifest_sha256)
+        return manifest_sha256
+
+    def _validate_store(self) -> None:
+        if self._metadata.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+            raise StoreError("SQLite-Integritätsprüfung fehlgeschlagen.")
+        if self._metadata.execute("PRAGMA foreign_key_check").fetchall():
+            raise StoreError("SQLite-Fremdschlüsselprüfung fehlgeschlagen.")
+        identity_columns = {
+            str(row[1])
+            for row in self._metadata.execute("PRAGMA table_info(store_identity)").fetchall()
+        }
+        if "store_id" not in identity_columns:
+            return
+        identity = self._metadata.execute(
+            "SELECT store_id FROM store_identity WHERE singleton = 1"
+        ).fetchone()
+        if identity is None or identity[0] is None:
+            return
+        tables = {
+            str(row[0])
+            for row in self._metadata.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "audit_events" in tables:
+            audit = self._metadata.execute(
+                """
+                SELECT count(*), COALESCE(MIN(audit_position), 1),
+                       COALESCE(MAX(audit_position), 0),
+                       count(import_publications.audit_event_id)
+                       + count(metadata_tombstones.audit_event_id)
+                FROM audit_events
+                LEFT JOIN import_publications USING (audit_event_id)
+                LEFT JOIN metadata_tombstones USING (audit_event_id)
+                """
+            ).fetchone()
+            assert audit is not None
+            count, minimum, maximum, payload_count = map(int, audit)
+            if minimum != 1 or maximum != count or payload_count != count:
+                raise StoreError("Auditfolge ist nicht lückenlos oder vollständig.")
+        if "dataset_snapshots" not in tables:
+            return
+        snapshots = self._metadata.execute(
+            """
+            SELECT snapshot_id, manifest_sha256, snapshot_schema_version,
+                   created_by_operation_id, parent_snapshot_id
+            FROM dataset_snapshots
+            """
+        ).fetchall()
+        for snapshot_id, manifest_sha256, schema_version, operation_id, parent_id in snapshots:
+            snapshot_id = str(snapshot_id)
+            self._validate_snapshot(
+                self._root / _PARQUET_DIRECTORY / "snapshots" / snapshot_id,
+                snapshot_id,
+                str(manifest_sha256),
+            )
+            manifest = json.loads(
+                (
+                    self._root
+                    / _PARQUET_DIRECTORY
+                    / "snapshots"
+                    / snapshot_id
+                    / "manifest.json"
+                ).read_bytes()
+            )
+            if (
+                manifest["snapshot_schema_version"] != schema_version
+                or manifest["created_by_operation_id"] != operation_id
+                or manifest["parent_snapshot_id"] != parent_id
+            ):
+                raise StoreError("Snapshot-Katalog und Manifest widersprechen sich.")
+
+    def _validate_snapshot(
+        self, directory: Path, snapshot_id: str, manifest_sha256: str
+    ) -> None:
+        try:
+            manifest_bytes = (directory / "manifest.json").read_bytes()
+            manifest = json.loads(manifest_bytes)
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise StoreError("Snapshot-Manifest ist nicht lesbar.") from error
+        store_row = self._metadata.execute(
+            "SELECT store_id FROM store_identity WHERE singleton = 1"
+        ).fetchone()
+        resolution_basis = manifest.get("resolution_basis") if isinstance(manifest, dict) else None
+        validation_counts = (
+            manifest.get("validation_counts") if isinstance(manifest, dict) else None
+        )
+        if (
+            not isinstance(manifest, dict)
+            or store_row is None
+            or manifest.get("store_id") != store_row[0]
+            or manifest_bytes
+            != json.dumps(
+                manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+            ).encode()
+            or hashlib.sha256(manifest_bytes).hexdigest() != manifest_sha256
+            or set(manifest)
+            != {
+                "snapshot_schema_version",
+                "snapshot_id",
+                "store_id",
+                "created_at_utc",
+                "created_by_operation_id",
+                "parent_snapshot_id",
+                "resolution_basis",
+                "files",
+                "validation_counts",
+            }
+            or manifest["snapshot_schema_version"] != _SNAPSHOT_SCHEMA_VERSION
+            or manifest["snapshot_id"] != snapshot_id
+            or not _is_lower_hex(manifest["snapshot_id"], 32)
+            or not _is_lower_hex(manifest["store_id"], 32)
+            or not _is_timestamp(manifest["created_at_utc"])
+            or not _is_lower_hex(manifest["created_by_operation_id"], 32)
+            or (
+                manifest["parent_snapshot_id"] is not None
+                and not _is_lower_hex(manifest["parent_snapshot_id"], 32)
+            )
+            or not isinstance(resolution_basis, dict)
+            or set(resolution_basis)
+            != {
+                "audit_max_position",
+                "governing_export_id",
+                "identity_rule_version_id",
+                "mapping_rule_version_id",
+            }
+            or type(resolution_basis["audit_max_position"]) is not int
+            or resolution_basis["audit_max_position"] < 1
+            or not _is_lower_hex(resolution_basis["governing_export_id"], 64)
+            or resolution_basis["identity_rule_version_id"] != _IDENTITY_RULE_VERSION
+            or resolution_basis["mapping_rule_version_id"] != _MAPPING_RULE_VERSION
+            or not isinstance(validation_counts, dict)
+            or set(validation_counts)
+            != {
+                "exports",
+                "source_occurrences",
+                "measurement_versions",
+                "logical_measurements",
+                "included",
+                "excluded",
+                "open_review_cases",
+            }
+            or any(type(value) is not int or value < 0 for value in validation_counts.values())
+        ):
+            raise StoreError("Snapshot-Manifest ist nicht kanonisch oder gültig.")
+        files = manifest["files"]
+        if (
+            not isinstance(files, list)
+            or any(not isinstance(entry, dict) for entry in files)
+            or tuple(entry.get("name") for entry in files)
+            != tuple(sorted(_SNAPSHOT_SCHEMAS))
+        ):
+            raise StoreError("Snapshot enthält nicht genau vier geschlossene Dateien.")
+        for entry in files:
+            if not isinstance(entry, dict) or set(entry) != {
+                "name",
+                "sha256",
+                "allocated_bytes",
+                "row_count",
+                "parquet_schema_fingerprint",
+            }:
+                raise StoreError("Snapshot-Dateieintrag ist ungültig.")
+            filename = str(entry["name"])
+            if (
+                not _is_lower_hex(entry["sha256"], 64)
+                or not _is_lower_hex(entry["parquet_schema_fingerprint"], 64)
+                or type(entry["allocated_bytes"]) is not int
+                or entry["allocated_bytes"] < 0
+                or type(entry["row_count"]) is not int
+                or entry["row_count"] < 0
+            ):
+                raise StoreError("Snapshot-Dateieintrag ist ungültig.")
+            path = directory / filename
+            try:
+                allocated_bytes = path.stat().st_blocks * 512
+                sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError as error:
+                raise StoreError("Snapshot-Datei fehlt.") from error
+            escaped = str(path).replace("'", "''")
+            try:
+                description = tuple(
+                    (str(row[0]), str(row[1]))
+                    for row in self._query.execute(
+                        f"DESCRIBE SELECT * FROM read_parquet('{escaped}')"
+                    ).fetchall()
+                )
+                row = self._query.execute(
+                    f"SELECT count(*) FROM read_parquet('{escaped}')"
+                ).fetchone()
+            except duckdb.Error as error:
+                raise StoreError("Snapshot-Parquet ist nicht lesbar.") from error
+            schema_fingerprint = hashlib.sha256(
+                json.dumps(description, separators=(",", ":")).encode()
+            ).hexdigest()
+            if (
+                description != _SNAPSHOT_SCHEMAS[filename]
+                or row is None
+                or int(row[0]) != entry["row_count"]
+                or allocated_bytes != entry["allocated_bytes"]
+                or sha256 != entry["sha256"]
+                or schema_fingerprint != entry["parquet_schema_fingerprint"]
+            ):
+                raise StoreError("Snapshot-Dateivalidierung fehlgeschlagen.")
+        if {path.name for path in directory.iterdir()} != {
+            "manifest.json",
+            *_SNAPSHOT_SCHEMAS,
+        }:
+            raise StoreError("Snapshot enthält unerlaubte Artefakte.")
+        paths = {
+            name.removesuffix(".parquet"): str(directory / name).replace("'", "''")
+            for name in _SNAPSHOT_SCHEMAS
+        }
+        snapshot_decisions = {
+            (str(row[0]), str(row[1]))
+            for row in self._query.execute(
+                f"""
+                SELECT correction_decision_id, 'correction'
+                FROM read_parquet('{paths['resolved_measurements']}')
+                WHERE correction_decision_id IS NOT NULL
+                UNION
+                SELECT source_deletion_decision_id, 'source_deletion'
+                FROM read_parquet('{paths['resolved_measurements']}')
+                WHERE source_deletion_decision_id IS NOT NULL
+                UNION
+                SELECT conflict_resolution_decision_id, 'conflict_resolution'
+                FROM read_parquet('{paths['resolved_measurements']}')
+                WHERE conflict_resolution_decision_id IS NOT NULL
+                UNION
+                SELECT effective_decision_id, 'local_exclusion'
+                FROM read_parquet('{paths['resolved_measurements']}')
+                WHERE disposition = 'excluded_local'
+                """
+            ).fetchall()
+        }
+        has_decision_refs = self._metadata.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'decision_refs'"
+        ).fetchone()
+        cataloged_decisions = (
+            set()
+            if has_decision_refs is None
+            else {
+                (str(row[0]), str(row[1]))
+                for row in self._metadata.execute(
+                    "SELECT decision_id, decision_kind FROM decision_refs"
+                ).fetchall()
+            }
+        )
+        snapshot_rules = {
+            (str(row[0]), str(row[1]))
+            for row in self._query.execute(
+                f"""
+                SELECT mapping_rule_version_id, 'mapping'
+                FROM read_parquet('{paths['source_occurrences']}')
+                UNION
+                SELECT rule_version_id, 'plausibility'
+                FROM read_parquet('{paths['open_review_cases']}')
+                WHERE rule_version_id IS NOT NULL
+                """
+            ).fetchall()
+        }
+        has_rule_refs = self._metadata.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'rule_version_refs'"
+        ).fetchone()
+        cataloged_rules = {
+            (_IDENTITY_RULE_VERSION, "identity"),
+            (_MAPPING_RULE_VERSION, "mapping"),
+        }
+        if has_rule_refs is not None:
+            cataloged_rules.update(
+                (str(row[0]), str(row[1]))
+                for row in self._metadata.execute(
+                    "SELECT rule_version_id, rule_kind FROM rule_version_refs"
+                ).fetchall()
+            )
+        if not snapshot_decisions <= cataloged_decisions or not snapshot_rules <= cataloged_rules:
+            raise StoreError("Snapshot-Entscheidungs- oder Regelreferenz ist nicht geschlossen.")
+        invalid = self._query.execute(
+            f"""
+            WITH
+            occurrences AS (
+                SELECT * FROM read_parquet('{paths['source_occurrences']}')
+            ),
+            versions AS (
+                SELECT * FROM read_parquet('{paths['measurement_versions']}')
+            ),
+            resolved AS (
+                SELECT * FROM read_parquet('{paths['resolved_measurements']}')
+            ),
+            reviews AS (
+                SELECT * FROM read_parquet('{paths['open_review_cases']}')
+            )
+            SELECT
+                (SELECT count(*) - count(DISTINCT occurrence_id) FROM occurrences)
+              + (SELECT count(*) - count(DISTINCT export_id || ':' || export_ordinal)
+                   FROM occurrences)
+              + (SELECT count(*) - count(DISTINCT measurement_version_id) FROM versions)
+              + (SELECT count(*) - count(DISTINCT logical_measurement_id) FROM resolved)
+              + (SELECT count(*) - count(DISTINCT review_case_id) FROM reviews)
+              + (SELECT count(*) FROM occurrences
+                   WHERE occurrence_id IS NULL
+                      OR export_id IS NULL
+                      OR export_ordinal IS NULL OR export_ordinal < 1
+                      OR identity_candidate_id IS NULL
+                      OR measurement_version_id IS NULL
+                      OR mapping_rule_version_id IS NULL
+                      OR occurrence_fingerprint IS NULL
+                      OR NOT regexp_full_match(occurrence_id, '[0-9a-f]{{64}}')
+                      OR NOT regexp_full_match(export_id, '[0-9a-f]{{64}}')
+                      OR NOT regexp_full_match(identity_candidate_id, '[0-9a-f]{{64}}')
+                      OR NOT regexp_full_match(measurement_version_id, '[0-9a-f]{{64}}')
+                      OR NOT regexp_full_match(occurrence_fingerprint, '[0-9a-f]{{64}}'))
+              + (SELECT count(*) FROM occurrences o LEFT JOIN versions v
+                   USING (measurement_version_id)
+                   WHERE v.measurement_version_id IS NULL
+                      OR o.identity_candidate_id != v.identity_candidate_id)
+              + (SELECT count(*) FROM resolved r LEFT JOIN versions v
+                   ON v.measurement_version_id = r.selected_measurement_version_id
+                   WHERE v.measurement_version_id IS NULL
+                      OR v.identity_candidate_id != r.logical_measurement_id
+                      OR r.canonical_unit != v.canonical_unit
+                      OR (r.disposition = 'included_source'
+                          AND r.effective_value != v.canonical_value))
+              + (SELECT count(*) FROM versions
+                   WHERE measurement_version_id IS NULL
+                      OR identity_candidate_id IS NULL
+                      OR payload_sha256 IS NULL
+                      OR NOT regexp_full_match(measurement_version_id, '[0-9a-f]{{64}}')
+                      OR NOT regexp_full_match(identity_candidate_id, '[0-9a-f]{{64}}')
+                      OR NOT regexp_full_match(payload_sha256, '[0-9a-f]{{64}}')
+                      OR canonical_type IS NULL
+                      OR canonical_unit IS NULL
+                      OR canonical_value IS NULL OR NOT isfinite(canonical_value)
+                      OR original_value IS NULL OR NOT isfinite(original_value)
+                      OR source_start_utc IS NULL OR source_end_utc IS NULL
+                      OR source_updated_at_utc IS NULL
+                      OR source_start_utc > source_end_utc
+                      OR measurement_local_date IS NULL
+                      OR canonical_type NOT IN ('active_energy', 'apple_resting_heart_rate')
+                      OR (canonical_type = 'active_energy' AND canonical_unit != 'kcal')
+                      OR (canonical_type = 'apple_resting_heart_rate'
+                          AND canonical_unit != 'count/min'))
+              + (SELECT count(*) FROM resolved
+                   WHERE logical_measurement_id IS NULL
+                      OR selected_measurement_version_id IS NULL
+                      OR canonical_unit IS NULL
+                      OR disposition IS NULL
+                      OR effective_value_source IS NULL
+                      OR NOT regexp_full_match(logical_measurement_id, '[0-9a-f]{{64}}')
+                      OR NOT regexp_full_match(
+                          selected_measurement_version_id, '[0-9a-f]{{64}}'
+                      )
+                      OR (effective_decision_id IS NOT NULL AND NOT regexp_full_match(
+                          effective_decision_id, '[0-9a-f]{{32}}'
+                      ))
+                      OR (correction_decision_id IS NOT NULL AND NOT regexp_full_match(
+                          correction_decision_id, '[0-9a-f]{{32}}'
+                      ))
+                      OR (source_deletion_decision_id IS NOT NULL
+                          AND NOT regexp_full_match(
+                              source_deletion_decision_id, '[0-9a-f]{{32}}'
+                          ))
+                      OR (conflict_resolution_decision_id IS NOT NULL
+                          AND NOT regexp_full_match(
+                              conflict_resolution_decision_id, '[0-9a-f]{{32}}'
+                          ))
+                      OR NOT (
+                       (disposition = 'included_source'
+                        AND effective_value IS NOT NULL AND isfinite(effective_value)
+                        AND effective_value_source = 'source'
+                        AND effective_decision_id IS NULL
+                        AND correction_decision_id IS NULL
+                        AND source_deletion_decision_id IS NULL)
+                       OR
+                       (disposition = 'included_correction'
+                        AND effective_value IS NOT NULL AND isfinite(effective_value)
+                        AND effective_value_source = 'correction'
+                        AND effective_decision_id IS NOT NULL
+                        AND correction_decision_id = effective_decision_id
+                        AND source_deletion_decision_id IS NULL)
+                       OR
+                       (disposition = 'excluded_local'
+                        AND effective_value IS NULL
+                        AND effective_value_source = 'none'
+                        AND effective_decision_id IS NOT NULL
+                        AND correction_decision_id IS NULL
+                        AND source_deletion_decision_id IS NULL)
+                       OR
+                       (disposition = 'excluded_source_deletion'
+                        AND effective_value IS NULL
+                        AND effective_value_source = 'none'
+                        AND effective_decision_id IS NOT NULL
+                        AND correction_decision_id IS NULL
+                        AND source_deletion_decision_id = effective_decision_id)
+                   ))
+              + (SELECT count(*) FROM reviews
+                   WHERE review_case_id IS NULL OR case_kind IS NULL
+                      OR evidence_fingerprint IS NULL
+                      OR NOT regexp_full_match(review_case_id, '[0-9a-f]{{32}}')
+                      OR NOT regexp_full_match(evidence_fingerprint, '[0-9a-f]{{64}}')
+                      OR case_kind NOT IN (
+                          'plausibility', 'continued_override',
+                          'suspected_source_deletion', 'source_conflict'
+                      )
+                      OR NOT (
+                          (case_kind = 'plausibility'
+                           AND measurement_version_id IS NOT NULL
+                           AND rule_version_id IS NOT NULL)
+                          OR
+                          (case_kind = 'continued_override'
+                           AND logical_measurement_id IS NOT NULL
+                           AND measurement_version_id IS NOT NULL
+                           AND rule_version_id IS NULL)
+                          OR
+                          (case_kind IN ('suspected_source_deletion', 'source_conflict')
+                           AND logical_measurement_id IS NOT NULL
+                           AND measurement_version_id IS NULL
+                           AND rule_version_id IS NULL)
+                      ))
+              + (SELECT count(*) FROM reviews r LEFT JOIN versions v
+                   ON v.measurement_version_id = r.measurement_version_id
+                   WHERE r.measurement_version_id IS NOT NULL
+                     AND v.measurement_version_id IS NULL)
+              + (SELECT count(*) FROM reviews r LEFT JOIN resolved m
+                   ON m.logical_measurement_id = r.logical_measurement_id
+                   WHERE r.logical_measurement_id IS NOT NULL
+                     AND m.logical_measurement_id IS NULL)
+            """
+        ).fetchone()
+        if invalid is None or int(invalid[0]) != 0:
+            raise StoreError("Snapshot-ID-Schließung oder Payloadvalidierung fehlgeschlagen.")
+        counts = self._query.execute(
+            f"""
+            SELECT
+                (SELECT count(DISTINCT export_id)
+                   FROM read_parquet('{paths['source_occurrences']}')),
+                (SELECT count(*) FROM read_parquet('{paths['source_occurrences']}')),
+                (SELECT count(*) FROM read_parquet('{paths['measurement_versions']}')),
+                (SELECT count(*) FROM read_parquet('{paths['resolved_measurements']}')),
+                (SELECT count(*) FROM read_parquet('{paths['resolved_measurements']}')
+                   WHERE disposition LIKE 'included%'),
+                (SELECT count(*) FROM read_parquet('{paths['resolved_measurements']}')
+                   WHERE disposition LIKE 'excluded%'),
+                (SELECT count(*) FROM read_parquet('{paths['open_review_cases']}'))
+            """
+        ).fetchone()
+        assert counts is not None
+        if manifest["validation_counts"] != dict(
+            zip(
+                (
+                    "exports",
+                    "source_occurrences",
+                    "measurement_versions",
+                    "logical_measurements",
+                    "included",
+                    "excluded",
+                    "open_review_cases",
+                ),
+                map(int, counts),
+                strict=True,
+            )
+        ):
+            raise StoreError("Snapshot-Validierungszähler stimmen nicht.")
 
     def _record_import(
         self,
@@ -1347,12 +2377,16 @@ class LocalStore:
         diagnostics: tuple[str, ...],
     ) -> PublishImportResult:
         parquet_path = (
-            self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id) / "samples.parquet"
+            self._root
+            / _PARQUET_DIRECTORY
+            / "snapshots"
+            / str(snapshot_id)
+            / "measurement_versions.parquet"
         )
         escaped_path = str(parquet_path).replace("'", "''")
         count_row = self._query.execute(
             f"""
-            SELECT count(*), count(DISTINCT logical_measurement_id)
+            SELECT count(*), count(DISTINCT identity_candidate_id)
             FROM read_parquet('{escaped_path}')
             """
         ).fetchone()
@@ -1376,9 +2410,9 @@ class LocalStore:
         ).fetchone()
         if row is None:
             return ()
-        parquet_path = (
-            self._root / _PARQUET_DIRECTORY / "snapshots" / str(row[0]) / "samples.parquet"
-        )
+        snapshot = self._root / _PARQUET_DIRECTORY / "snapshots" / str(row[0])
+        parquet_path = snapshot / "measurement_versions.parquet"
+        resolved_path = snapshot / "resolved_measurements.parquet"
         clauses: list[str] = []
         parameters: list[date] = []
         if start_date is not None:
@@ -1389,38 +2423,40 @@ class LocalStore:
             parameters.append(end_date)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         escaped_path = str(parquet_path).replace("'", "''")
+        escaped_resolved = str(resolved_path).replace("'", "''")
         rows = self._query.execute(
             f"""
-            WITH preferred_versions AS (
-                SELECT * FROM read_parquet('{escaped_path}')
-                QUALIFY row_number() OVER (
-                    PARTITION BY logical_measurement_id
-                    ORDER BY source_updated_at DESC, first_observed_at DESC,
-                             source_version DESC, measurement_version_id DESC
-                ) = 1
+            WITH effective_versions AS (
+                SELECT versions.* EXCLUDE(canonical_value),
+                       resolved.effective_value AS canonical_value
+                FROM read_parquet('{escaped_path}') AS versions
+                JOIN read_parquet('{escaped_resolved}') AS resolved
+                  ON resolved.selected_measurement_version_id = versions.measurement_version_id
+                WHERE resolved.disposition IN ('included_source', 'included_correction')
             ), projected_samples AS (
-                SELECT * FROM preferred_versions WHERE data_type = 'active_energy'
+                SELECT * FROM effective_versions WHERE canonical_type = 'active_energy'
                 UNION ALL
-                SELECT * FROM preferred_versions
-                WHERE data_type = 'apple_resting_heart_rate'
+                SELECT * FROM effective_versions
+                WHERE canonical_type = 'apple_resting_heart_rate'
                 QUALIFY row_number() OVER (
                     PARTITION BY measurement_local_date
-                    ORDER BY source_updated_at DESC, first_observed_at DESC,
-                             source_version DESC, source_start DESC,
+                    ORDER BY source_updated_at_utc DESC,
+                             source_version DESC, source_start_utc DESC,
                              measurement_version_id DESC
                 ) = 1
             )
-            SELECT data_type, canonical_unit, measurement_local_date,
+            SELECT canonical_type, canonical_unit, measurement_local_date,
                    SUM(canonical_value),
-                   list(source_start ORDER BY source_start),
+                   list(source_start_utc ORDER BY source_start_utc),
                    list(DISTINCT source_name ORDER BY source_name),
-                   list(measurement_version_id ORDER BY source_start),
-                   list(source_updated_at ORDER BY source_start),
-                   list(source_version ORDER BY source_start)
+                   list(measurement_version_id ORDER BY source_start_utc),
+                   list(source_updated_at_utc ORDER BY source_start_utc),
+                   list(source_version ORDER BY source_start_utc),
+                   list(source_start_offset_minutes ORDER BY source_start_utc)
             FROM projected_samples
             {where}
-            GROUP BY data_type, canonical_unit, measurement_local_date
-            ORDER BY data_type, measurement_local_date
+            GROUP BY canonical_type, canonical_unit, measurement_local_date
+            ORDER BY canonical_type, measurement_local_date
             """,
             parameters,
         ).fetchall()
@@ -1435,13 +2471,21 @@ class LocalStore:
             version_ids,
             source_updated_ats,
             source_versions,
+            source_start_offsets,
         ) in rows:
             key = (CanonicalHealthType(data_type), CanonicalUnit(unit))
             grouped.setdefault(key, []).append(
                 DailyHealthValue(
                     day=day,
                     value=value,
-                    source_starts=tuple(datetime.fromisoformat(item) for item in source_starts),
+                    source_starts=tuple(
+                        datetime.fromisoformat(item).astimezone(
+                            timezone(timedelta(minutes=offset))
+                        )
+                        for item, offset in zip(
+                            source_starts, source_start_offsets, strict=True
+                        )
+                    ),
                     source_names=tuple(source_names),
                     measurement_version_ids=tuple(
                         MeasurementVersionId(item) for item in version_ids
@@ -2016,15 +3060,24 @@ class LocalStore:
     def _quarantine_orphaned_import_artifact(
         self, path: Path, label: Literal["staging", "snapshot"]
     ) -> None:
-        recovered_id = f"recovered-{path.name}"
-        import_id = path.name
+        recovered_id = hashlib.sha256(f"recovered:{path.name}".encode()).hexdigest()[:32]
+        import_id = (
+            path.name
+            if len(path.name) == 32 and not set(path.name) - set("0123456789abcdef")
+            else recovered_id
+        )
         operation_id = snapshot_id = recovered_id
         bind_person = label == "snapshot"
         try:
             manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
             if isinstance(manifest, dict):
                 import_id = str(manifest.get("import_id", import_id))
-                operation_id = str(manifest.get("operation_id", recovered_id))
+                operation_id = str(
+                    manifest.get(
+                        "operation_id",
+                        manifest.get("created_by_operation_id", recovered_id),
+                    )
+                )
                 snapshot_id = str(manifest.get("snapshot_id", recovered_id))
                 bind_person = manifest.get("status") in {"reading_package", "published"}
         except (OSError, UnicodeError, json.JSONDecodeError):
@@ -2059,7 +3112,10 @@ class LocalStore:
         for path in quarantine_root.iterdir():
             if not path.is_dir():
                 continue
-            operation_id = snapshot_id = f"recovered-{path.name}"
+            recovered_id = hashlib.sha256(
+                f"recovered:{path.name}".encode()
+            ).hexdigest()[:32]
+            operation_id = snapshot_id = recovered_id
             personal_artifacts = (path / "snapshot").exists()
             for label in ("staging", "snapshot"):
                 try:
@@ -2067,7 +3123,12 @@ class LocalStore:
                         (path / label / "manifest.json").read_text(encoding="utf-8")
                     )
                     if isinstance(manifest, dict):
-                        operation_id = str(manifest.get("operation_id", operation_id))
+                        operation_id = str(
+                            manifest.get(
+                                "operation_id",
+                                manifest.get("created_by_operation_id", operation_id),
+                            )
+                        )
                         snapshot_id = str(manifest.get("snapshot_id", snapshot_id))
                         personal_artifacts = personal_artifacts or manifest.get("status") in {
                             "reading_package",

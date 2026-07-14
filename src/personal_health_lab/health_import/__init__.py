@@ -46,6 +46,10 @@ class HealthImportError(Exception):
     """The import could not complete because its internal store failed."""
 
 
+class _RejectedPackage(ValueError):
+    """The package boundary is unsafe or unsupported."""
+
+
 @dataclass(frozen=True, slots=True)
 class HealthImportResult:
     operation_id: OperationId
@@ -87,14 +91,14 @@ def _records(
     max_compression_ratio: float,
 ) -> tuple[CanonicalHealthRecord, ...]:
     if not package_path.is_file() or not is_zipfile(package_path):
-        raise ValueError("invalid zip")
+        raise _RejectedPackage("invalid zip")
     if package_path.stat().st_size > max_package_bytes:
-        raise ValueError("package too large")
+        raise _RejectedPackage("package too large")
     records: list[CanonicalHealthRecord] = []
     with ZipFile(package_path) as archive:
         entries = archive.infolist()
         if len(entries) > max_entries:
-            raise ValueError("too many entries")
+            raise _RejectedPackage("too many entries")
         total_size = 0
         export_count = 0
         for entry in entries:
@@ -113,20 +117,20 @@ def _records(
                 or total_size > max_uncompressed_bytes
                 or entry.file_size / max(entry.compress_size, 1) > max_compression_ratio
             ):
-                raise ValueError("unsafe archive entry")
+                raise _RejectedPackage("unsafe archive entry")
             if entry.is_dir():
                 continue
             if entry.filename != _EXPORT_MEMBER:
-                raise ValueError("unsupported archive entry")
+                raise _RejectedPackage("unsupported archive entry")
             export_count += 1
         if export_count != 1:
-            raise ValueError("missing or duplicate export.xml")
+            raise _RejectedPackage("missing or duplicate export.xml")
         with archive.open(_EXPORT_MEMBER) as source:
             tail = b""
             while chunk := source.read(64 * 1024):
                 probe = (tail + chunk).upper()
                 if b"\0" in probe or b"<!DOCTYPE" in probe or b"<!ENTITY" in probe:
-                    raise ValueError("unsafe xml declaration")
+                    raise _RejectedPackage("unsafe xml declaration")
                 tail = probe[-8:]
         with archive.open(_EXPORT_MEMBER) as source:
             root_seen = False
@@ -247,7 +251,7 @@ def import_health_export(
         )
         try:
             if package_path.stat().st_size > max_package_bytes:
-                raise ValueError("package too large")
+                raise _RejectedPackage("package too large")
             with package_path.open("rb") as package:
                 package_hash = hashlib.file_digest(package, "sha256").hexdigest()
             store.mark_import_reading(import_id)
@@ -260,13 +264,10 @@ def import_health_export(
                 max_compression_ratio=max_compression_ratio,
             )
         except (
+            _RejectedPackage,
             OSError,
             BadZipFile,
-            KeyError,
             NotImplementedError,
-            ParseError,
-            RuntimeError,
-            ValueError,
         ):
             store.reject_import(import_id, package_hash)
             return HealthImportResult(
@@ -277,6 +278,17 @@ def import_health_export(
                 snapshot_id=None,
                 record_count=0,
                 diagnostics=("invalid_health_export",),
+            )
+        except (KeyError, ParseError, RuntimeError, ValueError):
+            store.quarantine_import(import_id, snapshot_id, "invalid_health_data")
+            return HealthImportResult(
+                operation_id=operation_id,
+                import_id=import_id,
+                status="quarantined",
+                package_hash=package_hash,
+                snapshot_id=None,
+                record_count=0,
+                diagnostics=("invalid_health_data",),
             )
         try:
             published = store.publish_import(

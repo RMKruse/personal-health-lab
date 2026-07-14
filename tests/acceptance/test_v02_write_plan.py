@@ -79,6 +79,39 @@ REGISTERED_CASES.update(
 )
 REGISTERED_CASES.update(
     {
+        "V02-A-STO-001": "test_import_publishes_one_validated_four_file_snapshot",
+        "V02-A-STO-002": "test_sqlite_catalog_and_audit_constraints_are_hard",
+        "V02-A-STO-003": "test_import_publishes_one_validated_four_file_snapshot",
+        "V02-A-STO-004": "test_sqlite_catalog_and_audit_constraints_are_hard",
+        "V02-A-STO-005": "test_sqlite_catalog_and_audit_constraints_are_hard",
+        "V02-A-STO-006": "test_sqlite_catalog_and_audit_constraints_are_hard",
+        "V02-A-STO-007": "test_import_publishes_one_validated_four_file_snapshot",
+        "V02-A-STO-008": (
+            "test_snapshot_validation_rejects_every_closed_contract_violation"
+        ),
+        "V02-A-STO-009": (
+            "test_resolved_measurement_disposition_xor_accepts_closed_variants"
+        ),
+        "V02-A-STO-010": "test_import_publishes_one_validated_four_file_snapshot",
+        "V02-A-STO-011": "test_manifest_rejects_nested_non_schema_fields",
+        "V02-A-STO-012": "test_import_publishes_one_validated_four_file_snapshot",
+        "V02-A-STO-015": "test_import_publishes_one_validated_four_file_snapshot",
+        "V02-A-STO-016": (
+            "test_publication_fault_keeps_old_snapshot_active_and_quarantines_remainder"
+        ),
+        "V02-A-STO-017": "test_import_publishes_one_validated_four_file_snapshot",
+        "V02-A-STO-018": (
+            "test_publication_fault_keeps_old_snapshot_active_and_quarantines_remainder"
+        ),
+        "V02-A-SRC-022": (
+            "test_negative_exports_v1_are_rejected_without_changing_the_snapshot"
+        ),
+        "V02-A-SRC-023": "test_recognized_package_validation_failure_is_quarantined",
+        "V02-A-SRC-024": "test_import_publishes_one_validated_four_file_snapshot",
+    }
+)
+REGISTERED_CASES.update(
+    {
         **{
             f"V02-A-PRE-{number:03d}": "test_import_capacity_public_plan_states"
             for number in range(16, 20)
@@ -461,7 +494,7 @@ def test_enospc_after_positive_preflight_keeps_the_active_snapshot(
         quarantine = (
             config.active_store / "quarantine" / "imports" / str(receipt.result.import_id)
         )
-        assert (quarantine / "staging" / "samples.parquet").exists()
+        assert (quarantine / "staging" / "measurement_versions.parquet").exists()
         assert json.loads((quarantine / "diagnostic.json").read_text()) == {
             "diagnostic": "capacity_exhausted"
         }
@@ -531,7 +564,7 @@ def test_recovery_quarantines_snapshot_from_crash_before_catalog_commit(
     assert overview.quarantined_import_count == 1
     quarantined = list((config.active_store / "quarantine" / "imports").iterdir())
     assert len(quarantined) == 1
-    assert (quarantined[0] / "snapshot" / "samples.parquet").exists()
+    assert (quarantined[0] / "snapshot" / "measurement_versions.parquet").exists()
 
 
 def test_recovery_reconciles_personal_quarantine_before_binding_commit(

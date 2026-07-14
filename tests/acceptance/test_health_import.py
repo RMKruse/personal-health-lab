@@ -127,7 +127,6 @@ def _negative_export_v1(path: Path, case: str, valid_xml: str) -> Path:
         ("unsupported_type", {}),
         ("xxe", {}),
         ("utf16_entity", {}),
-        ("invalid_xml", {}),
         ("package_size", {"max_import_package_bytes": 100}),
         ("entry_count", {"max_import_entries": 1}),
         ("entry_size", {"max_import_entry_bytes": 512}),

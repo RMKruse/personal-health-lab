@@ -550,7 +550,7 @@ def test_legacy_real_store_gets_identity_only_after_confirmed_execution(
 
     with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
         metadata.execute(
-            "UPDATE store_identity SET schema_version = '1.0', store_id = NULL, "
+            "UPDATE store_identity SET schema_version = 1, store_id = NULL, "
             "person_binding = 'unbound' WHERE singleton = 1"
         )
         metadata.execute("ALTER TABLE imports DROP COLUMN diagnostics")
