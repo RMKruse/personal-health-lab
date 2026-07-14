@@ -778,7 +778,9 @@ Ein reproduzierter Modelllauf muss zusätzlich:
 
 Bytegenaue Gleichheit von Gleitkommaartefakten ist nicht erforderlich, sofern die versionierte fachliche Toleranz eingehalten wird.
 
-Ein Modelllauf aus einem nicht committed Arbeitsstand speichert neben dem Git-Commit `dirty=true` und einen Hash des relevanten lokalen Diffs, nicht dessen Inhalt. Der Lauf wird als „lokaler Entwicklungsstand“ gekennzeichnet und nur bei identischem Diff-Hash wiederverwendet.
+Ein Modelllauf aus einem nicht committed Arbeitsstand speichert neben dem Git-Commit `dirty=true` und einen Hash des relevanten lokalen Diffs, nicht dessen Inhalt. Der Lauf wird als „lokaler Entwicklungsstand“ gekennzeichnet und nur bei identischem Diff-Hash wiederverwendet. Geht der Diff verloren, bleibt das Ergebnis historisch nachvollziehbar, ist aber nicht erneut ausführbar und darf nicht als reproduzierbar bezeichnet werden. Seine statistische Modellreife bleibt davon unabhängig; auch ein solcher Lauf kann deshalb `robust` sein. Ein Lauf aus einem sauberen Commit erfüllt bei erhaltener Snapshot-, Konfigurations- und Umgebungsbasis den Reproduzierbarkeitsvertrag.
+
+V0.2 bereinigt frühere Datensatz-Snapshots und Analyseartefakte nicht automatisch. Für jeden historischen Modelllauf bleiben mindestens Snapshot, Ergebnisartefakt, Run- und Ergebnis-ID, Analysedefinition, Konfiguration, Code- und Umgebungsidentität sowie die beim Lauf festgehaltenen Ergebnisstatus und Begründungsfakten erhalten. Eine spätere Speicherbereinigung ist ein eigener, ausdrücklich bestätigter Lebenszyklus und nicht Teil der V0.2-Ergebnisstatusregeln.
 
 ---
 

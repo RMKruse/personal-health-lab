@@ -255,23 +255,31 @@ Der für eine konkrete Analyse gültige Wert: entweder der unveränderte importi
 _Avoid_: Rohwert, automatisch endgültiger Wert
 
 **Veraltetes Analyseergebnis**:
-Ein vorhandenes Ergebnis, dessen zugrunde liegender Daten- oder Prüfstatus sich durch eine spätere Bestätigung, Korrektur oder andere wirksame Benutzerentscheidung geändert hat. Es bleibt unverändert an seinen damaligen Datensatz-Snapshot gebunden und darf weder als aktuell präsentiert noch nachträglich hochgestuft werden; nur ein neuer Modelllauf kann den neuen Zustand abbilden.
+Ein vorhandenes Ergebnis, dessen Snapshot-Referenz nicht mit dem aktuell aktiven Datensatz-Snapshot übereinstimmt. Jede Veröffentlichung eines abweichenden aktiven Snapshots macht alle an den vorherigen Snapshot gebundenen Ergebnisse veraltet, unabhängig davon, ob sich Daten innerhalb ihres Analysezeitraums oder ihrer Datentypen geändert haben. „Aktuell“ oder „veraltet“ ist die aus der aktiven Snapshot-Referenz abgeleitete Aktualitätsdimension und bleibt unabhängig von Datenstatus und Modellreife. Das Ergebnis bleibt unverändert an seinen damaligen Datensatz-Snapshot gebunden und darf nicht als aktuell präsentiert werden.
 _Avoid_: aktuelles Ergebnis, gelöschter Modelllauf
 
+**Aktuelles Analyseergebnis**:
+Ein vorhandenes Ergebnis, dessen Snapshot-Referenz mit dem aktuell aktiven Datensatz-Snapshot übereinstimmt. Wird ein früherer unveränderlicher Snapshot bewusst wieder aktiviert, gelten seine daran gebundenen Ergebnisse erneut als aktuell; ihr gespeicherter Datenstatus und ihre Modellreife ändern sich dadurch nicht. Die Aktivierungshistorie der Snapshots hält die zwischenzeitliche Veraltung nachvollziehbar.
+_Avoid_: neuester Modelllauf unabhängig vom Snapshot, nachträglich neu berechnetes Ergebnis
+
 **Vorläufiges Analyseergebnis**:
-Ein Ergebnis, dessen Datensatz-Snapshot offene Datenprüffälle oder unvollständig beobachtete Aktivitätstage enthält. Es darf angezeigt werden, muss seinen vorläufigen Status und die Gründe sichtbar tragen und kann nach Datenprüfung oder späterer Modellanpassung durch eine Neuberechnung abgelöst werden.
+Ein Ergebnis, dessen Datensatz-Snapshot einen beliebigen aktuell wirksamen offenen Datenprüffall enthält oder dessen ausgewählte Eingabedaten einen unvollständig beobachteten Aktivitätstag des verwendeten Datentyps und Zeitraums einschließen. Offene Datenprüffälle wirken unabhängig von Datentyp und Analysezeitraum global auf alle Ergebnisse des Snapshots; passive Abdeckungslücken wirken nur auf tatsächlich davon abhängige Ergebnisse. „Vorläufig“ oder „geprüft“ ist der Datenstatus und bleibt unabhängig von Aktualität und Modellreife. Das Ergebnis darf angezeigt werden, muss seinen vorläufigen Status und die Gründe sichtbar tragen und kann nach Datenprüfung oder späterer Modellanpassung durch eine Neuberechnung abgelöst werden. Ein späterer Snapshot ohne den Grund ändert den Datenstatus des alten Ergebnisses nicht; dieses bleibt vorläufig und wird zusätzlich veraltet.
 _Avoid_: bestätigtes Ergebnis, fehlerfreies Ergebnis
 
+**Geprüftes Analyseergebnis**:
+Ein Ergebnis, dessen Datensatz-Snapshot keine aktuell wirksamen offenen Datenprüffälle enthält und dessen ausgewählte Eingabedaten keine für den verwendeten Datentyp und Zeitraum festgestellte passive Abdeckungslücke einschließen. Der Datenstatus behauptet weder objektive Fehlerfreiheit noch statistische Belastbarkeit.
+_Avoid_: garantiert fehlerfreies Ergebnis, belastbares Analyseergebnis
+
 **Modellreifeprüfung**:
-Die modellspezifische Prüfung, ob Datenmenge, Vollständigkeit, Merkmalsabhängigkeiten, Schätzstabilität und Zeitreihendiagnostik eine belastbare Darstellung erlauben. Sie ersetzt eine starre Mindestzahl von Kalendertagen.
+Die modellspezifische Prüfung, ob Datenmenge, Vollständigkeit, Merkmalsabhängigkeiten, Schätzstabilität und Zeitreihendiagnostik eine belastbare Darstellung erlauben. Ihre verpflichtenden Kriterien und Schwellen gehören zur versionierten Analysedefinition und müssen für ein belastbares Ergebnis sämtlich bestanden sein. Eine spätere Analysedefinition klassifiziert frühere Ergebnisse nicht neu. Die Modellreifeprüfung ersetzt eine starre Mindestzahl von Kalendertagen und bleibt vom technischen Laufstatus getrennt.
 _Avoid_: pauschale 90-Tage-Regel, erfolgreiche Programmausführung
 
 **Exploratives Analyseergebnis**:
-Ein formal berechnetes Ergebnis, dessen Modellreifeprüfung nicht vollständig bestanden wurde. Es darf zur Untersuchung angezeigt werden, muss aber sichtbar von einem belastbaren Ergebnis unterschieden sein.
+Ein formal berechnetes Ergebnis, das mindestens ein verpflichtendes Kriterium der Modellreifeprüfung nicht bestanden hat. Ein nicht berechenbarer oder numerisch gescheiterter Modelllauf erzeugt dagegen kein exploratives Analyseergebnis. „Explorativ“ oder „belastbar“ ist die Modellreife und bleibt unabhängig von Aktualität und Datenstatus. Ein exploratives Ergebnis darf zur Untersuchung angezeigt werden, muss aber sichtbar von einem belastbaren Ergebnis unterschieden sein.
 _Avoid_: belastbares Ergebnis, fehlgeschlagener Modelllauf
 
 **Belastbares Analyseergebnis**:
-Ein Ergebnis, dessen festgelegte Modellreifeprüfung bestanden wurde. Der Status bezeichnet statistische Stabilität im definierten Modell und ist weder ein Kausalitäts- noch ein medizinischer Gültigkeitsnachweis.
+Ein Ergebnis, das sämtliche verpflichtenden Kriterien der mit seiner Analysedefinition versionierten Modellreifeprüfung bestanden hat. Seine Modellreife ist unabhängig von Aktualität und Datenstatus; ein belastbares Ergebnis kann deshalb beispielsweise aktuell und vorläufig oder veraltet und geprüft sein. Der Status bezeichnet statistische Stabilität im definierten Modell und ist weder ein Kausalitäts- noch ein medizinischer Gültigkeitsnachweis.
 _Avoid_: kausaler Nachweis, medizinische Aussage
 
 ### Quellenabdeckung
