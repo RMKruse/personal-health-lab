@@ -134,5 +134,8 @@ def test_streamlit_renders_the_shared_real_import_confirmation_plan(
         for value in values
     )
     assert any("FileVault: unknown" in value for value in values)
+    assert any("Kapazität: ready" in value for value in values)
+    assert any("full-snapshot-import/v1" in value for value in values)
+    assert all(str(tmp_path) not in value for value in values)
     assert any("Datenspeicher-ID:" in value and "unbound" in value for value in values)
     assert any(button.label == "Bestätigen und ausführen" for button in app.button)

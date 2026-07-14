@@ -129,6 +129,47 @@
         }
       ]
     },
+    "capacityCheck": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "available_bytes",
+            "estimate_bytes",
+            "fragment_size",
+            "method_id",
+            "minimum_remaining_bytes",
+            "reason",
+            "required_bytes",
+            "safety_margin_bytes",
+            "status",
+            "target_volume"
+          ],
+          "properties": {
+            "available_bytes": {"type": ["integer", "null"], "minimum": 0},
+            "estimate_bytes": {"type": ["integer", "null"], "minimum": 0},
+            "fragment_size": {"type": ["integer", "null"], "minimum": 1},
+            "method_id": {"const": "full-snapshot-import/v1"},
+            "minimum_remaining_bytes": {"type": "integer", "minimum": 0},
+            "reason": {
+              "enum": [
+                null,
+                "estimate_unknown",
+                "space_unknown",
+                "target_read_only",
+                "target_unwritable"
+              ]
+            },
+            "required_bytes": {"type": ["integer", "null"], "minimum": 0},
+            "safety_margin_bytes": {"type": ["integer", "null"], "minimum": 0},
+            "status": {"enum": ["ready", "insufficient", "unknown", "unwritable"]},
+            "target_volume": {"type": "string", "pattern": "^(volume-[0-9a-f]{12}|unresolved)$"}
+          }
+        }
+      ]
+    },
     "workspace": {
       "type": "object",
       "additionalProperties": false,
@@ -320,8 +361,9 @@
         "preflight": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["filevault"],
+          "required": ["capacity", "filevault"],
           "properties": {
+            "capacity": {"$ref": "#/$defs/capacityCheck"},
             "filevault": {"$ref": "#/$defs/fileVaultCheck"}
           }
         },
@@ -378,6 +420,7 @@
           "required": [
             "approval",
             "confirmations",
+            "capacity",
             "diagnostics",
             "filevault"
           ],
@@ -402,6 +445,9 @@
               "items": {
                 "type": "string"
               }
+            },
+            "capacity": {
+              "$ref": "#/$defs/capacityCheck"
             },
             "filevault": {
               "$ref": "#/$defs/fileVaultCheck"

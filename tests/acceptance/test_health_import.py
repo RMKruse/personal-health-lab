@@ -375,6 +375,10 @@ def test_interrupted_import_keeps_snapshot_and_is_quarantined_on_restart(
             isinstance(candidate, WriteNotStarted)
             and candidate.status is WriteNotStartedStatus.STORE_BUSY
         ):
+            staging = config.active_store / "staging"
+            if not staging.exists() or not any(staging.iterdir()):
+                time.sleep(0.01)
+                continue
             busy = candidate
             before_busy = before_attempt
             os.kill(process.pid, signal.SIGSTOP)

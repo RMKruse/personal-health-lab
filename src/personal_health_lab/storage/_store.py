@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import os
 import platform
 import plistlib
 import shutil
@@ -32,6 +33,11 @@ _PARQUET_DIRECTORY = "parquet"
 _QUERY_FILE = "query.duckdb"
 _STORE_SCHEMA_VERSION = "1.2"
 _WRITER_LOCK_FILE = ".writer.lock"
+_FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
+_KIB = 1024
+_MIB = 1024 * _KIB
+_GIB = 1024 * _MIB
+_DIRECTORY_OVERHEAD = 64 * _KIB
 _STORE_IDENTITY_DDL = """
 CREATE TABLE store_identity (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -91,6 +97,143 @@ class FileVaultCheck:
     status: FileVaultStatus
     target_volume: str
     reason: FileVaultReason | None = None
+
+
+class CapacityStatus(StrEnum):
+    READY = "ready"
+    INSUFFICIENT = "insufficient"
+    UNKNOWN = "unknown"
+    UNWRITABLE = "unwritable"
+
+
+class CapacityReason(StrEnum):
+    ESTIMATE_UNKNOWN = "estimate_unknown"
+    SPACE_UNKNOWN = "space_unknown"
+    TARGET_READ_ONLY = "target_read_only"
+    TARGET_UNWRITABLE = "target_unwritable"
+
+
+@dataclass(frozen=True, slots=True)
+class CapacityCheck:
+    status: CapacityStatus
+    target_volume: str
+    method_id: str
+    estimate_bytes: int | None
+    safety_margin_bytes: int | None
+    minimum_remaining_bytes: int
+    available_bytes: int | None
+    required_bytes: int | None
+    fragment_size: int | None
+    reason: CapacityReason | None = None
+
+
+def _round_up(value: int, fragment_size: int) -> int:
+    return ((value + fragment_size - 1) // fragment_size) * fragment_size
+
+
+def full_snapshot_import_estimate(
+    input_bytes: int,
+    active_snapshot_bytes: int,
+    fragment_size: int,
+    *,
+    record_count: int = 0,
+    writer_bound: bool = True,
+    scratch_bound: bool = True,
+) -> int | None:
+    """Bound the peak live allocation of ``full-snapshot-import/v1``."""
+    if not writer_bound or not scratch_bound:
+        return None
+    if (
+        input_bytes < 0
+        or active_snapshot_bytes < 0
+        or record_count < 0
+        or fragment_size <= 0
+    ):
+        raise ValueError("Kapazitätseingaben müssen nichtnegativ und Fragmente positiv sein.")
+    input_bytes = max(input_bytes, 1)
+    scratch = _round_up(4 * input_bytes, fragment_size)
+    snapshot = _round_up(2 * input_bytes + 2 * active_snapshot_bytes, fragment_size)
+    catalog = _round_up(max((4 * input_bytes + 2) // 3, 512 * record_count), fragment_size)
+    journal = _round_up(max((2 * input_bytes + 2) // 3, 256 * record_count), fragment_size)
+    manifest = _round_up(max(input_bytes // 12, 64 * _KIB), fragment_size)
+    phases = (
+        scratch,
+        scratch + snapshot + manifest,
+        scratch + snapshot + manifest + catalog + journal,
+    )
+    return _DIRECTORY_OVERHEAD + max(phases)
+
+
+def _allocation_checkpoint(root: Path, phase: str) -> None:
+    """Private test seam for measuring the real writer's live allocation."""
+
+
+def probe_capacity(path: Path, estimate_bytes: int | None) -> CapacityCheck:
+    method_id = _FULL_SNAPSHOT_IMPORT_METHOD
+    minimum_remaining = _GIB
+    try:
+        stats = os.statvfs(path)
+        device = path.stat().st_dev
+    except OSError:
+        return CapacityCheck(
+            CapacityStatus.UNKNOWN,
+            "unresolved",
+            method_id,
+            estimate_bytes,
+            None,
+            minimum_remaining,
+            None,
+            None,
+            None,
+            CapacityReason.SPACE_UNKNOWN,
+        )
+    target_volume = "volume-" + hashlib.sha256(str(device).encode()).hexdigest()[:12]
+    available = stats.f_bavail * stats.f_frsize
+    if estimate_bytes is None:
+        return CapacityCheck(
+            CapacityStatus.UNKNOWN,
+            target_volume,
+            method_id,
+            None,
+            None,
+            minimum_remaining,
+            available,
+            None,
+            stats.f_frsize,
+            CapacityReason.ESTIMATE_UNKNOWN,
+        )
+    margin = max((estimate_bytes + 3) // 4, 256 * _MIB)
+    required = estimate_bytes + margin + minimum_remaining
+    read_only = bool(stats.f_flag & getattr(os, "ST_RDONLY", 1))
+    if read_only or not os.access(path, os.W_OK):
+        return CapacityCheck(
+            CapacityStatus.UNWRITABLE,
+            target_volume,
+            method_id,
+            estimate_bytes,
+            margin,
+            minimum_remaining,
+            available,
+            required,
+            stats.f_frsize,
+            (
+                CapacityReason.TARGET_READ_ONLY
+                if read_only
+                else CapacityReason.TARGET_UNWRITABLE
+            ),
+        )
+    return CapacityCheck(
+        CapacityStatus.READY if available >= required else CapacityStatus.INSUFFICIENT,
+        target_volume,
+        method_id,
+        estimate_bytes,
+        margin,
+        minimum_remaining,
+        available,
+        required,
+        stats.f_frsize,
+        None,
+    )
 
 
 def probe_filevault(path: Path) -> FileVaultCheck:
@@ -566,7 +709,54 @@ class LocalStore:
     _metadata: sqlite3.Connection
     _query: duckdb.DuckDBPyConnection
     _writer_lock: IO[bytes] | None = None
+    _scratch_bound: bool = True
     _closed: bool = False
+
+    def preflight_full_snapshot_import(
+        self,
+        input_bytes: int,
+        record_count: int = 0,
+        *,
+        writer_bound: bool = True,
+        scratch_bound: bool = True,
+    ) -> CapacityCheck:
+        active = self._metadata.execute(
+            "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
+        ).fetchone()
+        active_bytes = 0
+        if active is not None:
+            active_path = (
+                self._root
+                / _PARQUET_DIRECTORY
+                / "snapshots"
+                / str(active[0])
+                / "samples.parquet"
+            )
+            try:
+                escaped = str(active_path).replace("'", "''")
+                uncompressed = self._query.execute(
+                    "SELECT sum(total_uncompressed_size) "
+                    f"FROM parquet_metadata('{escaped}')"
+                ).fetchone()
+                active_bytes = max(
+                    active_path.stat().st_blocks * 512,
+                    0 if uncompressed is None or uncompressed[0] is None else int(uncompressed[0]),
+                )
+            except (OSError, duckdb.Error):
+                return probe_capacity(self._root, None)
+        try:
+            fragment_size = os.statvfs(self._root).f_frsize
+        except OSError:
+            return probe_capacity(self._root, None)
+        estimate = full_snapshot_import_estimate(
+            input_bytes,
+            active_bytes,
+            fragment_size,
+            record_count=record_count,
+            writer_bound=writer_bound,
+            scratch_bound=scratch_bound and self._scratch_bound,
+        )
+        return probe_capacity(self._root, estimate)
 
     def load_identity(self) -> StoreIdentity:
         columns = {
@@ -629,7 +819,12 @@ class LocalStore:
 
     @classmethod
     def open(cls, root: Path, mode: DataMode) -> Self:
-        writer_lock = cls._try_writer_lock(root)
+        try:
+            writer_lock = cls._try_writer_lock(root)
+        except StoreError:
+            if not root.exists():
+                raise
+            return cls._open(root, mode, initialize=False)
         if writer_lock is None:
             return cls._open(root, mode, initialize=False)
         store: Self | None = None
@@ -743,6 +938,13 @@ class LocalStore:
             if initialize and not query_path.exists():
                 duckdb.connect(str(query_path)).close()
             query = duckdb.connect(str(query_path), config={"access_mode": "READ_ONLY"})
+            scratch_bound = True
+            if writer_lock is not None:
+                temporary = str(root / ".duckdb-temp").replace("'", "''")
+                try:
+                    query.execute(f"SET temp_directory = '{temporary}'")
+                except duckdb.Error:
+                    scratch_bound = False
         except StoreError:
             if metadata is not None:
                 metadata.close()
@@ -758,6 +960,7 @@ class LocalStore:
             _metadata=metadata,
             _query=query,
             _writer_lock=writer_lock,
+            _scratch_bound=scratch_bound,
         )
 
     @staticmethod
@@ -783,7 +986,16 @@ class LocalStore:
     ) -> None:
         self._require_writer()
         staging = self._root / "staging" / str(import_id)
-        with self._metadata:
+        try:
+            staging.mkdir(parents=True)
+            self._write_manifest(
+                staging,
+                operation_id=operation_id,
+                import_id=import_id,
+                snapshot_id=snapshot_id,
+                status="running",
+            )
+            self._metadata.execute("BEGIN IMMEDIATE")
             self._metadata.execute(
                 "INSERT INTO imports VALUES (?, ?, ?, 'running', ?, 0, 0, ?, '')",
                 (
@@ -794,40 +1006,65 @@ class LocalStore:
                     datetime.now().astimezone().isoformat(),
                 ),
             )
-        try:
-            staging.mkdir(parents=True)
-            self._write_manifest(
-                staging,
-                operation_id=operation_id,
-                import_id=import_id,
-                snapshot_id=snapshot_id,
-                status="running",
-            )
-        except OSError as error:
+        except (OSError, sqlite3.Error) as error:
+            self._metadata.rollback()
+            shutil.rmtree(staging, ignore_errors=True)
             raise StoreError("Import-Staging konnte nicht angelegt werden.") from error
 
     def reject_import(self, import_id: ImportId, package_hash: str) -> None:
         self._require_writer()
-        with self._metadata:
-            self._metadata.execute(
-                """
-                UPDATE imports
-                SET package_hash = ?, status = 'rejected', diagnostics = 'invalid_health_export'
-                WHERE import_id = ?
-                """,
-                (package_hash, str(import_id)),
-            )
+        self._metadata.execute(
+            """
+            UPDATE imports
+            SET package_hash = ?, status = 'rejected', diagnostics = 'invalid_health_export'
+            WHERE import_id = ?
+            """,
+            (package_hash, str(import_id)),
+        )
+        self._metadata.commit()
         staging = self._root / "staging" / str(import_id)
         if staging.exists():
             self._remove_tree(staging)
 
     def mark_import_reading(self, import_id: ImportId) -> None:
         self._require_writer()
+        self._metadata.execute(
+            "UPDATE imports SET diagnostics = 'reading_package' WHERE import_id = ?",
+            (str(import_id),),
+        )
+        manifest_path = self._root / "staging" / str(import_id) / "manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["status"] = "reading_package"
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+            )
+        except (OSError, TypeError, json.JSONDecodeError) as error:
+            raise StoreError("Import-Manifest konnte nicht aktualisiert werden.") from error
+
+    def quarantine_import(
+        self, import_id: ImportId, snapshot_id: SnapshotId, diagnostic: str
+    ) -> None:
+        self._require_writer()
+        active = self._metadata.execute(
+            "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
+        ).fetchone()
+        paths = [(self._root / "staging" / str(import_id), "staging")]
+        if active is None or str(active[0]) != str(snapshot_id):
+            paths.append(
+                (
+                    self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id),
+                    "snapshot",
+                )
+            )
+        self._retain_import_quarantine(str(import_id), paths, diagnostic)
         with self._metadata:
             self._metadata.execute(
-                "UPDATE imports SET diagnostics = 'reading_package' WHERE import_id = ?",
-                (str(import_id),),
+                "UPDATE imports SET status = 'quarantined', diagnostics = ? "
+                "WHERE import_id = ? AND status = 'running'",
+                (diagnostic, str(import_id)),
             )
+            self._bind_person()
 
     def publish_import(
         self,
@@ -984,6 +1221,7 @@ class LocalStore:
         count_row = self._query.execute(
             "SELECT count(*), count(DISTINCT logical_measurement_id) FROM combined_samples"
         ).fetchone()
+        _allocation_checkpoint(self._root, "combined")
         assert count_row is not None
         version_count, logical_count = map(int, count_row)
         new_record_count = version_count - previous_count
@@ -1033,6 +1271,7 @@ class LocalStore:
             status="published",
             record_count=version_count,
         )
+        _allocation_checkpoint(self._root, "staged")
         snapshot.parent.mkdir(parents=True, exist_ok=True)
         staging.replace(snapshot)
         with self._metadata:
@@ -1054,6 +1293,7 @@ class LocalStore:
                 (str(snapshot_id),),
             )
             self._bind_person()
+            _allocation_checkpoint(self._root, "activated")
         return PublishImportResult(
             status="committed",
             snapshot_id=snapshot_id,
@@ -1717,12 +1957,20 @@ class LocalStore:
         for import_id, snapshot_id, diagnostics in running:
             bind_recovered_person = bind_recovered_person or diagnostics == "reading_package"
             staging = self._root / "staging" / str(import_id)
-            if staging.exists():
-                self._remove_tree(staging)
+            paths = [(staging, "staging")]
             if str(snapshot_id) != active_snapshot:
-                snapshot = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
-                if snapshot.exists():
-                    self._remove_tree(snapshot)
+                paths.append(
+                    (
+                        self._root
+                        / _PARQUET_DIRECTORY
+                        / "snapshots"
+                        / str(snapshot_id),
+                        "snapshot",
+                    )
+                )
+            self._retain_import_quarantine(
+                str(import_id), paths, "interrupted_before_publish"
+            )
         if running:
             with self._metadata:
                 if "diagnostics" in import_columns:
@@ -1747,42 +1995,132 @@ class LocalStore:
             for path in staging_root.iterdir():
                 if path.is_dir():
                     if path.name not in known_imports:
-                        self._quarantine_orphaned_staging(path)
+                        self._quarantine_orphaned_import_artifact(path, "staging")
                         continue
                     self._remove_tree(path)
 
-    def _quarantine_orphaned_staging(self, path: Path) -> None:
+        snapshots = self._root / _PARQUET_DIRECTORY / "snapshots"
+        if snapshots.exists():
+            known_snapshots = {
+                str(row[0])
+                for row in self._metadata.execute(
+                    "SELECT snapshot_id FROM imports "
+                    "WHERE status IN ('committed', 'duplicate')"
+                )
+            }
+            for path in snapshots.iterdir():
+                if path.is_dir() and path.name not in known_snapshots:
+                    self._quarantine_orphaned_import_artifact(path, "snapshot")
+        self._recover_import_quarantine()
+
+    def _quarantine_orphaned_import_artifact(
+        self, path: Path, label: Literal["staging", "snapshot"]
+    ) -> None:
         recovered_id = f"recovered-{path.name}"
+        import_id = path.name
         operation_id = snapshot_id = recovered_id
+        bind_person = label == "snapshot"
         try:
             manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
             if isinstance(manifest, dict):
+                import_id = str(manifest.get("import_id", import_id))
                 operation_id = str(manifest.get("operation_id", recovered_id))
                 snapshot_id = str(manifest.get("snapshot_id", recovered_id))
+                bind_person = manifest.get("status") in {"reading_package", "published"}
         except (OSError, UnicodeError, json.JSONDecodeError):
             pass
         with self._metadata:
             self._metadata.execute(
                 "INSERT INTO imports VALUES (?, ?, '', 'running', ?, 0, 0, ?, ?)",
                 (
-                    path.name,
+                    import_id,
                     operation_id,
                     snapshot_id,
                     datetime.now().astimezone().isoformat(),
-                    "orphaned_staging_detected",
+                    f"orphaned_{label}_detected",
                 ),
             )
-        self._remove_tree(path)
+        self._retain_import_quarantine(
+            import_id, [(path, label)], f"orphaned_{label}"
+        )
         with self._metadata:
             self._metadata.execute(
-                """
-                UPDATE imports
-                SET status = 'quarantined', diagnostics = 'orphaned_staging'
-                WHERE import_id = ?
-                """,
-                (path.name,),
+                "UPDATE imports SET status = 'quarantined', diagnostics = ? "
+                "WHERE import_id = ?",
+                (f"orphaned_{label}", import_id),
             )
-            self._bind_person()
+            if bind_person:
+                self._bind_person()
+
+    def _recover_import_quarantine(self) -> None:
+        quarantine_root = self._root / "quarantine" / "imports"
+        if not quarantine_root.exists():
+            return
+        for path in quarantine_root.iterdir():
+            if not path.is_dir():
+                continue
+            operation_id = snapshot_id = f"recovered-{path.name}"
+            personal_artifacts = (path / "snapshot").exists()
+            for label in ("staging", "snapshot"):
+                try:
+                    manifest = json.loads(
+                        (path / label / "manifest.json").read_text(encoding="utf-8")
+                    )
+                    if isinstance(manifest, dict):
+                        operation_id = str(manifest.get("operation_id", operation_id))
+                        snapshot_id = str(manifest.get("snapshot_id", snapshot_id))
+                        personal_artifacts = personal_artifacts or manifest.get("status") in {
+                            "reading_package",
+                            "published",
+                        }
+                        break
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    continue
+            diagnostic = "orphaned_quarantine"
+            try:
+                report = json.loads(
+                    (path / "diagnostic.json").read_text(encoding="utf-8")
+                )
+                if isinstance(report, dict) and isinstance(report.get("diagnostic"), str):
+                    diagnostic = report["diagnostic"]
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                pass
+            with self._metadata:
+                self._metadata.execute(
+                    """
+                    INSERT INTO imports VALUES (?, ?, '', 'quarantined', ?, 0, 0, ?, ?)
+                    ON CONFLICT(import_id) DO UPDATE SET
+                        status = 'quarantined', diagnostics = excluded.diagnostics
+                    """,
+                    (
+                        path.name,
+                        operation_id,
+                        snapshot_id,
+                        datetime.now().astimezone().isoformat(),
+                        diagnostic,
+                    ),
+                )
+                if personal_artifacts:
+                    self._bind_person()
+
+    def _retain_import_quarantine(
+        self,
+        import_id: str,
+        paths: list[tuple[Path, str]],
+        diagnostic: str,
+    ) -> None:
+        quarantine = self._root / "quarantine" / "imports" / import_id
+        try:
+            quarantine.mkdir(parents=True, exist_ok=True)
+            for source, label in paths:
+                if source.exists():
+                    os.replace(source, quarantine / label)
+            (quarantine / "diagnostic.json").write_text(
+                json.dumps({"diagnostic": diagnostic}, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        except OSError as error:
+            raise StoreError("Importquarantäne konnte nicht gesichert werden.") from error
 
     @staticmethod
     def _remove_tree(path: Path) -> None:

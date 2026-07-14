@@ -43,6 +43,30 @@ source = "https://github.com/RMKruse/personal-health-lab/issues/33"
 statement = "Actual write targets are rechecked and only a protected improvement may continue."
 evidence = ["positive", "negative", "transition"]
 
+[[contract]]
+id = "V02-C-PRE-005"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Capacity uses the hard estimate, margin, and minimum-rest formula per target volume."
+evidence = ["positive", "negative", "boundary"]
+
+[[contract]]
+id = "V02-C-PRE-006"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Operation estimates bound additional simultaneously live allocation."
+evidence = ["positive", "stress"]
+
+[[contract]]
+id = "V02-C-PRE-007"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Every writer and scratch bound is conservative and versioned."
+evidence = ["positive", "negative", "boundary"]
+
+[[contract]]
+id = "V02-C-PRE-008"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Allocation evidence, statvfs, and atomic runtime failures remain separate checks."
+evidence = ["positive", "negative", "fault"]
+
 [[fixture]]
 id = "V02-F-DOM-IMPORT-001"
 kind = "domain"
@@ -87,6 +111,51 @@ seed = 0
 parameters = "tests/fixtures/filevault/v1/unknown.json"
 platform = "macos"
 sha256 = "f5df7c67082a2e3cd1bdd4d08a9678b6e026fd51095fad1f2ed3877076370d1b"
+
+[[fixture]]
+id = "V02-F-SYS-CAPACITY-V1"
+kind = "system"
+generator = "controlled-statvfs-v1"
+seed = 0
+parameters = "exact, one-byte-short, unknown, read-only, and unwritable findings"
+platform = "all"
+sha256 = "46b8ed6bb049ef90d19b604c43ca25ebbba1a2d538e5250ebab6aec13aa52378"
+
+[[fixture]]
+id = "V02-F-SYS-ALLOC-NORMAL-V1"
+kind = "system"
+generator = "full-snapshot-import-allocation-v1"
+seed = 42
+parameters = "776061 input bytes and 294403 active snapshot bytes"
+platform = "all"
+sha256 = "e43819bffadff0a3428db300c14bbc233f63161baae8f4c932a4995f303df0d3"
+
+[[fixture]]
+id = "V02-F-SYS-ALLOC-STRESS-V1"
+kind = "system"
+generator = "full-snapshot-import-allocation-v1"
+seed = 42
+parameters = "normal allocation fixture multiplied by eight"
+platform = "all"
+sha256 = "063fe99a0f7b35c9f7e28f343c84cfaeaa4f29e80d1be8c7ea8898536a07f70d"
+
+[[fixture]]
+id = "V02-F-SYS-ENOSPC-V1"
+kind = "system"
+generator = "import-publish-fault-v1"
+seed = 0
+parameters = "ENOSPC after positive final preflight"
+platform = "all"
+sha256 = "0644ad00f35a2dbfb7bb1e1bd67ee6a586dfe95e9ef310fb131958bc3c7e7f3e"
+
+[[fixture]]
+id = "V02-F-SYS-UNWRITABLE-V1"
+kind = "system"
+generator = "controlled-target-access-v1"
+seed = 0
+parameters = "read-only, locked, and unwritable target"
+platform = "all"
+sha256 = "75cca5c428b6333e623ad2898c5419368a3ae41158db242e4ad2dae5fcf83a61"
 
 [[case]]
 id = "V02-A-API-004"
@@ -375,3 +444,171 @@ level = "application"
 expected_result = "committed ImportReceipt"
 expected_effect = "one published snapshot"
 forbidden_side_effects = ["plan_changed for protected improvement"]
+
+[[case]]
+id = "V02-A-PRE-016"
+contracts = ["V02-C-PRE-005"]
+fixtures = ["V02-F-SYS-CAPACITY-V1"]
+runner = "test_import_capacity_public_plan_states"
+initial_state = "available bytes exactly equal required bytes"
+operation = "preview import"
+level = "application"
+expected_result = "ready"
+expected_effect = "none"
+forbidden_side_effects = ["warning range"]
+
+[[case]]
+id = "V02-A-PRE-017"
+contracts = ["V02-C-PRE-005"]
+fixtures = ["V02-F-SYS-CAPACITY-V1"]
+runner = "test_import_capacity_public_plan_states"
+initial_state = "available bytes one below required bytes"
+operation = "preview import"
+level = "application"
+expected_result = "blocked"
+expected_effect = "none"
+forbidden_side_effects = ["import start"]
+
+[[case]]
+id = "V02-A-PRE-018"
+contracts = ["V02-C-PRE-005"]
+fixtures = ["V02-F-SYS-CAPACITY-V1"]
+runner = "test_import_capacity_public_plan_states"
+initial_state = "unknown available space or estimate"
+operation = "preview import"
+level = "application"
+expected_result = "blocked unknown capacity"
+expected_effect = "none"
+forbidden_side_effects = ["best-effort execution"]
+
+[[case]]
+id = "V02-A-PRE-019"
+contracts = ["V02-C-PRE-005"]
+fixtures = ["V02-F-SYS-CAPACITY-V1"]
+runner = "test_import_capacity_public_plan_states"
+initial_state = "known import estimate"
+operation = "calculate required bytes"
+level = "application"
+expected_result = "estimate plus max 25 percent or 256 MiB plus 1 GiB"
+expected_effect = "none"
+forbidden_side_effects = ["UI tuning", "warning range"]
+
+[[case]]
+id = "V02-A-PRE-020"
+contracts = ["V02-C-PRE-006"]
+fixtures = ["V02-F-SYS-ALLOC-NORMAL-V1", "V02-F-SYS-ALLOC-STRESS-V1"]
+runner = "test_full_snapshot_import_v1_formula_contract"
+initial_state = "full snapshot import fixtures"
+operation = "estimate peak live allocation"
+level = "storage"
+expected_result = "full-snapshot-import/v1 conservative bound"
+expected_effect = "none"
+forbidden_side_effects = ["base allocation counted as new"]
+
+[[case]]
+id = "V02-A-PRE-026"
+contracts = ["V02-C-PRE-007"]
+fixtures = ["V02-F-SYS-CAPACITY-V1"]
+runner = "test_full_snapshot_import_requires_writer_and_scratch_bounds"
+initial_state = "missing writer bound"
+operation = "estimate import"
+level = "storage"
+expected_result = "unknown"
+expected_effect = "none"
+forbidden_side_effects = ["guessed bound"]
+
+[[case]]
+id = "V02-A-PRE-027"
+contracts = ["V02-C-PRE-007"]
+fixtures = ["V02-F-SYS-CAPACITY-V1"]
+runner = "test_full_snapshot_import_requires_writer_and_scratch_bounds"
+initial_state = "DuckDB scratch not bound to target volume"
+operation = "estimate import"
+level = "storage"
+expected_result = "unknown"
+expected_effect = "none"
+forbidden_side_effects = ["cross-volume assumption"]
+
+[[case]]
+id = "V02-A-PRE-028"
+contracts = ["V02-C-PRE-007"]
+fixtures = ["V02-F-SYS-ALLOC-NORMAL-V1"]
+runner = "test_full_snapshot_import_v1_formula_contract"
+initial_state = "active snapshot and read-only export"
+operation = "estimate import"
+level = "storage"
+expected_result = "only new output and scratch allocation counted"
+expected_effect = "none"
+forbidden_side_effects = ["CoW credit", "input allocation"]
+
+[[case]]
+id = "V02-A-PRE-029"
+contracts = ["V02-C-PRE-007"]
+fixtures = ["V02-F-SYS-ALLOC-NORMAL-V1"]
+runner = "test_full_snapshot_import_v1_formula_contract"
+initial_state = "versioned writer formula"
+operation = "render import preflight"
+level = "application"
+expected_result = "full-snapshot-import/v1 method ID"
+expected_effect = "none"
+forbidden_side_effects = ["unversioned method"]
+
+[[case]]
+id = "V02-A-PRE-030"
+contracts = ["V02-C-PRE-008"]
+fixtures = ["V02-F-SYS-ALLOC-NORMAL-V1", "V02-F-SYS-ALLOC-STRESS-V1"]
+runner = "test_full_snapshot_import_v1_measures_real_writer_phases"
+initial_state = "normal and stress allocation fixtures"
+operation = "compare measured peak with estimate"
+level = "storage"
+expected_result = "measured st_blocks times 512 no greater than estimate"
+expected_effect = "none"
+forbidden_side_effects = ["logical-size-only proof"]
+
+[[case]]
+id = "V02-A-PRE-031"
+contracts = ["V02-C-PRE-008"]
+fixtures = ["V02-F-SYS-CAPACITY-V1"]
+runner = "test_import_capacity_uses_the_hard_exact_boundary"
+initial_state = "controlled statvfs result"
+operation = "probe available capacity"
+level = "storage"
+expected_result = "f_bavail times f_frsize"
+expected_effect = "none"
+forbidden_side_effects = ["f_bfree use"]
+
+[[case]]
+id = "V02-A-PRE-032"
+contracts = ["V02-C-PRE-008"]
+fixtures = ["V02-F-DOM-IMPORT-001", "V02-F-SYS-ENOSPC-V1"]
+runner = "test_enospc_after_positive_preflight_keeps_the_active_snapshot"
+initial_state = "active snapshot and positive final preflight"
+operation = "inject ENOSPC during publish"
+level = "application"
+expected_result = "quarantined import receipt"
+expected_effect = "old snapshot remains active"
+forbidden_side_effects = ["partial snapshot activation"]
+
+[[case]]
+id = "V02-A-PRE-033"
+contracts = ["V02-C-PRE-008"]
+fixtures = ["V02-F-SYS-UNWRITABLE-V1"]
+runner = "test_unwritable_or_locked_import_target_is_blocked"
+initial_state = "read-only, locked, or unwritable target"
+operation = "preview import"
+level = "application"
+expected_result = "blocked"
+expected_effect = "none"
+forbidden_side_effects = ["import start", "partial state"]
+
+[[case]]
+id = "V02-A-PRE-034"
+contracts = ["V02-C-PRE-008"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_competing_import_writer_keeps_readers_available"
+initial_state = "writer lock held by another process"
+operation = "execute import and load overview"
+level = "application"
+expected_result = "store_busy and readable old snapshot"
+expected_effect = "none"
+forbidden_side_effects = ["partial import", "reader block"]

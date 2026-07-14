@@ -14,10 +14,12 @@ from uuid import uuid4
 
 from personal_health_lab import DataMode
 from personal_health_lab.health_import import (
+    HealthExportEstimate,
     HealthImportError,
     ImportId,
     OperationId,
     SnapshotId,
+    estimate_health_export,
     import_health_export,
 )
 from personal_health_lab.overview import Overview, OverviewReader, OverviewSelection
@@ -32,6 +34,8 @@ from personal_health_lab.resting_hr_analysis import (
     run_resting_hr_analysis as execute_analysis,
 )
 from personal_health_lab.storage import (
+    CapacityCheck,
+    CapacityStatus,
     FileVaultCheck,
     FileVaultReason,
     FileVaultStatus,
@@ -180,6 +184,8 @@ class WriteApproval:
 class ImportHealthExportPlan:
     package_hash: str
     package_size: int
+    input_bytes: int = 0
+    record_count: int = 0
 
 
 WritePlanDetails = ImportHealthExportPlan
@@ -191,6 +197,7 @@ class WritePreflight:
     confirmations: tuple[WriteConfirmation, ...] = ()
     filevault: FileVaultCheck | None = None
     diagnostics: tuple[str, ...] = ()
+    capacity: CapacityCheck | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,16 +364,32 @@ class HealthLab:
             with request.package_path.open("rb") as package:
                 package_hash = hashlib.file_digest(package, "sha256").hexdigest()
             unavailable = False
+            estimate = estimate_health_export(
+                request.package_path,
+                max_package_bytes=self._config.max_import_package_bytes,
+                max_entries=self._config.max_import_entries,
+                max_entry_bytes=self._config.max_import_entry_bytes,
+                max_uncompressed_bytes=self._config.max_import_uncompressed_bytes,
+                max_compression_ratio=self._config.max_import_compression_ratio,
+            )
         except OSError:
             package_size = 0
             package_hash = ""
             unavailable = True
+            estimate = HealthExportEstimate(0, 0)
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        capacity = self._store.preflight_full_snapshot_import(
+            estimate.input_bytes, estimate.record_count
+        )
         return self._compose_import_plan(
             request,
             workspace,
             filevault,
             package_size,
             package_hash,
+            estimate,
+            capacity,
             unavailable=unavailable,
         )
 
@@ -377,6 +400,8 @@ class HealthLab:
         filevault: FileVaultCheck | None,
         package_size: int,
         package_hash: str,
+        estimate: HealthExportEstimate,
+        capacity: CapacityCheck,
         *,
         unavailable: bool,
     ) -> WritePlan:
@@ -390,7 +415,22 @@ class HealthLab:
             approval = WriteApproval(WriteApprovalStatus.READY)
             confirmations = ()
             diagnostics = ()
-        if approval.status is not WriteApprovalStatus.BLOCKED and filevault is not None:
+        if capacity.status is not CapacityStatus.READY:
+            approval = WriteApproval(WriteApprovalStatus.BLOCKED)
+            confirmations = ()
+            diagnostics = (
+                "capacity_"
+                + (capacity.reason.value if capacity.reason is not None else capacity.status.value),
+            )
+        if (
+            approval.status is not WriteApprovalStatus.BLOCKED
+            and filevault is not None
+            and filevault.reason is FileVaultReason.VOLUME_LOCKED
+        ):
+            approval = WriteApproval(WriteApprovalStatus.BLOCKED)
+            confirmations = ()
+            diagnostics = ("target_locked",)
+        elif approval.status is not WriteApprovalStatus.BLOCKED and filevault is not None:
             confirmation_list = [WriteConfirmation.REAL_IMPORT_SAME_PERSON]
             if workspace.store_id is None:
                 confirmation_list.append(WriteConfirmation.LEGACY_STORE_MIGRATION)
@@ -430,6 +470,17 @@ class HealthLab:
                                 ),
                             }
                         ),
+                        "capacity": {
+                            "status": capacity.status.value,
+                            "target_volume": capacity.target_volume,
+                            "method_id": capacity.method_id,
+                            "estimate_bytes": capacity.estimate_bytes,
+                            "safety_margin_bytes": capacity.safety_margin_bytes,
+                            "minimum_remaining_bytes": capacity.minimum_remaining_bytes,
+                            "required_bytes": capacity.required_bytes,
+                            "fragment_size": capacity.fragment_size,
+                            "reason": None if capacity.reason is None else capacity.reason.value,
+                        },
                         "version": 1,
                     },
                     sort_keys=True,
@@ -439,8 +490,12 @@ class HealthLab:
         )
         return WritePlan(
             fingerprint=fingerprint,
-            details=ImportHealthExportPlan(package_hash, package_size),
-            preflight=WritePreflight(approval, confirmations, filevault, diagnostics),
+            details=ImportHealthExportPlan(
+                package_hash, package_size, estimate.input_bytes, estimate.record_count
+            ),
+            preflight=WritePreflight(
+                approval, confirmations, filevault, diagnostics, capacity
+            ),
         )
 
     @staticmethod
@@ -460,7 +515,12 @@ class HealthLab:
         if current_plan.fingerprint == expected_plan:
             return current_plan
         filevault = current_plan.preflight.filevault
-        if filevault is None or filevault.status is not FileVaultStatus.PROTECTED:
+        capacity = current_plan.preflight.capacity
+        if (
+            filevault is None
+            or filevault.status is not FileVaultStatus.PROTECTED
+            or capacity is None
+        ):
             return None
         workspace = self.load_workspace_status()
         candidates = [
@@ -470,6 +530,10 @@ class HealthLab:
                 FileVaultCheck(status, filevault.target_volume),
                 current_plan.details.package_size,
                 current_plan.details.package_hash,
+                HealthExportEstimate(
+                    current_plan.details.input_bytes, current_plan.details.record_count
+                ),
+                capacity,
                 unavailable=False,
             )
             for status in (FileVaultStatus.UNPROTECTED, FileVaultStatus.TRANSITIONING)
@@ -481,6 +545,10 @@ class HealthLab:
                 FileVaultCheck(FileVaultStatus.UNKNOWN, filevault.target_volume, reason),
                 current_plan.details.package_size,
                 current_plan.details.package_hash,
+                HealthExportEstimate(
+                    current_plan.details.input_bytes, current_plan.details.record_count
+                ),
+                capacity,
                 unavailable=False,
             )
             for reason in FileVaultReason
@@ -499,6 +567,13 @@ class HealthLab:
         current_plan = self.preview_write(request)
         authorization_plan = self._authorization_plan(request, current_plan, expected_plan)
         if authorization_plan is None:
+            if current_plan.approval.status is WriteApprovalStatus.BLOCKED:
+                return self._not_started(
+                    current_plan,
+                    WriteNotStartedStatus.BLOCKED,
+                    current_plan.diagnostics,
+                    expected_plan,
+                )
             return self._not_started(
                 current_plan,
                 WriteNotStartedStatus.PLAN_CHANGED,
@@ -525,6 +600,41 @@ class HealthLab:
                 expected_plan,
             )
         except StoreError as error:
+            if self._store is not None:
+                final_filevault = (
+                    probe_filevault(self._config.active_store)
+                    if authorization_plan.preflight.filevault is not None
+                    else None
+                )
+                if (
+                    final_filevault is not None
+                    and final_filevault.reason is FileVaultReason.VOLUME_LOCKED
+                ):
+                    return self._not_started_with_preflight(
+                        authorization_plan,
+                        WriteNotStartedStatus.BLOCKED,
+                        ("target_locked",),
+                        expected_plan,
+                        filevault=final_filevault,
+                    )
+                final_capacity = self._store.preflight_full_snapshot_import(
+                    authorization_plan.details.input_bytes,
+                    authorization_plan.details.record_count,
+                )
+                if final_capacity.status is not CapacityStatus.READY:
+                    diagnostic = "capacity_" + (
+                        final_capacity.reason.value
+                        if final_capacity.reason is not None
+                        else final_capacity.status.value
+                    )
+                    return self._not_started_with_preflight(
+                        authorization_plan,
+                        WriteNotStartedStatus.BLOCKED,
+                        (diagnostic,),
+                        expected_plan,
+                        filevault=final_filevault,
+                        capacity=final_capacity,
+                    )
             raise HealthLabError("Health-Export konnte nicht importiert werden.") from error
         try:
             expected_filevault = authorization_plan.preflight.filevault
@@ -538,12 +648,38 @@ class HealthLab:
                 and final_filevault is not None
                 and not self._filevault_allows_execution(expected_filevault, final_filevault)
             ):
+                if final_filevault.reason is FileVaultReason.VOLUME_LOCKED:
+                    return self._not_started_with_preflight(
+                        authorization_plan,
+                        WriteNotStartedStatus.BLOCKED,
+                        ("target_locked",),
+                        expected_plan,
+                        filevault=final_filevault,
+                    )
                 return self._not_started_with_preflight(
                     authorization_plan,
                     WriteNotStartedStatus.PLAN_CHANGED,
                     ("plan_changed",),
                     expected_plan,
-                    final_filevault,
+                    filevault=final_filevault,
+                )
+            final_capacity = writer.preflight_full_snapshot_import(
+                authorization_plan.details.input_bytes,
+                authorization_plan.details.record_count,
+            )
+            if final_capacity.status is not CapacityStatus.READY:
+                diagnostic = "capacity_" + (
+                    final_capacity.reason.value
+                    if final_capacity.reason is not None
+                    else final_capacity.status.value
+                )
+                return self._not_started_with_preflight(
+                    authorization_plan,
+                    WriteNotStartedStatus.BLOCKED,
+                    (diagnostic,),
+                    expected_plan,
+                    filevault=final_filevault,
+                    capacity=final_capacity,
                 )
             if workspace.store_id is None:
                 writer.initialize_identity(
@@ -567,6 +703,7 @@ class HealthLab:
             authorization_plan.confirmations,
             final_filevault or current_plan.preflight.filevault,
             result.diagnostics,
+            final_capacity,
         )
         import_result = ImportReceipt(
             operation_id=result.operation_id,
@@ -610,17 +747,24 @@ class HealthLab:
         status: WriteNotStartedStatus,
         diagnostics: tuple[str, ...],
         plan_fingerprint: PlanFingerprint,
-        filevault: FileVaultCheck,
+        *,
+        filevault: FileVaultCheck | None = None,
+        capacity: CapacityCheck | None = None,
     ) -> WriteReceipt:
         return WriteReceipt(
             operation_id=OperationId(uuid4().hex),
             plan_fingerprint=plan_fingerprint,
             result=WriteNotStarted(status, diagnostics),
             final_preflight=WritePreflight(
-                plan.approval,
-                plan.confirmations,
-                filevault,
+                (
+                    WriteApproval(WriteApprovalStatus.BLOCKED)
+                    if status is WriteNotStartedStatus.BLOCKED
+                    else plan.approval
+                ),
+                () if status is WriteNotStartedStatus.BLOCKED else plan.confirmations,
+                filevault or plan.preflight.filevault,
                 diagnostics,
+                capacity or plan.preflight.capacity,
             ),
             diagnostics=diagnostics,
         )

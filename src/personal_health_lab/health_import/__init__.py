@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import stat
 from dataclasses import dataclass
@@ -49,7 +50,7 @@ class HealthImportError(Exception):
 class HealthImportResult:
     operation_id: OperationId
     import_id: ImportId
-    status: Literal["committed", "duplicate", "rejected"]
+    status: Literal["committed", "duplicate", "quarantined", "rejected"]
     package_hash: str
     snapshot_id: SnapshotId | None
     record_count: int
@@ -57,6 +58,12 @@ class HealthImportResult:
     logical_measurement_count: int = 0
     measurement_version_count: int = 0
     diagnostics: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class HealthExportEstimate:
+    input_bytes: int
+    record_count: int
 
 
 def _source_datetime(value: str) -> datetime:
@@ -185,6 +192,39 @@ def _records(
     return tuple(records)
 
 
+def estimate_health_export(
+    package_path: Path,
+    *,
+    max_package_bytes: int,
+    max_entries: int,
+    max_entry_bytes: int,
+    max_uncompressed_bytes: int,
+    max_compression_ratio: float,
+) -> HealthExportEstimate:
+    package_size = package_path.stat().st_size
+    try:
+        with ZipFile(package_path) as archive:
+            input_bytes = archive.getinfo(_EXPORT_MEMBER).file_size
+        records = _records(
+            package_path,
+            max_package_bytes=max_package_bytes,
+            max_entries=max_entries,
+            max_entry_bytes=max_entry_bytes,
+            max_uncompressed_bytes=max_uncompressed_bytes,
+            max_compression_ratio=max_compression_ratio,
+        )
+        return HealthExportEstimate(max(input_bytes, package_size), len(records))
+    except (
+        BadZipFile,
+        KeyError,
+        NotImplementedError,
+        ParseError,
+        RuntimeError,
+        ValueError,
+    ):
+        return HealthExportEstimate(max(package_size, 1), 0)
+
+
 def import_health_export(
     package_path: Path,
     *,
@@ -238,13 +278,35 @@ def import_health_export(
                 record_count=0,
                 diagnostics=("invalid_health_export",),
             )
-        published = store.publish_import(
-            operation_id=operation_id,
-            import_id=import_id,
-            package_hash=package_hash,
-            snapshot_id=snapshot_id,
-            records=records,
-        )
+        try:
+            published = store.publish_import(
+                operation_id=operation_id,
+                import_id=import_id,
+                package_hash=package_hash,
+                snapshot_id=snapshot_id,
+                records=records,
+            )
+        except (OSError, StoreError) as error:
+            cause = error.__cause__ if isinstance(error, StoreError) else error
+            diagnostics = {
+                errno.ENOSPC: "capacity_exhausted",
+                errno.EROFS: "target_read_only",
+                errno.EACCES: "target_unwritable",
+            }
+            if not isinstance(cause, OSError) or cause.errno not in diagnostics:
+                raise
+            diagnostic = diagnostics[cause.errno]
+            store.quarantine_import(import_id, snapshot_id, diagnostic)
+            return HealthImportResult(
+                operation_id=operation_id,
+                import_id=import_id,
+                status="quarantined",
+                package_hash=package_hash,
+                snapshot_id=None,
+                record_count=0,
+                package_record_count=len(records),
+                diagnostics=(diagnostic,),
+            )
     except StoreError as error:
         raise HealthImportError("Health-Importspeicher ist nicht verfügbar.") from error
     return HealthImportResult(
@@ -262,10 +324,12 @@ def import_health_export(
 
 
 __all__ = [
+    "HealthExportEstimate",
     "HealthImportError",
     "HealthImportResult",
     "ImportId",
     "OperationId",
     "SnapshotId",
+    "estimate_health_export",
     "import_health_export",
 ]

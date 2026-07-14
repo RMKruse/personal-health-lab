@@ -18,6 +18,9 @@ from personal_health_lab.resting_hr_analysis import (
     AnalysisResultId as AnalysisResultRef,
 )
 from personal_health_lab.storage import (
+    CapacityCheck,
+    CapacityReason,
+    CapacityStatus,
     FileVaultCheck,
     FileVaultReason,
     FileVaultStatus,
@@ -63,6 +66,9 @@ __all__ = [
     "AnalysisRunId",
     "AnalysisStatus",
     "AssociationInterval",
+    "CapacityCheck",
+    "CapacityReason",
+    "CapacityStatus",
     "ConfigurationError",
     "DataMode",
     "FeatureNotAvailableError",

@@ -99,6 +99,18 @@ if import_plan is not None:
             else "-"
         )
     )
+    capacity = import_plan.preflight.capacity
+    st.caption(
+        "Kapazität: "
+        + (
+            f"{capacity.status.value} · Ziel {capacity.target_volume} · "
+            f"Methode {capacity.method_id} · Schätzung {capacity.estimate_bytes} · "
+            f"Marge {capacity.safety_margin_bytes} · Mindestrest "
+            f"{capacity.minimum_remaining_bytes} · Verfügbar {capacity.available_bytes}"
+            if capacity
+            else "-"
+        )
+    )
     st.caption("Diagnosen: " + (", ".join(import_plan.diagnostics) or "-"))
     execute_disabled = import_plan.approval.status is WriteApprovalStatus.BLOCKED
     execute_label = (

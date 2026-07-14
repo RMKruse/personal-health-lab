@@ -13,6 +13,9 @@ from ._store import (
     AssociationDirection,
     AssociationEstimate,
     AssociationInterval,
+    CapacityCheck,
+    CapacityReason,
+    CapacityStatus,
     FileVaultCheck,
     FileVaultReason,
     FileVaultStatus,
@@ -28,6 +31,8 @@ from ._store import (
     StoreError,
     StoreId,
     StoreIdentity,
+    full_snapshot_import_estimate,
+    probe_capacity,
     probe_filevault,
 )
 
@@ -42,6 +47,9 @@ __all__ = [
     "AssociationDirection",
     "AssociationEstimate",
     "AssociationInterval",
+    "CapacityCheck",
+    "CapacityReason",
+    "CapacityStatus",
     "DataMode",
     "FileVaultCheck",
     "FileVaultReason",
@@ -58,5 +66,7 @@ __all__ = [
     "StoreError",
     "StoreId",
     "StoreIdentity",
+    "full_snapshot_import_estimate",
+    "probe_capacity",
     "probe_filevault",
 ]

@@ -94,6 +94,11 @@ def test_real_json_import_renders_shared_confirmation_plan(
         "target_volume": "unresolved",
         "reason": "unsupported_platform",
     }
+    capacity = plan["preflight"]["capacity"]
+    assert capacity["status"] == "ready"
+    assert capacity["method_id"] == "full-snapshot-import/v1"
+    assert capacity["target_volume"].startswith("volume-")
+    assert str(tmp_path) not in json.dumps(capacity)
     assert plan["workspace"]["mode"] == "real"
     assert plan["workspace"]["person_binding"] == "unbound"
     assert len(plan["workspace"]["store_id"]) == 32

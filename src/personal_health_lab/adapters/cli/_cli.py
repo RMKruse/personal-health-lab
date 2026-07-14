@@ -14,6 +14,7 @@ from personal_health_lab.application import (
     AnalysisProvenance,
     AnalysisStatus,
     AssociationInterval,
+    CapacityCheck,
     ConfigurationError,
     DataMode,
     FileVaultCheck,
@@ -163,6 +164,23 @@ def _filevault_json(filevault: FileVaultCheck | None) -> dict[str, str | None] |
     }
 
 
+def _capacity_json(capacity: CapacityCheck | None) -> dict[str, object] | None:
+    if capacity is None:
+        return None
+    return {
+        "available_bytes": capacity.available_bytes,
+        "estimate_bytes": capacity.estimate_bytes,
+        "fragment_size": capacity.fragment_size,
+        "method_id": capacity.method_id,
+        "minimum_remaining_bytes": capacity.minimum_remaining_bytes,
+        "reason": None if capacity.reason is None else capacity.reason.value,
+        "required_bytes": capacity.required_bytes,
+        "safety_margin_bytes": capacity.safety_margin_bytes,
+        "status": capacity.status.value,
+        "target_volume": capacity.target_volume,
+    }
+
+
 def _write_plan_json(
     plan: WritePlan,
     runtime_config: Mapping[str, object],
@@ -179,6 +197,7 @@ def _write_plan_json(
         "fingerprint": str(plan.fingerprint),
         "kind": "write_plan",
         "preflight": {
+            "capacity": _capacity_json(plan.preflight.capacity),
             "filevault": _filevault_json(plan.preflight.filevault),
         },
         "request": {"package": "<redacted>", "type": "import_health_export"},
@@ -220,6 +239,7 @@ def _write_receipt_json(
                 item.value for item in receipt.final_preflight.confirmations
             ),
             "diagnostics": receipt.final_preflight.diagnostics,
+            "capacity": _capacity_json(receipt.final_preflight.capacity),
             "filevault": _filevault_json(receipt.final_preflight.filevault),
         },
         "kind": "write_receipt",
@@ -246,6 +266,18 @@ def _print_write_plan(plan: WritePlan, workspace: WorkspaceStatus) -> None:
             f"{filevault.status.value} · Ziel {filevault.target_volume}"
             + (f" · Grund {filevault.reason.value}" if filevault.reason else "")
             if filevault
+            else "-"
+        )
+    )
+    capacity = plan.preflight.capacity
+    print(
+        "Kapazität: "
+        + (
+            f"{capacity.status.value} · Ziel {capacity.target_volume} · "
+            f"Methode {capacity.method_id} · Schätzung {capacity.estimate_bytes} · "
+            f"Marge {capacity.safety_margin_bytes} · Mindestrest "
+            f"{capacity.minimum_remaining_bytes} · Verfügbar {capacity.available_bytes}"
+            if capacity
             else "-"
         )
     )
