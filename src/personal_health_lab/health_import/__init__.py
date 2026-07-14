@@ -21,12 +21,10 @@ from personal_health_lab.health_data import (
     MeasurementVersionId,
 )
 from personal_health_lab.storage import (
-    DataMode,
     ImportId,
     LocalStore,
     OperationId,
     SnapshotId,
-    StoreBusyError,
     StoreError,
 )
 
@@ -51,7 +49,7 @@ class HealthImportError(Exception):
 class HealthImportResult:
     operation_id: OperationId
     import_id: ImportId
-    status: Literal["committed", "duplicate", "rejected", "store_busy"]
+    status: Literal["committed", "duplicate", "rejected"]
     package_hash: str
     snapshot_id: SnapshotId | None
     record_count: int
@@ -190,8 +188,7 @@ def _records(
 def import_health_export(
     package_path: Path,
     *,
-    root: Path,
-    mode: DataMode,
+    store: LocalStore,
     max_package_bytes: int,
     max_entries: int,
     max_entry_bytes: int,
@@ -203,20 +200,6 @@ def import_health_export(
     snapshot_id = SnapshotId(uuid4().hex)
     package_hash = ""
     try:
-        store = LocalStore.open_writer(root=root, mode=mode)
-    except StoreBusyError:
-        return HealthImportResult(
-            operation_id=operation_id,
-            import_id=import_id,
-            status="store_busy",
-            package_hash=package_hash,
-            snapshot_id=None,
-            record_count=0,
-            diagnostics=("store_busy",),
-        )
-    except StoreError as error:
-        raise HealthImportError("Health-Importspeicher ist nicht verfügbar.") from error
-    try:
         store.start_import(
             operation_id=operation_id,
             import_id=import_id,
@@ -227,6 +210,7 @@ def import_health_export(
                 raise ValueError("package too large")
             with package_path.open("rb") as package:
                 package_hash = hashlib.file_digest(package, "sha256").hexdigest()
+            store.mark_import_reading(import_id)
             records = _records(
                 package_path,
                 max_package_bytes=max_package_bytes,
@@ -263,8 +247,6 @@ def import_health_export(
         )
     except StoreError as error:
         raise HealthImportError("Health-Importspeicher ist nicht verfügbar.") from error
-    finally:
-        store.close()
     return HealthImportResult(
         operation_id=operation_id,
         import_id=import_id,

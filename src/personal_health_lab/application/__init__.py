@@ -17,6 +17,13 @@ from personal_health_lab.resting_hr_analysis import (
 from personal_health_lab.resting_hr_analysis import (
     AnalysisResultId as AnalysisResultRef,
 )
+from personal_health_lab.storage import (
+    FileVaultCheck,
+    FileVaultReason,
+    FileVaultStatus,
+    PersonBindingStatus,
+    StoreId,
+)
 
 from ._application import (
     AnalysisReceipt,
@@ -33,8 +40,11 @@ from ._application import (
     PlanFingerprint,
     RestingHeartRateAnalysisConfig,
     RuntimeConfig,
+    WorkspaceState,
+    WorkspaceStatus,
     WriteApproval,
     WriteApprovalStatus,
+    WriteConfirmation,
     WriteNotStarted,
     WriteNotStartedStatus,
     WritePlan,
@@ -56,6 +66,9 @@ __all__ = [
     "ConfigurationError",
     "DataMode",
     "FeatureNotAvailableError",
+    "FileVaultCheck",
+    "FileVaultReason",
+    "FileVaultStatus",
     "HealthLab",
     "HealthLabError",
     "ImportHealthExport",
@@ -68,12 +81,17 @@ __all__ = [
     "Overview",
     "OverviewSelection",
     "OverviewStatus",
+    "PersonBindingStatus",
     "PlanFingerprint",
     "RestingHeartRateAnalysisConfig",
     "RuntimeConfig",
     "SnapshotRef",
+    "StoreId",
+    "WorkspaceState",
+    "WorkspaceStatus",
     "WriteApproval",
     "WriteApprovalStatus",
+    "WriteConfirmation",
     "WriteNotStarted",
     "WriteNotStartedStatus",
     "WritePlan",

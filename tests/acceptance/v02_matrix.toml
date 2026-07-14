@@ -19,6 +19,30 @@ source = "https://github.com/RMKruse/personal-health-lab/issues/33"
 statement = "Plans, receipts, and expected outcomes are closed typed values."
 evidence = ["positive", "negative", "fault"]
 
+[[contract]]
+id = "V02-C-PRE-001"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Every store has a stable non-personal ID and immutable data-mode binding."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V02-C-PRE-002"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Real imports require one-person confirmation and bind only decided personal data."
+evidence = ["positive", "negative", "fault"]
+
+[[contract]]
+id = "V02-C-PRE-003"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "FileVault has four typed findings and synthetic stores are never probed."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V02-C-PRE-004"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Actual write targets are rechecked and only a protected improvement may continue."
+evidence = ["positive", "negative", "transition"]
+
 [[fixture]]
 id = "V02-F-DOM-IMPORT-001"
 kind = "domain"
@@ -27,6 +51,42 @@ seed = 35
 parameters = "one supported resting-heart-rate record"
 platform = "all"
 sha256 = "694c8cc83d62f4c504307850b29d819be0bb4014190b5e806bfcd2e266232826"
+
+[[fixture]]
+id = "V02-F-SYS-FILEVAULT-PROTECTED-V1"
+kind = "system"
+generator = "controlled-filevault-v1"
+seed = 0
+parameters = "tests/fixtures/filevault/v1/protected.json"
+platform = "macos"
+sha256 = "8e40cf8c699892dd506c92125440c1c6d20a25e400ae357563b5bc4482e7c6b1"
+
+[[fixture]]
+id = "V02-F-SYS-FILEVAULT-UNPROTECTED-V1"
+kind = "system"
+generator = "controlled-filevault-v1"
+seed = 0
+parameters = "tests/fixtures/filevault/v1/unprotected.json"
+platform = "macos"
+sha256 = "ca52b887d140a04a801805fd174b79c777ab4cf730cba3003be8f8cecdc31aba"
+
+[[fixture]]
+id = "V02-F-SYS-FILEVAULT-TRANSITIONING-V1"
+kind = "system"
+generator = "controlled-filevault-v1"
+seed = 0
+parameters = "tests/fixtures/filevault/v1/transitioning.json"
+platform = "macos"
+sha256 = "74a9a15fdf724ebb102b57484168526b36686ecc4b8ed1e77c034921d6a6ec6c"
+
+[[fixture]]
+id = "V02-F-SYS-FILEVAULT-UNKNOWN-V1"
+kind = "system"
+generator = "controlled-filevault-v1"
+seed = 0
+parameters = "tests/fixtures/filevault/v1/unknown.json"
+platform = "macos"
+sha256 = "f5df7c67082a2e3cd1bdd4d08a9678b6e026fd51095fad1f2ed3877076370d1b"
 
 [[case]]
 id = "V02-A-API-004"
@@ -135,3 +195,183 @@ level = "application"
 expected_result = "HealthLabError"
 expected_effect = "none"
 forbidden_side_effects = ["technical defect encoded as business outcome"]
+
+[[case]]
+id = "V02-A-PRE-001"
+contracts = ["V02-C-PRE-001"]
+fixtures = []
+runner = "test_new_store_has_stable_identity_and_immutable_mode"
+initial_state = "new real and synthetic stores"
+operation = "open and load workspace status twice"
+level = "application"
+expected_result = "stable random store ID and matching immutable mode"
+expected_effect = "one identity per store"
+forbidden_side_effects = ["person-derived identity"]
+
+[[case]]
+id = "V02-A-PRE-002"
+contracts = ["V02-C-PRE-001"]
+fixtures = []
+runner = "test_complete_store_copy_retains_the_same_identity"
+initial_state = "initialized synthetic store"
+operation = "copy every store file and open the copy"
+level = "application"
+expected_result = "copy exposes the original store ID"
+expected_effect = "none"
+forbidden_side_effects = ["new ID for a complete copy", "merge", "synchronization"]
+
+[[case]]
+id = "V02-A-PRE-003"
+contracts = ["V02-C-PRE-001", "V02-C-PRE-002"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_legacy_real_store_gets_identity_only_after_confirmed_execution"
+initial_state = "non-empty legacy real store without V0.2 identity"
+operation = "preview, abort, then execute the same import plan"
+level = "application"
+expected_result = "identity assigned once only by confirmed execution"
+expected_effect = "legacy personal store becomes bound"
+forbidden_side_effects = ["identity assignment on open", "identity assignment on preview"]
+
+[[case]]
+id = "V02-A-PRE-004"
+contracts = ["V02-C-PRE-001"]
+fixtures = []
+runner = "test_new_store_has_stable_identity_and_immutable_mode"
+initial_state = "initialized store"
+operation = "open the same store in the other data mode"
+level = "application"
+expected_result = "ConfigurationError"
+expected_effect = "none"
+forbidden_side_effects = ["mode change"]
+
+[[case]]
+id = "V02-A-PRE-005"
+contracts = ["V02-C-PRE-002"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_real_import_uses_one_typed_confirmation_plan"
+initial_state = "new or previously bound real store"
+operation = "preview a real import"
+level = "application"
+expected_result = "one shared plan includes same-person confirmation"
+expected_effect = "none"
+forbidden_side_effects = ["person fingerprint", "adapter-owned confirmation rule"]
+
+[[case]]
+id = "V02-A-PRE-006"
+contracts = ["V02-C-PRE-002"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_real_store_binds_only_after_a_decided_personal_import"
+initial_state = "new real stores"
+operation = "abort, reject, or contend for the writer lock"
+level = "application"
+expected_result = "unbound workspace after every non-personal outcome"
+expected_effect = "no person binding"
+forbidden_side_effects = ["binding on preview", "binding on clean rejection", "binding on store_busy"]
+
+[[case]]
+id = "V02-A-PRE-007"
+contracts = ["V02-C-PRE-002"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_quarantined_real_import_binds_the_store"
+initial_state = "real import interrupted after reading personal data"
+operation = "reopen and recover the store"
+level = "application"
+expected_result = "bound workspace with quarantined import"
+expected_effect = "durable person binding"
+forbidden_side_effects = ["unbound quarantine"]
+
+[[case]]
+id = "V02-A-PRE-008"
+contracts = ["V02-C-PRE-002"]
+fixtures = []
+runner = "test_pending_person_binding_is_visible_in_workspace_status"
+initial_state = "restore-pending real-store identity"
+operation = "load workspace status"
+level = "application"
+expected_result = "typed pending person binding"
+expected_effect = "none"
+forbidden_side_effects = ["implicit permanent binding"]
+
+[[case]]
+id = "V02-A-PRE-009"
+contracts = ["V02-C-PRE-003"]
+fixtures = ["V02-F-DOM-IMPORT-001", "V02-F-SYS-FILEVAULT-PROTECTED-V1"]
+runner = "test_real_import_uses_one_typed_confirmation_plan"
+initial_state = "protected real import target"
+operation = "preview and execute real import"
+level = "application"
+expected_result = "protected finding without FileVault confirmation reason"
+expected_effect = "import may proceed after same-person confirmation"
+forbidden_side_effects = ["FileVault warning for protected target"]
+
+[[case]]
+id = "V02-A-PRE-010"
+contracts = ["V02-C-PRE-003"]
+fixtures = ["V02-F-DOM-IMPORT-001", "V02-F-SYS-FILEVAULT-UNPROTECTED-V1", "V02-F-SYS-FILEVAULT-TRANSITIONING-V1", "V02-F-SYS-FILEVAULT-UNKNOWN-V1"]
+runner = "test_real_import_uses_one_typed_confirmation_plan"
+initial_state = "unprotected, transitioning, or unknown real target"
+operation = "preview and execute real import"
+level = "application"
+expected_result = "typed finding in one combined confirmation plan"
+expected_effect = "confirmed import may proceed"
+forbidden_side_effects = ["FileVault-only block", "second confirmation dialog"]
+
+[[case]]
+id = "V02-A-PRE-011"
+contracts = ["V02-C-PRE-003"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_synthetic_import_skips_filevault_probe"
+initial_state = "synthetic store"
+operation = "preview and execute import"
+level = "application"
+expected_result = "no FileVault preflight or confirmation"
+expected_effect = "synthetic import may proceed"
+forbidden_side_effects = ["FileVault system call"]
+
+[[case]]
+id = "V02-A-PRE-012"
+contracts = ["V02-C-PRE-003"]
+fixtures = ["V02-F-DOM-IMPORT-001", "V02-F-SYS-FILEVAULT-UNPROTECTED-V1"]
+runner = "test_hardware_encryption_without_filevault_is_unprotected"
+initial_state = "encrypted volume with FileVault explicitly false"
+operation = "preview real import"
+level = "application"
+expected_result = "unprotected FileVault finding"
+expected_effect = "confirmation required"
+forbidden_side_effects = ["hardware encryption treated as FileVault proof"]
+
+[[case]]
+id = "V02-A-PRE-013"
+contracts = ["V02-C-PRE-004"]
+fixtures = ["V02-F-DOM-IMPORT-001", "V02-F-SYS-FILEVAULT-PROTECTED-V1", "V02-F-SYS-FILEVAULT-UNPROTECTED-V1", "V02-F-SYS-FILEVAULT-TRANSITIONING-V1", "V02-F-SYS-FILEVAULT-UNKNOWN-V1"]
+runner = "test_real_import_uses_one_typed_confirmation_plan"
+initial_state = "real store and read-only Health export input"
+operation = "preview real import"
+level = "application"
+expected_result = "preflight identifies the store target volume"
+expected_effect = "none"
+forbidden_side_effects = ["FileVault gate on read-only export input"]
+
+[[case]]
+id = "V02-A-PRE-014"
+contracts = ["V02-C-PRE-004"]
+fixtures = ["V02-F-DOM-IMPORT-001", "V02-F-SYS-FILEVAULT-PROTECTED-V1", "V02-F-SYS-FILEVAULT-UNPROTECTED-V1"]
+runner = "test_filevault_is_rechecked_after_the_writer_lock"
+initial_state = "previewed real import whose protection degrades"
+operation = "execute expected plan"
+level = "application"
+expected_result = "plan_changed WriteNotStarted"
+expected_effect = "none"
+forbidden_side_effects = ["import start under changed risk"]
+
+[[case]]
+id = "V02-A-PRE-015"
+contracts = ["V02-C-PRE-004"]
+fixtures = ["V02-F-DOM-IMPORT-001", "V02-F-SYS-FILEVAULT-UNPROTECTED-V1", "V02-F-SYS-FILEVAULT-PROTECTED-V1"]
+runner = "test_filevault_improvement_to_protected_may_continue"
+initial_state = "previewed unprotected real target improved to protected"
+operation = "execute expected plan"
+level = "application"
+expected_result = "committed ImportReceipt"
+expected_effect = "one published snapshot"
+forbidden_side_effects = ["plan_changed for protected improvement"]

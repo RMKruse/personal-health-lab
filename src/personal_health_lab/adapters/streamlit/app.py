@@ -36,7 +36,19 @@ except (KeyError, ValueError, ConfigurationError):
     st.stop()
 
 st.title("HealthLab Übersicht")
-st.caption(f"Datenmodus: {config.mode.value}")
+try:
+    with HealthLab.open(config) as health_lab:
+        workspace_status = health_lab.load_workspace_status()
+except (ConfigurationError, HealthLabError):
+    st.error("HealthLab-Konfiguration oder lokaler Datenspeicher ist ungültig.")
+    st.stop()
+st.caption(
+    f"Datenmodus: {workspace_status.mode.value} · Datenspeicher-ID: "
+    f"{workspace_status.store_id or '-'} · Bindung: {workspace_status.person_binding.value}"
+)
+st.caption(
+    "Zulässige Schreibaktionen: " + ", ".join(workspace_status.allowed_writes)
+)
 
 import_plan = st.session_state.get("import_plan")
 uploaded = st.file_uploader(
@@ -73,9 +85,28 @@ if import_plan is not None:
         f"Paket: {import_plan.details.package_size} Bytes · "
         f"SHA-256 {import_plan.details.package_hash or '-'}"
     )
+    st.caption(
+        "Bestätigungen: "
+        + (", ".join(confirmation.value for confirmation in import_plan.confirmations) or "-")
+    )
+    filevault = import_plan.preflight.filevault
+    st.caption(
+        "FileVault: "
+        + (
+            f"{filevault.status.value} · Ziel {filevault.target_volume}"
+            + (f" · Grund {filevault.reason.value}" if filevault.reason else "")
+            if filevault
+            else "-"
+        )
+    )
     st.caption("Diagnosen: " + (", ".join(import_plan.diagnostics) or "-"))
     execute_disabled = import_plan.approval.status is WriteApprovalStatus.BLOCKED
-    if st.button("Vorschau ausführen", disabled=execute_disabled):
+    execute_label = (
+        "Bestätigen und ausführen"
+        if import_plan.approval.status is WriteApprovalStatus.CONFIRMATION_REQUIRED
+        else "Vorschau ausführen"
+    )
+    if st.button(execute_label, disabled=execute_disabled):
         import_failed = False
         try:
             with HealthLab.open(config) as health_lab:

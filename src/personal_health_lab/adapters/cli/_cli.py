@@ -16,6 +16,7 @@ from personal_health_lab.application import (
     AssociationInterval,
     ConfigurationError,
     DataMode,
+    FileVaultCheck,
     HealthLab,
     ImportHealthExport,
     ImportReceipt,
@@ -24,6 +25,7 @@ from personal_health_lab.application import (
     OverviewSelection,
     PlanFingerprint,
     RestingHeartRateAnalysisConfig,
+    WorkspaceStatus,
     WriteApprovalStatus,
     WriteNotStarted,
     WritePlan,
@@ -140,9 +142,35 @@ def _analysis_json(overview: Overview) -> dict[str, object] | None:
     }
 
 
-def _write_plan_json(plan: WritePlan, runtime_config: Mapping[str, object]) -> dict[str, object]:
+def _workspace_json(status: WorkspaceStatus) -> dict[str, object]:
+    return {
+        "allowed_reads": status.allowed_reads,
+        "allowed_writes": status.allowed_writes,
+        "mode": status.mode.value,
+        "person_binding": status.person_binding.value,
+        "state": status.state.value,
+        "store_id": None if status.store_id is None else str(status.store_id),
+    }
+
+
+def _filevault_json(filevault: FileVaultCheck | None) -> dict[str, str | None] | None:
+    if filevault is None:
+        return None
+    return {
+        "status": filevault.status.value,
+        "target_volume": filevault.target_volume,
+        "reason": None if filevault.reason is None else filevault.reason.value,
+    }
+
+
+def _write_plan_json(
+    plan: WritePlan,
+    runtime_config: Mapping[str, object],
+    workspace: WorkspaceStatus,
+) -> dict[str, object]:
     return {
         "approval": {"status": plan.approval.status.value},
+        "confirmations": tuple(item.value for item in plan.confirmations),
         "details": {
             "package_hash": plan.details.package_hash,
             "package_size": plan.details.package_size,
@@ -150,9 +178,13 @@ def _write_plan_json(plan: WritePlan, runtime_config: Mapping[str, object]) -> d
         "diagnostics": plan.diagnostics,
         "fingerprint": str(plan.fingerprint),
         "kind": "write_plan",
+        "preflight": {
+            "filevault": _filevault_json(plan.preflight.filevault),
+        },
         "request": {"package": "<redacted>", "type": "import_health_export"},
         "runtime_config": dict(runtime_config),
         "schema_version": "2.0",
+        "workspace": _workspace_json(workspace),
     }
 
 
@@ -184,7 +216,11 @@ def _write_receipt_json(
         "diagnostics": receipt.diagnostics,
         "final_preflight": {
             "approval": {"status": receipt.final_preflight.approval.status.value},
+            "confirmations": tuple(
+                item.value for item in receipt.final_preflight.confirmations
+            ),
             "diagnostics": receipt.final_preflight.diagnostics,
+            "filevault": _filevault_json(receipt.final_preflight.filevault),
         },
         "kind": "write_receipt",
         "operation_id": str(receipt.operation_id),
@@ -195,9 +231,25 @@ def _write_receipt_json(
     }
 
 
-def _print_write_plan(plan: WritePlan) -> None:
+def _print_write_plan(plan: WritePlan, workspace: WorkspaceStatus) -> None:
     print(f"Schreibvorschau: {plan.approval.status.value}")
     print(f"Plan-Fingerprint: {plan.fingerprint}")
+    print(
+        "Datenspeicher-ID: "
+        f"{workspace.store_id or '-'} · Bindung: {workspace.person_binding.value}"
+    )
+    print("Bestätigungen: " + (", ".join(plan.confirmations) or "-"))
+    filevault = plan.preflight.filevault
+    print(
+        "FileVault: "
+        + (
+            f"{filevault.status.value} · Ziel {filevault.target_volume}"
+            + (f" · Grund {filevault.reason.value}" if filevault.reason else "")
+            if filevault
+            else "-"
+        )
+    )
+    print("Zulässige Aktionen: " + ", ".join(workspace.allowed_writes))
     print("Diagnosen: " + (", ".join(plan.diagnostics) or "-"))
 
 
@@ -218,6 +270,7 @@ def main(args: Sequence[str] | None = None) -> int:
             config_file=parsed.config,
         )
         with HealthLab.open(config) as health_lab:
+            workspace_status = health_lab.load_workspace_status()
             if parsed.command == "import":
                 import_request = ImportHealthExport(parsed.package)
                 import_plan = health_lab.preview_write(import_request)
@@ -232,7 +285,7 @@ def main(args: Sequence[str] | None = None) -> int:
                     not parsed.as_json
                     and import_plan.approval.status is not WriteApprovalStatus.BLOCKED
                 ):
-                    _print_write_plan(import_plan)
+                    _print_write_plan(import_plan, workspace_status)
                     if input("Health-Exportimport ausführen? [j/N] ").strip().lower() in {
                         "j",
                         "ja",
@@ -332,14 +385,14 @@ def main(args: Sequence[str] | None = None) -> int:
             )
     elif parsed.command == "import" and parsed.as_json:
         output = (
-            _write_plan_json(import_plan, runtime_config)
+            _write_plan_json(import_plan, runtime_config, workspace_status)
             if import_write_receipt is None
             else _write_receipt_json(import_write_receipt, runtime_config)
         )
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
     elif parsed.command == "import":
         if import_plan.approval.status is WriteApprovalStatus.BLOCKED:
-            _print_write_plan(import_plan)
+            _print_write_plan(import_plan, workspace_status)
         if import_write_receipt is None:
             print("Health-Exportimport nicht ausgeführt.")
         elif isinstance(import_write_receipt.result, ImportReceipt):

@@ -1,5 +1,6 @@
 import fcntl
 import json
+import platform
 import subprocess
 import sys
 from importlib.resources import files
@@ -60,6 +61,43 @@ def _execute_json_import(
     assert receipt["kind"] == "write_receipt"
     assert receipt["plan_fingerprint"] == plan["fingerprint"]
     return exit_code, receipt
+
+
+def test_real_json_import_renders_shared_confirmation_plan(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = generate_export("lag-signal-v1", 42, tmp_path / "fixture")
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+
+    assert main(
+        [
+            "--mode",
+            "real",
+            "--synthetic-store",
+            str(tmp_path / "synthetic"),
+            "--real-store",
+            str(tmp_path / "real"),
+            "import",
+            str(fixture.export_path),
+            "--json",
+        ]
+    ) == 0
+    plan = json.loads(capsys.readouterr().out)
+
+    _assert_json_contract(plan)
+    assert plan["approval"]["status"] == "confirmation_required"
+    assert plan["confirmations"] == ["real_import_same_person", "filevault_unknown"]
+    assert plan["preflight"]["filevault"] == {
+        "status": "unknown",
+        "target_volume": "unresolved",
+        "reason": "unsupported_platform",
+    }
+    assert plan["workspace"]["mode"] == "real"
+    assert plan["workspace"]["person_binding"] == "unbound"
+    assert len(plan["workspace"]["store_id"]) == 32
+    assert plan["workspace"]["allowed_writes"] == ["import_health_export"]
 
 
 def test_cli_returns_expected_incomplete_for_rejected_import(

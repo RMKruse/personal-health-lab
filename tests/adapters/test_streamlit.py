@@ -1,3 +1,4 @@
+import platform
 from datetime import date
 from pathlib import Path
 
@@ -108,3 +109,30 @@ def test_streamlit_shows_imported_daily_series(
     assert not app.exception
     assert app.markdown[0].value == "Status: provisional"
     assert any("Letztes belastbares Ergebnis" in item.value for item in app.warning)
+
+
+def test_streamlit_renders_the_shared_real_import_confirmation_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = generate_export("lag-signal-v1", 42, tmp_path / "fixture")
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setenv("HEALTHLAB_MODE", "real")
+    monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(tmp_path / "synthetic"))
+    monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(tmp_path / "real"))
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
+
+    app = AppTest.from_file(str(app_path)).run()
+    app.file_uploader[0].set_value(
+        ("apple-health-export.zip", fixture.export_path.read_bytes(), "application/zip")
+    )
+    app.button[0].click().run()
+
+    assert not app.exception
+    values = [item.value for item in (*app.markdown, *app.caption, *app.warning)]
+    assert any(
+        "real_import_same_person" in value and "filevault_unknown" in value
+        for value in values
+    )
+    assert any("FileVault: unknown" in value for value in values)
+    assert any("Datenspeicher-ID:" in value and "unbound" in value for value in values)
+    assert any(button.label == "Bestätigen und ausführen" for button in app.button)

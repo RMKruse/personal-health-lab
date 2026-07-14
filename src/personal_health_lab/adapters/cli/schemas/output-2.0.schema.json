@@ -85,6 +85,84 @@
         }
       }
     },
+    "fileVaultCheck": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "reason",
+            "status",
+            "target_volume"
+          ],
+          "properties": {
+            "reason": {
+              "enum": [
+                null,
+                "unsupported_platform",
+                "mount_unresolved",
+                "disk_info_unavailable",
+                "volume_identity_missing",
+                "volume_locked",
+                "apfs_state_unavailable",
+                "filevault_state_unavailable",
+                "filevault_state_unreported",
+                "encryption_state_unconfirmed",
+                "probe_failed"
+              ]
+            },
+            "status": {
+              "enum": [
+                "protected",
+                "unprotected",
+                "transitioning",
+                "unknown"
+              ]
+            },
+            "target_volume": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "allowed_reads",
+        "allowed_writes",
+        "mode",
+        "person_binding",
+        "state",
+        "store_id"
+      ],
+      "properties": {
+        "allowed_reads": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "allowed_writes": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "mode": {
+          "enum": ["synthetic", "real"]
+        },
+        "person_binding": {
+          "enum": ["unbound", "bound", "pending"]
+        },
+        "state": {
+          "enum": ["ready", "migration_required"]
+        },
+        "store_id": {
+          "$ref": "#/$defs/nullableString"
+        }
+      }
+    },
     "importResult": {
       "type": "object",
       "additionalProperties": false,
@@ -182,17 +260,32 @@
       "additionalProperties": false,
       "required": [
         "approval",
+        "confirmations",
         "details",
         "diagnostics",
         "fingerprint",
         "kind",
+        "preflight",
         "request",
         "runtime_config",
-        "schema_version"
+        "schema_version",
+        "workspace"
       ],
       "properties": {
         "approval": {
           "$ref": "#/$defs/writeApproval"
+        },
+        "confirmations": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "real_import_same_person",
+              "filevault_unprotected",
+              "filevault_transitioning",
+              "filevault_unknown",
+              "legacy_store_migration"
+            ]
+          }
         },
         "details": {
           "type": "object",
@@ -224,6 +317,14 @@
         "kind": {
           "const": "write_plan"
         },
+        "preflight": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["filevault"],
+          "properties": {
+            "filevault": {"$ref": "#/$defs/fileVaultCheck"}
+          }
+        },
         "request": {
           "type": "object",
           "additionalProperties": false,
@@ -245,6 +346,9 @@
         },
         "schema_version": {
           "const": "2.0"
+        },
+        "workspace": {
+          "$ref": "#/$defs/workspace"
         }
       }
     },
@@ -273,17 +377,34 @@
           "additionalProperties": false,
           "required": [
             "approval",
-            "diagnostics"
+            "confirmations",
+            "diagnostics",
+            "filevault"
           ],
           "properties": {
             "approval": {
               "$ref": "#/$defs/writeApproval"
+            },
+            "confirmations": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "real_import_same_person",
+                  "filevault_unprotected",
+                  "filevault_transitioning",
+                  "filevault_unknown",
+                  "legacy_store_migration"
+                ]
+              }
             },
             "diagnostics": {
               "type": "array",
               "items": {
                 "type": "string"
               }
+            },
+            "filevault": {
+              "$ref": "#/$defs/fileVaultCheck"
             }
           }
         },

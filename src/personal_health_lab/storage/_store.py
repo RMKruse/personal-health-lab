@@ -3,13 +3,17 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import platform
+import plistlib
 import shutil
 import sqlite3
+import subprocess
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import IO, Literal, Self, cast
+from uuid import uuid4
 
 import duckdb
 
@@ -26,8 +30,22 @@ from personal_health_lab.health_data import (
 _METADATA_FILE = "metadata.sqlite3"
 _PARQUET_DIRECTORY = "parquet"
 _QUERY_FILE = "query.duckdb"
-_STORE_SCHEMA_VERSION = "1.1"
+_STORE_SCHEMA_VERSION = "1.2"
 _WRITER_LOCK_FILE = ".writer.lock"
+_STORE_IDENTITY_DDL = """
+CREATE TABLE store_identity (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    mode TEXT NOT NULL CHECK (mode IN ('synthetic', 'real')),
+    schema_version TEXT NOT NULL,
+    store_id TEXT CHECK (
+        store_id IS NULL OR (
+            length(store_id) = 32 AND store_id NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    person_binding TEXT NOT NULL DEFAULT 'unbound'
+        CHECK (person_binding IN ('unbound', 'bound', 'pending'))
+)
+"""
 
 
 class StoreError(RuntimeError):
@@ -40,6 +58,212 @@ class StoreConfigurationError(StoreError, ValueError):
 
 class StoreBusyError(StoreError):
     """Another process owns the store's writer lock."""
+
+
+class PersonBindingStatus(StrEnum):
+    UNBOUND = "unbound"
+    BOUND = "bound"
+    PENDING = "pending"
+
+
+class FileVaultStatus(StrEnum):
+    PROTECTED = "protected"
+    UNPROTECTED = "unprotected"
+    TRANSITIONING = "transitioning"
+    UNKNOWN = "unknown"
+
+
+class FileVaultReason(StrEnum):
+    UNSUPPORTED_PLATFORM = "unsupported_platform"
+    MOUNT_UNRESOLVED = "mount_unresolved"
+    DISK_INFO_UNAVAILABLE = "disk_info_unavailable"
+    VOLUME_IDENTITY_MISSING = "volume_identity_missing"
+    VOLUME_LOCKED = "volume_locked"
+    APFS_STATE_UNAVAILABLE = "apfs_state_unavailable"
+    FILEVAULT_STATE_UNAVAILABLE = "filevault_state_unavailable"
+    FILEVAULT_STATE_UNREPORTED = "filevault_state_unreported"
+    ENCRYPTION_STATE_UNCONFIRMED = "encryption_state_unconfirmed"
+    PROBE_FAILED = "probe_failed"
+
+
+@dataclass(frozen=True, slots=True)
+class FileVaultCheck:
+    status: FileVaultStatus
+    target_volume: str
+    reason: FileVaultReason | None = None
+
+
+def probe_filevault(path: Path) -> FileVaultCheck:
+    if platform.system() != "Darwin":
+        return FileVaultCheck(
+            FileVaultStatus.UNKNOWN, "unresolved", FileVaultReason.UNSUPPORTED_PLATFORM
+        )
+    try:
+        mounted = subprocess.run(
+            ["/bin/df", "-P", str(path.resolve())],
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        lines = mounted.stdout.decode("utf-8", errors="strict").splitlines()
+        device = lines[-1].split()[0]
+        if mounted.returncode != 0 or len(lines) < 2 or not device.startswith("/dev/disk"):
+            return FileVaultCheck(
+                FileVaultStatus.UNKNOWN, "unresolved", FileVaultReason.MOUNT_UNRESOLVED
+            )
+        inspected = subprocess.run(
+            ["/usr/sbin/diskutil", "info", "-plist", device],
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        info = plistlib.loads(inspected.stdout)
+        if inspected.returncode != 0 or not isinstance(info, dict):
+            return FileVaultCheck(
+                FileVaultStatus.UNKNOWN,
+                "unresolved",
+                FileVaultReason.DISK_INFO_UNAVAILABLE,
+            )
+        target_volume = info.get("VolumeUUID") or info.get("APFSVolumeUUID")
+        if not isinstance(target_volume, str) or not target_volume:
+            return FileVaultCheck(
+                FileVaultStatus.UNKNOWN,
+                "unresolved",
+                FileVaultReason.VOLUME_IDENTITY_MISSING,
+            )
+        if info.get("Locked") is True:
+            return FileVaultCheck(
+                FileVaultStatus.UNKNOWN, target_volume, FileVaultReason.VOLUME_LOCKED
+            )
+        is_apfs = info.get("FilesystemType") == "apfs" or isinstance(
+            info.get("APFSVolumeUUID"), str
+        )
+        if is_apfs:
+            apfs = subprocess.run(
+                ["/usr/sbin/diskutil", "apfs", "list", "-plist"],
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            apfs_info = plistlib.loads(apfs.stdout)
+            if apfs.returncode != 0 or not isinstance(apfs_info, dict):
+                return FileVaultCheck(
+                    FileVaultStatus.UNKNOWN,
+                    target_volume,
+                    FileVaultReason.APFS_STATE_UNAVAILABLE,
+                )
+            apfs_volume = _find_apfs_volume(
+                apfs_info, device.removeprefix("/dev/"), target_volume
+            )
+            if apfs_volume is None:
+                return FileVaultCheck(
+                    FileVaultStatus.UNKNOWN,
+                    target_volume,
+                    FileVaultReason.APFS_STATE_UNAVAILABLE,
+                )
+            if apfs_volume.get("CryptoMigrationOn") is True:
+                return FileVaultCheck(FileVaultStatus.TRANSITIONING, target_volume)
+            roles = apfs_volume.get("Roles")
+            target_group = info.get("APFSVolumeGroupID")
+        else:
+            roles = target_group = None
+        startup_group: object = None
+        if isinstance(roles, list) and {"Data", "System"}.intersection(roles):
+            if not isinstance(target_group, str) or not target_group:
+                return FileVaultCheck(
+                    FileVaultStatus.UNKNOWN,
+                    target_volume,
+                    FileVaultReason.APFS_STATE_UNAVAILABLE,
+                )
+            startup = subprocess.run(
+                ["/usr/sbin/diskutil", "info", "-plist", "/"],
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            startup_info = plistlib.loads(startup.stdout)
+            if startup.returncode != 0 or not isinstance(startup_info, dict):
+                return FileVaultCheck(
+                    FileVaultStatus.UNKNOWN,
+                    target_volume,
+                    FileVaultReason.APFS_STATE_UNAVAILABLE,
+                )
+            startup_group = startup_info.get("APFSVolumeGroupID")
+            if not isinstance(startup_group, str) or not startup_group:
+                return FileVaultCheck(
+                    FileVaultStatus.UNKNOWN,
+                    target_volume,
+                    FileVaultReason.APFS_STATE_UNAVAILABLE,
+                )
+        if (
+            isinstance(target_group, str)
+            and target_group
+            and target_group == startup_group
+        ):
+            active = subprocess.run(
+                ["/usr/bin/fdesetup", "isactive"],
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            if active.returncode == 0 and active.stdout.strip().lower() == b"true":
+                return FileVaultCheck(FileVaultStatus.PROTECTED, target_volume)
+            if active.returncode == 0 and active.stdout.strip().lower() == b"false":
+                return FileVaultCheck(FileVaultStatus.UNPROTECTED, target_volume)
+            return FileVaultCheck(
+                FileVaultStatus.UNKNOWN,
+                target_volume,
+                FileVaultReason.FILEVAULT_STATE_UNAVAILABLE,
+            )
+        filevault = info.get("FileVault")
+        if filevault is True and info.get("Encryption") is True:
+            return FileVaultCheck(FileVaultStatus.PROTECTED, target_volume)
+        if filevault is False:
+            return FileVaultCheck(FileVaultStatus.UNPROTECTED, target_volume)
+        if filevault is True:
+            return FileVaultCheck(
+                FileVaultStatus.UNKNOWN,
+                target_volume,
+                FileVaultReason.ENCRYPTION_STATE_UNCONFIRMED,
+            )
+        return FileVaultCheck(
+            FileVaultStatus.UNKNOWN,
+            target_volume,
+            FileVaultReason.FILEVAULT_STATE_UNREPORTED,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError, IndexError):
+        return FileVaultCheck(
+            FileVaultStatus.UNKNOWN, "unresolved", FileVaultReason.PROBE_FAILED
+        )
+
+
+def _find_apfs_volume(
+    value: object, device: str, volume_uuid: str
+) -> dict[str, object] | None:
+    if isinstance(value, dict):
+        matches_volume = value.get("DeviceIdentifier") == device or value.get(
+            "APFSVolumeUUID"
+        ) == volume_uuid
+        if matches_volume:
+            return value
+        return next(
+            (
+                match
+                for child in value.values()
+                if (match := _find_apfs_volume(child, device, volume_uuid)) is not None
+            ),
+            None,
+        )
+    if isinstance(value, list):
+        return next(
+            (
+                match
+                for child in value
+                if (match := _find_apfs_volume(child, device, volume_uuid)) is not None
+            ),
+            None,
+        )
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +291,23 @@ class ImportId(_OpaqueStoreId):
 @dataclass(frozen=True, slots=True)
 class SnapshotId(_OpaqueStoreId):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class StoreId(_OpaqueStoreId):
+    def __post_init__(self) -> None:
+        if len(self._value) != 32 or any(
+            character not in "0123456789abcdef" for character in self._value
+        ):
+            raise ValueError("Datenspeicher-ID ist ungültig.")
+
+
+@dataclass(frozen=True, slots=True)
+class StoreIdentity:
+    store_id: StoreId | None
+    mode: DataMode
+    person_binding: PersonBindingStatus
+    schema_version: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +460,105 @@ class ProvenanceCounts:
     quarantined_import_count: int
 
 
+def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
+    metadata.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS imports (
+            import_id TEXT PRIMARY KEY,
+            operation_id TEXT NOT NULL,
+            package_hash TEXT NOT NULL,
+            status TEXT NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            package_record_count INTEGER NOT NULL,
+            record_count INTEGER NOT NULL,
+            committed_at TEXT NOT NULL,
+            diagnostics TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS active_snapshot (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            snapshot_id TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS import_measurement_versions (
+            import_id TEXT NOT NULL,
+            measurement_version_id TEXT NOT NULL,
+            PRIMARY KEY (import_id, measurement_version_id)
+        );
+        CREATE TABLE IF NOT EXISTS analysis_receipts (
+            operation_id TEXT PRIMARY KEY,
+            analysis_run_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            result_id TEXT,
+            snapshot_id TEXT,
+            analysis_definition_id TEXT,
+            config_json TEXT NOT NULL,
+            config_hash TEXT,
+            config_schema_version TEXT,
+            code_commit TEXT,
+            code_dirty INTEGER,
+            code_diff_hash TEXT,
+            environment_lock_hash TEXT,
+            diagnostics TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        """
+    )
+    import_columns = {
+        str(row[1]) for row in metadata.execute("PRAGMA table_info(imports)").fetchall()
+    }
+    if "diagnostics" not in import_columns:
+        metadata.execute("ALTER TABLE imports ADD COLUMN diagnostics TEXT NOT NULL DEFAULT ''")
+    analysis_table = metadata.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'analysis_runs'"
+    ).fetchone()
+    if analysis_table is None:
+        metadata.execute(
+            """
+            CREATE TABLE analysis_runs (
+                analysis_run_id TEXT PRIMARY KEY,
+                operation_id TEXT NOT NULL,
+                result_id TEXT NOT NULL UNIQUE,
+                snapshot_id TEXT NOT NULL,
+                analysis_definition_id TEXT NOT NULL,
+                analysis_start_date TEXT,
+                analysis_end_date TEXT,
+                config_json TEXT NOT NULL,
+                config_hash TEXT NOT NULL,
+                config_schema_version TEXT NOT NULL,
+                code_commit TEXT NOT NULL,
+                code_dirty INTEGER NOT NULL,
+                code_diff_hash TEXT,
+                environment_lock_hash TEXT NOT NULL,
+                reuse_key TEXT NOT NULL,
+                model_maturity TEXT NOT NULL,
+                diagnostics TEXT NOT NULL,
+                status TEXT NOT NULL,
+                completed_at TEXT NOT NULL
+            )
+            """
+        )
+        return
+    analysis_columns = {
+        str(row[1]) for row in metadata.execute("PRAGMA table_info(analysis_runs)")
+    }
+    migrations = {
+        "analysis_start_date": "TEXT",
+        "analysis_end_date": "TEXT",
+        "config_json": "TEXT NOT NULL DEFAULT '{}'",
+        "config_hash": "TEXT NOT NULL DEFAULT ''",
+        "config_schema_version": "TEXT NOT NULL DEFAULT '1.0'",
+        "code_commit": "TEXT NOT NULL DEFAULT ''",
+        "code_dirty": "INTEGER NOT NULL DEFAULT 0",
+        "code_diff_hash": "TEXT",
+        "environment_lock_hash": "TEXT NOT NULL DEFAULT ''",
+        "reuse_key": "TEXT NOT NULL DEFAULT ''",
+        "model_maturity": "TEXT",
+        "diagnostics": "TEXT NOT NULL DEFAULT '[]'",
+    }
+    for column, declaration in migrations.items():
+        if column not in analysis_columns:
+            metadata.execute(f"ALTER TABLE analysis_runs ADD COLUMN {column} {declaration}")
+
+
 @dataclass(slots=True)
 class LocalStore:
     _root: Path
@@ -227,6 +567,65 @@ class LocalStore:
     _query: duckdb.DuckDBPyConnection
     _writer_lock: IO[bytes] | None = None
     _closed: bool = False
+
+    def load_identity(self) -> StoreIdentity:
+        columns = {
+            str(row[1])
+            for row in self._metadata.execute("PRAGMA table_info(store_identity)").fetchall()
+        }
+        store_id = "store_id" if "store_id" in columns else "NULL"
+        binding = "person_binding" if "person_binding" in columns else "'unbound'"
+        row = self._metadata.execute(
+            f"SELECT {store_id}, mode, {binding}, schema_version "
+            "FROM store_identity WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            raise StoreConfigurationError("Datenspeicheridentität fehlt.")
+        return StoreIdentity(
+            store_id=None if row[0] is None else StoreId(str(row[0])),
+            mode=DataMode(str(row[1])),
+            person_binding=PersonBindingStatus(str(row[2])),
+            schema_version=str(row[3]),
+        )
+
+    def initialize_identity(self, *, confirm_existing_person: bool) -> StoreIdentity:
+        self._require_writer()
+        identity = self.load_identity()
+        if identity.store_id is not None:
+            return identity
+        has_personal_data = bool(
+            self._metadata.execute(
+                "SELECT 1 FROM imports "
+                "WHERE status IN ('committed', 'duplicate', 'quarantined') LIMIT 1"
+            ).fetchone()
+        )
+        if self._mode is DataMode.REAL and has_personal_data and not confirm_existing_person:
+            raise StoreConfigurationError(
+                "Bestehende reale Daten benötigen die Einpersonenbestätigung."
+            )
+        binding = (
+            PersonBindingStatus.BOUND
+            if self._mode is DataMode.REAL and has_personal_data
+            else PersonBindingStatus.UNBOUND
+        )
+        if identity.schema_version == "1.0":
+            backup_directory = self._root / "migration-backups"
+            backup_directory.mkdir(exist_ok=True)
+            backup_path = backup_directory / (
+                f"metadata-v1.0-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}.sqlite3"
+            )
+            with sqlite3.connect(backup_path) as backup:
+                self._metadata.backup(backup)
+        with self._metadata:
+            _ensure_current_tables(self._metadata)
+            self._metadata.execute("ALTER TABLE store_identity RENAME TO legacy_store_identity")
+            self._metadata.execute(_STORE_IDENTITY_DDL)
+            self._metadata.execute(
+                "INSERT INTO store_identity VALUES (1, ?, ?, ?, ?)",
+                (self._mode.value, _STORE_SCHEMA_VERSION, uuid4().hex, binding.value),
+            )
+            self._metadata.execute("DROP TABLE legacy_store_identity")
+        return self.load_identity()
 
     @classmethod
     def open(cls, root: Path, mode: DataMode) -> Self:
@@ -293,152 +692,50 @@ class LocalStore:
             )
             if existing_identity is not None:
                 existing_mode, existing_schema = map(str, existing_identity)
-                if existing_mode != mode.value or existing_schema not in {"1.0", "1.1"}:
+                if existing_mode != mode.value or existing_schema not in {"1.0", "1.1", "1.2"}:
                     raise StoreConfigurationError(
                         "Datenspeicher gehört zu einem anderen Modus oder Schema."
                     )
-                if existing_schema == "1.0":
-                    if not initialize:
-                        raise StoreConfigurationError(
-                            "Datenspeicher benötigt eine Schema-Migration."
-                        )
-                    backup_directory = root / "migration-backups"
-                    backup_directory.mkdir(exist_ok=True)
-                    backup_path = backup_directory / (
-                        f"metadata-v1.0-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}.sqlite3"
-                    )
-                    with sqlite3.connect(backup_path) as backup:
-                        metadata.backup(backup)
-            if initialize:
+            legacy_identity = (
+                existing_identity is not None
+                and str(existing_identity[1]) != _STORE_SCHEMA_VERSION
+            )
+            if initialize and not legacy_identity:
                 (root / _PARQUET_DIRECTORY).mkdir(exist_ok=True)
-                metadata.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS store_identity (
-                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                        mode TEXT NOT NULL,
-                        schema_version TEXT NOT NULL
-                    )
-                    """
-                )
-                metadata.executescript(
-                    """
-                    CREATE TABLE IF NOT EXISTS imports (
-                        import_id TEXT PRIMARY KEY,
-                        operation_id TEXT NOT NULL,
-                        package_hash TEXT NOT NULL,
-                        status TEXT NOT NULL,
-                        snapshot_id TEXT NOT NULL,
-                        package_record_count INTEGER NOT NULL,
-                        record_count INTEGER NOT NULL,
-                        committed_at TEXT NOT NULL,
-                        diagnostics TEXT NOT NULL DEFAULT ''
-                    );
-                    CREATE TABLE IF NOT EXISTS active_snapshot (
-                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                        snapshot_id TEXT NOT NULL
-                    );
-                    CREATE TABLE IF NOT EXISTS import_measurement_versions (
-                        import_id TEXT NOT NULL,
-                        measurement_version_id TEXT NOT NULL,
-                        PRIMARY KEY (import_id, measurement_version_id)
-                    );
-                    CREATE TABLE IF NOT EXISTS analysis_receipts (
-                        operation_id TEXT PRIMARY KEY,
-                        analysis_run_id TEXT NOT NULL,
-                        status TEXT NOT NULL,
-                        result_id TEXT,
-                        snapshot_id TEXT,
-                        analysis_definition_id TEXT,
-                        config_json TEXT NOT NULL,
-                        config_hash TEXT,
-                        config_schema_version TEXT,
-                        code_commit TEXT,
-                        code_dirty INTEGER,
-                        code_diff_hash TEXT,
-                        environment_lock_hash TEXT,
-                        diagnostics TEXT NOT NULL,
-                        created_at TEXT NOT NULL
-                    );
-                    """
-                )
-                columns = {
-                    str(row[1]) for row in metadata.execute("PRAGMA table_info(imports)").fetchall()
-                }
-                if "diagnostics" not in columns:
-                    metadata.execute(
-                        "ALTER TABLE imports ADD COLUMN diagnostics TEXT NOT NULL DEFAULT ''"
-                    )
-                analysis_table = metadata.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'analysis_runs'"
-                ).fetchone()
-                if analysis_table is None:
-                    metadata.execute(
-                        """
-                        CREATE TABLE analysis_runs (
-                            analysis_run_id TEXT PRIMARY KEY,
-                            operation_id TEXT NOT NULL,
-                            result_id TEXT NOT NULL UNIQUE,
-                            snapshot_id TEXT NOT NULL,
-                            analysis_definition_id TEXT NOT NULL,
-                            analysis_start_date TEXT,
-                            analysis_end_date TEXT,
-                            config_json TEXT NOT NULL,
-                            config_hash TEXT NOT NULL,
-                            config_schema_version TEXT NOT NULL,
-                            code_commit TEXT NOT NULL,
-                            code_dirty INTEGER NOT NULL,
-                            code_diff_hash TEXT,
-                            environment_lock_hash TEXT NOT NULL,
-                            reuse_key TEXT NOT NULL,
-                            model_maturity TEXT NOT NULL,
-                            diagnostics TEXT NOT NULL,
-                            status TEXT NOT NULL,
-                            completed_at TEXT NOT NULL
-                        )
-                        """
-                    )
-                else:
-                    analysis_columns = {
-                        str(row[1]) for row in metadata.execute("PRAGMA table_info(analysis_runs)")
-                    }
-                    analysis_column_migrations = {
-                        "analysis_start_date": "TEXT",
-                        "analysis_end_date": "TEXT",
-                        "config_json": "TEXT NOT NULL DEFAULT '{}'",
-                        "config_hash": "TEXT NOT NULL DEFAULT ''",
-                        "config_schema_version": "TEXT NOT NULL DEFAULT '1.0'",
-                        "code_commit": "TEXT NOT NULL DEFAULT ''",
-                        "code_dirty": "INTEGER NOT NULL DEFAULT 0",
-                        "code_diff_hash": "TEXT",
-                        "environment_lock_hash": "TEXT NOT NULL DEFAULT ''",
-                        "reuse_key": "TEXT NOT NULL DEFAULT ''",
-                        "model_maturity": "TEXT",
-                        "diagnostics": "TEXT NOT NULL DEFAULT '[]'",
-                    }
-                    for column, declaration in analysis_column_migrations.items():
-                        if column not in analysis_columns:
-                            metadata.execute(
-                                f"ALTER TABLE analysis_runs ADD COLUMN {column} {declaration}"
-                            )
-                if existing_identity is not None and str(existing_identity[1]) == "1.0":
-                    metadata.execute(
-                        "UPDATE store_identity SET schema_version = ? WHERE singleton = 1",
-                        (_STORE_SCHEMA_VERSION,),
-                    )
+                if identity_table is None:
+                    metadata.execute(_STORE_IDENTITY_DDL)
+                _ensure_current_tables(metadata)
                 metadata.commit()
+            identity_columns = {
+                str(row[1])
+                for row in metadata.execute("PRAGMA table_info(store_identity)").fetchall()
+            }
+            store_id = "store_id" if "store_id" in identity_columns else "NULL"
+            binding = (
+                "person_binding" if "person_binding" in identity_columns else "'unbound'"
+            )
             identity = metadata.execute(
-                "SELECT mode, schema_version FROM store_identity WHERE singleton = 1"
+                f"SELECT mode, schema_version, {store_id}, {binding} "
+                "FROM store_identity WHERE singleton = 1"
             ).fetchone()
-            expected_identity = (mode.value, _STORE_SCHEMA_VERSION)
             if identity is None:
                 if not initialize:
                     raise StoreConfigurationError("Datenspeicher ist noch nicht initialisiert.")
                 metadata.execute(
-                    "INSERT INTO store_identity(singleton, mode, schema_version) VALUES (1, ?, ?)",
-                    expected_identity,
+                    "INSERT INTO store_identity"
+                    "(singleton, mode, schema_version, store_id, person_binding) "
+                    "VALUES (1, ?, ?, ?, 'unbound')",
+                    (mode.value, _STORE_SCHEMA_VERSION, uuid4().hex),
                 )
                 metadata.commit()
-            elif identity != expected_identity:
+            elif (
+                str(identity[0]) != mode.value
+                or str(identity[1]) not in {"1.0", "1.1", "1.2"}
+                or (
+                    str(identity[1]) == _STORE_SCHEMA_VERSION
+                    and (identity[2] is None or not str(identity[2]))
+                )
+            ):
                 raise StoreConfigurationError(
                     "Datenspeicher gehört zu einem anderen Modus oder Schema."
                 )
@@ -523,6 +820,14 @@ class LocalStore:
         staging = self._root / "staging" / str(import_id)
         if staging.exists():
             self._remove_tree(staging)
+
+    def mark_import_reading(self, import_id: ImportId) -> None:
+        self._require_writer()
+        with self._metadata:
+            self._metadata.execute(
+                "UPDATE imports SET diagnostics = 'reading_package' WHERE import_id = ?",
+                (str(import_id),),
+            )
 
     def publish_import(
         self,
@@ -748,6 +1053,7 @@ class LocalStore:
                 """,
                 (str(snapshot_id),),
             )
+            self._bind_person()
         return PublishImportResult(
             status="committed",
             snapshot_id=snapshot_id,
@@ -1349,6 +1655,12 @@ class LocalStore:
         if self._writer_lock is None:
             raise RuntimeError("Operation benötigt den exklusiven Writer-Lock.")
 
+    def _bind_person(self) -> None:
+        if self._mode is DataMode.REAL:
+            self._metadata.execute(
+                "UPDATE store_identity SET person_binding = 'bound' WHERE singleton = 1"
+            )
+
     def _recover_imports(self) -> None:
         try:
             self._recover_imports_unchecked()
@@ -1392,10 +1704,18 @@ class LocalStore:
             "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
         ).fetchone()
         active_snapshot = None if active is None else str(active[0])
+        import_columns = {
+            str(row[1])
+            for row in self._metadata.execute("PRAGMA table_info(imports)").fetchall()
+        }
+        diagnostics_column = "diagnostics" if "diagnostics" in import_columns else "''"
         running = self._metadata.execute(
-            "SELECT import_id, snapshot_id FROM imports WHERE status = 'running'"
+            f"SELECT import_id, snapshot_id, {diagnostics_column} "
+            "FROM imports WHERE status = 'running'"
         ).fetchall()
-        for import_id, snapshot_id in running:
+        bind_recovered_person = False
+        for import_id, snapshot_id, diagnostics in running:
+            bind_recovered_person = bind_recovered_person or diagnostics == "reading_package"
             staging = self._root / "staging" / str(import_id)
             if staging.exists():
                 self._remove_tree(staging)
@@ -1405,13 +1725,20 @@ class LocalStore:
                     self._remove_tree(snapshot)
         if running:
             with self._metadata:
-                self._metadata.execute(
-                    """
-                    UPDATE imports
-                    SET status = 'quarantined', diagnostics = 'interrupted_before_publish'
-                    WHERE status = 'running'
-                    """
-                )
+                if "diagnostics" in import_columns:
+                    self._metadata.execute(
+                        """
+                        UPDATE imports
+                        SET status = 'quarantined', diagnostics = 'interrupted_before_publish'
+                        WHERE status = 'running'
+                        """
+                    )
+                else:
+                    self._metadata.execute(
+                        "UPDATE imports SET status = 'quarantined' WHERE status = 'running'"
+                    )
+                if bind_recovered_person:
+                    self._bind_person()
         staging_root = self._root / "staging"
         if staging_root.exists():
             known_imports = {
@@ -1455,6 +1782,7 @@ class LocalStore:
                 """,
                 (path.name,),
             )
+            self._bind_person()
 
     @staticmethod
     def _remove_tree(path: Path) -> None:

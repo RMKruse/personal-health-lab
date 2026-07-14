@@ -31,6 +31,17 @@ from personal_health_lab.resting_hr_analysis import (
 from personal_health_lab.resting_hr_analysis import (
     run_resting_hr_analysis as execute_analysis,
 )
+from personal_health_lab.storage import (
+    FileVaultCheck,
+    FileVaultReason,
+    FileVaultStatus,
+    LocalStore,
+    PersonBindingStatus,
+    StoreBusyError,
+    StoreError,
+    StoreId,
+    probe_filevault,
+)
 
 logger = logging.getLogger("personal_health_lab")
 SnapshotRef = SnapshotId
@@ -49,6 +60,21 @@ class FeatureNotAvailableError(HealthLabError):
 
 
 AnalysisResultRef = AnalysisResultId
+
+
+class WorkspaceState(StrEnum):
+    READY = "ready"
+    MIGRATION_REQUIRED = "migration_required"
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceStatus:
+    mode: DataMode
+    store_id: StoreId | None
+    person_binding: PersonBindingStatus
+    state: WorkspaceState = WorkspaceState.READY
+    allowed_reads: tuple[str, ...] = ("workspace_status", "overview")
+    allowed_writes: tuple[str, ...] = ("import_health_export",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +163,14 @@ class WriteApprovalStatus(StrEnum):
     BLOCKED = "blocked"
 
 
+class WriteConfirmation(StrEnum):
+    REAL_IMPORT_SAME_PERSON = "real_import_same_person"
+    FILEVAULT_UNPROTECTED = "filevault_unprotected"
+    FILEVAULT_TRANSITIONING = "filevault_transitioning"
+    FILEVAULT_UNKNOWN = "filevault_unknown"
+    LEGACY_STORE_MIGRATION = "legacy_store_migration"
+
+
 @dataclass(frozen=True, slots=True)
 class WriteApproval:
     status: WriteApprovalStatus
@@ -152,11 +186,30 @@ WritePlanDetails = ImportHealthExportPlan
 
 
 @dataclass(frozen=True, slots=True)
+class WritePreflight:
+    approval: WriteApproval
+    confirmations: tuple[WriteConfirmation, ...] = ()
+    filevault: FileVaultCheck | None = None
+    diagnostics: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class WritePlan:
     fingerprint: PlanFingerprint
-    approval: WriteApproval
     details: WritePlanDetails
-    diagnostics: tuple[str, ...] = ()
+    preflight: WritePreflight
+
+    @property
+    def approval(self) -> WriteApproval:
+        return self.preflight.approval
+
+    @property
+    def confirmations(self) -> tuple[WriteConfirmation, ...]:
+        return self.preflight.confirmations
+
+    @property
+    def diagnostics(self) -> tuple[str, ...]:
+        return self.preflight.diagnostics
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,12 +240,6 @@ class WriteNotStarted:
 
 
 WriteResult = ImportReceipt | WriteNotStarted
-
-
-@dataclass(frozen=True, slots=True)
-class WritePreflight:
-    approval: WriteApproval
-    diagnostics: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,6 +302,7 @@ class HealthLab:
 
     def __init__(self, config: RuntimeConfig) -> None:
         self._config = config
+        self._store: LocalStore | None = None
         self._overview_reader: OverviewReader | None = None
 
     @classmethod
@@ -265,10 +313,11 @@ class HealthLab:
         if self._overview_reader is not None:
             raise HealthLabError("HealthLab-Sitzung ist bereits geöffnet.")
         try:
-            self._overview_reader = OverviewReader.open(
+            self._store = LocalStore.open(
                 root=self._config.active_store,
                 mode=self._config.mode,
             )
+            self._overview_reader = OverviewReader(self._store)
         except ValueError as error:
             raise ConfigurationError(str(error)) from error
         except RuntimeError as error:
@@ -285,21 +334,71 @@ class HealthLab:
         if self._overview_reader is not None:
             self._overview_reader.close()
             self._overview_reader = None
+            self._store = None
         logger.info("healthlab_closed mode=%s", self._config.mode.value)
 
     def preview_write(self, request: WriteRequest) -> WritePlan:
         self._require_open()
+        filevault = (
+            probe_filevault(self._config.active_store)
+            if self._config.mode is DataMode.REAL
+            else None
+        )
+        return self._build_import_plan(request, filevault)
+
+    def _build_import_plan(
+        self,
+        request: ImportHealthExport,
+        filevault: FileVaultCheck | None,
+    ) -> WritePlan:
+        workspace = self.load_workspace_status()
         try:
             package_size = request.package_path.stat().st_size
             with request.package_path.open("rb") as package:
                 package_hash = hashlib.file_digest(package, "sha256").hexdigest()
-            approval = WriteApproval(WriteApprovalStatus.READY)
-            diagnostics: tuple[str, ...] = ()
+            unavailable = False
         except OSError:
             package_size = 0
             package_hash = ""
+            unavailable = True
+        return self._compose_import_plan(
+            request,
+            workspace,
+            filevault,
+            package_size,
+            package_hash,
+            unavailable=unavailable,
+        )
+
+    def _compose_import_plan(
+        self,
+        request: ImportHealthExport,
+        workspace: WorkspaceStatus,
+        filevault: FileVaultCheck | None,
+        package_size: int,
+        package_hash: str,
+        *,
+        unavailable: bool,
+    ) -> WritePlan:
+        confirmations: tuple[WriteConfirmation, ...]
+        diagnostics: tuple[str, ...]
+        if unavailable:
             approval = WriteApproval(WriteApprovalStatus.BLOCKED)
+            confirmations = ()
             diagnostics = ("health_export_unavailable",)
+        else:
+            approval = WriteApproval(WriteApprovalStatus.READY)
+            confirmations = ()
+            diagnostics = ()
+        if approval.status is not WriteApprovalStatus.BLOCKED and filevault is not None:
+            confirmation_list = [WriteConfirmation.REAL_IMPORT_SAME_PERSON]
+            if workspace.store_id is None:
+                confirmation_list.append(WriteConfirmation.LEGACY_STORE_MIGRATION)
+            if filevault.status is not FileVaultStatus.PROTECTED:
+                confirmation_list.append(WriteConfirmation(f"filevault_{filevault.status.value}"))
+            confirmations = tuple(confirmation_list)
+            diagnostics = tuple(confirmation.value for confirmation in confirmations)
+            approval = WriteApproval(WriteApprovalStatus.CONFIRMATION_REQUIRED)
         fingerprint = PlanFingerprint(
             hashlib.sha256(
                 json.dumps(
@@ -317,6 +416,20 @@ class HealthLab:
                         "package_path": str(request.package_path),
                         "package_size": package_size,
                         "store": str(self._config.active_store),
+                        "store_id": str(workspace.store_id),
+                        "person_binding": workspace.person_binding.value,
+                        "confirmations": [item.value for item in confirmations],
+                        "filevault": (
+                            None
+                            if filevault is None
+                            else {
+                                "status": filevault.status.value,
+                                "target_volume": filevault.target_volume,
+                                "reason": (
+                                    None if filevault.reason is None else filevault.reason.value
+                                ),
+                            }
+                        ),
                         "version": 1,
                     },
                     sort_keys=True,
@@ -326,9 +439,55 @@ class HealthLab:
         )
         return WritePlan(
             fingerprint=fingerprint,
-            approval=approval,
             details=ImportHealthExportPlan(package_hash, package_size),
-            diagnostics=diagnostics,
+            preflight=WritePreflight(approval, confirmations, filevault, diagnostics),
+        )
+
+    @staticmethod
+    def _filevault_allows_execution(
+        expected: FileVaultCheck, actual: FileVaultCheck
+    ) -> bool:
+        return expected.target_volume == actual.target_volume and (
+            expected == actual or actual.status is FileVaultStatus.PROTECTED
+        )
+
+    def _authorization_plan(
+        self,
+        request: ImportHealthExport,
+        current_plan: WritePlan,
+        expected_plan: PlanFingerprint,
+    ) -> WritePlan | None:
+        if current_plan.fingerprint == expected_plan:
+            return current_plan
+        filevault = current_plan.preflight.filevault
+        if filevault is None or filevault.status is not FileVaultStatus.PROTECTED:
+            return None
+        workspace = self.load_workspace_status()
+        candidates = [
+            self._compose_import_plan(
+                request,
+                workspace,
+                FileVaultCheck(status, filevault.target_volume),
+                current_plan.details.package_size,
+                current_plan.details.package_hash,
+                unavailable=False,
+            )
+            for status in (FileVaultStatus.UNPROTECTED, FileVaultStatus.TRANSITIONING)
+        ]
+        candidates.extend(
+            self._compose_import_plan(
+                request,
+                workspace,
+                FileVaultCheck(FileVaultStatus.UNKNOWN, filevault.target_volume, reason),
+                current_plan.details.package_size,
+                current_plan.details.package_hash,
+                unavailable=False,
+            )
+            for reason in FileVaultReason
+        )
+        return next(
+            (candidate for candidate in candidates if candidate.fingerprint == expected_plan),
+            None,
         )
 
     def execute_write(
@@ -338,23 +497,61 @@ class HealthLab:
         expected_plan: PlanFingerprint,
     ) -> WriteReceipt:
         current_plan = self.preview_write(request)
-        if current_plan.fingerprint != expected_plan:
+        authorization_plan = self._authorization_plan(request, current_plan, expected_plan)
+        if authorization_plan is None:
             return self._not_started(
                 current_plan,
                 WriteNotStartedStatus.PLAN_CHANGED,
                 ("plan_changed",),
+                expected_plan,
             )
         if current_plan.approval.status is WriteApprovalStatus.BLOCKED:
             return self._not_started(
                 current_plan,
                 WriteNotStartedStatus.BLOCKED,
                 current_plan.diagnostics,
+                expected_plan,
             )
         try:
+            workspace = self.load_workspace_status()
+            writer = LocalStore.open_writer(
+                root=self._config.active_store, mode=self._config.mode
+            )
+        except StoreBusyError:
+            return self._not_started(
+                authorization_plan,
+                WriteNotStartedStatus.STORE_BUSY,
+                ("store_busy",),
+                expected_plan,
+            )
+        except StoreError as error:
+            raise HealthLabError("Health-Export konnte nicht importiert werden.") from error
+        try:
+            expected_filevault = authorization_plan.preflight.filevault
+            final_filevault = (
+                probe_filevault(self._config.active_store)
+                if expected_filevault is not None
+                else None
+            )
+            if (
+                expected_filevault is not None
+                and final_filevault is not None
+                and not self._filevault_allows_execution(expected_filevault, final_filevault)
+            ):
+                return self._not_started_with_preflight(
+                    authorization_plan,
+                    WriteNotStartedStatus.PLAN_CHANGED,
+                    ("plan_changed",),
+                    expected_plan,
+                    final_filevault,
+                )
+            if workspace.store_id is None:
+                writer.initialize_identity(
+                    confirm_existing_person=self._config.mode is DataMode.REAL
+                )
             result = import_health_export(
                 request.package_path,
-                root=self._config.active_store,
-                mode=self._config.mode,
+                store=writer,
                 max_package_bytes=self._config.max_import_package_bytes,
                 max_entries=self._config.max_import_entries,
                 max_entry_bytes=self._config.max_import_entry_bytes,
@@ -363,6 +560,14 @@ class HealthLab:
             )
         except HealthImportError as error:
             raise HealthLabError("Health-Export konnte nicht importiert werden.") from error
+        finally:
+            writer.close()
+        final_preflight = WritePreflight(
+            authorization_plan.approval,
+            authorization_plan.confirmations,
+            final_filevault or current_plan.preflight.filevault,
+            result.diagnostics,
+        )
         import_result = ImportReceipt(
             operation_id=result.operation_id,
             import_id=result.import_id,
@@ -376,18 +581,11 @@ class HealthLab:
             measurement_version_count=result.measurement_version_count,
             diagnostics=result.diagnostics,
         )
-        if import_result.status is ImportStatus.STORE_BUSY:
-            write_result: WriteResult = WriteNotStarted(
-                WriteNotStartedStatus.STORE_BUSY,
-                import_result.diagnostics,
-            )
-        else:
-            write_result = import_result
         return WriteReceipt(
             operation_id=result.operation_id,
-            plan_fingerprint=current_plan.fingerprint,
-            result=write_result,
-            final_preflight=WritePreflight(current_plan.approval, current_plan.diagnostics),
+            plan_fingerprint=expected_plan,
+            result=import_result,
+            final_preflight=final_preflight,
             diagnostics=result.diagnostics,
         )
 
@@ -396,12 +594,34 @@ class HealthLab:
         plan: WritePlan,
         status: WriteNotStartedStatus,
         diagnostics: tuple[str, ...],
+        plan_fingerprint: PlanFingerprint | None = None,
     ) -> WriteReceipt:
         return WriteReceipt(
             operation_id=OperationId(uuid4().hex),
-            plan_fingerprint=plan.fingerprint,
+            plan_fingerprint=plan_fingerprint or plan.fingerprint,
             result=WriteNotStarted(status, diagnostics),
-            final_preflight=WritePreflight(plan.approval, plan.diagnostics),
+            final_preflight=plan.preflight,
+            diagnostics=diagnostics,
+        )
+
+    @staticmethod
+    def _not_started_with_preflight(
+        plan: WritePlan,
+        status: WriteNotStartedStatus,
+        diagnostics: tuple[str, ...],
+        plan_fingerprint: PlanFingerprint,
+        filevault: FileVaultCheck,
+    ) -> WriteReceipt:
+        return WriteReceipt(
+            operation_id=OperationId(uuid4().hex),
+            plan_fingerprint=plan_fingerprint,
+            result=WriteNotStarted(status, diagnostics),
+            final_preflight=WritePreflight(
+                plan.approval,
+                plan.confirmations,
+                filevault,
+                diagnostics,
+            ),
             diagnostics=diagnostics,
         )
 
@@ -439,6 +659,22 @@ class HealthLab:
     def load_overview(self, selection: OverviewSelection) -> Overview:
         reader = self._require_open()
         return reader.load(selection)
+
+    def load_workspace_status(self) -> WorkspaceStatus:
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        identity = self._store.load_identity()
+        return WorkspaceStatus(
+            mode=identity.mode,
+            store_id=identity.store_id,
+            person_binding=identity.person_binding,
+            state=(
+                WorkspaceState.READY
+                if identity.store_id is not None
+                else WorkspaceState.MIGRATION_REQUIRED
+            ),
+        )
 
     def _require_open(self) -> OverviewReader:
         if self._overview_reader is None:

@@ -39,11 +39,36 @@ REGISTERED_CASES = {
         "V02-A-API-014",
     )
 }
+REGISTERED_CASES.update(
+    {
+        "V02-A-PRE-001": "test_new_store_has_stable_identity_and_immutable_mode",
+        "V02-A-PRE-002": "test_complete_store_copy_retains_the_same_identity",
+        "V02-A-PRE-003": (
+            "test_legacy_real_store_gets_identity_only_after_confirmed_execution"
+        ),
+        "V02-A-PRE-004": "test_new_store_has_stable_identity_and_immutable_mode",
+        "V02-A-PRE-005": "test_real_import_uses_one_typed_confirmation_plan",
+        "V02-A-PRE-006": "test_real_store_binds_only_after_a_decided_personal_import",
+        "V02-A-PRE-007": "test_quarantined_real_import_binds_the_store",
+        "V02-A-PRE-008": "test_pending_person_binding_is_visible_in_workspace_status",
+        "V02-A-PRE-009": "test_real_import_uses_one_typed_confirmation_plan",
+        "V02-A-PRE-010": "test_real_import_uses_one_typed_confirmation_plan",
+        "V02-A-PRE-011": "test_synthetic_import_skips_filevault_probe",
+        "V02-A-PRE-012": "test_hardware_encryption_without_filevault_is_unprotected",
+        "V02-A-PRE-013": "test_real_import_uses_one_typed_confirmation_plan",
+        "V02-A-PRE-014": "test_filevault_is_rechecked_after_the_writer_lock",
+        "V02-A-PRE-015": "test_filevault_improvement_to_protected_may_continue",
+    }
+)
 
 
 def _matrix() -> dict[str, object]:
     with MATRIX_PATH.open("rb") as source:
         return tomllib.load(source)
+
+
+def _cases_for(runner: str) -> list[dict[str, object]]:
+    return [case for case in _matrix()["case"] if case["runner"] == runner]
 
 
 def _validate_matrix(matrix: dict[str, object]) -> None:
@@ -106,7 +131,11 @@ def test_v02_matrix_is_well_formed_and_fully_registered() -> None:
     _validate_matrix(_matrix())
 
 
-@pytest.mark.parametrize("case", _matrix()["case"], ids=lambda case: case["id"])
+@pytest.mark.parametrize(
+    "case",
+    _cases_for("test_v02_import_write_contract"),
+    ids=lambda case: case["id"],
+)
 def test_v02_import_write_contract(
     case: dict[str, object],
     tmp_path: Path,

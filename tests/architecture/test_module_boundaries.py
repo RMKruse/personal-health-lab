@@ -18,7 +18,13 @@ MODULES = {
 }
 ALLOWED_DEPENDENCIES = {
     "adapters": {"application", "package_root", "synthetic_export"},
-    "application": {"health_import", "overview", "package_root", "resting_hr_analysis"},
+    "application": {
+        "health_import",
+        "overview",
+        "package_root",
+        "resting_hr_analysis",
+        "storage",
+    },
     "health_data": set(),
     "health_import": {"health_data", "storage"},
     "overview": {"health_data", "package_root", "storage"},
