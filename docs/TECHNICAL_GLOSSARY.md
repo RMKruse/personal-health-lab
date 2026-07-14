@@ -7,6 +7,9 @@ Dieses Glossar enthält technische, betriebliche und lieferumfangsbezogene Begri
 **Modul**:
 Ein Teil des Systems mit genau einem Interface und einer verborgenen Implementierung. Ein tiefes Modul bündelt viel Verhalten hinter einem kleinen Interface.
 
+**Anwendungsmodul**:
+Das einzige öffentliche Produktionsmodul für CLI und Streamlit. Es besitzt Sitzung und Arbeitsbereichsstatus, den gemeinsamen Vorschau-/Ausführungsablauf einschließlich Plan-Fingerprint, Freigabestatus, Preflight-Neuprüfung und Dispatch sowie die einmalige Übersetzung interner Ergebnisse und Fehler; präsentationsneutrale Projektionen und opake IDs der besitzenden Module exportiert es gezielt weiter.
+
 **Interface**:
 Alles, was ein Aufrufer über ein Modul wissen muss: Operationen, Invarianten, Reihenfolge, Fehlerfälle, Konfiguration und relevante Leistungsmerkmale.
 
@@ -23,7 +26,16 @@ Ein unveränderlicher, typisierter Verweis auf eine veröffentlichte Datensatzve
 Ein eigener nicht austauschbarer Typ für Identitäten wie `ImportId`, `SnapshotId`, `AnalysisRunId` oder `LogicalMeasurementId`. UUID-, Hash- oder Stringdarstellung bleibt Implementierungsdetail.
 
 **Speichermodul**:
-Das interne Modul mit einem absichtsorientierten Interface für Importveröffentlichung, Snapshot-Auflösung, Analysepersistenz und Overview-Daten. Tabellen-CRUD, Dateipfade und konkrete Speichertechniken bleiben in seiner Implementierung verborgen.
+Das interne Modul mit einem absichtsorientierten Interface für Betriebsfakten, Volume- und FileVault-Befunde, exklusiven Writer-Lock, Persistenz, harte Artefaktvalidierung und atomare Snapshot-Aktivierung. Die fachliche Snapshot-Auflösung, Preflight-Freigabe und Regeln anderer Module besitzt es nicht; Tabellen-CRUD, Dateipfade und konkrete Speichertechniken bleiben in seiner Implementierung verborgen.
+
+**Datenqualitätsmodul**:
+Das tiefe interne Modul `data_quality`, das Plausibilitätsregelversionen, Prüfzyklen, Datenprüffälle, Benutzerentscheidungen und die fachliche Auflösung wirksamer Analysewerte und offener Prüffälle in einen Datensatz-Snapshot besitzt. `storage` schreibt, validiert und aktiviert sein Ergebnis, entscheidet aber nicht dessen Inhalt.
+
+**Wiederherstellungsmodul**:
+Das tiefe interne Modul `recovery`, das Metadatensicherung, zweiphasige Wiederherstellung, Quellenreferenzabgleich und atomare Overlay-Aktivierung besitzt. Benötigte Health-Exporte bleiben hinter `health_import`; Sicherungsmigrationen verwendet das Modul über `migration`, den abschließenden Snapshot über `data_quality`.
+
+**Migrationsmodul**:
+Das tiefe interne Modul `migration`, das den gemeinsamen Vorwärtsmigrationsvertrag für Datenspeicher, Datensatz-Snapshots und Metadatensicherungen sowie Migrationsplan, Staging, Schrittkette, Zielvalidierung und zulässigen Rollback besitzt.
 
 **Single-Writer-Regel**:
 Die Datenspeicherinvariante, dass genau eine schreibende Operation gleichzeitig aktiv sein darf, während snapshot-basierte Leser parallel arbeiten dürfen. Ein weiterer Schreiber erhält den erwartbaren Status `store_busy`.
@@ -148,10 +160,10 @@ Das tiefe interne Modul, das XML-Streaming, Positivliste, Normalisierung, Dedupl
 Die Behandlung jedes Exportpakets als nicht vertrauenswürdige Eingabe mit Schutz vor ZIP-Pfadtraversal, Dekompressionsbomben, unerlaubten Einträgen, XML-External-Entities, Netzwerkzugriffen und Schreibzugriffen außerhalb des Staging-Bereichs.
 
 **Ruhepulsanalysemodul**:
-Das tiefe interne Modul, das Snapshot-Auflösung, Tagesmerkmale, Modellreifeprüfung, Distributed-Lag-Fit, Moving-Block-Bootstrap, Diagnostik und Ergebnispersistenz hinter einer Analyseoperation verbirgt.
+Das tiefe interne Modul, das Auswahl und Pinning einer veröffentlichten Snapshot-Referenz, Tagesmerkmale, Modellreifeprüfung, Distributed-Lag-Fit, Moving-Block-Bootstrap, Diagnostik und Ergebnispersistenz hinter einer Analyseoperation verbirgt.
 
 **Overview-Modul**:
-Das tiefe interne Lesemodul, das Snapshot- und Ergebniswahl, Statusmarker, Zeitreihen, Provenienz und Methodik zu einem präsentationsneutralen `Overview` zusammensetzt. `Overview` bleibt eine fokussierte V0.2-Leseprojektion unter mehreren; ausschließlich `application` veröffentlicht diese Projektionen an Adapter, während ihre interne Modulzuordnung eine getrennte Architekturentscheidung ist.
+Das tiefe interne Lesemodul, das Snapshot- und Ergebniswahl, Statusmarker, Zeitreihen, Provenienz und Methodik zu einem präsentationsneutralen `Overview` zusammensetzt. `Overview` bleibt eine fokussierte V0.2-Leseprojektion unter mehreren und wird wie die Projektionen von `data_quality`, `recovery` und `migration` ausschließlich über `application` an Adapter veröffentlicht.
 
 **Health-Data-Modul**:
 Der gemeinsame Besitzer kanonischer Health-Sample-, Provenienz-, Einheiten- und Zeittypen samt ihren Invarianten. Es enthält weder Import- noch Persistenzlogik und ist kein allgemeiner `domain`-Sammelplatz.

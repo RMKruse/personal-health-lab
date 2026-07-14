@@ -1,0 +1,7 @@
+---
+status: accepted
+---
+
+# V0.2 erhält tiefe Module mit gerichtetem Abhängigkeitsgraphen
+
+V0.2 ergänzt `data_quality`, `recovery` und `migration`: `data_quality` besitzt Plausibilitätsregeln, Prüfzyklen, Entscheidungen und die fachliche Snapshot-Auflösung, `recovery` besitzt Metadatensicherung und zweiphasige Wiederherstellung, `migration` besitzt den gemeinsamen Migrationsvertrag, und `storage` beschränkt sich auf Betriebsfakten, Writer-Lock, Persistenz, harte Validierung und atomare Aktivierung. `application` besitzt den gemeinsamen Vorschau-/Ausführungsablauf einschließlich Preflight und darf dafür — abweichend vom V0.1-Graphen aus ADR-0019 — direkt von `storage` abhängen; `health_import` bleibt tief und delegiert im Normalbetrieb an `data_quality`, im Zustand `restore_pending` an `recovery`, während `recovery` von `data_quality` und `migration` abhängt und alle Pfade gerichtet zu `storage` und `health_data` führen. Produktionsadapter importieren weiterhin ausschließlich `application`, das präsentationsneutrale Projektionen und opake IDs der besitzenden Module gezielt weiterexportiert und nur interne Ergebnisse und Fehler übersetzt; getestet wird primär durch `HealthLab`, ergänzt um reine interne Algorithmentests, private Storage-Fault-Injection und den V0.2-Architekturtest, ohne zusätzliche Snapshot-, Preflight-, Repository-, Port- oder generische Workflow-Module.

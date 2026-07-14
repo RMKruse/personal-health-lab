@@ -128,6 +128,9 @@ personal-health-lab/
 │       ├── application/
 │       ├── health_data/
 │       ├── health_import/
+│       ├── data_quality/
+│       ├── recovery/
+│       ├── migration/
 │       ├── resting_hr_analysis/
 │       ├── storage/
 │       ├── overview/
@@ -153,18 +156,31 @@ flowchart LR
     CLI["CLI-Adapter"] --> APP["application"]
     UI["Streamlit-Adapter"] --> APP
     APP --> IMP["health_import"]
+    APP --> QUALITY["data_quality"]
+    APP --> RECOVERY["recovery"]
+    APP --> MIGRATION["migration"]
     APP --> ANA["resting_hr_analysis"]
     APP --> OVR["overview"]
+    APP --> STORE["storage"]
+    IMP --> QUALITY
+    IMP --> RECOVERY
     IMP --> STORE["storage"]
+    RECOVERY --> QUALITY
+    RECOVERY --> MIGRATION
+    RECOVERY --> STORE
+    MIGRATION --> STORE
+    QUALITY --> STORE
     ANA --> STORE
     OVR --> STORE
     IMP --> DATA["health_data"]
+    QUALITY --> DATA
     ANA --> DATA
+    OVR --> DATA
     STORE --> DATA
     DCLI["Development-CLI-Adapter"] -.-> SYN["synthetic_export"]
 ```
 
-Produktionsadapter hängen vom Anwendungsmodul ab, niemals umgekehrt. Der Development-CLI-Adapter darf zusätzlich `synthetic_export` verwenden. `health_data` hängt von keinem anderen Projektmodul ab. `storage` kennt kanonische Typen, aber keine Analyse- oder UI-Logik. Das reale Anwendungsmodul bleibt von `synthetic_export` unabhängig. Neue Abhängigkeiten dürfen keinen Zyklus erzeugen.
+Produktionsadapter hängen vom Anwendungsmodul ab, niemals umgekehrt. `application` besitzt den gemeinsamen Vorschau-/Ausführungsablauf einschließlich Preflight und darf dafür direkt von `storage` abhängen. `data_quality` besitzt Regeln, Prüfworkflow, Entscheidungen und fachliche Snapshot-Auflösung; `recovery` besitzt Sicherung und Wiederherstellung; `migration` besitzt den gemeinsamen Migrationsvertrag. `health_import` delegiert im Normalbetrieb an `data_quality` und im Zustand `restore_pending` an `recovery`, ohne dass `application` diese Schritte orchestriert. Der Development-CLI-Adapter darf zusätzlich `synthetic_export` verwenden. `health_data` hängt von keinem anderen Projektmodul ab, `storage` kennt keine Fach-, Analyse- oder UI-Logik, und neue Abhängigkeiten dürfen keinen Zyklus erzeugen.
 
 Ein automatischer Architekturtest prüft diese Regeln und lehnt verbotene Modulimporte sowie Abhängigkeitszyklen ab.
 
@@ -331,7 +347,7 @@ app.load_migration_diagnostics() -> MigrationDiagnostics | ProjectionUnavailable
 
 Projektionen liefern typisierte Werte, Begründungscodes und fachlich zulässige Aktionen, aber keine fertigen UI-Texte. Benutzertexte wie Notizen und Pflichtbegründungen bleiben Fachdatum. Produktionsadapter importieren sämtliche Requests, Pläne, Receipts, Projektionen, IDs, Enums und Ausnahmen ausschließlich über `personal_health_lab.application`; sie greifen niemals direkt auf Speicher- oder interne Lesemodule zu. Benutzerausgewählte Paket-, Sicherungs- und Zielpfade dürfen Eingaben sein, interne oder unredigierte Speicherpfade und konkrete SQLite-, Parquet-, DuckDB-, Staging- oder Tabellenformen erscheinen weder in Projektionen noch in Receipts.
 
-Das interne `overview`-Modul verbirgt weiterhin Snapshot- und Ergebniswahl, Statusmarker, Zeitreihen-, Provenienz- und Methodikabfragen für `Overview`. Die interne Eigentümerschaft der weiteren Projektionen wird getrennt festgelegt und ist kein Grund, ihre Orchestrierung in Adapter zu verlagern.
+Das interne `overview`-Modul besitzt `Overview`, `data_quality` besitzt Datenprüfung, Datenprüffalldetail und Plausibilitätsregeln, `recovery` besitzt Sicherung und Wiederherstellung, und `migration` besitzt Migration und Diagnose. Diese Module liefern unveränderliche präsentationsneutrale Projektionen und opake IDs, die `application` gezielt weiterexportiert; nur interne Ergebnisse, Status und Fehler werden dort einmalig in den gemeinsamen öffentlichen Schreibvertrag übersetzt.
 
 `OverviewSelection` enthält ausschließlich den gewünschten Zeitraum beziehungsweise eines der festen Zeitfenster. Das Modul wählt aktuelle wirksame Analyseergebnisse selbst und liefert Qualitäts-, Quellen- und Provenienzstatus immer vollständig; rein visuelles Ein- und Ausblenden bleibt Sache des Adapters.
 
