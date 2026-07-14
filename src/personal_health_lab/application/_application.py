@@ -5,7 +5,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
@@ -13,7 +13,7 @@ from typing import Self
 from uuid import uuid4
 
 from personal_health_lab import DataMode
-from personal_health_lab.data_quality import load_review_state
+from personal_health_lab.data_quality import load_review_case_detail, load_review_state
 from personal_health_lab.health_import import (
     HealthExportEstimate,
     HealthImportError,
@@ -80,7 +80,12 @@ class WorkspaceStatus:
     store_id: StoreId | None
     person_binding: PersonBindingStatus
     state: WorkspaceState = WorkspaceState.READY
-    allowed_reads: tuple[str, ...] = ("workspace_status", "overview", "data_review")
+    allowed_reads: tuple[str, ...] = (
+        "workspace_status",
+        "overview",
+        "data_review",
+        "data_review_case",
+    )
     allowed_writes: tuple[str, ...] = ("import_health_export",)
 
 
@@ -239,7 +244,58 @@ class ImportReceipt:
 
 
 class DataReviewCaseKind(StrEnum):
+    PLAUSIBILITY = "plausibility"
+    RULE_DEFINITION = "rule_definition"
     SOURCE_CONFLICT = "source_conflict"
+
+
+class DataQualityStatus(StrEnum):
+    REVIEWED = "reviewed"
+    PROVISIONAL = "provisional"
+
+
+class DataReviewCycleStatus(StrEnum):
+    OPEN = "open"
+    CLOSED = "closed"
+
+
+@dataclass(frozen=True, slots=True)
+class DataReviewCycleId:
+    _value: str
+
+    def __post_init__(self) -> None:
+        if len(self._value) != 32 or not set(self._value) <= set("0123456789abcdef"):
+            raise ValueError("Prüfzyklus-ID muss ein 32-stelliger Hex-Wert sein.")
+
+    def __str__(self) -> str:
+        return self._value
+
+
+@dataclass(frozen=True, slots=True)
+class DataReviewCycle:
+    cycle_id: DataReviewCycleId
+    snapshot_ref: SnapshotRef
+    status: DataReviewCycleStatus
+    open_case_count: int
+
+
+class ReviewReasonCode(StrEnum):
+    BELOW_FIXED_LOWER_BOUND = "below_fixed_lower_bound"
+    ABOVE_FIXED_UPPER_BOUND = "above_fixed_upper_bound"
+
+
+class EffectiveValueSource(StrEnum):
+    SOURCE = "source"
+    CORRECTION = "correction"
+    NONE = "none"
+
+
+@dataclass(frozen=True, slots=True)
+class PlausibilityReason:
+    code: ReviewReasonCode
+    lower_bound: float
+    upper_bound: float | None
+    unit: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,6 +333,18 @@ class DataReviewCase:
 class DataReview:
     snapshot_ref: SnapshotRef | None
     cases: tuple[DataReviewCase, ...]
+    status: DataQualityStatus = DataQualityStatus.REVIEWED
+    cycles: tuple[DataReviewCycle, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DataReviewCaseDetail:
+    case: DataReviewCase
+    source_type: str | None
+    measured_at: datetime | None
+    effective_value: float | None
+    effective_value_source: EffectiveValueSource | None
+    reasons: tuple[PlausibilityReason, ...]
 
 
 class WriteNotStartedStatus(StrEnum):
@@ -757,7 +825,7 @@ class HealthLab:
             package_hash=result.package_hash,
             snapshot_ref=result.snapshot_id,
             record_count=result.record_count,
-            anomaly_count=0,
+            anomaly_count=result.anomaly_count,
             package_record_count=result.package_record_count,
             logical_measurement_count=result.logical_measurement_count,
             measurement_version_count=result.measurement_version_count,
@@ -854,7 +922,7 @@ class HealthLab:
         self._require_open()
         if self._store is None:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
-        snapshot, stored_cases = load_review_state(self._store)
+        snapshot, stored_cases, stored_cycles = load_review_state(self._store)
         cases = tuple(
             DataReviewCase(
                 case_id=DataReviewCaseId(case.review_case_id),
@@ -867,7 +935,50 @@ class HealthLab:
             for case in stored_cases
             if selection.kind is None or case.kind == selection.kind.value
         )
-        return DataReview(snapshot_ref=snapshot, cases=cases)
+        return DataReview(
+            snapshot_ref=snapshot,
+            cases=cases,
+            status=(DataQualityStatus.PROVISIONAL if stored_cases else DataQualityStatus.REVIEWED),
+            cycles=tuple(
+                DataReviewCycle(
+                    cycle_id=DataReviewCycleId(str(cycle.cycle_id)),
+                    snapshot_ref=cycle.snapshot_id,
+                    status=DataReviewCycleStatus(cycle.status),
+                    open_case_count=cycle.open_case_count,
+                )
+                for cycle in stored_cycles
+            ),
+        )
+
+    def load_data_review_case(self, case_id: DataReviewCaseId) -> DataReviewCaseDetail:
+        review = self.load_data_review(DataReviewSelection())
+        case = next((item for item in review.cases if item.case_id == case_id), None)
+        if case is None or self._store is None:
+            raise HealthLabError("Datenprüffall ist nicht offen.")
+        try:
+            detail = load_review_case_detail(self._store, str(case_id))
+        except ValueError as error:
+            raise HealthLabError(str(error)) from error
+        return DataReviewCaseDetail(
+            case=case,
+            source_type=detail.source_type,
+            measured_at=detail.measured_at,
+            effective_value=detail.effective_value,
+            effective_value_source=(
+                None
+                if detail.effective_value_source is None
+                else EffectiveValueSource(detail.effective_value_source)
+            ),
+            reasons=tuple(
+                PlausibilityReason(
+                    code=ReviewReasonCode(reason.code),
+                    lower_bound=reason.lower_bound,
+                    upper_bound=reason.upper_bound,
+                    unit=reason.unit,
+                )
+                for reason in detail.reasons
+            ),
+        )
 
     def load_workspace_status(self) -> WorkspaceStatus:
         self._require_open()

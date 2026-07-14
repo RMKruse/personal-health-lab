@@ -79,6 +79,22 @@ REGISTERED_CASES.update(
 )
 REGISTERED_CASES.update(
     {
+        "V02-A-RULE-001": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
+        "V02-A-RULE-002": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
+        "V02-A-RULE-021": "test_late_measurement_uses_the_rule_for_its_measurement_time",
+        "V02-A-RULE-025": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
+        "V02-A-RULE-026": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
+        "V02-A-RULE-027": "test_unknown_source_type_is_cataloged_and_requests_a_rule_once",
+        "V02-A-RULE-028": "test_unknown_source_type_is_cataloged_and_requests_a_rule_once",
+        "V02-A-REV-001": "test_clean_import_cycle_closes_immediately",
+        "V02-A-REV-003": "test_clean_import_cycle_closes_immediately",
+        "V02-A-REV-004": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
+        "V02-A-REV-005": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
+        "V02-A-REV-006": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
+    }
+)
+REGISTERED_CASES.update(
+    {
         **{
             f"V02-A-SRC-{number:03d}": (
                 "test_package_occurrences_and_measurement_versions_remain_separate"
@@ -747,7 +763,12 @@ def test_v02_import_write_contract(
     case_id = case["id"]
     config = _config(tmp_path)
     package = _package(tmp_path / "health.zip")
-    assert hashlib.sha256(package.read_bytes()).hexdigest() == _matrix()["fixture"][0]["sha256"]
+    import_fixture = next(
+        fixture
+        for fixture in _matrix()["fixture"]
+        if fixture["id"] == "V02-F-DOM-IMPORT-001"
+    )
+    assert hashlib.sha256(package.read_bytes()).hexdigest() == import_fixture["sha256"]
     request = ImportHealthExport(package)
 
     with HealthLab.open(config) as health_lab:

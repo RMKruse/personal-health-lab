@@ -4,19 +4,95 @@ from __future__ import annotations
 
 import hashlib
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Literal
 
-from personal_health_lab.health_data import LogicalMeasurementId
+from personal_health_lab.health_data import LogicalMeasurementId, MeasurementVersionId
 from personal_health_lab.storage import (
     ExportFact,
     LocalStore,
     MeasurementVersionFact,
     OpenDataReviewCase,
     ResolvedMeasurement,
+    ReviewCaseId,
+    ReviewCycleRecord,
     SnapshotId,
     SourceOccurrenceFact,
     SourceResolution,
+    SourceTypeRuleRequest,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewReason:
+    code: Literal["below_fixed_lower_bound", "above_fixed_upper_bound"]
+    lower_bound: float
+    upper_bound: float | None
+    unit: str
+
+
+@dataclass(frozen=True, slots=True)
+class _FixedPlausibilityRule:
+    version_id: str
+    source_type: str
+    effective_from: datetime
+    lower_bound: float
+    upper_bound: float | None
+
+
+_FIXED_RULES = (
+    _FixedPlausibilityRule(
+        "fixed-plausibility/v1",
+        "apple_resting_heart_rate",
+        datetime.min.replace(tzinfo=UTC),
+        20.0,
+        250.0,
+    ),
+    _FixedPlausibilityRule(
+        "fixed-plausibility/v1",
+        "active_energy",
+        datetime.min.replace(tzinfo=UTC),
+        0.0,
+        None,
+    ),
+)
+
+
+def _rule_at(source_type: str, measured_at: datetime) -> _FixedPlausibilityRule | None:
+    return max(
+        (
+            rule
+            for rule in _FIXED_RULES
+            if rule.source_type == source_type and rule.effective_from <= measured_at
+        ),
+        key=lambda rule: rule.effective_from,
+        default=None,
+    )
+
+
+def _plausibility_reasons(
+    rule: _FixedPlausibilityRule, value: float, unit: str
+) -> tuple[ReviewReason, ...]:
+    reasons = []
+    if value < rule.lower_bound:
+        reasons.append(
+            ReviewReason("below_fixed_lower_bound", rule.lower_bound, rule.upper_bound, unit)
+        )
+    if rule.upper_bound is not None and value > rule.upper_bound:
+        reasons.append(
+            ReviewReason("above_fixed_upper_bound", rule.lower_bound, rule.upper_bound, unit)
+        )
+    return tuple(reasons)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewCaseDetail:
+    source_type: str | None
+    measured_at: datetime | None
+    effective_value: float | None
+    effective_value_source: str | None
+    reasons: tuple[ReviewReason, ...]
 
 
 def select_governing_export(exports: tuple[ExportFact, ...]) -> str:
@@ -44,6 +120,8 @@ def resolve_sources(
     previous_measurements: tuple[ResolvedMeasurement, ...],
     previous_review_cases: tuple[OpenDataReviewCase, ...],
     governing_export_id: str,
+    imported_measurement_version_ids: tuple[str, ...] = (),
+    unknown_source_types: tuple[str, ...] = (),
 ) -> SourceResolution:
     """Resolve effective source values and expose identity contradictions."""
     version_by_id = {item.measurement_version_id: item for item in versions}
@@ -101,12 +179,88 @@ def resolve_sources(
         )
     )
 
-    new_cases = _source_conflicts(occurrences, version_by_id)
+    generated_cases = (
+        *_source_conflicts(occurrences, version_by_id),
+        *_plausibility_cases(version_by_id, imported_measurement_version_ids),
+        *(_unknown_rule_case(source_type) for source_type in sorted(set(unknown_source_types))),
+    )
+    previous_case_ids = {item.review_case_id for item in previous_review_cases}
     cases_by_id = {item.review_case_id: item for item in previous_review_cases}
-    cases_by_id.update((item.review_case_id, item) for item in new_cases)
+    cases_by_id.update((item.review_case_id, item) for item in generated_cases)
+    source_type_requests = tuple(
+        SourceTypeRuleRequest(
+            source_type, ReviewCaseId(_unknown_rule_case(source_type).review_case_id)
+        )
+        for source_type in sorted(set(unknown_source_types))
+    )
+    new_case_ids = tuple(
+        ReviewCaseId(case_id)
+        for case_id in sorted(
+            case.review_case_id
+            for case in generated_cases
+            if case.review_case_id not in previous_case_ids
+        )
+    )
+    new_case_id_set = {str(case_id) for case_id in new_case_ids}
     return SourceResolution(
         measurements=measurements,
         review_cases=tuple(cases_by_id[key] for key in sorted(cases_by_id)),
+        new_review_case_ids=new_case_ids,
+        source_type_requests=source_type_requests,
+        cycle_status="open" if new_case_ids else "closed",
+        cycle_open_case_count=len(new_case_ids),
+        anomaly_count=sum(
+            case.review_case_id in new_case_id_set and case.kind == "plausibility"
+            for case in generated_cases
+        ),
+    )
+
+
+def _plausibility_cases(
+    version_by_id: dict[str, MeasurementVersionFact],
+    imported_measurement_version_ids: tuple[str, ...],
+) -> tuple[OpenDataReviewCase, ...]:
+    cases = []
+    for version_id in sorted(set(imported_measurement_version_ids)):
+        version = version_by_id[version_id]
+        measured_at = datetime.fromisoformat(version.source_start_utc)
+        rule = _rule_at(version.canonical_type, measured_at)
+        if rule is None:
+            continue
+        reasons = _plausibility_reasons(rule, version.canonical_value, version.canonical_unit)
+        if not reasons:
+            continue
+        evidence = hashlib.sha256(
+            repr(
+                tuple(
+                    (reason.code, reason.lower_bound, reason.upper_bound, reason.unit)
+                    for reason in reasons
+                )
+            ).encode()
+        ).hexdigest()
+        case_key = f"{version_id}:{rule.version_id}:{evidence}"
+        cases.append(
+            OpenDataReviewCase(
+                review_case_id=hashlib.sha256(case_key.encode()).hexdigest()[:32],
+                kind="plausibility",
+                logical_measurement_id=LogicalMeasurementId(version.logical_measurement_id),
+                measurement_version_id=MeasurementVersionId(version_id),
+                rule_version_id=rule.version_id,
+                evidence_fingerprint=evidence,
+            )
+        )
+    return tuple(cases)
+
+
+def _unknown_rule_case(source_type: str) -> OpenDataReviewCase:
+    case_key = f"rule_definition:{source_type}"
+    return OpenDataReviewCase(
+        review_case_id=hashlib.sha256(case_key.encode()).hexdigest()[:32],
+        kind="rule_definition",
+        logical_measurement_id=None,
+        measurement_version_id=None,
+        rule_version_id=None,
+        evidence_fingerprint=hashlib.sha256(f"{case_key}:evidence".encode()).hexdigest(),
     )
 
 
@@ -170,12 +324,61 @@ def _source_conflict(
 
 def load_review_state(
     store: LocalStore,
-) -> tuple[SnapshotId | None, tuple[OpenDataReviewCase, ...]]:
+) -> tuple[
+    SnapshotId | None,
+    tuple[OpenDataReviewCase, ...],
+    tuple[ReviewCycleRecord, ...],
+]:
     """Load the active review projection through its owning module."""
-    return store.load_active_snapshot_id(), store.load_open_data_review_cases()
+    return (
+        store.load_active_snapshot_id(),
+        store.load_open_data_review_cases(),
+        store.load_review_cycles(),
+    )
+
+
+def load_review_case_detail(store: LocalStore, review_case_id: str) -> ReviewCaseDetail:
+    case = next(
+        (
+            item
+            for item in store.load_open_data_review_cases()
+            if item.review_case_id == review_case_id
+        ),
+        None,
+    )
+    if case is None:
+        raise ValueError("Datenprüffall ist nicht offen.")
+    if case.kind == "rule_definition":
+        return ReviewCaseDetail(
+            source_type=store.load_source_type_for_review_case(review_case_id),
+            measured_at=None,
+            effective_value=None,
+            effective_value_source=None,
+            reasons=(),
+        )
+    if case.kind != "plausibility" or case.measurement_version_id is None:
+        return ReviewCaseDetail(None, None, None, None, ())
+    version = store.load_measurement_version_fact(case.measurement_version_id)
+    if version is None:
+        raise ValueError("Quellmessungsversion des Datenprüffalls fehlt.")
+    rule = _rule_at(version.canonical_type, datetime.fromisoformat(version.source_start_utc))
+    if rule is None or rule.version_id != case.rule_version_id:
+        raise ValueError("Plausibilitätsregel des Datenprüffalls fehlt.")
+    reasons = _plausibility_reasons(rule, version.canonical_value, version.canonical_unit)
+    resolved = store.load_resolved_measurement(version.logical_measurement_id)
+    return ReviewCaseDetail(
+        source_type=version.canonical_type,
+        measured_at=datetime.fromisoformat(version.source_start_utc),
+        effective_value=None if resolved is None else resolved.effective_value,
+        effective_value_source=None if resolved is None else resolved.effective_value_source,
+        reasons=reasons,
+    )
 
 
 __all__ = [
+    "ReviewCaseDetail",
+    "ReviewReason",
+    "load_review_case_detail",
     "load_review_state",
     "resolve_sources",
     "select_governing_export",

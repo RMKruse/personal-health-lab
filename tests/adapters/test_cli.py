@@ -81,23 +81,29 @@ def test_cli_projects_source_conflicts_from_the_shared_data_review(
         plan = health_lab.preview_write(request)
         health_lab.execute_write(request, expected_plan=plan.fingerprint)
 
-    assert main(
-        [
-            "--mode",
-            "synthetic",
-            "--synthetic-store",
-            str(config.synthetic_store),
-            "--real-store",
-            str(config.real_store),
-            "review",
-            "--json",
-        ]
-    ) == 0
+    assert (
+        main(
+            [
+                "--mode",
+                "synthetic",
+                "--synthetic-store",
+                str(config.synthetic_store),
+                "--real-store",
+                str(config.real_store),
+                "review",
+                "--json",
+            ]
+        )
+        == 0
+    )
     output = json.loads(capsys.readouterr().out)
 
     _assert_json_contract(output)
     assert output["cases"][0]["kind"] == "source_conflict"
     assert output["cases"][0]["logical_measurement_id"] is not None
+    assert output["status"] == "provisional"
+    assert output["cycles"][0]["status"] == "open"
+    assert output["cases"][0]["detail"]["reasons"] == []
 
 
 def test_real_json_import_renders_shared_confirmation_plan(

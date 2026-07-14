@@ -182,6 +182,9 @@ try:
     with HealthLab.open(config) as health_lab:
         overview = health_lab.load_overview(selection)
         data_review = health_lab.load_data_review(DataReviewSelection())
+        data_review_details = tuple(
+            health_lab.load_data_review_case(case.case_id) for case in data_review.cases
+        )
 except (ConfigurationError, HealthLabError):
     st.error("HealthLab-Konfiguration oder lokaler Datenspeicher ist ungültig.")
     st.stop()
@@ -220,10 +223,19 @@ st.caption(
 )
 if data_review.cases:
     st.subheader("Datenprüfung")
-    for case in data_review.cases:
+    st.caption(f"Datenstatus: {data_review.status.value}")
+    for detail in data_review_details:
+        case = detail.case
         st.warning(
             f"Prüffall: {case.kind.value} · "
             f"Messung {case.logical_measurement_id or case.measurement_version_id or '-'}"
+        )
+        st.caption(
+            "Details: "
+            f"Typ {detail.source_type or '-'} · Wert {detail.effective_value} · "
+            "Quelle "
+            f"{detail.effective_value_source.value if detail.effective_value_source else '-'} · "
+            f"Begründungen {', '.join(reason.code.value for reason in detail.reasons) or '-'}"
         )
 if overview.quarantined_import_count:
     st.warning("Mindestens ein unterbrochener Import wurde sicher quarantänisiert.")

@@ -8,6 +8,9 @@
     },
     {
       "$ref": "#/$defs/writeReceiptOutput"
+    },
+    {
+      "$ref": "#/$defs/dataReviewOutput"
     }
   ],
   "$defs": {
@@ -67,6 +70,78 @@
         "synthetic_store": {
           "const": "<redacted>"
         }
+      }
+    },
+    "dataReviewOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cases", "cycles", "runtime_config", "schema_version", "selection", "snapshot_ref", "status"],
+      "properties": {
+        "cases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["case_id", "detail", "evidence_fingerprint", "kind", "logical_measurement_id", "measurement_version_id", "rule_version_id"],
+            "properties": {
+              "case_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+              "detail": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["effective_value", "effective_value_source", "measured_at", "reasons", "source_type"],
+                "properties": {
+                  "effective_value": {"type": ["number", "null"]},
+                  "effective_value_source": {"enum": ["source", "correction", "none", null]},
+                  "measured_at": {"$ref": "#/$defs/nullableString"},
+                  "reasons": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["code", "lower_bound", "upper_bound", "unit"],
+                      "properties": {
+                        "code": {"enum": ["below_fixed_lower_bound", "above_fixed_upper_bound"]},
+                        "lower_bound": {"type": "number"},
+                        "upper_bound": {"type": ["number", "null"]},
+                        "unit": {"type": "string"}
+                      }
+                    }
+                  },
+                  "source_type": {"$ref": "#/$defs/nullableString"}
+                }
+              },
+              "evidence_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "kind": {"enum": ["plausibility", "rule_definition", "suspected_source_deletion", "source_conflict"]},
+              "logical_measurement_id": {"$ref": "#/$defs/nullableString"},
+              "measurement_version_id": {"$ref": "#/$defs/nullableString"},
+              "rule_version_id": {"$ref": "#/$defs/nullableString"}
+            }
+          }
+        },
+        "cycles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["cycle_id", "open_case_count", "snapshot_ref", "status"],
+            "properties": {
+              "cycle_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+              "open_case_count": {"type": "integer", "minimum": 0},
+              "snapshot_ref": {"type": "string"},
+              "status": {"enum": ["open", "closed"]}
+            }
+          }
+        },
+        "runtime_config": {"$ref": "#/$defs/runtimeConfig"},
+        "schema_version": {"const": "2.0"},
+        "selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {"kind": {"type": ["string", "null"]}}
+        },
+        "snapshot_ref": {"$ref": "#/$defs/nullableString"},
+        "status": {"enum": ["reviewed", "provisional"]}
       }
     },
     "writeApproval": {

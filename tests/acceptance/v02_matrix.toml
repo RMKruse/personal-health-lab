@@ -2,6 +2,189 @@ schema_version = 1
 release = "v0.2"
 
 [[contract]]
+id = "V02-C-RULE-001"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Initial fixed plausibility bounds are inclusive and type-specific."
+evidence = ["positive", "negative", "boundary"]
+
+[[contract]]
+id = "V02-C-RULE-006"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Late measurements use the rule valid at measurement time."
+evidence = ["transition"]
+
+[[contract]]
+id = "V02-C-RULE-008"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Finding identity and unknown source-type requests are deterministic."
+evidence = ["positive", "negative"]
+
+[[contract]]
+id = "V02-C-REV-001"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Review cycles are independent and close when they have no effective open case."
+evidence = ["positive", "transition"]
+
+[[contract]]
+id = "V02-C-REV-002"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "An open plausibility case keeps the effective value and makes data provisional."
+evidence = ["positive", "negative"]
+
+[[fixture]]
+id = "V02-F-DOM-FIXED-PLAUSIBILITY-V1"
+kind = "domain"
+generator = "inline-health-export-v1"
+seed = 0
+parameters = "resting-heart-rate 20..250 bpm; active-energy >=0 kcal; unknown source type"
+platform = "all"
+sha256 = "71f9350613043edb33cb8479c956e0388fde64dccce95d801e766779eab264fa"
+
+[[case]]
+id = "V02-A-RULE-001"
+contracts = ["V02-C-RULE-001"]
+fixtures = ["V02-F-DOM-FIXED-PLAUSIBILITY-V1"]
+runner = "test_fixed_rules_are_inclusive_and_keep_flagged_source_values"
+initial_state = "initial resting-heart-rate rule"
+operation = "import boundary and outside values"
+level = "application"
+expected_result = "20 and 250 bpm accepted; outside values flagged"
+expected_effect = "two deterministic plausibility cases"
+forbidden_side_effects = ["exclusive boundary"]
+
+[[case]]
+id = "V02-A-RULE-002"
+contracts = ["V02-C-RULE-001"]
+fixtures = ["V02-F-DOM-FIXED-PLAUSIBILITY-V1"]
+runner = "test_fixed_rules_are_inclusive_and_keep_flagged_source_values"
+initial_state = "initial active-energy rule"
+operation = "import zero, negative, and large positive values"
+level = "application"
+expected_result = "zero and large positive accepted; negative flagged"
+expected_effect = "one deterministic plausibility case"
+forbidden_side_effects = ["upper fixed bound"]
+
+[[case]]
+id = "V02-A-RULE-021"
+contracts = ["V02-C-RULE-006"]
+fixtures = ["V02-F-DOM-FIXED-PLAUSIBILITY-V1"]
+runner = "test_late_measurement_uses_the_rule_for_its_measurement_time"
+initial_state = "newer export already imported"
+operation = "import an older measurement later"
+level = "application"
+expected_result = "measurement-time rule version applied in current cycle"
+expected_effect = "one plausibility case"
+forbidden_side_effects = ["current-time rule selection"]
+
+[[case]]
+id = "V02-A-RULE-025"
+contracts = ["V02-C-RULE-008"]
+fixtures = ["V02-F-DOM-FIXED-PLAUSIBILITY-V1"]
+runner = "test_fixed_rules_are_inclusive_and_keep_flagged_source_values"
+initial_state = "one imported measurement version"
+operation = "evaluate fixed rule"
+level = "application"
+expected_result = "at most one case per version, rule, and fingerprint"
+expected_effect = "deduplicated case identity"
+forbidden_side_effects = ["duplicate case"]
+
+[[case]]
+id = "V02-A-RULE-026"
+contracts = ["V02-C-RULE-008"]
+fixtures = ["V02-F-DOM-FIXED-PLAUSIBILITY-V1"]
+runner = "test_fixed_rules_are_inclusive_and_keep_flagged_source_values"
+initial_state = "measurements violating different rule components"
+operation = "load case details"
+level = "application"
+expected_result = "reason sets have distinct fingerprints"
+expected_effect = "typed lower and upper reasons"
+forbidden_side_effects = ["collapsed reason set"]
+
+[[case]]
+id = "V02-A-RULE-027"
+contracts = ["V02-C-RULE-008"]
+fixtures = ["V02-F-DOM-FIXED-PLAUSIBILITY-V1"]
+runner = "test_unknown_source_type_is_cataloged_and_requests_a_rule_once"
+initial_state = "unknown source type"
+operation = "import twice"
+level = "application"
+expected_result = "source type cataloged and requested once"
+expected_effect = "one rule-definition case"
+forbidden_side_effects = ["rejection", "duplicate request"]
+
+[[case]]
+id = "V02-A-RULE-028"
+contracts = ["V02-C-RULE-008"]
+fixtures = ["V02-F-DOM-FIXED-PLAUSIBILITY-V1"]
+runner = "test_unknown_source_type_is_cataloged_and_requests_a_rule_once"
+initial_state = "source type without a plausibility rule"
+operation = "import source values"
+level = "application"
+expected_result = "no plausibility violation"
+expected_effect = "rule-definition request only"
+forbidden_side_effects = ["invented fixed rule"]
+
+[[case]]
+id = "V02-A-REV-001"
+contracts = ["V02-C-REV-001"]
+fixtures = ["V02-F-DOM-FIXED-PLAUSIBILITY-V1"]
+runner = "test_clean_import_cycle_closes_immediately"
+initial_state = "clean import"
+operation = "complete import review"
+level = "application"
+expected_result = "cycle closed"
+expected_effect = "reviewed data status"
+forbidden_side_effects = ["open empty cycle"]
+
+[[case]]
+id = "V02-A-REV-003"
+contracts = ["V02-C-REV-001"]
+fixtures = ["V02-F-DOM-FIXED-PLAUSIBILITY-V1"]
+runner = "test_clean_import_cycle_closes_immediately"
+initial_state = "cycle without an effective open case"
+operation = "finish cycle"
+level = "application"
+expected_result = "cycle closed"
+expected_effect = "zero open cases"
+forbidden_side_effects = ["stale open status"]
+
+[[case]]
+id = "V02-A-REV-004"
+contracts = ["V02-C-REV-001"]
+fixtures = ["V02-F-DOM-FIXED-PLAUSIBILITY-V1"]
+runner = "test_fixed_rules_are_inclusive_and_keep_flagged_source_values"
+initial_state = "effective open plausibility case"
+operation = "load data review"
+level = "application"
+expected_result = "global provisional status"
+expected_effect = "open cycle visible"
+forbidden_side_effects = ["reviewed status"]
+
+[[case]]
+id = "V02-A-REV-005"
+contracts = ["V02-C-REV-002"]
+fixtures = ["V02-F-DOM-FIXED-PLAUSIBILITY-V1"]
+runner = "test_fixed_rules_are_inclusive_and_keep_flagged_source_values"
+initial_state = "open plausibility case"
+operation = "load case detail and overview"
+level = "application"
+expected_result = "source value remains effective"
+expected_effect = "provisional snapshot"
+forbidden_side_effects = ["automatic removal"]
+
+[[case]]
+id = "V02-A-REV-006"
+contracts = ["V02-C-REV-002"]
+fixtures = ["V02-F-DOM-FIXED-PLAUSIBILITY-V1"]
+runner = "test_fixed_rules_are_inclusive_and_keep_flagged_source_values"
+initial_state = "flagged source value"
+operation = "publish import"
+level = "application"
+expected_result = "value retained without explicit exclusion"
+expected_effect = "effective source projection unchanged"
+forbidden_side_effects = ["implicit exclusion"]
+
+[[contract]]
 id = "V02-C-API-002"
 source = "https://github.com/RMKruse/personal-health-lab/issues/33"
 statement = "Every write uses a side-effect-free preview and explicit execution."

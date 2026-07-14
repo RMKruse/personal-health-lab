@@ -18,6 +18,8 @@ from personal_health_lab.application import (
     ConfigurationError,
     DataMode,
     DataReview,
+    DataReviewCaseDetail,
+    DataReviewCaseId,
     DataReviewSelection,
     FileVaultCheck,
     HealthLab,
@@ -77,7 +79,19 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _data_review_json(review: DataReview) -> dict[str, object]:
+def _data_review_json(
+    review: DataReview, details: tuple[DataReviewCaseDetail, ...]
+) -> dict[str, object]:
+    detail_by_id = {detail.case.case_id: detail for detail in details}
+
+    def effective_source(case_id: DataReviewCaseId) -> str | None:
+        source = detail_by_id[case_id].effective_value_source
+        return None if source is None else source.value
+
+    def measured_at(case_id: DataReviewCaseId) -> str | None:
+        value = detail_by_id[case_id].measured_at
+        return None if value is None else value.isoformat()
+
     return {
         "cases": [
             {
@@ -95,11 +109,36 @@ def _data_review_json(review: DataReview) -> dict[str, object]:
                     else str(case.measurement_version_id)
                 ),
                 "rule_version_id": case.rule_version_id,
+                "detail": {
+                    "effective_value": detail_by_id[case.case_id].effective_value,
+                    "effective_value_source": effective_source(case.case_id),
+                    "measured_at": measured_at(case.case_id),
+                    "reasons": [
+                        {
+                            "code": reason.code.value,
+                            "lower_bound": reason.lower_bound,
+                            "upper_bound": reason.upper_bound,
+                            "unit": reason.unit,
+                        }
+                        for reason in detail_by_id[case.case_id].reasons
+                    ],
+                    "source_type": detail_by_id[case.case_id].source_type,
+                },
             }
             for case in review.cases
         ],
         "selection": {"kind": None},
         "snapshot_ref": None if review.snapshot_ref is None else str(review.snapshot_ref),
+        "status": review.status.value,
+        "cycles": [
+            {
+                "cycle_id": str(cycle.cycle_id),
+                "open_case_count": cycle.open_case_count,
+                "snapshot_ref": str(cycle.snapshot_ref),
+                "status": cycle.status.value,
+            }
+            for cycle in review.cycles
+        ],
     }
 
 
@@ -370,6 +409,9 @@ def main(args: Sequence[str] | None = None) -> int:
                 )
             elif parsed.command == "review":
                 data_review = health_lab.load_data_review(DataReviewSelection())
+                data_review_details = tuple(
+                    health_lab.load_data_review_case(case.case_id) for case in data_review.cases
+                )
             else:
                 overview = health_lab.load_overview(OverviewSelection())
     except ConfigurationError as error:
@@ -469,18 +511,19 @@ def main(args: Sequence[str] | None = None) -> int:
         print(
             json.dumps(
                 {
-                    **_data_review_json(data_review),
+                    **_data_review_json(data_review, data_review_details),
                     "runtime_config": runtime_config,
-                    "schema_version": "1.0",
+                    "schema_version": "2.0",
                 },
                 ensure_ascii=False,
                 sort_keys=True,
             )
         )
     elif parsed.command == "review":
+        print(f"Datenstatus: {data_review.status.value}")
         print(f"Offene Datenprüffälle: {len(data_review.cases)}")
-        for case in data_review.cases:
-            print(f"{case.case_id}: {case.kind.value}")
+        for detail in data_review_details:
+            print(f"{detail.case.case_id}: {detail.case.kind.value} ({detail.source_type or '-'})")
     elif parsed.as_json:
         print(
             json.dumps(

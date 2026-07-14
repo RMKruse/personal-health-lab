@@ -66,6 +66,7 @@ class HealthImportResult:
     logical_measurement_count: int = 0
     measurement_version_count: int = 0
     source_occurrence_count: int = 0
+    anomaly_count: int = 0
     diagnostics: tuple[str, ...] = ()
 
 
@@ -80,6 +81,7 @@ class _ParsedExport:
     export_id: str
     export_date: datetime | None
     records: tuple[CanonicalHealthRecord, ...]
+    unknown_source_types: tuple[str, ...] = ()
 
 
 def _source_datetime(value: str) -> datetime:
@@ -107,6 +109,7 @@ def _records(
     if package_path.stat().st_size > max_package_bytes:
         raise _RejectedPackage("package too large")
     records: list[CanonicalHealthRecord] = []
+    unknown_source_types: set[str] = set()
     with ZipFile(package_path) as archive:
         entries = archive.infolist()
         if len(entries) > max_entries:
@@ -234,10 +237,17 @@ def _records(
                             ),
                         )
                     )
+                elif source_type := element.attrib.get("type"):
+                    unknown_source_types.add(source_type)
                 element.clear()
-    if not records:
+    if not records and not unknown_source_types:
         raise ValueError("no supported records")
-    return _ParsedExport(export_digest.hexdigest(), export_date, tuple(records))
+    return _ParsedExport(
+        export_digest.hexdigest(),
+        export_date,
+        tuple(records),
+        tuple(sorted(unknown_source_types)),
+    )
 
 
 def estimate_health_export(
@@ -349,6 +359,7 @@ def import_health_export(
                 export_id=parsed.export_id,
                 export_date=parsed.export_date,
                 records=parsed.records,
+                unknown_source_types=parsed.unknown_source_types,
                 governing_export_id=governing_export_id,
                 resolve_sources=resolve_sources,
             )
@@ -386,6 +397,7 @@ def import_health_export(
         logical_measurement_count=published.logical_measurement_count,
         measurement_version_count=published.measurement_version_count,
         source_occurrence_count=published.source_occurrence_count,
+        anomaly_count=published.anomaly_count,
         diagnostics=published.diagnostics,
     )
 

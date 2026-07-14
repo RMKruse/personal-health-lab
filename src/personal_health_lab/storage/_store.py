@@ -39,6 +39,7 @@ _FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
 _SNAPSHOT_SCHEMA_VERSION = 1
 _IDENTITY_RULE_VERSION = "healthkit-natural/v2"
 _MAPPING_RULE_VERSION = "healthkit-canonical/v1"
+_FIXED_PLAUSIBILITY_RULE_VERSION = "fixed-plausibility/v1"
 _SNAPSHOT_SCHEMAS = {
     "source_occurrences.parquet": (
         ("occurrence_id", "VARCHAR"),
@@ -657,6 +658,7 @@ class PublishImportResult:
     logical_measurement_count: int
     measurement_version_count: int
     source_occurrence_count: int
+    anomaly_count: int = 0
     diagnostics: tuple[str, ...] = ()
 
 
@@ -668,6 +670,7 @@ class OpenDataReviewCase:
         "continued_override",
         "suspected_source_deletion",
         "source_conflict",
+        "rule_definition",
     ]
     logical_measurement_id: LogicalMeasurementId | None
     measurement_version_id: MeasurementVersionId | None
@@ -718,9 +721,44 @@ class ResolvedMeasurement:
 
 
 @dataclass(frozen=True, slots=True)
+class ReviewCaseId:
+    value: str
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True, slots=True)
+class SourceTypeRuleRequest:
+    source_type: str
+    review_case_id: ReviewCaseId
+
+
+@dataclass(frozen=True, slots=True)
+class StoredReviewCycleId:
+    value: str
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True, slots=True)
 class SourceResolution:
     measurements: tuple[ResolvedMeasurement, ...]
     review_cases: tuple[OpenDataReviewCase, ...]
+    new_review_case_ids: tuple[ReviewCaseId, ...] = ()
+    source_type_requests: tuple[SourceTypeRuleRequest, ...] = ()
+    cycle_status: Literal["open", "closed"] = "closed"
+    cycle_open_case_count: int = 0
+    anomaly_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewCycleRecord:
+    cycle_id: StoredReviewCycleId
+    snapshot_id: SnapshotId
+    status: Literal["open", "closed"]
+    open_case_count: int
 
 
 type SourceResolver = Callable[..., SourceResolution]
@@ -848,6 +886,26 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                 rule_kind IN ('identity', 'mapping', 'plausibility')
             )
         ) STRICT;
+        CREATE TABLE IF NOT EXISTS source_type_catalog (
+            source_type TEXT PRIMARY KEY,
+            review_case_id TEXT NOT NULL UNIQUE CHECK (
+                length(review_case_id) = 32
+                AND review_case_id NOT GLOB '*[^0-9a-f]*'
+            )
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS review_cycles (
+            cycle_id TEXT PRIMARY KEY CHECK (
+                length(cycle_id) = 32 AND cycle_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            snapshot_id TEXT NOT NULL UNIQUE REFERENCES dataset_snapshots(snapshot_id),
+            cycle_kind TEXT NOT NULL CHECK (cycle_kind = 'import'),
+            status TEXT NOT NULL CHECK (status IN ('open', 'closed')),
+            open_case_count INTEGER NOT NULL CHECK (open_case_count >= 0),
+            CHECK (
+                (status = 'open' AND open_case_count > 0)
+                OR (status = 'closed' AND open_case_count = 0)
+            )
+        ) STRICT;
         CREATE TABLE IF NOT EXISTS audit_events (
             audit_position INTEGER PRIMARY KEY CHECK (audit_position > 0),
             audit_event_id TEXT NOT NULL UNIQUE CHECK (
@@ -946,6 +1004,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
         (
             (_IDENTITY_RULE_VERSION, "identity"),
             (_MAPPING_RULE_VERSION, "mapping"),
+            (_FIXED_PLAUSIBILITY_RULE_VERSION, "plausibility"),
         ),
     )
     import_columns = {
@@ -1405,6 +1464,7 @@ class LocalStore:
         export_id: str,
         export_date: datetime | None,
         records: tuple[CanonicalHealthRecord, ...],
+        unknown_source_types: tuple[str, ...],
         governing_export_id: str,
         resolve_sources: SourceResolver,
     ) -> PublishImportResult:
@@ -1419,6 +1479,7 @@ class LocalStore:
                 export_id=export_id,
                 export_date=export_date,
                 records=records,
+                unknown_source_types=unknown_source_types,
                 governing_export_id=governing_export_id,
                 resolve_sources=resolve_sources,
             )
@@ -1435,6 +1496,7 @@ class LocalStore:
         export_id: str,
         export_date: datetime | None,
         records: tuple[CanonicalHealthRecord, ...],
+        unknown_source_types: tuple[str, ...],
         governing_export_id: str,
         resolve_sources: SourceResolver,
     ) -> PublishImportResult:
@@ -1504,50 +1566,52 @@ class LocalStore:
             )
             """
         )
-        self._query.executemany(
-            """
+        staged_rows = [
+            (
+                str(record.measurement_version_id),
+                str(record.logical_measurement_id),
+                hashlib.sha256(
+                    json.dumps(
+                        {
+                            "type": record.data_type.value,
+                            "unit": record.unit.value,
+                            "value": record.value,
+                            "start": record.source_start.isoformat(),
+                            "end": record.source_end.isoformat(),
+                            "source": record.provenance.source_name,
+                            "device": record.provenance.device,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest(),
+                record.data_type.value,
+                record.unit.value,
+                record.value,
+                record.source_start.astimezone(UTC).isoformat(),
+                record.source_end.astimezone(UTC).isoformat(),
+                record.source_updated_at.astimezone(UTC).isoformat(),
+                _utc_offset_minutes(record.source_start),
+                _utc_offset_minutes(record.source_end),
+                _utc_offset_minutes(record.source_updated_at),
+                record.measurement_local_day,
+                record.provenance.source_name,
+                record.provenance.source_version,
+                record.provenance.device,
+                record.provenance.original_value,
+                record.provenance.original_unit,
+                record.provenance.strong_source_id_hash,
+            )
+            for record in records
+        ]
+        if staged_rows:
+            self._query.executemany(
+                """
             INSERT INTO staged_samples
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            [
-                (
-                    str(record.measurement_version_id),
-                    str(record.logical_measurement_id),
-                    hashlib.sha256(
-                        json.dumps(
-                            {
-                                "type": record.data_type.value,
-                                "unit": record.unit.value,
-                                "value": record.value,
-                                "start": record.source_start.isoformat(),
-                                "end": record.source_end.isoformat(),
-                                "source": record.provenance.source_name,
-                                "device": record.provenance.device,
-                            },
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ).encode()
-                    ).hexdigest(),
-                    record.data_type.value,
-                    record.unit.value,
-                    record.value,
-                    record.source_start.astimezone(UTC).isoformat(),
-                    record.source_end.astimezone(UTC).isoformat(),
-                    record.source_updated_at.astimezone(UTC).isoformat(),
-                    _utc_offset_minutes(record.source_start),
-                    _utc_offset_minutes(record.source_end),
-                    _utc_offset_minutes(record.source_updated_at),
-                    record.measurement_local_day,
-                    record.provenance.source_name,
-                    record.provenance.source_version,
-                    record.provenance.device,
-                    record.provenance.original_value,
-                    record.provenance.original_unit,
-                    record.provenance.strong_source_id_hash,
-                )
-                for record in records
-            ],
-        )
+                staged_rows,
+            )
         if active is None:
             self._query.execute(
                 """
@@ -1599,7 +1663,7 @@ class LocalStore:
                 "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
             ).fetchone()[0]
         )
-        manifest_sha256 = self._stage_snapshot(
+        manifest_sha256, resolution = self._stage_snapshot(
             staging,
             operation_id=operation_id,
             snapshot_id=snapshot_id,
@@ -1608,6 +1672,7 @@ class LocalStore:
             export_date=export_date,
             governing_export_id=governing_export_id,
             records=records,
+            unknown_source_types=unknown_source_types,
             audit_position=audit_position,
             resolve_sources=resolve_sources,
         )
@@ -1654,6 +1719,22 @@ class LocalStore:
                     completed_at,
                 ),
             )
+            self._metadata.executemany(
+                "INSERT OR IGNORE INTO source_type_catalog VALUES (?, ?)",
+                (
+                    (request.source_type, str(request.review_case_id))
+                    for request in resolution.source_type_requests
+                ),
+            )
+            self._metadata.execute(
+                "INSERT INTO review_cycles VALUES (?, ?, 'import', ?, ?)",
+                (
+                    str(snapshot_id),
+                    str(snapshot_id),
+                    resolution.cycle_status,
+                    resolution.cycle_open_case_count,
+                ),
+            )
             self._metadata.execute(
                 "INSERT INTO snapshot_activations VALUES (?, ?, ?, ?, 'import', ?)",
                 (
@@ -1689,6 +1770,7 @@ class LocalStore:
             logical_measurement_count=logical_count,
             measurement_version_count=version_count,
             source_occurrence_count=self._snapshot_occurrence_count(snapshot_id),
+            anomaly_count=resolution.anomaly_count,
         )
 
     def _stage_snapshot(
@@ -1702,9 +1784,10 @@ class LocalStore:
         export_date: datetime | None,
         governing_export_id: str,
         records: tuple[CanonicalHealthRecord, ...],
+        unknown_source_types: tuple[str, ...],
         audit_position: int,
         resolve_sources: SourceResolver,
-    ) -> str:
+    ) -> tuple[str, SourceResolution]:
         self._query.execute(
             """
             CREATE OR REPLACE TEMP TABLE staged_occurrences (
@@ -1718,23 +1801,25 @@ class LocalStore:
             )
             """
         )
-        self._query.executemany(
-            "INSERT INTO staged_occurrences VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [
-                (
-                    hashlib.sha256(f"{export_id}:{ordinal}".encode()).hexdigest(),
-                    export_id,
-                    ordinal,
-                    str(record.logical_measurement_id),
-                    str(record.measurement_version_id),
-                    _MAPPING_RULE_VERSION,
-                    hashlib.sha256(
-                        f"{export_id}:{ordinal}:{record.measurement_version_id}".encode()
-                    ).hexdigest(),
-                )
-                for ordinal, record in enumerate(records, start=1)
-            ],
-        )
+        occurrence_rows = [
+            (
+                hashlib.sha256(f"{export_id}:{ordinal}".encode()).hexdigest(),
+                export_id,
+                ordinal,
+                str(record.logical_measurement_id),
+                str(record.measurement_version_id),
+                _MAPPING_RULE_VERSION,
+                hashlib.sha256(
+                    f"{export_id}:{ordinal}:{record.measurement_version_id}".encode()
+                ).hexdigest(),
+            )
+            for ordinal, record in enumerate(records, start=1)
+        ]
+        if occurrence_rows:
+            self._query.executemany(
+                "INSERT INTO staged_occurrences VALUES (?, ?, ?, ?, ?, ?, ?)",
+                occurrence_rows,
+            )
         if parent_snapshot_id is None:
             self._query.execute(
                 "CREATE OR REPLACE TEMP TABLE source_occurrences AS "
@@ -1816,6 +1901,7 @@ class LocalStore:
                             "continued_override",
                             "suspected_source_deletion",
                             "source_conflict",
+                            "rule_definition",
                         ],
                         row[1],
                     ),
@@ -1872,6 +1958,10 @@ class LocalStore:
             previous_measurements=previous_measurements,
             previous_review_cases=previous_review_cases,
             governing_export_id=governing_export_id,
+            imported_measurement_version_ids=tuple(
+                str(record.measurement_version_id) for record in records
+            ),
+            unknown_source_types=unknown_source_types,
         )
         self._query.execute(
             "CREATE OR REPLACE TEMP TABLE resolved_measurements ("
@@ -1881,24 +1971,26 @@ class LocalStore:
             "correction_decision_id VARCHAR, source_deletion_decision_id VARCHAR, "
             "conflict_resolution_decision_id VARCHAR)"
         )
-        self._query.executemany(
-            "INSERT INTO resolved_measurements VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                (
-                    item.logical_measurement_id,
-                    item.selected_measurement_version_id,
-                    item.disposition,
-                    item.effective_value,
-                    item.canonical_unit,
-                    item.effective_value_source,
-                    item.effective_decision_id,
-                    item.correction_decision_id,
-                    item.source_deletion_decision_id,
-                    item.conflict_resolution_decision_id,
-                )
-                for item in resolution.measurements
-            ],
-        )
+        resolved_rows = [
+            (
+                item.logical_measurement_id,
+                item.selected_measurement_version_id,
+                item.disposition,
+                item.effective_value,
+                item.canonical_unit,
+                item.effective_value_source,
+                item.effective_decision_id,
+                item.correction_decision_id,
+                item.source_deletion_decision_id,
+                item.conflict_resolution_decision_id,
+            )
+            for item in resolution.measurements
+        ]
+        if resolved_rows:
+            self._query.executemany(
+                "INSERT INTO resolved_measurements VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                resolved_rows,
+            )
         self._query.execute(
             "CREATE OR REPLACE TEMP TABLE open_review_cases ("
             "review_case_id VARCHAR, case_kind VARCHAR, logical_measurement_id VARCHAR, "
@@ -2008,7 +2100,7 @@ class LocalStore:
         (directory / "manifest.json").write_bytes(manifest_bytes)
         manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
         self._validate_snapshot(directory, str(snapshot_id), manifest_sha256)
-        return manifest_sha256
+        return manifest_sha256, resolution
 
     def _validate_store(self) -> None:
         if self._metadata.execute("PRAGMA integrity_check").fetchone() != ("ok",):
@@ -2267,6 +2359,7 @@ class LocalStore:
         cataloged_rules = {
             (_IDENTITY_RULE_VERSION, "identity"),
             (_MAPPING_RULE_VERSION, "mapping"),
+            (_FIXED_PLAUSIBILITY_RULE_VERSION, "plausibility"),
         }
         if has_rule_refs is not None:
             cataloged_rules.update(
@@ -2402,7 +2495,7 @@ class LocalStore:
                       OR NOT regexp_full_match(evidence_fingerprint, '[0-9a-f]{{64}}')
                       OR case_kind NOT IN (
                           'plausibility', 'continued_override',
-                          'suspected_source_deletion', 'source_conflict'
+                          'suspected_source_deletion', 'source_conflict', 'rule_definition'
                       )
                       OR NOT (
                           (case_kind = 'plausibility'
@@ -2418,6 +2511,11 @@ class LocalStore:
                            AND logical_measurement_id IS NOT NULL
                            AND measurement_version_id IS NULL
                            AND rule_version_id IS NULL)
+                          OR
+                          (case_kind = 'rule_definition'
+                           AND logical_measurement_id IS NULL
+                           AND measurement_version_id IS NULL
+                           AND rule_version_id IS NULL)
                       ))
               + (SELECT count(*) FROM reviews r LEFT JOIN versions v
                    ON v.measurement_version_id = r.measurement_version_id
@@ -2426,6 +2524,7 @@ class LocalStore:
               + (SELECT count(*) FROM reviews r LEFT JOIN resolved m
                    ON m.logical_measurement_id = r.logical_measurement_id
                    WHERE r.logical_measurement_id IS NOT NULL
+                     AND r.case_kind != 'rule_definition'
                      AND m.logical_measurement_id IS NULL)
             """
         ).fetchone()
@@ -2675,6 +2774,7 @@ class LocalStore:
                         "continued_override",
                         "suspected_source_deletion",
                         "source_conflict",
+                        "rule_definition",
                     ],
                     kind,
                 ),
@@ -2700,6 +2800,85 @@ class LocalStore:
                 evidence_fingerprint,
             ) in rows
         )
+
+    def load_review_cycles(self) -> tuple[ReviewCycleRecord, ...]:
+        self._require_open()
+        return tuple(
+            ReviewCycleRecord(
+                cycle_id=StoredReviewCycleId(str(cycle_id)),
+                snapshot_id=SnapshotId(str(snapshot_id)),
+                status=cast(Literal["open", "closed"], status),
+                open_case_count=int(open_case_count),
+            )
+            for cycle_id, snapshot_id, status, open_case_count in self._metadata.execute(
+                "SELECT cycle_id, snapshot_id, status, open_case_count "
+                "FROM review_cycles ORDER BY rowid"
+            ).fetchall()
+        )
+
+    def load_measurement_version_fact(
+        self, measurement_version_id: MeasurementVersionId
+    ) -> MeasurementVersionFact | None:
+        self._require_open()
+        active = self.load_active_snapshot_id()
+        if active is None:
+            return None
+        path = (
+            self._root
+            / _PARQUET_DIRECTORY
+            / "snapshots"
+            / str(active)
+            / "measurement_versions.parquet"
+        )
+        escaped = str(path).replace("'", "''")
+        row = self._query.execute(
+            f"SELECT measurement_version_id, identity_candidate_id, canonical_type, "
+            f"canonical_unit, canonical_value, source_start_utc, source_end_utc, "
+            f"source_name, device, strong_source_id_hash FROM read_parquet('{escaped}') "
+            "WHERE measurement_version_id = ?",
+            (str(measurement_version_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        return MeasurementVersionFact(
+            measurement_version_id=str(row[0]),
+            logical_measurement_id=str(row[1]),
+            canonical_type=str(row[2]),
+            canonical_unit=str(row[3]),
+            canonical_value=float(row[4]),
+            source_start_utc=str(row[5]),
+            source_end_utc=str(row[6]),
+            source_name=str(row[7]),
+            device=str(row[8]),
+            strong_source_id_hash=None if row[9] is None else str(row[9]),
+        )
+
+    def load_resolved_measurement(self, logical_measurement_id: str) -> ResolvedMeasurement | None:
+        self._require_open()
+        active = self.load_active_snapshot_id()
+        if active is None:
+            return None
+        path = (
+            self._root
+            / _PARQUET_DIRECTORY
+            / "snapshots"
+            / str(active)
+            / "resolved_measurements.parquet"
+        )
+        escaped = str(path).replace("'", "''")
+        row = self._query.execute(
+            f"SELECT * FROM read_parquet('{escaped}') WHERE logical_measurement_id = ?",
+            (logical_measurement_id,),
+        ).fetchone()
+        return None if row is None else ResolvedMeasurement(*row)
+
+    def load_source_type_for_review_case(self, review_case_id: str) -> str | None:
+        self._require_open()
+        row = self._metadata.execute(
+            "SELECT source_type FROM source_type_catalog WHERE review_case_id = ?",
+            (review_case_id,),
+        ).fetchone()
+        return None if row is None else str(row[0])
 
     def load_export_facts(self) -> tuple[ExportFact, ...]:
         self._require_open()
