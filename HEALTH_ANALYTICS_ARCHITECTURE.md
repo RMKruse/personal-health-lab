@@ -283,7 +283,13 @@ Die CLI-Seam besitzt zwei getrennte Einstiegspunkte: `healthlab` für Import, An
 
 Die Exitcode-Klassen sind: `0` für Erfolg oder idempotenten No-op, `2` für ungültige CLI-Verwendung, `3` für einen erwartbaren nicht abgeschlossenen Zustand und `1` für einen unerwarteten technischen Defekt. Der JSON-Body enthält stets den konkreten typisierten Status.
 
+Jede V0.2-Schreiboperation verwendet unabhängig vom aktuellen Schutz- und Freigabestatus denselben zweistufigen Anwendungsvertrag: eine nebenwirkungsfreie typisierte Schreibvorschau und deren ausdrückliche Ausführung. Sämtliche fachlichen Eingaben sind vor der Vorschau festgelegt und im Plan-Fingerprint gebunden; Bearbeiten verwirft den Plan. Die menschenlesbare CLI zeigt Vorschau und Bestätigung innerhalb eines Aufrufs. Im JSON-Modus liefert der erste Aufruf den vollständigen Plan; der zweite wiederholt dieselben Argumente und führt nur bei neu berechnetem identischem Fingerprint aus. Angezeigte Pläne werden nicht persistiert.
+
+Eine Sammelbestätigung macht Filter, Anzahl, stabile Fall-IDs und entscheidungsrelevante Werte der vollständigen materialisierten Treffermenge prüfbar. Streamlit darf dafür eine paginierte Tabelle und die CLI den nativen Pager verwenden; JSON enthält die vollständige Liste. Kein Adapter kürzt still oder rekonstruiert die Treffermenge selbst.
+
 Streamlit verwendet `session_state` ausschließlich für flüchtige UI-Auswahl und Navigation. Import-, Prüf- und Analysezustände bleiben hinter dem Anwendungs-Interface persistent. Caches dürfen nur unveränderliche Overview-Daten halten und müssen Snapshot- oder Run-IDs im Cache-Key führen.
+
+V0.2-Schreibvorschauen erscheinen inline auf der jeweils zuständigen Fachseite. Ein Seitenwechsel verwirft sie; global bleibt nur ein schreibgeschützter Workspace-Status, keine Operationswarteschlange. `migration_required` fokussiert ausschließlich „Migration und Diagnose“, `restore_pending` ausschließlich „Sicherung und Wiederherstellung“; die übrigen Seitennamen bleiben zur Orientierung sichtbar, sind aber deaktiviert. Diese Navigation ist Präsentationslogik, während zulässige Operationen, Plan, Freigabestatus, Diagnosen und Ausführung vollständig aus dem gemeinsamen Anwendungs-Interface stammen.
 
 `load_overview(selection)` liefert ein präsentationsneutrales `Overview` mit Zeitreihen, Trends, Unsicherheit, Qualitäts- und Quellenstatus, Analyseverweisen, Methodik und Provenienz. CLI serialisiert dieses Modell als Tabelle oder JSON; Streamlit visualisiert es. Adapter dürfen keine fachliche Daten- oder Interpretationslogik ergänzen.
 
