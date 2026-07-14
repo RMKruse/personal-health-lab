@@ -449,7 +449,11 @@ Parquet-Schema-Migrationen verändern keine veröffentlichte Datensatzversion in
 
 Nicht mehr referenzierte Datensatzversionen werden ausschließlich nach einer Vorschau mit Referenzen und geschätztem Speichergewinn sowie einer ausdrücklichen Benutzerbestätigung gelöscht. Es gibt keine automatische Parquet-Bereinigung im MVP.
 
-Vor Importen und Copy-on-write-Migrationen prüft die Anwendung den geschätzten Speicherbedarf einschließlich einer Sicherheitsreserve. Bei voraussichtlich unzureichendem freien Speicher beginnt der Vorgang nicht.
+Vor Importen, Metadatensicherungen, Wiederherstellungsschritten und Copy-on-write-Migrationen prüft die Anwendung den geschätzten Speicherbedarf einschließlich einer Sicherheitsreserve. Bei voraussichtlich unzureichendem oder nicht konservativ schätzbarem freien Speicher beginnt der Vorgang nicht.
+
+Die versionierte Operationsschätzung berechnet pro tatsächlichem Zielvolume den Spitzenwert der gleichzeitig lebenden zusätzlichen Allokationen. Ein Full-Snapshot-Import verwendet kanonisch gezählte Eingabebytes sowie gebundene Bounds für Parquet-Ausgabe, DuckDB-Scratch, SQLite-Wachstum und Journal. Eine Metadatensicherung zählt ihren kanonischen Encoder vorab und ersetzt die temporäre Datei auf demselben Volume atomar. Die gestufte Wiederherstellung besitzt getrennte Kapazitätsgates für Beginn, jeden Quellimport und Aktivierung; bereits persistierte Wiederherstellungsfakten sind dabei Basis des nächsten Schritts und nicht erneut Zusatzbedarf. Jeder registrierte Migrationsschritt deklariert seine Ziel- und Scratch-Bounds. Alte Snapshots bleiben Basis und eine mögliche APFS-Copy-on-write-Ersparnis wird niemals angerechnet. Fehlt ein Bound, lautet der Kapazitätsbefund `unknown` und blockiert.
+
+Versionierte synthetische Allokations-Fixtures messen je Phase `st_blocks × 512` und müssen für normales V0.2-Volumen sowie einen größeren Stressfall unter der jeweiligen Operationsschätzung bleiben. Änderungen an Writer, Dateiformat, Scratch-Grenze, Phasen-Liveness oder Schätzformel erzeugen eine neue Schätzmethodenversion. Der Preflight bleibt dennoch eine Momentaufnahme; `ENOSPC` muss jede Operation atomar abbrechen und den aktiven Zustand unverändert lassen.
 
 Pro Datenspeicher darf genau eine schreibende Operation gleichzeitig aktiv sein. Importe, Migrationen, Wiederherstellungen und das Speichern eines Modelllaufs benötigen denselben exklusiven Schreib-Lock; snapshot-basierte Leser dürfen parallel arbeiten. Ein weiterer Schreiber erhält den erwartbaren Status `store_busy`.
 

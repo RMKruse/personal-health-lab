@@ -1,0 +1,3 @@
+# Schreibkapazität nach gleichzeitig lebender Allokation budgetieren
+
+V0.2 schätzt den zusätzlichen Spitzenplatzbedarf pro Schreiboperation und tatsächlichem Zielvolume als Maximum der gleichzeitig lebenden, von versionierten Writern begrenzten Artefakte. Die gestufte Wiederherstellung prüft Start, jeden Quellimport und Aktivierung getrennt; Migrationen rechnen keine Copy-on-write-Ersparnis an, und jeder fehlende Output- oder Scratch-Bound ergibt den blockierenden Befund `unknown`. Versionierte Allokations-Fixtures messen `st_blocks × 512`, damit Format-, Writer- oder Liveness-Änderungen eine neue Schätzmethodenversion und einen neuen Nachweis erzwingen.
