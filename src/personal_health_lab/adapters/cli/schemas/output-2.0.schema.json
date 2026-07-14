@@ -213,6 +213,7 @@
         "import_id",
         "logical_measurement_count",
         "measurement_version_count",
+        "source_occurrence_count",
         "package_hash",
         "package_record_count",
         "record_count",
@@ -239,6 +240,10 @@
           "minimum": 0
         },
         "measurement_version_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source_occurrence_count": {
           "type": "integer",
           "minimum": 0
         },

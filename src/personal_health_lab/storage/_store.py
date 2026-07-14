@@ -9,6 +9,7 @@ import plistlib
 import shutil
 import sqlite3
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta, timezone
 from enum import StrEnum
@@ -25,6 +26,7 @@ from personal_health_lab.health_data import (
     CanonicalUnit,
     DailyHealthSeries,
     DailyHealthValue,
+    LogicalMeasurementId,
     MeasurementVersionId,
 )
 
@@ -35,7 +37,7 @@ _STORE_SCHEMA_VERSION = 2
 _WRITER_LOCK_FILE = ".writer.lock"
 _FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
 _SNAPSHOT_SCHEMA_VERSION = 1
-_IDENTITY_RULE_VERSION = "healthkit-natural/v1"
+_IDENTITY_RULE_VERSION = "healthkit-natural/v2"
 _MAPPING_RULE_VERSION = "healthkit-canonical/v1"
 _SNAPSHOT_SCHEMAS = {
     "source_occurrences.parquet": (
@@ -110,8 +112,10 @@ CREATE TABLE store_identity (
 
 
 def _is_lower_hex(value: object, length: int) -> bool:
-    return isinstance(value, str) and len(value) == length and all(
-        character in "0123456789abcdef" for character in value
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(character in "0123456789abcdef" for character in value)
     )
 
 
@@ -220,12 +224,7 @@ def full_snapshot_import_estimate(
     """Bound the peak live allocation of ``full-snapshot-import/v1``."""
     if not writer_bound or not scratch_bound:
         return None
-    if (
-        input_bytes < 0
-        or active_snapshot_bytes < 0
-        or record_count < 0
-        or fragment_size <= 0
-    ):
+    if input_bytes < 0 or active_snapshot_bytes < 0 or record_count < 0 or fragment_size <= 0:
         raise ValueError("Kapazitätseingaben müssen nichtnegativ und Fragmente positiv sein.")
     input_bytes = max(input_bytes, 1)
     scratch = _round_up(4 * input_bytes, fragment_size)
@@ -297,11 +296,7 @@ def probe_capacity(path: Path, estimate_bytes: int | None) -> CapacityCheck:
             available,
             required,
             stats.f_frsize,
-            (
-                CapacityReason.TARGET_READ_ONLY
-                if read_only
-                else CapacityReason.TARGET_UNWRITABLE
-            ),
+            (CapacityReason.TARGET_READ_ONLY if read_only else CapacityReason.TARGET_UNWRITABLE),
         )
     return CapacityCheck(
         CapacityStatus.READY if available >= required else CapacityStatus.INSUFFICIENT,
@@ -376,9 +371,7 @@ def probe_filevault(path: Path) -> FileVaultCheck:
                     target_volume,
                     FileVaultReason.APFS_STATE_UNAVAILABLE,
                 )
-            apfs_volume = _find_apfs_volume(
-                apfs_info, device.removeprefix("/dev/"), target_volume
-            )
+            apfs_volume = _find_apfs_volume(apfs_info, device.removeprefix("/dev/"), target_volume)
             if apfs_volume is None:
                 return FileVaultCheck(
                     FileVaultStatus.UNKNOWN,
@@ -419,11 +412,7 @@ def probe_filevault(path: Path) -> FileVaultCheck:
                     target_volume,
                     FileVaultReason.APFS_STATE_UNAVAILABLE,
                 )
-        if (
-            isinstance(target_group, str)
-            and target_group
-            and target_group == startup_group
-        ):
+        if isinstance(target_group, str) and target_group and target_group == startup_group:
             active = subprocess.run(
                 ["/usr/bin/fdesetup", "isactive"],
                 capture_output=True,
@@ -456,18 +445,14 @@ def probe_filevault(path: Path) -> FileVaultCheck:
             FileVaultReason.FILEVAULT_STATE_UNREPORTED,
         )
     except (OSError, subprocess.SubprocessError, UnicodeError, ValueError, IndexError):
-        return FileVaultCheck(
-            FileVaultStatus.UNKNOWN, "unresolved", FileVaultReason.PROBE_FAILED
-        )
+        return FileVaultCheck(FileVaultStatus.UNKNOWN, "unresolved", FileVaultReason.PROBE_FAILED)
 
 
-def _find_apfs_volume(
-    value: object, device: str, volume_uuid: str
-) -> dict[str, object] | None:
+def _find_apfs_volume(value: object, device: str, volume_uuid: str) -> dict[str, object] | None:
     if isinstance(value, dict):
-        matches_volume = value.get("DeviceIdentifier") == device or value.get(
-            "APFSVolumeUUID"
-        ) == volume_uuid
+        matches_volume = (
+            value.get("DeviceIdentifier") == device or value.get("APFSVolumeUUID") == volume_uuid
+        )
         if matches_volume:
             return value
         return next(
@@ -671,7 +656,74 @@ class PublishImportResult:
     record_count: int
     logical_measurement_count: int
     measurement_version_count: int
+    source_occurrence_count: int
     diagnostics: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class OpenDataReviewCase:
+    review_case_id: str
+    kind: Literal[
+        "plausibility",
+        "continued_override",
+        "suspected_source_deletion",
+        "source_conflict",
+    ]
+    logical_measurement_id: LogicalMeasurementId | None
+    measurement_version_id: MeasurementVersionId | None
+    rule_version_id: str | None
+    evidence_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExportFact:
+    export_id: str
+    export_date: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class SourceOccurrenceFact:
+    export_id: str
+    export_ordinal: int
+    logical_measurement_id: str
+    measurement_version_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class MeasurementVersionFact:
+    measurement_version_id: str
+    logical_measurement_id: str
+    canonical_type: str
+    canonical_unit: str
+    canonical_value: float
+    source_start_utc: str
+    source_end_utc: str
+    source_name: str
+    device: str
+    strong_source_id_hash: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedMeasurement:
+    logical_measurement_id: str
+    selected_measurement_version_id: str
+    disposition: str
+    effective_value: float | None
+    canonical_unit: str
+    effective_value_source: str
+    effective_decision_id: str | None
+    correction_decision_id: str | None
+    source_deletion_decision_id: str | None
+    conflict_resolution_decision_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SourceResolution:
+    measurements: tuple[ResolvedMeasurement, ...]
+    review_cases: tuple[OpenDataReviewCase, ...]
+
+
+type SourceResolver = Callable[..., SourceResolution]
 
 
 @dataclass(frozen=True, slots=True)
@@ -764,6 +816,20 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                 AND measurement_version_id NOT GLOB '*[^0-9a-f]*'
             ),
             PRIMARY KEY (import_id, measurement_version_id)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS exports (
+            export_id TEXT PRIMARY KEY CHECK (
+                length(export_id) = 64 AND export_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            package_hash TEXT NOT NULL UNIQUE CHECK (
+                length(package_hash) = 64 AND package_hash NOT GLOB '*[^0-9a-f]*'
+            ),
+            export_date_utc TEXT,
+            order_state TEXT NOT NULL CHECK (order_state IN ('ordered', 'unordered')),
+            CHECK (
+                (order_state = 'ordered' AND export_date_utc IS NOT NULL)
+                OR (order_state = 'unordered' AND export_date_utc IS NULL)
+            )
         ) STRICT;
         CREATE TABLE IF NOT EXISTS decision_refs (
             decision_id TEXT PRIMARY KEY CHECK (
@@ -917,9 +983,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             """
         )
         return
-    analysis_columns = {
-        str(row[1]) for row in metadata.execute("PRAGMA table_info(analysis_runs)")
-    }
+    analysis_columns = {str(row[1]) for row in metadata.execute("PRAGMA table_info(analysis_runs)")}
     migrations = {
         "analysis_start_date": "TEXT",
         "analysis_end_date": "TEXT",
@@ -965,16 +1029,11 @@ class LocalStore:
             try:
                 for filename in _SNAPSHOT_SCHEMAS:
                     active_path = (
-                        self._root
-                        / _PARQUET_DIRECTORY
-                        / "snapshots"
-                        / str(active[0])
-                        / filename
+                        self._root / _PARQUET_DIRECTORY / "snapshots" / str(active[0]) / filename
                     )
                     escaped = str(active_path).replace("'", "''")
                     uncompressed = self._query.execute(
-                        "SELECT sum(total_uncompressed_size) "
-                        f"FROM parquet_metadata('{escaped}')"
+                        f"SELECT sum(total_uncompressed_size) FROM parquet_metadata('{escaped}')"
                     ).fetchone()
                     active_bytes += max(
                         active_path.stat().st_blocks * 512,
@@ -1164,9 +1223,8 @@ class LocalStore:
                     raise StoreConfigurationError(
                         "Datenspeicher gehört zu einem anderen Modus oder Schema."
                     )
-            legacy_identity = (
-                existing_identity is not None
-                and str(existing_identity[1]) != str(_STORE_SCHEMA_VERSION)
+            legacy_identity = existing_identity is not None and str(existing_identity[1]) != str(
+                _STORE_SCHEMA_VERSION
             )
             if initialize and not legacy_identity:
                 (root / _PARQUET_DIRECTORY).mkdir(exist_ok=True)
@@ -1179,9 +1237,7 @@ class LocalStore:
                 for row in metadata.execute("PRAGMA table_info(store_identity)").fetchall()
             }
             store_id = "store_id" if "store_id" in identity_columns else "NULL"
-            binding = (
-                "person_binding" if "person_binding" in identity_columns else "'unbound'"
-            )
+            binding = "person_binding" if "person_binding" in identity_columns else "'unbound'"
             identity = metadata.execute(
                 f"SELECT mode, schema_version, {store_id}, {binding} "
                 "FROM store_identity WHERE singleton = 1"
@@ -1198,8 +1254,7 @@ class LocalStore:
                 metadata.commit()
             elif (
                 str(identity[0]) != mode.value
-                or str(identity[1])
-                not in {"1", "1.0", "1.1", "1.2", str(_STORE_SCHEMA_VERSION)}
+                or str(identity[1]) not in {"1", "1.0", "1.1", "1.2", str(_STORE_SCHEMA_VERSION)}
                 or (
                     str(identity[1]) == str(_STORE_SCHEMA_VERSION)
                     and (identity[2] is None or not str(identity[2]))
@@ -1347,7 +1402,11 @@ class LocalStore:
         import_id: ImportId,
         package_hash: str,
         snapshot_id: SnapshotId,
+        export_id: str,
+        export_date: datetime | None,
         records: tuple[CanonicalHealthRecord, ...],
+        governing_export_id: str,
+        resolve_sources: SourceResolver,
     ) -> PublishImportResult:
         self._require_open()
         self._require_writer()
@@ -1357,7 +1416,11 @@ class LocalStore:
                 import_id=import_id,
                 package_hash=package_hash,
                 snapshot_id=snapshot_id,
+                export_id=export_id,
+                export_date=export_date,
                 records=records,
+                governing_export_id=governing_export_id,
+                resolve_sources=resolve_sources,
             )
         except (OSError, sqlite3.Error, duckdb.Error) as error:
             raise StoreError("Health-Import konnte nicht veröffentlicht werden.") from error
@@ -1369,19 +1432,26 @@ class LocalStore:
         import_id: ImportId,
         package_hash: str,
         snapshot_id: SnapshotId,
+        export_id: str,
+        export_date: datetime | None,
         records: tuple[CanonicalHealthRecord, ...],
+        governing_export_id: str,
+        resolve_sources: SourceResolver,
     ) -> PublishImportResult:
         observed_at = datetime.now().astimezone()
         duplicate = self._metadata.execute(
             """
             SELECT active_snapshot.snapshot_id
             FROM active_snapshot
-            WHERE singleton = 1 AND EXISTS (
-                SELECT 1 FROM imports
-                WHERE package_hash = ? AND status = 'committed'
+            WHERE singleton = 1 AND (
+                EXISTS (
+                    SELECT 1 FROM imports
+                    WHERE package_hash = ? AND status = 'committed'
+                )
+                OR EXISTS (SELECT 1 FROM exports WHERE export_id = ?)
             )
             """,
-            (package_hash,),
+            (package_hash, export_id),
         ).fetchone()
         if duplicate is not None:
             result = self._current_import_result(
@@ -1451,9 +1521,7 @@ class LocalStore:
                                 "value": record.value,
                                 "start": record.source_start.isoformat(),
                                 "end": record.source_end.isoformat(),
-                                "updated": record.source_updated_at.isoformat(),
                                 "source": record.provenance.source_name,
-                                "source_version": record.provenance.source_version,
                                 "device": record.provenance.device,
                             },
                             sort_keys=True,
@@ -1475,7 +1543,7 @@ class LocalStore:
                     record.provenance.device,
                     record.provenance.original_value,
                     record.provenance.original_unit,
-                    None,
+                    record.provenance.strong_source_id_hash,
                 )
                 for record in records
             ],
@@ -1525,30 +1593,6 @@ class LocalStore:
         assert count_row is not None
         version_count, logical_count = map(int, count_row)
         new_record_count = version_count - previous_count
-        if new_record_count == 0:
-            assert active is not None
-            current_snapshot = SnapshotId(str(active[0]))
-            result = PublishImportResult(
-                status="duplicate",
-                snapshot_id=current_snapshot,
-                record_count=0,
-                logical_measurement_count=logical_count,
-                measurement_version_count=version_count,
-                diagnostics=("no_new_measurement_versions",),
-            )
-            with self._metadata:
-                self._record_import(
-                    operation_id=operation_id,
-                    import_id=import_id,
-                    package_hash=package_hash,
-                    snapshot_id=current_snapshot,
-                    status=result.status,
-                    package_record_count=len(records),
-                    record_count=0,
-                    records=records,
-                )
-            shutil.rmtree(self._root / "staging" / str(import_id), ignore_errors=True)
-            return result
 
         audit_position = int(
             self._metadata.execute(
@@ -1560,9 +1604,12 @@ class LocalStore:
             operation_id=operation_id,
             snapshot_id=snapshot_id,
             parent_snapshot_id=None if active is None else SnapshotId(str(active[0])),
-            package_hash=package_hash,
+            export_id=export_id,
+            export_date=export_date,
+            governing_export_id=governing_export_id,
             records=records,
             audit_position=audit_position,
+            resolve_sources=resolve_sources,
         )
         _allocation_checkpoint(self._root, "staged")
         _publication_fault_point(self._root, "import.before_snapshot_move/v1")
@@ -1576,6 +1623,15 @@ class LocalStore:
                 "INSERT INTO write_operations VALUES (?, 'import_health_export', ?, ?, "
                 "'committed', 1)",
                 (str(operation_id), observed_at.astimezone(UTC).isoformat(), completed_at),
+            )
+            self._metadata.execute(
+                "INSERT INTO exports VALUES (?, ?, ?, ?)",
+                (
+                    export_id,
+                    package_hash,
+                    None if export_date is None else export_date.astimezone(UTC).isoformat(),
+                    "unordered" if export_date is None else "ordered",
+                ),
             )
             self._record_import(
                 operation_id=operation_id,
@@ -1632,6 +1688,7 @@ class LocalStore:
             record_count=new_record_count,
             logical_measurement_count=logical_count,
             measurement_version_count=version_count,
+            source_occurrence_count=self._snapshot_occurrence_count(snapshot_id),
         )
 
     def _stage_snapshot(
@@ -1641,9 +1698,12 @@ class LocalStore:
         operation_id: OperationId,
         snapshot_id: SnapshotId,
         parent_snapshot_id: SnapshotId | None,
-        package_hash: str,
+        export_id: str,
+        export_date: datetime | None,
+        governing_export_id: str,
         records: tuple[CanonicalHealthRecord, ...],
         audit_position: int,
+        resolve_sources: SourceResolver,
     ) -> str:
         self._query.execute(
             """
@@ -1662,14 +1722,14 @@ class LocalStore:
             "INSERT INTO staged_occurrences VALUES (?, ?, ?, ?, ?, ?, ?)",
             [
                 (
-                    hashlib.sha256(f"{package_hash}:{ordinal}".encode()).hexdigest(),
-                    package_hash,
+                    hashlib.sha256(f"{export_id}:{ordinal}".encode()).hexdigest(),
+                    export_id,
                     ordinal,
                     str(record.logical_measurement_id),
                     str(record.measurement_version_id),
                     _MAPPING_RULE_VERSION,
                     hashlib.sha256(
-                        f"{package_hash}:{ordinal}:{record.measurement_version_id}".encode()
+                        f"{export_id}:{ordinal}:{record.measurement_version_id}".encode()
                     ).hexdigest(),
                 )
                 for ordinal, record in enumerate(records, start=1)
@@ -1710,70 +1770,155 @@ class LocalStore:
         )
         self._query.execute(
             """
-            CREATE OR REPLACE TEMP TABLE source_resolutions AS
-            SELECT
-                identity_candidate_id AS logical_measurement_id,
-                measurement_version_id AS selected_measurement_version_id,
-                'included_source'::VARCHAR AS disposition,
-                canonical_value AS effective_value,
-                canonical_unit,
-                'source'::VARCHAR AS effective_value_source,
-                NULL::VARCHAR AS effective_decision_id,
-                NULL::VARCHAR AS correction_decision_id,
-                NULL::VARCHAR AS source_deletion_decision_id,
-                NULL::VARCHAR AS conflict_resolution_decision_id
-            FROM measurement_versions
-            QUALIFY row_number() OVER (
-                PARTITION BY identity_candidate_id
-                ORDER BY source_updated_at_utc DESC, source_version DESC,
-                         measurement_version_id DESC
-            ) = 1
+            CREATE OR REPLACE TEMP TABLE export_order (
+                export_id VARCHAR,
+                export_date_utc VARCHAR
+            )
             """
         )
-        if parent_snapshot_id is None:
-            self._query.execute(
-                "CREATE OR REPLACE TEMP TABLE resolved_measurements AS "
-                "SELECT * FROM source_resolutions"
+        export_rows = [
+            (str(row[0]), None if row[1] is None else str(row[1]))
+            for row in self._metadata.execute(
+                "SELECT export_id, export_date_utc FROM exports"
+            ).fetchall()
+        ]
+        export_rows.append(
+            (
+                export_id,
+                None if export_date is None else export_date.astimezone(UTC).isoformat(),
             )
-            self._query.execute(
-                """
-                CREATE OR REPLACE TEMP TABLE open_review_cases AS
-                SELECT NULL::VARCHAR AS review_case_id,
-                       NULL::VARCHAR AS case_kind,
-                       NULL::VARCHAR AS logical_measurement_id,
-                       NULL::VARCHAR AS measurement_version_id,
-                       NULL::VARCHAR AS rule_version_id,
-                       NULL::VARCHAR AS evidence_fingerprint
-                WHERE false
-                """
-            )
-        else:
+        )
+        self._query.executemany("INSERT INTO export_order VALUES (?, ?)", export_rows)
+        previous_measurements: tuple[ResolvedMeasurement, ...] = ()
+        previous_review_cases: tuple[OpenDataReviewCase, ...] = ()
+        if parent_snapshot_id is not None:
             previous_directory = (
                 self._root / _PARQUET_DIRECTORY / "snapshots" / str(parent_snapshot_id)
             )
-            previous_resolved = str(
-                previous_directory / "resolved_measurements.parquet"
-            ).replace("'", "''")
+            previous_resolved = str(previous_directory / "resolved_measurements.parquet").replace(
+                "'", "''"
+            )
             previous_reviews = str(previous_directory / "open_review_cases.parquet").replace(
                 "'", "''"
             )
-            self._query.execute(
-                f"""
-                CREATE OR REPLACE TEMP TABLE resolved_measurements AS
-                SELECT * FROM read_parquet('{previous_resolved}')
-                WHERE disposition != 'included_source'
-                UNION ALL BY NAME
-                SELECT current.* FROM source_resolutions current
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM read_parquet('{previous_resolved}') previous
-                    WHERE previous.logical_measurement_id = current.logical_measurement_id
-                      AND previous.disposition != 'included_source'
-                )
-                """
+            previous_measurements = tuple(
+                ResolvedMeasurement(*row)
+                for row in self._query.execute(
+                    f"SELECT * FROM read_parquet('{previous_resolved}')"
+                ).fetchall()
             )
-            self._query.execute(
-                "CREATE OR REPLACE TEMP TABLE open_review_cases AS "
-                f"SELECT * FROM read_parquet('{previous_reviews}')"
+            previous_review_cases = tuple(
+                OpenDataReviewCase(
+                    review_case_id=str(row[0]),
+                    kind=cast(
+                        Literal[
+                            "plausibility",
+                            "continued_override",
+                            "suspected_source_deletion",
+                            "source_conflict",
+                        ],
+                        row[1],
+                    ),
+                    logical_measurement_id=(
+                        None if row[2] is None else LogicalMeasurementId(str(row[2]))
+                    ),
+                    measurement_version_id=(
+                        None if row[3] is None else MeasurementVersionId(str(row[3]))
+                    ),
+                    rule_version_id=None if row[4] is None else str(row[4]),
+                    evidence_fingerprint=str(row[5]),
+                )
+                for row in self._query.execute(
+                    f"SELECT * FROM read_parquet('{previous_reviews}')"
+                ).fetchall()
+            )
+
+        occurrence_facts = tuple(
+            SourceOccurrenceFact(str(row[0]), int(row[1]), str(row[2]), str(row[3]))
+            for row in self._query.execute(
+                "SELECT export_id, export_ordinal, identity_candidate_id, "
+                "measurement_version_id FROM source_occurrences"
+            ).fetchall()
+        )
+        version_facts = tuple(
+            MeasurementVersionFact(
+                measurement_version_id=str(row[0]),
+                logical_measurement_id=str(row[1]),
+                canonical_type=str(row[2]),
+                canonical_unit=str(row[3]),
+                canonical_value=float(row[4]),
+                source_start_utc=str(row[5]),
+                source_end_utc=str(row[6]),
+                source_name=str(row[7]),
+                device=str(row[8]),
+                strong_source_id_hash=None if row[9] is None else str(row[9]),
+            )
+            for row in self._query.execute(
+                "SELECT measurement_version_id, identity_candidate_id, canonical_type, "
+                "canonical_unit, canonical_value, source_start_utc, source_end_utc, "
+                "source_name, device, strong_source_id_hash FROM measurement_versions"
+            ).fetchall()
+        )
+        export_facts = tuple(
+            ExportFact(str(row[0]), None if row[1] is None else datetime.fromisoformat(str(row[1])))
+            for row in self._query.execute(
+                "SELECT export_id, export_date_utc FROM export_order"
+            ).fetchall()
+        )
+        resolution = resolve_sources(
+            occurrences=occurrence_facts,
+            versions=version_facts,
+            exports=export_facts,
+            previous_measurements=previous_measurements,
+            previous_review_cases=previous_review_cases,
+            governing_export_id=governing_export_id,
+        )
+        self._query.execute(
+            "CREATE OR REPLACE TEMP TABLE resolved_measurements ("
+            "logical_measurement_id VARCHAR, selected_measurement_version_id VARCHAR, "
+            "disposition VARCHAR, effective_value DOUBLE, canonical_unit VARCHAR, "
+            "effective_value_source VARCHAR, effective_decision_id VARCHAR, "
+            "correction_decision_id VARCHAR, source_deletion_decision_id VARCHAR, "
+            "conflict_resolution_decision_id VARCHAR)"
+        )
+        self._query.executemany(
+            "INSERT INTO resolved_measurements VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    item.logical_measurement_id,
+                    item.selected_measurement_version_id,
+                    item.disposition,
+                    item.effective_value,
+                    item.canonical_unit,
+                    item.effective_value_source,
+                    item.effective_decision_id,
+                    item.correction_decision_id,
+                    item.source_deletion_decision_id,
+                    item.conflict_resolution_decision_id,
+                )
+                for item in resolution.measurements
+            ],
+        )
+        self._query.execute(
+            "CREATE OR REPLACE TEMP TABLE open_review_cases ("
+            "review_case_id VARCHAR, case_kind VARCHAR, logical_measurement_id VARCHAR, "
+            "measurement_version_id VARCHAR, rule_version_id VARCHAR, "
+            "evidence_fingerprint VARCHAR)"
+        )
+        review_rows = [
+            (
+                item.review_case_id,
+                item.kind,
+                None if item.logical_measurement_id is None else str(item.logical_measurement_id),
+                None if item.measurement_version_id is None else str(item.measurement_version_id),
+                item.rule_version_id,
+                item.evidence_fingerprint,
+            )
+            for item in resolution.review_cases
+        ]
+        if review_rows:
+            self._query.executemany(
+                "INSERT INTO open_review_cases VALUES (?, ?, ?, ?, ?, ?)", review_rows
             )
 
         entries: list[dict[str, int | str]] = []
@@ -1781,9 +1926,7 @@ class LocalStore:
             table = filename.removesuffix(".parquet")
             path = directory / filename
             escaped = str(path).replace("'", "''")
-            self._query.execute(
-                f"COPY (SELECT * FROM {table}) TO '{escaped}' (FORMAT PARQUET)"
-            )
+            self._query.execute(f"COPY (SELECT * FROM {table}) TO '{escaped}' (FORMAT PARQUET)")
             description = tuple(
                 (str(row[0]), str(row[1]))
                 for row in self._query.execute(
@@ -1792,9 +1935,7 @@ class LocalStore:
             )
             if description != _SNAPSHOT_SCHEMAS[filename]:
                 raise StoreError("Staging-Snapshot besitzt ein unerwartetes Schema.")
-            row = self._query.execute(
-                f"SELECT count(*) FROM read_parquet('{escaped}')"
-            ).fetchone()
+            row = self._query.execute(f"SELECT count(*) FROM read_parquet('{escaped}')").fetchone()
             assert row is not None
             entries.append(
                 {
@@ -1843,12 +1984,10 @@ class LocalStore:
             "store_id": str(store_row[0]),
             "created_at_utc": datetime.now(UTC).isoformat(),
             "created_by_operation_id": str(operation_id),
-            "parent_snapshot_id": (
-                None if parent_snapshot_id is None else str(parent_snapshot_id)
-            ),
+            "parent_snapshot_id": (None if parent_snapshot_id is None else str(parent_snapshot_id)),
             "resolution_basis": {
                 "audit_max_position": audit_position,
-                "governing_export_id": package_hash,
+                "governing_export_id": governing_export_id,
                 "identity_rule_version_id": _IDENTITY_RULE_VERSION,
                 "mapping_rule_version_id": _MAPPING_RULE_VERSION,
             },
@@ -1889,9 +2028,7 @@ class LocalStore:
             return
         tables = {
             str(row[0])
-            for row in self._metadata.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
+            for row in self._metadata.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
         if "audit_events" in tables:
             audit = self._metadata.execute(
@@ -1927,11 +2064,7 @@ class LocalStore:
             )
             manifest = json.loads(
                 (
-                    self._root
-                    / _PARQUET_DIRECTORY
-                    / "snapshots"
-                    / snapshot_id
-                    / "manifest.json"
+                    self._root / _PARQUET_DIRECTORY / "snapshots" / snapshot_id / "manifest.json"
                 ).read_bytes()
             )
             if (
@@ -1941,9 +2074,7 @@ class LocalStore:
             ):
                 raise StoreError("Snapshot-Katalog und Manifest widersprechen sich.")
 
-    def _validate_snapshot(
-        self, directory: Path, snapshot_id: str, manifest_sha256: str
-    ) -> None:
+    def _validate_snapshot(self, directory: Path, snapshot_id: str, manifest_sha256: str) -> None:
         try:
             manifest_bytes = (directory / "manifest.json").read_bytes()
             manifest = json.loads(manifest_bytes)
@@ -1998,7 +2129,8 @@ class LocalStore:
             or type(resolution_basis["audit_max_position"]) is not int
             or resolution_basis["audit_max_position"] < 1
             or not _is_lower_hex(resolution_basis["governing_export_id"], 64)
-            or resolution_basis["identity_rule_version_id"] != _IDENTITY_RULE_VERSION
+            or not isinstance(resolution_basis["identity_rule_version_id"], str)
+            or not resolution_basis["identity_rule_version_id"]
             or resolution_basis["mapping_rule_version_id"] != _MAPPING_RULE_VERSION
             or not isinstance(validation_counts, dict)
             or set(validation_counts)
@@ -2018,8 +2150,7 @@ class LocalStore:
         if (
             not isinstance(files, list)
             or any(not isinstance(entry, dict) for entry in files)
-            or tuple(entry.get("name") for entry in files)
-            != tuple(sorted(_SNAPSHOT_SCHEMAS))
+            or tuple(entry.get("name") for entry in files) != tuple(sorted(_SNAPSHOT_SCHEMAS))
         ):
             raise StoreError("Snapshot enthält nicht genau vier geschlossene Dateien.")
         for entry in files:
@@ -2086,19 +2217,19 @@ class LocalStore:
             for row in self._query.execute(
                 f"""
                 SELECT correction_decision_id, 'correction'
-                FROM read_parquet('{paths['resolved_measurements']}')
+                FROM read_parquet('{paths["resolved_measurements"]}')
                 WHERE correction_decision_id IS NOT NULL
                 UNION
                 SELECT source_deletion_decision_id, 'source_deletion'
-                FROM read_parquet('{paths['resolved_measurements']}')
+                FROM read_parquet('{paths["resolved_measurements"]}')
                 WHERE source_deletion_decision_id IS NOT NULL
                 UNION
                 SELECT conflict_resolution_decision_id, 'conflict_resolution'
-                FROM read_parquet('{paths['resolved_measurements']}')
+                FROM read_parquet('{paths["resolved_measurements"]}')
                 WHERE conflict_resolution_decision_id IS NOT NULL
                 UNION
                 SELECT effective_decision_id, 'local_exclusion'
-                FROM read_parquet('{paths['resolved_measurements']}')
+                FROM read_parquet('{paths["resolved_measurements"]}')
                 WHERE disposition = 'excluded_local'
                 """
             ).fetchall()
@@ -2121,14 +2252,15 @@ class LocalStore:
             for row in self._query.execute(
                 f"""
                 SELECT mapping_rule_version_id, 'mapping'
-                FROM read_parquet('{paths['source_occurrences']}')
+                FROM read_parquet('{paths["source_occurrences"]}')
                 UNION
                 SELECT rule_version_id, 'plausibility'
-                FROM read_parquet('{paths['open_review_cases']}')
+                FROM read_parquet('{paths["open_review_cases"]}')
                 WHERE rule_version_id IS NOT NULL
                 """
             ).fetchall()
         }
+        snapshot_rules.add((str(resolution_basis["identity_rule_version_id"]), "identity"))
         has_rule_refs = self._metadata.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'rule_version_refs'"
         ).fetchone()
@@ -2149,16 +2281,16 @@ class LocalStore:
             f"""
             WITH
             occurrences AS (
-                SELECT * FROM read_parquet('{paths['source_occurrences']}')
+                SELECT * FROM read_parquet('{paths["source_occurrences"]}')
             ),
             versions AS (
-                SELECT * FROM read_parquet('{paths['measurement_versions']}')
+                SELECT * FROM read_parquet('{paths["measurement_versions"]}')
             ),
             resolved AS (
-                SELECT * FROM read_parquet('{paths['resolved_measurements']}')
+                SELECT * FROM read_parquet('{paths["resolved_measurements"]}')
             ),
             reviews AS (
-                SELECT * FROM read_parquet('{paths['open_review_cases']}')
+                SELECT * FROM read_parquet('{paths["open_review_cases"]}')
             )
             SELECT
                 (SELECT count(*) - count(DISTINCT occurrence_id) FROM occurrences)
@@ -2303,15 +2435,15 @@ class LocalStore:
             f"""
             SELECT
                 (SELECT count(DISTINCT export_id)
-                   FROM read_parquet('{paths['source_occurrences']}')),
-                (SELECT count(*) FROM read_parquet('{paths['source_occurrences']}')),
-                (SELECT count(*) FROM read_parquet('{paths['measurement_versions']}')),
-                (SELECT count(*) FROM read_parquet('{paths['resolved_measurements']}')),
-                (SELECT count(*) FROM read_parquet('{paths['resolved_measurements']}')
+                   FROM read_parquet('{paths["source_occurrences"]}')),
+                (SELECT count(*) FROM read_parquet('{paths["source_occurrences"]}')),
+                (SELECT count(*) FROM read_parquet('{paths["measurement_versions"]}')),
+                (SELECT count(*) FROM read_parquet('{paths["resolved_measurements"]}')),
+                (SELECT count(*) FROM read_parquet('{paths["resolved_measurements"]}')
                    WHERE disposition LIKE 'included%'),
-                (SELECT count(*) FROM read_parquet('{paths['resolved_measurements']}')
+                (SELECT count(*) FROM read_parquet('{paths["resolved_measurements"]}')
                    WHERE disposition LIKE 'excluded%'),
-                (SELECT count(*) FROM read_parquet('{paths['open_review_cases']}'))
+                (SELECT count(*) FROM read_parquet('{paths["open_review_cases"]}'))
             """
         ).fetchone()
         assert counts is not None
@@ -2398,8 +2530,22 @@ class LocalStore:
             record_count=record_count,
             logical_measurement_count=logical_count,
             measurement_version_count=version_count,
+            source_occurrence_count=self._snapshot_occurrence_count(snapshot_id),
             diagnostics=diagnostics,
         )
+
+    def _snapshot_occurrence_count(self, snapshot_id: SnapshotId) -> int:
+        path = (
+            self._root
+            / _PARQUET_DIRECTORY
+            / "snapshots"
+            / str(snapshot_id)
+            / "source_occurrences.parquet"
+        )
+        escaped = str(path).replace("'", "''")
+        row = self._query.execute(f"SELECT count(*) FROM read_parquet('{escaped}')").fetchone()
+        assert row is not None
+        return int(row[0])
 
     def load_daily_series(
         self, start_date: date | None, end_date: date | None
@@ -2479,12 +2625,8 @@ class LocalStore:
                     day=day,
                     value=value,
                     source_starts=tuple(
-                        datetime.fromisoformat(item).astimezone(
-                            timezone(timedelta(minutes=offset))
-                        )
-                        for item, offset in zip(
-                            source_starts, source_start_offsets, strict=True
-                        )
+                        datetime.fromisoformat(item).astimezone(timezone(timedelta(minutes=offset)))
+                        for item, offset in zip(source_starts, source_start_offsets, strict=True)
                     ),
                     source_names=tuple(source_names),
                     measurement_version_ids=tuple(
@@ -2500,6 +2642,87 @@ class LocalStore:
             DailyHealthSeries(data_type=data_type, unit=unit, values=tuple(values))
             for (data_type, unit), values in grouped.items()
         )
+
+    def load_open_data_review_cases(self) -> tuple[OpenDataReviewCase, ...]:
+        self._require_open()
+        row = self._metadata.execute(
+            "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            return ()
+        path = (
+            self._root
+            / _PARQUET_DIRECTORY
+            / "snapshots"
+            / str(row[0])
+            / "open_review_cases.parquet"
+        )
+        escaped = str(path).replace("'", "''")
+        rows = self._query.execute(
+            f"""
+            SELECT review_case_id, case_kind, logical_measurement_id,
+                   measurement_version_id, rule_version_id, evidence_fingerprint
+            FROM read_parquet('{escaped}')
+            ORDER BY review_case_id
+            """
+        ).fetchall()
+        return tuple(
+            OpenDataReviewCase(
+                review_case_id=str(review_case_id),
+                kind=cast(
+                    Literal[
+                        "plausibility",
+                        "continued_override",
+                        "suspected_source_deletion",
+                        "source_conflict",
+                    ],
+                    kind,
+                ),
+                logical_measurement_id=(
+                    None
+                    if logical_measurement_id is None
+                    else LogicalMeasurementId(str(logical_measurement_id))
+                ),
+                measurement_version_id=(
+                    None
+                    if measurement_version_id is None
+                    else MeasurementVersionId(str(measurement_version_id))
+                ),
+                rule_version_id=(None if rule_version_id is None else str(rule_version_id)),
+                evidence_fingerprint=str(evidence_fingerprint),
+            )
+            for (
+                review_case_id,
+                kind,
+                logical_measurement_id,
+                measurement_version_id,
+                rule_version_id,
+                evidence_fingerprint,
+            ) in rows
+        )
+
+    def load_export_facts(self) -> tuple[ExportFact, ...]:
+        self._require_open()
+        return tuple(
+            ExportFact(
+                export_id=str(export_id),
+                export_date=(
+                    None
+                    if export_date_utc is None
+                    else datetime.fromisoformat(str(export_date_utc))
+                ),
+            )
+            for export_id, export_date_utc in self._metadata.execute(
+                "SELECT export_id, export_date_utc FROM exports ORDER BY export_id"
+            ).fetchall()
+        )
+
+    def load_active_snapshot_id(self) -> SnapshotId | None:
+        self._require_open()
+        row = self._metadata.execute(
+            "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
+        ).fetchone()
+        return None if row is None else SnapshotId(str(row[0]))
 
     def load_analysis_input(
         self, start_date: date | None, end_date: date | None
@@ -2989,8 +3212,7 @@ class LocalStore:
         ).fetchone()
         active_snapshot = None if active is None else str(active[0])
         import_columns = {
-            str(row[1])
-            for row in self._metadata.execute("PRAGMA table_info(imports)").fetchall()
+            str(row[1]) for row in self._metadata.execute("PRAGMA table_info(imports)").fetchall()
         }
         diagnostics_column = "diagnostics" if "diagnostics" in import_columns else "''"
         running = self._metadata.execute(
@@ -3005,16 +3227,11 @@ class LocalStore:
             if str(snapshot_id) != active_snapshot:
                 paths.append(
                     (
-                        self._root
-                        / _PARQUET_DIRECTORY
-                        / "snapshots"
-                        / str(snapshot_id),
+                        self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id),
                         "snapshot",
                     )
                 )
-            self._retain_import_quarantine(
-                str(import_id), paths, "interrupted_before_publish"
-            )
+            self._retain_import_quarantine(str(import_id), paths, "interrupted_before_publish")
         if running:
             with self._metadata:
                 if "diagnostics" in import_columns:
@@ -3048,8 +3265,7 @@ class LocalStore:
             known_snapshots = {
                 str(row[0])
                 for row in self._metadata.execute(
-                    "SELECT snapshot_id FROM imports "
-                    "WHERE status IN ('committed', 'duplicate')"
+                    "SELECT snapshot_id FROM imports WHERE status IN ('committed', 'duplicate')"
                 )
             }
             for path in snapshots.iterdir():
@@ -3093,13 +3309,10 @@ class LocalStore:
                     f"orphaned_{label}_detected",
                 ),
             )
-        self._retain_import_quarantine(
-            import_id, [(path, label)], f"orphaned_{label}"
-        )
+        self._retain_import_quarantine(import_id, [(path, label)], f"orphaned_{label}")
         with self._metadata:
             self._metadata.execute(
-                "UPDATE imports SET status = 'quarantined', diagnostics = ? "
-                "WHERE import_id = ?",
+                "UPDATE imports SET status = 'quarantined', diagnostics = ? WHERE import_id = ?",
                 (f"orphaned_{label}", import_id),
             )
             if bind_person:
@@ -3112,9 +3325,7 @@ class LocalStore:
         for path in quarantine_root.iterdir():
             if not path.is_dir():
                 continue
-            recovered_id = hashlib.sha256(
-                f"recovered:{path.name}".encode()
-            ).hexdigest()[:32]
+            recovered_id = hashlib.sha256(f"recovered:{path.name}".encode()).hexdigest()[:32]
             operation_id = snapshot_id = recovered_id
             personal_artifacts = (path / "snapshot").exists()
             for label in ("staging", "snapshot"):
@@ -3139,9 +3350,7 @@ class LocalStore:
                     continue
             diagnostic = "orphaned_quarantine"
             try:
-                report = json.loads(
-                    (path / "diagnostic.json").read_text(encoding="utf-8")
-                )
+                report = json.loads((path / "diagnostic.json").read_text(encoding="utf-8"))
                 if isinstance(report, dict) and isinstance(report.get("diagnostic"), str):
                     diagnostic = report["diagnostic"]
             except (OSError, UnicodeError, json.JSONDecodeError):

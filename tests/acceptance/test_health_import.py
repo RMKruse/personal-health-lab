@@ -25,8 +25,9 @@ from personal_health_lab.health_data import CanonicalHealthType, CanonicalUnit
 from personal_health_lab.synthetic_export import generate_export
 
 
-def _export(path: Path, records: str) -> Path:
-    xml = f'<?xml version="1.0"?><HealthData>{records}</HealthData>'
+def _export(path: Path, records: str, export_date: str | None = None) -> Path:
+    date_element = "" if export_date is None else f'<ExportDate value="{export_date}"/>'
+    xml = f'<?xml version="1.0"?><HealthData>{date_element}{records}</HealthData>'
     with ZipFile(path, "w", ZIP_DEFLATED) as archive:
         archive.writestr("apple_health_export/export.xml", xml)
     return path
@@ -295,8 +296,16 @@ def test_cumulative_exports_are_idempotent_and_preserve_measurement_versions(
         "2024-01-01 12:00:00 +0100",
         "2024-01-01 12:30:00 +0100",
     )
-    base = _export(tmp_path / "base.zip", active + resting_v1)
-    expanded = _export(tmp_path / "expanded.zip", active + resting_v2 + new_active)
+    base = _export(
+        tmp_path / "base.zip",
+        active + resting_v1,
+        "2024-01-02 12:00:00 +0100",
+    )
+    expanded = _export(
+        tmp_path / "expanded.zip",
+        active + resting_v2 + new_active,
+        "2024-01-03 12:00:00 +0100",
+    )
     config = RuntimeConfig(
         mode=DataMode.SYNTHETIC,
         synthetic_store=tmp_path / "synthetic-store",

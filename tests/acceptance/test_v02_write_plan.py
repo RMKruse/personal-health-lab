@@ -79,6 +79,30 @@ REGISTERED_CASES.update(
 )
 REGISTERED_CASES.update(
     {
+        **{
+            f"V02-A-SRC-{number:03d}": (
+                "test_package_occurrences_and_measurement_versions_remain_separate"
+            )
+            for number in range(1, 4)
+        },
+        **{
+            f"V02-A-SRC-{number:03d}": (
+                "test_only_the_newest_ordered_export_governs_source_versions"
+            )
+            for number in range(4, 7)
+        },
+        "V02-A-SRC-007": (
+            "test_strong_and_natural_identity_create_only_payload_versions"
+        ),
+        "V02-A-SRC-008": (
+            "test_strong_and_natural_identity_create_only_payload_versions"
+        ),
+        "V02-A-SRC-009": (
+            "test_identity_collision_is_visible_in_the_public_data_review_projection"
+        ),
+        "V02-A-SRC-010": (
+            "test_strong_and_natural_identity_create_only_payload_versions"
+        ),
         "V02-A-STO-001": "test_import_publishes_one_validated_four_file_snapshot",
         "V02-A-STO-002": "test_sqlite_catalog_and_audit_constraints_are_hard",
         "V02-A-STO-003": "test_import_publishes_one_validated_four_file_snapshot",

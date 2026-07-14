@@ -1,10 +1,12 @@
 import platform
+from collections.abc import Callable
 from datetime import date
 from pathlib import Path
 
 import pytest
 from streamlit.testing.v1 import AppTest
 
+from personal_health_lab.application import DataMode, HealthLab, ImportHealthExport, RuntimeConfig
 from personal_health_lab.synthetic_export import generate_export
 
 
@@ -139,3 +141,29 @@ def test_streamlit_renders_the_shared_real_import_confirmation_plan(
     assert all(str(tmp_path) not in value for value in values)
     assert any("Datenspeicher-ID:" in value and "unbound" in value for value in values)
     assert any(button.label == "Bestätigen und ausführen" for button in app.button)
+
+
+def test_streamlit_projects_source_conflicts_from_the_shared_data_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_conflict_package: Callable[[Path], Path],
+) -> None:
+    synthetic_store = tmp_path / "synthetic"
+    real_store = tmp_path / "real"
+    package = source_conflict_package(tmp_path / "conflict.zip")
+    config = RuntimeConfig(DataMode.SYNTHETIC, synthetic_store, real_store)
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(package)
+        plan = health_lab.preview_write(request)
+        health_lab.execute_write(request, expected_plan=plan.fingerprint)
+
+    monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
+    monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(synthetic_store))
+    monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(real_store))
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
+
+    app = AppTest.from_file(str(app_path)).run()
+
+    assert not app.exception
+    assert any(item.value == "Datenprüfung" for item in app.subheader)
+    assert any("source_conflict" in item.value for item in app.warning)

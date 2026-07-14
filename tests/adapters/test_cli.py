@@ -3,6 +3,7 @@ import json
 import platform
 import subprocess
 import sys
+from collections.abc import Callable
 from importlib.resources import files
 from pathlib import Path
 from zipfile import ZipFile
@@ -11,6 +12,7 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from personal_health_lab.adapters.cli import main
+from personal_health_lab.application import DataMode, HealthLab, ImportHealthExport, RuntimeConfig
 from personal_health_lab.synthetic_export import GenerationOptions, generate_export
 
 _EXPECTED_RUNTIME_CONFIG = {
@@ -61,6 +63,41 @@ def _execute_json_import(
     assert receipt["kind"] == "write_receipt"
     assert receipt["plan_fingerprint"] == plan["fingerprint"]
     return exit_code, receipt
+
+
+def test_cli_projects_source_conflicts_from_the_shared_data_review(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    source_conflict_package: Callable[[Path], Path],
+) -> None:
+    config = RuntimeConfig(
+        mode=DataMode.SYNTHETIC,
+        synthetic_store=tmp_path / "synthetic",
+        real_store=tmp_path / "real",
+    )
+    package = source_conflict_package(tmp_path / "conflict.zip")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(package)
+        plan = health_lab.preview_write(request)
+        health_lab.execute_write(request, expected_plan=plan.fingerprint)
+
+    assert main(
+        [
+            "--mode",
+            "synthetic",
+            "--synthetic-store",
+            str(config.synthetic_store),
+            "--real-store",
+            str(config.real_store),
+            "review",
+            "--json",
+        ]
+    ) == 0
+    output = json.loads(capsys.readouterr().out)
+
+    _assert_json_contract(output)
+    assert output["cases"][0]["kind"] == "source_conflict"
+    assert output["cases"][0]["logical_measurement_id"] is not None
 
 
 def test_real_json_import_renders_shared_confirmation_plan(

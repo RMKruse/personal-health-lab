@@ -47,6 +47,14 @@ class HealthProvenance:
     device: str
     original_value: float
     original_unit: str
+    strong_source_id_hash: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.strong_source_id_hash is not None and (
+            len(self.strong_source_id_hash) != 64
+            or not set(self.strong_source_id_hash) <= set("0123456789abcdef")
+        ):
+            raise ValueError("Starke Quellen-ID muss ein SHA-256-Wert sein.")
 
 
 @dataclass(frozen=True, slots=True)

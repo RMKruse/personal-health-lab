@@ -13,6 +13,7 @@ from personal_health_lab.application import (
     AnalysisDefinitionId,
     AnalysisStatus,
     ConfigurationError,
+    DataReviewSelection,
     HealthLab,
     HealthLabError,
     ImportHealthExport,
@@ -180,6 +181,7 @@ if st.button("Zeitraum analysieren"):
 try:
     with HealthLab.open(config) as health_lab:
         overview = health_lab.load_overview(selection)
+        data_review = health_lab.load_data_review(DataReviewSelection())
 except (ConfigurationError, HealthLabError):
     st.error("HealthLab-Konfiguration oder lokaler Datenspeicher ist ungültig.")
     st.stop()
@@ -216,6 +218,13 @@ st.caption(
     f"Snapshots: {overview.snapshot_count} · "
     f"Quarantänisierte Importe: {overview.quarantined_import_count}"
 )
+if data_review.cases:
+    st.subheader("Datenprüfung")
+    for case in data_review.cases:
+        st.warning(
+            f"Prüffall: {case.kind.value} · "
+            f"Messung {case.logical_measurement_id or case.measurement_version_id or '-'}"
+        )
 if overview.quarantined_import_count:
     st.warning("Mindestens ein unterbrochener Import wurde sicher quarantänisiert.")
 

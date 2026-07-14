@@ -13,10 +13,13 @@ from typing import Self
 from uuid import uuid4
 
 from personal_health_lab import DataMode
+from personal_health_lab.data_quality import load_review_state
 from personal_health_lab.health_import import (
     HealthExportEstimate,
     HealthImportError,
     ImportId,
+    LogicalMeasurementId,
+    MeasurementVersionId,
     OperationId,
     SnapshotId,
     estimate_health_export,
@@ -77,7 +80,7 @@ class WorkspaceStatus:
     store_id: StoreId | None
     person_binding: PersonBindingStatus
     state: WorkspaceState = WorkspaceState.READY
-    allowed_reads: tuple[str, ...] = ("workspace_status", "overview")
+    allowed_reads: tuple[str, ...] = ("workspace_status", "overview", "data_review")
     allowed_writes: tuple[str, ...] = ("import_health_export",)
 
 
@@ -231,7 +234,49 @@ class ImportReceipt:
     package_record_count: int = 0
     logical_measurement_count: int = 0
     measurement_version_count: int = 0
+    source_occurrence_count: int = 0
     diagnostics: tuple[str, ...] = ()
+
+
+class DataReviewCaseKind(StrEnum):
+    SOURCE_CONFLICT = "source_conflict"
+
+
+@dataclass(frozen=True, slots=True)
+class DataReviewCaseId:
+    _value: str
+
+    def __post_init__(self) -> None:
+        if len(self._value) != 32 or not set(self._value) <= set("0123456789abcdef"):
+            raise ValueError("Prüffall-ID muss ein 32-stelliger Hex-Wert sein.")
+
+    def __str__(self) -> str:
+        return self._value
+
+
+@dataclass(frozen=True, slots=True)
+class DataReviewSelection:
+    kind: DataReviewCaseKind | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind is not None and not isinstance(self.kind, DataReviewCaseKind):
+            raise ConfigurationError("Prüffallart hat einen ungültigen Typ.")
+
+
+@dataclass(frozen=True, slots=True)
+class DataReviewCase:
+    case_id: DataReviewCaseId
+    kind: DataReviewCaseKind
+    logical_measurement_id: LogicalMeasurementId | None
+    measurement_version_id: MeasurementVersionId | None
+    rule_version_id: str | None
+    evidence_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class DataReview:
+    snapshot_ref: SnapshotRef | None
+    cases: tuple[DataReviewCase, ...]
 
 
 class WriteNotStartedStatus(StrEnum):
@@ -716,6 +761,7 @@ class HealthLab:
             package_record_count=result.package_record_count,
             logical_measurement_count=result.logical_measurement_count,
             measurement_version_count=result.measurement_version_count,
+            source_occurrence_count=result.source_occurrence_count,
             diagnostics=result.diagnostics,
         )
         return WriteReceipt(
@@ -803,6 +849,25 @@ class HealthLab:
     def load_overview(self, selection: OverviewSelection) -> Overview:
         reader = self._require_open()
         return reader.load(selection)
+
+    def load_data_review(self, selection: DataReviewSelection) -> DataReview:
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        snapshot, stored_cases = load_review_state(self._store)
+        cases = tuple(
+            DataReviewCase(
+                case_id=DataReviewCaseId(case.review_case_id),
+                kind=DataReviewCaseKind(case.kind),
+                logical_measurement_id=case.logical_measurement_id,
+                measurement_version_id=case.measurement_version_id,
+                rule_version_id=case.rule_version_id,
+                evidence_fingerprint=case.evidence_fingerprint,
+            )
+            for case in stored_cases
+            if selection.kind is None or case.kind == selection.kind.value
+        )
+        return DataReview(snapshot_ref=snapshot, cases=cases)
 
     def load_workspace_status(self) -> WorkspaceStatus:
         self._require_open()

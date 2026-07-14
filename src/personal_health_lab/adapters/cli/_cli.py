@@ -17,6 +17,8 @@ from personal_health_lab.application import (
     CapacityCheck,
     ConfigurationError,
     DataMode,
+    DataReview,
+    DataReviewSelection,
     FileVaultCheck,
     HealthLab,
     ImportHealthExport,
@@ -70,7 +72,35 @@ def _parser() -> argparse.ArgumentParser:
     analysis.add_argument("--start-date", type=date.fromisoformat)
     analysis.add_argument("--end-date", type=date.fromisoformat)
     analysis.add_argument("--json", action="store_true", dest="as_json")
+    review = commands.add_parser("review", help="Offene Datenprüffälle laden")
+    review.add_argument("--json", action="store_true", dest="as_json")
     return parser
+
+
+def _data_review_json(review: DataReview) -> dict[str, object]:
+    return {
+        "cases": [
+            {
+                "case_id": str(case.case_id),
+                "evidence_fingerprint": case.evidence_fingerprint,
+                "kind": case.kind.value,
+                "logical_measurement_id": (
+                    None
+                    if case.logical_measurement_id is None
+                    else str(case.logical_measurement_id)
+                ),
+                "measurement_version_id": (
+                    None
+                    if case.measurement_version_id is None
+                    else str(case.measurement_version_id)
+                ),
+                "rule_version_id": case.rule_version_id,
+            }
+            for case in review.cases
+        ],
+        "selection": {"kind": None},
+        "snapshot_ref": None if review.snapshot_ref is None else str(review.snapshot_ref),
+    }
 
 
 def _analysis_json(overview: Overview) -> dict[str, object] | None:
@@ -221,6 +251,7 @@ def _write_receipt_json(
             "package_hash": result.package_hash,
             "package_record_count": result.package_record_count,
             "record_count": result.record_count,
+            "source_occurrence_count": result.source_occurrence_count,
             "snapshot_ref": str(result.snapshot_ref) if result.snapshot_ref else None,
             "status": result.status.value,
             "type": "import_health_export",
@@ -337,6 +368,8 @@ def main(args: Sequence[str] | None = None) -> int:
                 overview = health_lab.load_overview(
                     OverviewSelection(parsed.start_date, parsed.end_date)
                 )
+            elif parsed.command == "review":
+                data_review = health_lab.load_data_review(DataReviewSelection())
             else:
                 overview = health_lab.load_overview(OverviewSelection())
     except ConfigurationError as error:
@@ -432,6 +465,22 @@ def main(args: Sequence[str] | None = None) -> int:
             print(f"Importierte Records: {import_write_receipt.result.record_count}")
         else:
             print(f"Health-Exportimport: {import_write_receipt.result.status.value}")
+    elif parsed.command == "review" and parsed.as_json:
+        print(
+            json.dumps(
+                {
+                    **_data_review_json(data_review),
+                    "runtime_config": runtime_config,
+                    "schema_version": "1.0",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    elif parsed.command == "review":
+        print(f"Offene Datenprüffälle: {len(data_review.cases)}")
+        for case in data_review.cases:
+            print(f"{case.case_id}: {case.kind.value}")
     elif parsed.as_json:
         print(
             json.dumps(

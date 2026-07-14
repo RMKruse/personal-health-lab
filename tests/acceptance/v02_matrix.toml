@@ -614,6 +614,153 @@ expected_effect = "none"
 forbidden_side_effects = ["partial import", "reader block"]
 
 [[contract]]
+id = "V02-C-SRC-001"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Package identity, export occurrence, logical measurement, and version remain separate."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V02-C-SRC-002"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "The export date alone determines the governing ordered export."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V02-C-SRC-003"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Strong source IDs win; otherwise the versioned natural identity can conflict."
+evidence = ["positive", "negative", "transition"]
+
+[[fixture]]
+id = "V02-F-DOM-SOURCE-IDENTITY-V1"
+kind = "domain"
+generator = "v02-source-identity-v1"
+seed = 0
+parameters = "ordered exports, strong and natural identities, payload versions, and collisions"
+platform = "all"
+sha256 = "8448dbda5f461c90f884bf20370a135bd56e51f4ba73c27fbed9c59190d3ca88"
+
+[[case]]
+id = "V02-A-SRC-001"
+contracts = ["V02-C-SRC-001"]
+fixtures = ["V02-F-DOM-SOURCE-IDENTITY-V1"]
+runner = "test_package_occurrences_and_measurement_versions_remain_separate"
+initial_state = "empty store"
+operation = "import the identical package twice"
+level = "application"
+expected_result = "duplicate"
+expected_effect = "no occurrence, version, snapshot, or audit"
+forbidden_side_effects = ["second occurrence", "new snapshot"]
+
+[[case]]
+id = "V02-A-SRC-002"
+contracts = ["V02-C-SRC-001"]
+fixtures = ["V02-F-DOM-SOURCE-IDENTITY-V1"]
+runner = "test_package_occurrences_and_measurement_versions_remain_separate"
+initial_state = "one committed export"
+operation = "import the same sample in a new export"
+level = "application"
+expected_result = "committed"
+expected_effect = "one new occurrence and no new measurement version"
+forbidden_side_effects = ["duplicate version"]
+
+[[case]]
+id = "V02-A-SRC-003"
+contracts = ["V02-C-SRC-001"]
+fixtures = ["V02-F-DOM-SOURCE-IDENTITY-V1"]
+runner = "test_package_occurrences_and_measurement_versions_remain_separate"
+initial_state = "one committed export"
+operation = "import an additive export"
+level = "application"
+expected_result = "committed"
+expected_effect = "only the new logical measurement is added"
+forbidden_side_effects = ["duplicate logical measurement"]
+
+[[case]]
+id = "V02-A-SRC-004"
+contracts = ["V02-C-SRC-002"]
+fixtures = ["V02-F-DOM-SOURCE-IDENTITY-V1"]
+runner = "test_only_the_newest_ordered_export_governs_source_versions"
+initial_state = "one ordered export"
+operation = "import a newer ordered export"
+level = "application"
+expected_result = "new export governs"
+expected_effect = "new payload version is effective"
+forbidden_side_effects = ["import-time ordering"]
+
+[[case]]
+id = "V02-A-SRC-005"
+contracts = ["V02-C-SRC-002"]
+fixtures = ["V02-F-DOM-SOURCE-IDENTITY-V1"]
+runner = "test_only_the_newest_ordered_export_governs_source_versions"
+initial_state = "newest export governs"
+operation = "import an older export later"
+level = "application"
+expected_result = "older export recorded but not governing"
+expected_effect = "effective version unchanged"
+forbidden_side_effects = ["governing export regression"]
+
+[[case]]
+id = "V02-A-SRC-006"
+contracts = ["V02-C-SRC-002"]
+fixtures = ["V02-F-DOM-SOURCE-IDENTITY-V1"]
+runner = "test_only_the_newest_ordered_export_governs_source_versions"
+initial_state = "newest export governs"
+operation = "import an unordered export"
+level = "application"
+expected_result = "unordered export recorded but not governing"
+expected_effect = "effective version unchanged"
+forbidden_side_effects = ["deletion suspicion", "governing export change"]
+
+[[case]]
+id = "V02-A-SRC-007"
+contracts = ["V02-C-SRC-003"]
+fixtures = ["V02-F-DOM-SOURCE-IDENTITY-V1"]
+runner = "test_strong_and_natural_identity_create_only_payload_versions"
+initial_state = "measurement with strong source ID"
+operation = "import changed payload under the same strong ID"
+level = "application"
+expected_result = "one logical measurement with a new version"
+expected_effect = "new version preferred by export date"
+forbidden_side_effects = ["second logical measurement"]
+
+[[case]]
+id = "V02-A-SRC-008"
+contracts = ["V02-C-SRC-003"]
+fixtures = ["V02-F-DOM-SOURCE-IDENTITY-V1"]
+runner = "test_strong_and_natural_identity_create_only_payload_versions"
+initial_state = "measurement without optional strong ID"
+operation = "import changed payload under the natural identity"
+level = "application"
+expected_result = "one logical measurement with a new version"
+expected_effect = "versioned natural heuristic used"
+forbidden_side_effects = ["missing-ID rejection"]
+
+[[case]]
+id = "V02-A-SRC-009"
+contracts = ["V02-C-SRC-003"]
+fixtures = ["V02-F-DOM-SOURCE-IDENTITY-V1"]
+runner = "test_identity_collision_is_visible_in_the_public_data_review_projection"
+initial_state = "strong-ID contradiction or natural-key collision"
+operation = "import conflicting occurrences and load data review"
+level = "application"
+expected_result = "open source_conflict case"
+expected_effect = "conflict visible through public projection"
+forbidden_side_effects = ["silent merge", "storage-only conflict"]
+
+[[case]]
+id = "V02-A-SRC-010"
+contracts = ["V02-C-SRC-003"]
+fixtures = ["V02-F-DOM-SOURCE-IDENTITY-V1"]
+runner = "test_strong_and_natural_identity_create_only_payload_versions"
+initial_state = "one normalized payload"
+operation = "change only sourceVersion and creationDate"
+level = "application"
+expected_result = "new occurrence without new version"
+expected_effect = "measurement version count unchanged"
+forbidden_side_effects = ["provenance-only version"]
+
+[[contract]]
 id = "V02-C-SRC-007"
 source = "https://github.com/RMKruse/personal-health-lab/issues/33"
 statement = "Health export packages remain untrusted and publish atomically."

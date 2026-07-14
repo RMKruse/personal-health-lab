@@ -5,7 +5,8 @@
   "oneOf": [
     {"$ref": "#/$defs/importOutput"},
     {"$ref": "#/$defs/analysisOutput"},
-    {"$ref": "#/$defs/overviewOutput"}
+    {"$ref": "#/$defs/overviewOutput"},
+    {"$ref": "#/$defs/dataReviewOutput"}
   ],
   "$defs": {
     "nullableString": {
@@ -370,6 +371,55 @@
         "schema_version": {"const": "1.0"},
         "selection": {"$ref": "#/$defs/selection"},
         "status": {"enum": ["empty", "ready", "provisional"]}
+      }
+    },
+    "dataReviewOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cases",
+        "runtime_config",
+        "schema_version",
+        "selection",
+        "snapshot_ref"
+      ],
+      "properties": {
+        "cases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "case_id",
+              "evidence_fingerprint",
+              "kind",
+              "logical_measurement_id",
+              "measurement_version_id",
+              "rule_version_id"
+            ],
+            "properties": {
+              "case_id": {"type": "string"},
+              "evidence_fingerprint": {"type": "string"},
+              "kind": {
+                "const": "source_conflict"
+              },
+              "logical_measurement_id": {"$ref": "#/$defs/nullableString"},
+              "measurement_version_id": {"$ref": "#/$defs/nullableString"},
+              "rule_version_id": {"$ref": "#/$defs/nullableString"}
+            }
+          }
+        },
+        "runtime_config": {"$ref": "#/$defs/runtimeConfig"},
+        "schema_version": {"const": "1.0"},
+        "selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": {"type": ["string", "null"]}
+          }
+        },
+        "snapshot_ref": {"$ref": "#/$defs/nullableString"}
       }
     }
   }

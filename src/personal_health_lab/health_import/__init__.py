@@ -13,6 +13,7 @@ from uuid import uuid4
 from xml.etree.ElementTree import ParseError, iterparse
 from zipfile import BadZipFile, ZipFile, is_zipfile
 
+from personal_health_lab.data_quality import resolve_sources, select_governing_export
 from personal_health_lab.health_data import (
     CanonicalHealthRecord,
     CanonicalHealthType,
@@ -22,6 +23,7 @@ from personal_health_lab.health_data import (
     MeasurementVersionId,
 )
 from personal_health_lab.storage import (
+    ExportFact,
     ImportId,
     LocalStore,
     OperationId,
@@ -32,6 +34,8 @@ from personal_health_lab.storage import (
 _EXPORT_MEMBER = "apple_health_export/export.xml"
 _ACTIVE_ENERGY = "HKQuantityTypeIdentifierActiveEnergyBurned"
 _RESTING_HEART_RATE = "HKQuantityTypeIdentifierRestingHeartRate"
+_IDENTITY_RULE_VERSION = "healthkit-natural/v2"
+_SYNC_IDENTIFIER = "HKMetadataKeySyncIdentifier"
 _MAPPINGS = {
     _ACTIVE_ENERGY: (CanonicalHealthType.ACTIVE_ENERGY, CanonicalUnit.KILOCALORIE, "kcal"),
     _RESTING_HEART_RATE: (
@@ -61,6 +65,7 @@ class HealthImportResult:
     package_record_count: int = 0
     logical_measurement_count: int = 0
     measurement_version_count: int = 0
+    source_occurrence_count: int = 0
     diagnostics: tuple[str, ...] = ()
 
 
@@ -68,6 +73,13 @@ class HealthImportResult:
 class HealthExportEstimate:
     input_bytes: int
     record_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedExport:
+    export_id: str
+    export_date: datetime | None
+    records: tuple[CanonicalHealthRecord, ...]
 
 
 def _source_datetime(value: str) -> datetime:
@@ -89,7 +101,7 @@ def _records(
     max_entry_bytes: int,
     max_uncompressed_bytes: int,
     max_compression_ratio: float,
-) -> tuple[CanonicalHealthRecord, ...]:
+) -> _ParsedExport:
     if not package_path.is_file() or not is_zipfile(package_path):
         raise _RejectedPackage("invalid zip")
     if package_path.stat().st_size > max_package_bytes:
@@ -125,20 +137,29 @@ def _records(
             export_count += 1
         if export_count != 1:
             raise _RejectedPackage("missing or duplicate export.xml")
+        export_digest = hashlib.sha256()
         with archive.open(_EXPORT_MEMBER) as source:
             tail = b""
             while chunk := source.read(64 * 1024):
+                export_digest.update(chunk)
                 probe = (tail + chunk).upper()
                 if b"\0" in probe or b"<!DOCTYPE" in probe or b"<!ENTITY" in probe:
                     raise _RejectedPackage("unsafe xml declaration")
                 tail = probe[-8:]
         with archive.open(_EXPORT_MEMBER) as source:
             root_seen = False
+            export_date = None
             for event, element in iterparse(source, events=("start", "end")):
                 if not root_seen:
                     if event != "start" or element.tag != "HealthData":
                         raise ValueError("invalid root")
                     root_seen = True
+                if event == "end" and element.tag == "ExportDate":
+                    if export_date is not None:
+                        raise ValueError("duplicate export date")
+                    export_date = _source_datetime(element.attrib["value"])
+                    element.clear()
+                    continue
                 if event != "end" or element.tag != "Record":
                     continue
                 mapping = _MAPPINGS.get(element.attrib.get("type", ""))
@@ -153,8 +174,23 @@ def _records(
                     source_name = element.attrib["sourceName"]
                     source_version = element.attrib.get("sourceVersion", "")
                     device = element.attrib.get("device", "")
+                    sync_id = next(
+                        (
+                            child.attrib.get("value")
+                            for child in element
+                            if child.tag == "MetadataEntry"
+                            and child.attrib.get("key") == _SYNC_IDENTIFIER
+                            and child.attrib.get("value")
+                        ),
+                        None,
+                    )
+                    strong_source_id_hash = None if sync_id is None else _id(source_name, sync_id)
                     logical_id = LogicalMeasurementId(
-                        _id(
+                        _id(_IDENTITY_RULE_VERSION, "strong", strong_source_id_hash)
+                        if strong_source_id_hash is not None
+                        else _id(
+                            _IDENTITY_RULE_VERSION,
+                            "natural",
                             data_type.value,
                             source_start.isoformat(),
                             source_end.isoformat(),
@@ -162,16 +198,23 @@ def _records(
                             device,
                         )
                     )
+                    payload_sha256 = _id(
+                        data_type.value,
+                        canonical_unit.value,
+                        value,
+                        source_start.isoformat(),
+                        source_end.isoformat(),
+                        source_name,
+                        device,
+                    )
                     records.append(
                         CanonicalHealthRecord(
                             logical_measurement_id=logical_id,
                             measurement_version_id=MeasurementVersionId(
                                 _id(
+                                    _IDENTITY_RULE_VERSION,
                                     logical_id,
-                                    source_updated_at.isoformat(),
-                                    source_version,
-                                    value,
-                                    source_unit,
+                                    payload_sha256,
                                 )
                             ),
                             data_type=data_type,
@@ -187,13 +230,14 @@ def _records(
                                 device=device,
                                 original_value=value,
                                 original_unit=source_unit,
+                                strong_source_id_hash=strong_source_id_hash,
                             ),
                         )
                     )
                 element.clear()
     if not records:
         raise ValueError("no supported records")
-    return tuple(records)
+    return _ParsedExport(export_digest.hexdigest(), export_date, tuple(records))
 
 
 def estimate_health_export(
@@ -209,7 +253,7 @@ def estimate_health_export(
     try:
         with ZipFile(package_path) as archive:
             input_bytes = archive.getinfo(_EXPORT_MEMBER).file_size
-        records = _records(
+        parsed = _records(
             package_path,
             max_package_bytes=max_package_bytes,
             max_entries=max_entries,
@@ -217,7 +261,7 @@ def estimate_health_export(
             max_uncompressed_bytes=max_uncompressed_bytes,
             max_compression_ratio=max_compression_ratio,
         )
-        return HealthExportEstimate(max(input_bytes, package_size), len(records))
+        return HealthExportEstimate(max(input_bytes, package_size), len(parsed.records))
     except (
         BadZipFile,
         KeyError,
@@ -255,7 +299,7 @@ def import_health_export(
             with package_path.open("rb") as package:
                 package_hash = hashlib.file_digest(package, "sha256").hexdigest()
             store.mark_import_reading(import_id)
-            records = _records(
+            parsed = _records(
                 package_path,
                 max_package_bytes=max_package_bytes,
                 max_entries=max_entries,
@@ -291,12 +335,22 @@ def import_health_export(
                 diagnostics=("invalid_health_data",),
             )
         try:
+            governing_export_id = select_governing_export(
+                (
+                    *store.load_export_facts(),
+                    ExportFact(parsed.export_id, parsed.export_date),
+                )
+            )
             published = store.publish_import(
                 operation_id=operation_id,
                 import_id=import_id,
                 package_hash=package_hash,
                 snapshot_id=snapshot_id,
-                records=records,
+                export_id=parsed.export_id,
+                export_date=parsed.export_date,
+                records=parsed.records,
+                governing_export_id=governing_export_id,
+                resolve_sources=resolve_sources,
             )
         except (OSError, StoreError) as error:
             cause = error.__cause__ if isinstance(error, StoreError) else error
@@ -316,7 +370,7 @@ def import_health_export(
                 package_hash=package_hash,
                 snapshot_id=None,
                 record_count=0,
-                package_record_count=len(records),
+                package_record_count=len(parsed.records),
                 diagnostics=(diagnostic,),
             )
     except StoreError as error:
@@ -328,9 +382,10 @@ def import_health_export(
         package_hash=package_hash,
         snapshot_id=published.snapshot_id,
         record_count=published.record_count,
-        package_record_count=len(records),
+        package_record_count=len(parsed.records),
         logical_measurement_count=published.logical_measurement_count,
         measurement_version_count=published.measurement_version_count,
+        source_occurrence_count=published.source_occurrence_count,
         diagnostics=published.diagnostics,
     )
 
@@ -340,6 +395,8 @@ __all__ = [
     "HealthImportError",
     "HealthImportResult",
     "ImportId",
+    "LogicalMeasurementId",
+    "MeasurementVersionId",
     "OperationId",
     "SnapshotId",
     "estimate_health_export",

@@ -7,6 +7,7 @@ PACKAGE_ROOT = Path(__file__).parents[2] / "src/personal_health_lab"
 MODULES = {
     "adapters",
     "application",
+    "data_quality",
     "health_data",
     "health_import",
     "overview",
@@ -20,13 +21,15 @@ ALLOWED_DEPENDENCIES = {
     "adapters": {"application", "package_root", "synthetic_export"},
     "application": {
         "health_import",
+        "data_quality",
         "overview",
         "package_root",
         "resting_hr_analysis",
         "storage",
     },
     "health_data": set(),
-    "health_import": {"health_data", "storage"},
+    "data_quality": {"health_data", "storage"},
+    "health_import": {"data_quality", "health_data", "storage"},
     "overview": {"health_data", "package_root", "storage"},
     "package_root": {"runtime"},
     "resting_hr_analysis": {"health_data", "storage"},
@@ -148,8 +151,7 @@ def test_only_development_cli_can_reach_the_synthetic_generator() -> None:
     production_imports = [
         str(path.relative_to(PACKAGE_ROOT))
         for path in adapters_root.rglob("*.py")
-        if "dev_cli" not in path.parts
-        and "synthetic_export" in path.read_text(encoding="utf-8")
+        if "dev_cli" not in path.parts and "synthetic_export" in path.read_text(encoding="utf-8")
     ]
 
     assert production_imports == []
