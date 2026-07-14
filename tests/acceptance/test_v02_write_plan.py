@@ -81,6 +81,19 @@ REGISTERED_CASES.update(
     {
         "V02-A-RULE-001": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
         "V02-A-RULE-002": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
+        "V02-A-RULE-003": (
+            "test_personal_range_uses_previous_effective_days_and_keeps_earlier_findings"
+        ),
+        "V02-A-RULE-004": "test_personal_range_is_inclusive_and_skips_unready_inputs",
+        "V02-A-RULE-005": "test_personal_range_is_inclusive_and_skips_unready_inputs",
+        "V02-A-RULE-006": "test_personal_range_is_inclusive_and_skips_unready_inputs",
+        "V02-A-RULE-007": (
+            "test_personal_range_uses_previous_effective_days_and_keeps_earlier_findings"
+        ),
+        "V02-A-RULE-008": "test_personal_range_uses_corrections_instead_of_source_values",
+        "V02-A-RULE-009": (
+            "test_personal_range_uses_previous_effective_days_and_keeps_earlier_findings"
+        ),
         "V02-A-RULE-021": "test_late_measurement_uses_the_rule_for_its_measurement_time",
         "V02-A-RULE-025": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
         "V02-A-RULE-026": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",

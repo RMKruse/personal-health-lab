@@ -709,9 +709,12 @@ class MeasurementVersionFact:
     canonical_value: float
     source_start_utc: str
     source_end_utc: str
+    source_updated_at_utc: str
+    source_version: str
     source_name: str
     device: str
     strong_source_id_hash: str | None
+    measurement_local_date: date
 
 
 @dataclass(frozen=True, slots=True)
@@ -1981,14 +1984,19 @@ class LocalStore:
                 canonical_value=float(row[4]),
                 source_start_utc=str(row[5]),
                 source_end_utc=str(row[6]),
-                source_name=str(row[7]),
-                device=str(row[8]),
-                strong_source_id_hash=None if row[9] is None else str(row[9]),
+                source_updated_at_utc=str(row[7]),
+                source_version=str(row[8]),
+                source_name=str(row[9]),
+                device=str(row[10]),
+                strong_source_id_hash=None if row[11] is None else str(row[11]),
+                measurement_local_date=row[12],
             )
             for row in self._query.execute(
                 "SELECT measurement_version_id, identity_candidate_id, canonical_type, "
                 "canonical_unit, canonical_value, source_start_utc, source_end_utc, "
-                "source_name, device, strong_source_id_hash FROM measurement_versions"
+                "source_updated_at_utc, source_version, source_name, device, "
+                "strong_source_id_hash, measurement_local_date "
+                "FROM measurement_versions"
             ).fetchall()
         )
         export_facts = tuple(
@@ -3360,7 +3368,9 @@ class LocalStore:
         row = self._query.execute(
             f"SELECT measurement_version_id, identity_candidate_id, canonical_type, "
             f"canonical_unit, canonical_value, source_start_utc, source_end_utc, "
-            f"source_name, device, strong_source_id_hash FROM read_parquet('{escaped}') "
+            f"source_updated_at_utc, source_version, source_name, device, "
+            f"strong_source_id_hash, measurement_local_date "
+            f"FROM read_parquet('{escaped}') "
             "WHERE measurement_version_id = ?",
             (str(measurement_version_id),),
         ).fetchone()
@@ -3374,9 +3384,12 @@ class LocalStore:
             canonical_value=float(row[4]),
             source_start_utc=str(row[5]),
             source_end_utc=str(row[6]),
-            source_name=str(row[7]),
-            device=str(row[8]),
-            strong_source_id_hash=None if row[9] is None else str(row[9]),
+            source_updated_at_utc=str(row[7]),
+            source_version=str(row[8]),
+            source_name=str(row[9]),
+            device=str(row[10]),
+            strong_source_id_hash=None if row[11] is None else str(row[11]),
+            measurement_local_date=row[12],
         )
 
     def load_resolved_measurement(self, logical_measurement_id: str) -> ResolvedMeasurement | None:

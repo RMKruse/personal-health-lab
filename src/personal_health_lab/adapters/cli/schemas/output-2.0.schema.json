@@ -108,7 +108,7 @@
                       "additionalProperties": false,
                       "required": ["code", "lower_bound", "upper_bound", "unit"],
                       "properties": {
-                        "code": {"enum": ["below_fixed_lower_bound", "above_fixed_upper_bound"]},
+                        "code": {"enum": ["below_fixed_lower_bound", "above_fixed_upper_bound", "below_personal_lower_bound", "above_personal_upper_bound"]},
                         "lower_bound": {"type": "number"},
                         "upper_bound": {"type": ["number", "null"]},
                         "unit": {"type": "string"}

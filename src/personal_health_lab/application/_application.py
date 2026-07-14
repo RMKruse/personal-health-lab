@@ -354,6 +354,8 @@ class DataReviewCycle:
 class ReviewReasonCode(StrEnum):
     BELOW_FIXED_LOWER_BOUND = "below_fixed_lower_bound"
     ABOVE_FIXED_UPPER_BOUND = "above_fixed_upper_bound"
+    BELOW_PERSONAL_LOWER_BOUND = "below_personal_lower_bound"
+    ABOVE_PERSONAL_UPPER_BOUND = "above_personal_upper_bound"
 
 
 class EffectiveValueSource(StrEnum):

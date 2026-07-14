@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 from collections import defaultdict
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
+from statistics import median
 from typing import Literal
 
 from personal_health_lab.health_data import LogicalMeasurementId, MeasurementVersionId
@@ -36,7 +37,12 @@ def _natural_identity(version: MeasurementVersionFact) -> tuple[str, str, str, s
 
 @dataclass(frozen=True, slots=True)
 class ReviewReason:
-    code: Literal["below_fixed_lower_bound", "above_fixed_upper_bound"]
+    code: Literal[
+        "below_fixed_lower_bound",
+        "above_fixed_upper_bound",
+        "below_personal_lower_bound",
+        "above_personal_upper_bound",
+    ]
     lower_bound: float
     upper_bound: float | None
     unit: str
@@ -82,7 +88,10 @@ def _rule_at(source_type: str, measured_at: datetime) -> _FixedPlausibilityRule 
 
 
 def _plausibility_reasons(
-    rule: _FixedPlausibilityRule, value: float, unit: str
+    rule: _FixedPlausibilityRule,
+    value: float,
+    unit: str,
+    personal_bounds: tuple[float, float] | None = None,
 ) -> tuple[ReviewReason, ...]:
     reasons = []
     if value < rule.lower_bound:
@@ -93,7 +102,61 @@ def _plausibility_reasons(
         reasons.append(
             ReviewReason("above_fixed_upper_bound", rule.lower_bound, rule.upper_bound, unit)
         )
+    if personal_bounds is not None and value < personal_bounds[0]:
+        reasons.append(ReviewReason("below_personal_lower_bound", *personal_bounds, unit))
+    if personal_bounds is not None and value > personal_bounds[1]:
+        reasons.append(ReviewReason("above_personal_upper_bound", *personal_bounds, unit))
     return tuple(reasons)
+
+
+def _personal_bounds(
+    rule: _FixedPlausibilityRule,
+    current_day: date,
+    daily_values: tuple[tuple[date, float], ...],
+    unit: str,
+) -> tuple[float, float] | None:
+    first_day = current_day - timedelta(days=42)
+    values = [
+        value
+        for day, value in daily_values
+        if first_day <= day < current_day and not _plausibility_reasons(rule, value, unit)
+    ]
+    if len(values) < 28:
+        return None
+    center = median(values)
+    mad = median(abs(value - center) for value in values)
+    if mad == 0:
+        return None
+    width = 3.5 * mad / 0.6745
+    return center - width, center + width
+
+
+def _effective_daily_resting_hr(
+    version_by_id: dict[str, MeasurementVersionFact],
+    measurements: tuple[ResolvedMeasurement, ...],
+) -> dict[date, tuple[MeasurementVersionFact, ResolvedMeasurement]]:
+    daily: dict[date, tuple[MeasurementVersionFact, ResolvedMeasurement]] = {}
+    for measurement in measurements:
+        version = version_by_id[measurement.selected_measurement_version_id]
+        if (
+            version.canonical_type != "apple_resting_heart_rate"
+            or measurement.effective_value is None
+        ):
+            continue
+        current = daily.get(version.measurement_local_date)
+        if current is None or (
+            version.source_updated_at_utc,
+            version.source_version,
+            version.source_start_utc,
+            version.measurement_version_id,
+        ) > (
+            current[0].source_updated_at_utc,
+            current[0].source_version,
+            current[0].source_start_utc,
+            current[0].measurement_version_id,
+        ):
+            daily[version.measurement_local_date] = (version, measurement)
+    return daily
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,7 +306,7 @@ def resolve_sources(
             governing_export_id,
             suppressed_deletion_ids,
         ),
-        *_plausibility_cases(version_by_id, imported_measurement_version_ids),
+        *_plausibility_cases(version_by_id, measurements, imported_measurement_version_ids),
         *(_unknown_rule_case(source_type) for source_type in sorted(set(unknown_source_types))),
     )
     previous_case_ids = {item.review_case_id for item in previous_review_cases}
@@ -284,16 +347,51 @@ def resolve_sources(
 
 def _plausibility_cases(
     version_by_id: dict[str, MeasurementVersionFact],
+    measurements: tuple[ResolvedMeasurement, ...],
     imported_measurement_version_ids: tuple[str, ...],
 ) -> tuple[OpenDataReviewCase, ...]:
     cases = []
+    daily = _effective_daily_resting_hr(version_by_id, measurements)
+    daily_values = tuple(
+        (day, measurement.effective_value)
+        for day, (_, measurement) in sorted(daily.items())
+        if measurement.effective_value is not None
+    )
+    measurement_by_version = {
+        measurement.selected_measurement_version_id: measurement for measurement in measurements
+    }
     for version_id in sorted(set(imported_measurement_version_ids)):
         version = version_by_id[version_id]
         measured_at = datetime.fromisoformat(version.source_start_utc)
         rule = _rule_at(version.canonical_type, measured_at)
         if rule is None:
             continue
-        reasons = _plausibility_reasons(rule, version.canonical_value, version.canonical_unit)
+        reasons = list(_plausibility_reasons(rule, version.canonical_value, version.canonical_unit))
+        measurement = measurement_by_version.get(version_id)
+        selected = daily.get(version.measurement_local_date)
+        if (
+            version.canonical_type == "apple_resting_heart_rate"
+            and measurement is not None
+            and measurement.effective_value is not None
+            and selected is not None
+            and selected[0].measurement_version_id == version_id
+        ):
+            personal_bounds = _personal_bounds(
+                rule,
+                version.measurement_local_date,
+                daily_values,
+                version.canonical_unit,
+            )
+            reasons.extend(
+                reason
+                for reason in _plausibility_reasons(
+                    rule,
+                    measurement.effective_value,
+                    version.canonical_unit,
+                    personal_bounds,
+                )
+                if reason.code in {"below_personal_lower_bound", "above_personal_upper_bound"}
+            )
         if not reasons:
             continue
         evidence = hashlib.sha256(
@@ -505,14 +603,48 @@ def load_review_case_detail(store: LocalStore, review_case_id: str) -> ReviewCas
     rule = _rule_at(version.canonical_type, datetime.fromisoformat(version.source_start_utc))
     if rule is None or rule.version_id != case.rule_version_id:
         raise ValueError("Plausibilitätsregel des Datenprüffalls fehlt.")
-    reasons = _plausibility_reasons(rule, version.canonical_value, version.canonical_unit)
     resolved = store.load_resolved_measurement(version.logical_measurement_id)
+    reasons = list(_plausibility_reasons(rule, version.canonical_value, version.canonical_unit))
+    if version.canonical_type == "apple_resting_heart_rate":
+        series = next(
+            (
+                item
+                for item in store.load_daily_series(
+                    version.measurement_local_date - timedelta(days=42),
+                    version.measurement_local_date,
+                )
+                if item.data_type.value == "apple_resting_heart_rate"
+            ),
+            None,
+        )
+        daily_values = (
+            () if series is None else tuple((item.day, item.value) for item in series.values)
+        )
+        is_effective_day_value = series is not None and any(
+            item.day == version.measurement_local_date
+            and MeasurementVersionId(version.measurement_version_id) in item.measurement_version_ids
+            for item in series.values
+        )
+        if is_effective_day_value and resolved is not None and resolved.effective_value is not None:
+            personal_bounds = _personal_bounds(
+                rule, version.measurement_local_date, daily_values, version.canonical_unit
+            )
+            reasons.extend(
+                reason
+                for reason in _plausibility_reasons(
+                    rule,
+                    resolved.effective_value,
+                    version.canonical_unit,
+                    personal_bounds,
+                )
+                if reason.code in {"below_personal_lower_bound", "above_personal_upper_bound"}
+            )
     return ReviewCaseDetail(
         source_type=version.canonical_type,
         measured_at=datetime.fromisoformat(version.source_start_utc),
         effective_value=None if resolved is None else resolved.effective_value,
         effective_value_source=None if resolved is None else resolved.effective_value_source,
-        reasons=reasons,
+        reasons=tuple(reasons),
     )
 
 

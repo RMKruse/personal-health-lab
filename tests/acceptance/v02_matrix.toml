@@ -8,6 +8,18 @@ statement = "Initial fixed plausibility bounds are inclusive and type-specific."
 evidence = ["positive", "negative", "boundary"]
 
 [[contract]]
+id = "V02-C-RULE-002"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "The personal resting-heart-rate range uses 42 previous local days, at least 28 values, and median/MAD."
+evidence = ["positive", "negative", "boundary"]
+
+[[contract]]
+id = "V02-C-RULE-003"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Personal history uses effective prior values only."
+evidence = ["positive", "transition"]
+
+[[contract]]
 id = "V02-C-RULE-006"
 source = "https://github.com/RMKruse/personal-health-lab/issues/33"
 statement = "Late measurements use the rule valid at measurement time."
@@ -40,6 +52,15 @@ parameters = "resting-heart-rate 20..250 bpm; active-energy >=0 kcal; unknown so
 platform = "all"
 sha256 = "71f9350613043edb33cb8479c956e0388fde64dccce95d801e766779eab264fa"
 
+[[fixture]]
+id = "V02-F-DOM-PERSONAL-RANGE-V1"
+kind = "domain"
+generator = "inline-health-export-v1"
+seed = 0
+parameters = "28 prior resting-heart-rate values, boundaries, missingness, MAD zero, active energy, effective corrections, and temporal exclusion"
+platform = "all"
+sha256 = "75d44ebfa21185f4a843a9b8381e07d19fed1e68e5c4d8bd2e437d82e8015d35"
+
 [[case]]
 id = "V02-A-RULE-001"
 contracts = ["V02-C-RULE-001"]
@@ -63,6 +84,90 @@ level = "application"
 expected_result = "zero and large positive accepted; negative flagged"
 expected_effect = "one deterministic plausibility case"
 forbidden_side_effects = ["upper fixed bound"]
+
+[[case]]
+id = "V02-A-RULE-003"
+contracts = ["V02-C-RULE-002"]
+fixtures = ["V02-F-DOM-PERSONAL-RANGE-V1"]
+runner = "test_personal_range_uses_previous_effective_days_and_keeps_earlier_findings"
+initial_state = "28 valid prior resting-heart-rate days"
+operation = "import a value outside the median/MAD range"
+level = "application"
+expected_result = "personal finding with exact median/MAD bounds"
+expected_effect = "one deterministic plausibility case"
+forbidden_side_effects = ["medical classification"]
+
+[[case]]
+id = "V02-A-RULE-004"
+contracts = ["V02-C-RULE-002"]
+fixtures = ["V02-F-DOM-PERSONAL-RANGE-V1"]
+runner = "test_personal_range_is_inclusive_and_skips_unready_inputs"
+initial_state = "28 valid prior resting-heart-rate days"
+operation = "import values on and strictly outside personal bounds"
+level = "application"
+expected_result = "bounds accepted and outside value flagged"
+expected_effect = "inclusive personal range"
+forbidden_side_effects = ["exclusive boundary"]
+
+[[case]]
+id = "V02-A-RULE-005"
+contracts = ["V02-C-RULE-002"]
+fixtures = ["V02-F-DOM-PERSONAL-RANGE-V1"]
+runner = "test_personal_range_is_inclusive_and_skips_unready_inputs"
+initial_state = "short, missing-current, and zero-MAD histories"
+operation = "evaluate personal rule"
+level = "application"
+expected_result = "no personal finding"
+expected_effect = "none"
+forbidden_side_effects = ["imputation", "epsilon fallback"]
+
+[[case]]
+id = "V02-A-RULE-006"
+contracts = ["V02-C-RULE-002"]
+fixtures = ["V02-F-DOM-PERSONAL-RANGE-V1"]
+runner = "test_personal_range_is_inclusive_and_skips_unready_inputs"
+initial_state = "active-energy source samples"
+operation = "evaluate personal rule"
+level = "application"
+expected_result = "no personal range"
+expected_effect = "none"
+forbidden_side_effects = ["active-energy personal finding"]
+
+[[case]]
+id = "V02-A-RULE-007"
+contracts = ["V02-C-RULE-003"]
+fixtures = ["V02-F-DOM-PERSONAL-RANGE-V1"]
+runner = "test_personal_range_uses_previous_effective_days_and_keeps_earlier_findings"
+initial_state = "prior personal finding remains open"
+operation = "evaluate a later resting-heart-rate value"
+level = "application"
+expected_result = "earlier flagged value remains in history"
+expected_effect = "later bounds include the earlier value"
+forbidden_side_effects = ["automatic anomaly exclusion"]
+
+[[case]]
+id = "V02-A-RULE-008"
+contracts = ["V02-C-RULE-003"]
+fixtures = ["V02-F-DOM-PERSONAL-RANGE-V1"]
+runner = "test_personal_range_uses_corrections_instead_of_source_values"
+initial_state = "prior effective corrections"
+operation = "evaluate a later resting-heart-rate value"
+level = "data_quality"
+expected_result = "corrected values replace source values in history"
+expected_effect = "personal finding uses effective history"
+forbidden_side_effects = ["raw source substitution"]
+
+[[case]]
+id = "V02-A-RULE-009"
+contracts = ["V02-C-RULE-003"]
+fixtures = ["V02-F-DOM-PERSONAL-RANGE-V1"]
+runner = "test_personal_range_uses_previous_effective_days_and_keeps_earlier_findings"
+initial_state = "current and future resting-heart-rate values present"
+operation = "evaluate current value"
+level = "application"
+expected_result = "only prior local days define the range"
+expected_effect = "deterministic prior-only bounds"
+forbidden_side_effects = ["current leakage", "future leakage"]
 
 [[case]]
 id = "V02-A-RULE-021"

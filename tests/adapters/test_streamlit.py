@@ -88,6 +88,7 @@ def test_streamlit_shows_imported_daily_series(
     assert not app.exception
     assert any("Analysestatus: completed" in message.value for message in app.success)
     assert [heading.value for heading in app.subheader] == [
+        "Datenprüfung",
         "Aktive Energie (kcal)",
         "Apple-Ruhepuls (count/min)",
         "Verzögerungsprofil",
@@ -132,8 +133,7 @@ def test_streamlit_renders_the_shared_real_import_confirmation_plan(
     assert not app.exception
     values = [item.value for item in (*app.markdown, *app.caption, *app.warning)]
     assert any(
-        "real_import_same_person" in value and "filevault_unknown" in value
-        for value in values
+        "real_import_same_person" in value and "filevault_unknown" in value for value in values
     )
     assert any("FileVault: unknown" in value for value in values)
     assert any("Kapazität: ready" in value for value in values)
@@ -174,3 +174,26 @@ def test_streamlit_projects_source_conflicts_from_the_shared_data_review(
         for item in app.warning
     )
     assert any("Details:" in item.value for item in app.caption)
+
+
+def test_streamlit_projects_the_personal_range_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    personal_range_package: Callable[[Path], Path],
+) -> None:
+    synthetic_store = tmp_path / "synthetic"
+    config = RuntimeConfig(DataMode.SYNTHETIC, synthetic_store, tmp_path / "real")
+    package = personal_range_package(tmp_path / "personal.zip")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(package)
+        plan = health_lab.preview_write(request)
+        health_lab.execute_write(request, expected_plan=plan.fingerprint)
+
+    monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
+    monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(synthetic_store))
+    monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(tmp_path / "real"))
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
+    app = AppTest.from_file(str(app_path)).run()
+
+    assert not app.exception
+    assert any("above_personal_upper_bound" in item.value for item in app.caption)

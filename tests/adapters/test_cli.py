@@ -108,6 +108,41 @@ def test_cli_projects_source_conflicts_from_the_shared_data_review(
     assert output["cases"][0]["detail"]["reasons"] == []
 
 
+def test_cli_projects_the_personal_range_finding(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    personal_range_package: Callable[[Path], Path],
+) -> None:
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "synthetic", tmp_path / "real")
+    package = personal_range_package(tmp_path / "personal.zip")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(package)
+        plan = health_lab.preview_write(request)
+        health_lab.execute_write(request, expected_plan=plan.fingerprint)
+
+    assert (
+        main(
+            [
+                "--mode",
+                "synthetic",
+                "--synthetic-store",
+                str(config.synthetic_store),
+                "--real-store",
+                str(config.real_store),
+                "review",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    output = json.loads(capsys.readouterr().out)
+
+    _assert_json_contract(output)
+    reason = output["cases"][0]["detail"]["reasons"][0]
+    assert reason["code"] == "above_personal_upper_bound"
+    assert reason["lower_bound"] < 64 < reason["upper_bound"] + 1
+
+
 def test_real_json_import_renders_shared_confirmation_plan(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -374,7 +409,7 @@ def test_cli_imports_export_and_prints_daily_series(
     assert result[0] == 0
     receipt = result[1]
     assert receipt["result"]["status"] == "committed"
-    assert receipt["result"]["anomaly_count"] == 0
+    assert receipt["result"]["anomaly_count"] == 1
     assert receipt["result"]["record_count"] == 1_825
     assert receipt["runtime_config"] == _EXPECTED_RUNTIME_CONFIG
 
