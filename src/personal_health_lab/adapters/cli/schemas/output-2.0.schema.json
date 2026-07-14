@@ -1,0 +1,319 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:personal-health-lab:cli-output:2.0",
+  "title": "HealthLab production CLI write output 2.0",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/writePlanOutput"
+    },
+    {
+      "$ref": "#/$defs/writeReceiptOutput"
+    }
+  ],
+  "$defs": {
+    "nullableString": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "runtimeConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_import_compression_ratio",
+        "max_import_entries",
+        "max_import_entry_bytes",
+        "max_import_package_bytes",
+        "max_import_uncompressed_bytes",
+        "mode",
+        "real_store",
+        "schema_version",
+        "synthetic_store"
+      ],
+      "properties": {
+        "max_import_compression_ratio": {
+          "type": "number",
+          "minimum": 1
+        },
+        "max_import_entries": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_import_entry_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_import_package_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_import_uncompressed_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "mode": {
+          "enum": [
+            "synthetic",
+            "real"
+          ]
+        },
+        "real_store": {
+          "const": "<redacted>"
+        },
+        "schema_version": {
+          "const": "1.0"
+        },
+        "synthetic_store": {
+          "const": "<redacted>"
+        }
+      }
+    },
+    "writeApproval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "ready",
+            "confirmation_required",
+            "blocked"
+          ]
+        }
+      }
+    },
+    "importResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "anomaly_count",
+        "diagnostics",
+        "import_id",
+        "logical_measurement_count",
+        "measurement_version_count",
+        "package_hash",
+        "package_record_count",
+        "record_count",
+        "snapshot_ref",
+        "status",
+        "type"
+      ],
+      "properties": {
+        "anomaly_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "import_id": {
+          "type": "string"
+        },
+        "logical_measurement_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "measurement_version_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "package_hash": {
+          "type": "string"
+        },
+        "package_record_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "record_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "snapshot_ref": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "status": {
+          "enum": [
+            "committed",
+            "duplicate",
+            "rejected",
+            "quarantined"
+          ]
+        },
+        "type": {
+          "const": "import_health_export"
+        }
+      }
+    },
+    "writeNotStarted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "diagnostics",
+        "status",
+        "type"
+      ],
+      "properties": {
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "status": {
+          "enum": [
+            "plan_changed",
+            "blocked",
+            "store_busy"
+          ]
+        },
+        "type": {
+          "const": "write_not_started"
+        }
+      }
+    },
+    "writePlanOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approval",
+        "details",
+        "diagnostics",
+        "fingerprint",
+        "kind",
+        "request",
+        "runtime_config",
+        "schema_version"
+      ],
+      "properties": {
+        "approval": {
+          "$ref": "#/$defs/writeApproval"
+        },
+        "details": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "package_hash",
+            "package_size"
+          ],
+          "properties": {
+            "package_hash": {
+              "type": "string"
+            },
+            "package_size": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "fingerprint": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "kind": {
+          "const": "write_plan"
+        },
+        "request": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "package",
+            "type"
+          ],
+          "properties": {
+            "package": {
+              "const": "<redacted>"
+            },
+            "type": {
+              "const": "import_health_export"
+            }
+          }
+        },
+        "runtime_config": {
+          "$ref": "#/$defs/runtimeConfig"
+        },
+        "schema_version": {
+          "const": "2.0"
+        }
+      }
+    },
+    "writeReceiptOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "diagnostics",
+        "final_preflight",
+        "kind",
+        "operation_id",
+        "plan_fingerprint",
+        "result",
+        "runtime_config",
+        "schema_version"
+      ],
+      "properties": {
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "final_preflight": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "approval",
+            "diagnostics"
+          ],
+          "properties": {
+            "approval": {
+              "$ref": "#/$defs/writeApproval"
+            },
+            "diagnostics": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "kind": {
+          "const": "write_receipt"
+        },
+        "operation_id": {
+          "type": "string"
+        },
+        "plan_fingerprint": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "result": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/importResult"
+            },
+            {
+              "$ref": "#/$defs/writeNotStarted"
+            }
+          ]
+        },
+        "runtime_config": {
+          "$ref": "#/$defs/runtimeConfig"
+        },
+        "schema_version": {
+          "const": "2.0"
+        }
+      }
+    }
+  }
+}

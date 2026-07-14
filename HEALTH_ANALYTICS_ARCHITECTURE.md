@@ -214,20 +214,25 @@ Alle öffentlichen Modulexporte sind vollständig typisiert. `mypy` läuft minde
 
    CLI und Streamlit rechtfertigen eine gemeinsame Anwendungs-Seam. Weitere Seams entstehen erst bei mindestens zwei realen Adaptern; V0.1 abstrahiert den lokalen Speicher nicht hypothetisch.
 
-### V0.1-Modularchitektur
+### Übergang von V0.1 zu V0.2
 
 CLI und Streamlit sind zwei Adapter an derselben Anwendungs-Seam. Sie verwenden dasselbe Interface und enthalten keine Import-, Speicher-, Datenqualitäts- oder Analyselogik. Das CLI stellt zuerst den vollständig reproduzierbaren Ablauf bereit; Streamlit ergänzt anschließend die interaktive Darstellung.
 
-Das externe V0.1-Interface bleibt auf drei Operationen begrenzt:
+Der erste V0.2-Tracer ersetzt die benannte V0.1-Importmethode durch den gemeinsamen
+Schreibplan. Analyse und Overview bleiben bis zu ihren eigenen Umsetzungstickets auf der
+V0.1-Seam:
 
 ```python
 with HealthLab.open(runtime_config) as app:
-    import_receipt = app.import_health_export(package_path)
+    request = ImportHealthExport(package_path)
+    plan = app.preview_write(request)
+    import_receipt = app.execute_write(request, expected_plan=plan.fingerprint)
     analysis_receipt = app.run_resting_hr_analysis(config)
     overview = app.load_overview(selection)
 
-# Interface:
-# import_health_export(package_path: Path) -> ImportReceipt
+# Übergangs-Interface:
+# preview_write(request: ImportHealthExport) -> WritePlan
+# execute_write(request, expected_plan=...) -> WriteReceipt
 # run_resting_hr_analysis(config: RestingHeartRateAnalysisConfig) -> AnalysisReceipt
 # load_overview(selection: OverviewSelection) -> Overview
 ```
@@ -236,7 +241,7 @@ Receipts enthalten stabile IDs, Status und Diagnosen, aber keine Parquet-, SQLit
 
 | Receipt | Pflichtinhalt |
 |---|---|
-| `ImportReceipt` | `operation_id`, `import_id`, Status, Paket-Hash, optionale `SnapshotRef`, Datensatzzähler, Anzahl Auffälligkeiten und datensparsame Diagnosen |
+| `WriteReceipt` mit `ImportReceipt` | Plan-Fingerprint, finale Vorprüfung, `operation_id`, `import_id`, Status, Paket-Hash, optionale `SnapshotRef`, Datensatzzähler, Anzahl Auffälligkeiten und datensparsame Diagnosen |
 | `AnalysisReceipt` | `operation_id`, `analysis_run_id`, Status, `SnapshotRef`, `analysis_definition_id`, Modellreifestatus, optionale Ergebnisreferenz und datensparsame Diagnosen |
 
 Receipts enthalten keine einzelnen Gesundheitswerte. Detaildaten werden über `Overview` beziehungsweise spätere dedizierte Leseoperationen geladen.

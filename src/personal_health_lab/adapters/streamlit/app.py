@@ -15,10 +15,13 @@ from personal_health_lab.application import (
     ConfigurationError,
     HealthLab,
     HealthLabError,
+    ImportHealthExport,
+    ImportReceipt,
     ImportStatus,
     OverviewSelection,
     OverviewStatus,
     RestingHeartRateAnalysisConfig,
+    WriteApprovalStatus,
 )
 
 
@@ -35,22 +38,75 @@ except (KeyError, ValueError, ConfigurationError):
 st.title("HealthLab Übersicht")
 st.caption(f"Datenmodus: {config.mode.value}")
 
-uploaded = st.file_uploader("Apple-Health-Export", type="zip")
-if st.button("Health-Export importieren", disabled=uploaded is None):
+import_plan = st.session_state.get("import_plan")
+uploaded = st.file_uploader(
+    "Apple-Health-Export",
+    type="zip",
+    disabled=import_plan is not None,
+)
+if st.button("Health-Export prüfen", disabled=uploaded is None or import_plan is not None):
+    request = None
     try:
         assert uploaded is not None
         uploaded.seek(0)
-        with NamedTemporaryFile(suffix=".zip") as package:
+        with NamedTemporaryFile(suffix=".zip", delete=False) as package:
             shutil.copyfileobj(uploaded, package)
             package.flush()
-            with HealthLab.open(config) as health_lab:
-                import_receipt = health_lab.import_health_export(Path(package.name))
-        st.session_state["last_import_status"] = import_receipt.status
-        st.session_state["last_import_snapshot"] = str(import_receipt.snapshot_ref or "-")
-        st.session_state["last_import_diagnostics"] = ", ".join(import_receipt.diagnostics) or "-"
+            request = ImportHealthExport(Path(package.name))
+        with HealthLab.open(config) as health_lab:
+            plan = health_lab.preview_write(request)
+        st.session_state["import_request"] = request
+        st.session_state["import_plan"] = plan
         st.rerun()
     except (OSError, HealthLabError):
+        if request is not None:
+            request.package_path.unlink(missing_ok=True)
         st.error("Health-Export konnte nicht importiert werden.")
+
+import_plan = st.session_state.get("import_plan")
+if import_plan is not None:
+    import_request = st.session_state["import_request"]
+    st.subheader("Schreibvorschau")
+    st.write(f"Freigabe: {import_plan.approval.status.value}")
+    st.code(str(import_plan.fingerprint))
+    st.caption(
+        f"Paket: {import_plan.details.package_size} Bytes · "
+        f"SHA-256 {import_plan.details.package_hash or '-'}"
+    )
+    st.caption("Diagnosen: " + (", ".join(import_plan.diagnostics) or "-"))
+    execute_disabled = import_plan.approval.status is WriteApprovalStatus.BLOCKED
+    if st.button("Vorschau ausführen", disabled=execute_disabled):
+        import_failed = False
+        try:
+            with HealthLab.open(config) as health_lab:
+                write_receipt = health_lab.execute_write(
+                    import_request,
+                    expected_plan=import_plan.fingerprint,
+                )
+            import_result = write_receipt.result
+            st.session_state["last_import_status"] = import_result.status
+            st.session_state["last_import_snapshot"] = (
+                str(import_result.snapshot_ref or "-")
+                if isinstance(import_result, ImportReceipt)
+                else "-"
+            )
+            st.session_state["last_import_diagnostics"] = (
+                ", ".join(import_result.diagnostics) or "-"
+            )
+        except (OSError, HealthLabError):
+            import_failed = True
+            st.error("Health-Export konnte nicht importiert werden.")
+        finally:
+            import_request.package_path.unlink(missing_ok=True)
+            st.session_state.pop("import_request", None)
+            st.session_state.pop("import_plan", None)
+        if not import_failed:
+            st.rerun()
+    if st.button("Vorschau verwerfen und bearbeiten"):
+        import_request.package_path.unlink(missing_ok=True)
+        st.session_state.pop("import_request", None)
+        st.session_state.pop("import_plan", None)
+        st.rerun()
 
 start_date = st.date_input("Von", value=None)
 end_date = st.date_input("Bis", value=None)

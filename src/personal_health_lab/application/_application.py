@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
 from dataclasses import dataclass
@@ -8,6 +10,7 @@ from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
 from typing import Self
+from uuid import uuid4
 
 from personal_health_lab import DataMode
 from personal_health_lab.health_import import (
@@ -104,6 +107,59 @@ class ImportStatus(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class PlanFingerprint:
+    _value: str
+
+    def __post_init__(self) -> None:
+        if len(self._value) != 64 or not set(self._value) <= set("0123456789abcdef"):
+            raise ValueError("Plan-Fingerprint muss ein SHA-256-Wert sein.")
+
+    def __str__(self) -> str:
+        return self._value
+
+
+@dataclass(frozen=True, slots=True)
+class ImportHealthExport:
+    package_path: Path
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.package_path, Path):
+            raise ConfigurationError("Health-Exportpfad muss ein pathlib.Path-Wert sein.")
+        object.__setattr__(self, "package_path", self.package_path.expanduser().resolve())
+
+
+WriteRequest = ImportHealthExport
+
+
+class WriteApprovalStatus(StrEnum):
+    READY = "ready"
+    CONFIRMATION_REQUIRED = "confirmation_required"
+    BLOCKED = "blocked"
+
+
+@dataclass(frozen=True, slots=True)
+class WriteApproval:
+    status: WriteApprovalStatus
+
+
+@dataclass(frozen=True, slots=True)
+class ImportHealthExportPlan:
+    package_hash: str
+    package_size: int
+
+
+WritePlanDetails = ImportHealthExportPlan
+
+
+@dataclass(frozen=True, slots=True)
+class WritePlan:
+    fingerprint: PlanFingerprint
+    approval: WriteApproval
+    details: WritePlanDetails
+    diagnostics: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class ImportReceipt:
     operation_id: OperationId
     import_id: ImportId
@@ -115,6 +171,36 @@ class ImportReceipt:
     package_record_count: int = 0
     logical_measurement_count: int = 0
     measurement_version_count: int = 0
+    diagnostics: tuple[str, ...] = ()
+
+
+class WriteNotStartedStatus(StrEnum):
+    PLAN_CHANGED = "plan_changed"
+    BLOCKED = "blocked"
+    STORE_BUSY = "store_busy"
+
+
+@dataclass(frozen=True, slots=True)
+class WriteNotStarted:
+    status: WriteNotStartedStatus
+    diagnostics: tuple[str, ...] = ()
+
+
+WriteResult = ImportReceipt | WriteNotStarted
+
+
+@dataclass(frozen=True, slots=True)
+class WritePreflight:
+    approval: WriteApproval
+    diagnostics: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class WriteReceipt:
+    operation_id: OperationId
+    plan_fingerprint: PlanFingerprint
+    result: WriteResult
+    final_preflight: WritePreflight
     diagnostics: tuple[str, ...] = ()
 
 
@@ -201,11 +287,72 @@ class HealthLab:
             self._overview_reader = None
         logger.info("healthlab_closed mode=%s", self._config.mode.value)
 
-    def import_health_export(self, package_path: Path) -> ImportReceipt:
+    def preview_write(self, request: WriteRequest) -> WritePlan:
         self._require_open()
         try:
+            package_size = request.package_path.stat().st_size
+            with request.package_path.open("rb") as package:
+                package_hash = hashlib.file_digest(package, "sha256").hexdigest()
+            approval = WriteApproval(WriteApprovalStatus.READY)
+            diagnostics: tuple[str, ...] = ()
+        except OSError:
+            package_size = 0
+            package_hash = ""
+            approval = WriteApproval(WriteApprovalStatus.BLOCKED)
+            diagnostics = ("health_export_unavailable",)
+        fingerprint = PlanFingerprint(
+            hashlib.sha256(
+                json.dumps(
+                    {
+                        "limits": {
+                            "compression_ratio": self._config.max_import_compression_ratio,
+                            "entries": self._config.max_import_entries,
+                            "entry_bytes": self._config.max_import_entry_bytes,
+                            "package_bytes": self._config.max_import_package_bytes,
+                            "uncompressed_bytes": self._config.max_import_uncompressed_bytes,
+                        },
+                        "mode": self._config.mode.value,
+                        "operation": "import_health_export",
+                        "package_hash": package_hash,
+                        "package_path": str(request.package_path),
+                        "package_size": package_size,
+                        "store": str(self._config.active_store),
+                        "version": 1,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+        )
+        return WritePlan(
+            fingerprint=fingerprint,
+            approval=approval,
+            details=ImportHealthExportPlan(package_hash, package_size),
+            diagnostics=diagnostics,
+        )
+
+    def execute_write(
+        self,
+        request: WriteRequest,
+        *,
+        expected_plan: PlanFingerprint,
+    ) -> WriteReceipt:
+        current_plan = self.preview_write(request)
+        if current_plan.fingerprint != expected_plan:
+            return self._not_started(
+                current_plan,
+                WriteNotStartedStatus.PLAN_CHANGED,
+                ("plan_changed",),
+            )
+        if current_plan.approval.status is WriteApprovalStatus.BLOCKED:
+            return self._not_started(
+                current_plan,
+                WriteNotStartedStatus.BLOCKED,
+                current_plan.diagnostics,
+            )
+        try:
             result = import_health_export(
-                package_path,
+                request.package_path,
                 root=self._config.active_store,
                 mode=self._config.mode,
                 max_package_bytes=self._config.max_import_package_bytes,
@@ -216,7 +363,7 @@ class HealthLab:
             )
         except HealthImportError as error:
             raise HealthLabError("Health-Export konnte nicht importiert werden.") from error
-        return ImportReceipt(
+        import_result = ImportReceipt(
             operation_id=result.operation_id,
             import_id=result.import_id,
             status=ImportStatus(result.status),
@@ -228,6 +375,34 @@ class HealthLab:
             logical_measurement_count=result.logical_measurement_count,
             measurement_version_count=result.measurement_version_count,
             diagnostics=result.diagnostics,
+        )
+        if import_result.status is ImportStatus.STORE_BUSY:
+            write_result: WriteResult = WriteNotStarted(
+                WriteNotStartedStatus.STORE_BUSY,
+                import_result.diagnostics,
+            )
+        else:
+            write_result = import_result
+        return WriteReceipt(
+            operation_id=result.operation_id,
+            plan_fingerprint=current_plan.fingerprint,
+            result=write_result,
+            final_preflight=WritePreflight(current_plan.approval, current_plan.diagnostics),
+            diagnostics=result.diagnostics,
+        )
+
+    @staticmethod
+    def _not_started(
+        plan: WritePlan,
+        status: WriteNotStartedStatus,
+        diagnostics: tuple[str, ...],
+    ) -> WriteReceipt:
+        return WriteReceipt(
+            operation_id=OperationId(uuid4().hex),
+            plan_fingerprint=plan.fingerprint,
+            result=WriteNotStarted(status, diagnostics),
+            final_preflight=WritePreflight(plan.approval, plan.diagnostics),
+            diagnostics=diagnostics,
         )
 
     def run_resting_hr_analysis(self, config: RestingHeartRateAnalysisConfig) -> AnalysisReceipt:

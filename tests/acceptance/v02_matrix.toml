@@ -1,0 +1,137 @@
+schema_version = 1
+release = "v0.2"
+
+[[contract]]
+id = "V02-C-API-002"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Every write uses a side-effect-free preview and explicit execution."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V02-C-API-003"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "The plan fingerprint binds all decision-relevant facts and is not persisted."
+evidence = ["positive", "negative"]
+
+[[contract]]
+id = "V02-C-API-004"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Plans, receipts, and expected outcomes are closed typed values."
+evidence = ["positive", "negative", "fault"]
+
+[[fixture]]
+id = "V02-F-DOM-IMPORT-001"
+kind = "domain"
+generator = "v02-health-export-v1"
+seed = 35
+parameters = "one supported resting-heart-rate record"
+platform = "all"
+sha256 = "694c8cc83d62f4c504307850b29d819be0bb4014190b5e806bfcd2e266232826"
+
+[[case]]
+id = "V02-A-API-004"
+contracts = ["V02-C-API-002"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_v02_import_write_contract"
+initial_state = "empty temporary store"
+operation = "preview ImportHealthExport"
+level = "application"
+expected_result = "ready WritePlan"
+expected_effect = "none"
+forbidden_side_effects = ["store mutation", "writer lock"]
+
+[[case]]
+id = "V02-A-API-005"
+contracts = ["V02-C-API-002"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_v02_import_write_contract"
+initial_state = "previewed import"
+operation = "execute identical request and expected fingerprint"
+level = "application"
+expected_result = "committed ImportReceipt"
+expected_effect = "one published snapshot"
+forbidden_side_effects = ["execution of a different request"]
+
+[[case]]
+id = "V02-A-API-006"
+contracts = ["V02-C-API-002"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_v02_import_write_contract"
+initial_state = "empty temporary store"
+operation = "preview and abort"
+level = "application"
+expected_result = "ready WritePlan"
+expected_effect = "none"
+forbidden_side_effects = ["snapshot", "import audit"]
+
+[[case]]
+id = "V02-A-API-007"
+contracts = ["V02-C-API-002"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_v02_import_write_contract"
+initial_state = "previewed import"
+operation = "edit request and preview again"
+level = "application"
+expected_result = "different PlanFingerprint"
+expected_effect = "none"
+forbidden_side_effects = ["reuse of stale plan"]
+
+[[case]]
+id = "V02-A-API-010"
+contracts = ["V02-C-API-003"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_v02_import_write_contract"
+initial_state = "empty temporary store"
+operation = "preview and execute import"
+level = "application"
+expected_result = "fingerprint echoed only in receipt"
+expected_effect = "one published snapshot"
+forbidden_side_effects = ["persisted plan", "persisted fingerprint"]
+
+[[case]]
+id = "V02-A-API-011"
+contracts = ["V02-C-API-004"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_v02_import_write_contract"
+initial_state = "valid and missing package inputs"
+operation = "preview ImportHealthExport"
+level = "application"
+expected_result = "closed WriteApproval status"
+expected_effect = "none"
+forbidden_side_effects = ["untyped status"]
+
+[[case]]
+id = "V02-A-API-012"
+contracts = ["V02-C-API-004"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_v02_import_write_contract"
+initial_state = "changed request or unavailable writer"
+operation = "execute ImportHealthExport"
+level = "application"
+expected_result = "typed WriteNotStarted"
+expected_effect = "none"
+forbidden_side_effects = ["partial import"]
+
+[[case]]
+id = "V02-A-API-013"
+contracts = ["V02-C-API-004"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_v02_import_write_contract"
+initial_state = "valid import plan"
+operation = "execute ImportHealthExport"
+level = "application"
+expected_result = "typed ImportReceipt"
+expected_effect = "import outcome preserved"
+forbidden_side_effects = ["untyped dictionary result"]
+
+[[case]]
+id = "V02-A-API-014"
+contracts = ["V02-C-API-004"]
+fixtures = ["V02-F-DOM-IMPORT-001"]
+runner = "test_v02_import_write_contract"
+initial_state = "temporary store with injected technical failure"
+operation = "execute ImportHealthExport"
+level = "application"
+expected_result = "HealthLabError"
+expected_effect = "none"
+forbidden_side_effects = ["technical defect encoded as business outcome"]

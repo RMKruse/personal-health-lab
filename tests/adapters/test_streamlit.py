@@ -19,7 +19,7 @@ def test_streamlit_shows_the_same_empty_overview(
 
     assert not app.exception
     assert app.title[0].value == "HealthLab Übersicht"
-    assert app.markdown[0].value == "Status: empty"
+    assert any(item.value == "Status: empty" for item in app.markdown)
     assert app.info[0].value == "Keine Gesundheitsdaten vorhanden."
 
     app.button[1].click().run()
@@ -56,6 +56,23 @@ def test_streamlit_shows_imported_daily_series(
         ("apple-health-export.zip", fixture.export_path.read_bytes(), "application/zip")
     )
     app.button[0].click().run()
+
+    assert not app.exception
+    assert any(item.value == "Schreibvorschau" for item in app.subheader)
+    assert any(item.value == "Status: empty" for item in app.markdown)
+    assert len(app.code[0].value) == 64
+
+    app.button[2].click().run()
+
+    assert not app.exception
+    assert all(item.value != "Schreibvorschau" for item in app.subheader)
+    assert app.markdown[0].value == "Status: empty"
+
+    app.file_uploader[0].set_value(
+        ("apple-health-export.zip", fixture.export_path.read_bytes(), "application/zip")
+    )
+    app.button[0].click().run()
+    app.button[1].click().run()
 
     assert not app.exception
     assert any("Importstatus: committed" in message.value for message in app.success)

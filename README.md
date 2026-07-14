@@ -172,13 +172,18 @@ Verbindliche Regeln:
 - Der Development-CLI-Adapter darf `synthetic_export` verwenden; das reale Anwendungsmodul und der reale Datenmodus nicht.
 - Neue Abhängigkeiten dürfen keinen Zyklus erzeugen.
 
-## V0.1-Interface
+## Anwendungs-Interface
 
 ```python
 with HealthLab.open(runtime_config) as app:
-    app.import_health_export(package_path)
+    request = ImportHealthExport(package_path)
+    plan = app.preview_write(request)
+    app.execute_write(request, expected_plan=plan.fingerprint)
     app.run_resting_hr_analysis(config)
     app.load_overview(selection)
 ```
 
-CLI, Streamlit und End-to-End-Tests verwenden dasselbe Interface. Import-, Speicher-, Qualitäts- und Analyselogik bleibt in den tiefen internen Modulen.
+Der erste V0.2-Tracer führt den Import über Schreibvorschau und ausdrückliche Ausführung;
+die noch nicht migrierten Analyse- und Leseoperationen bleiben vorläufig auf der V0.1-Seam.
+CLI, Streamlit und End-to-End-Tests verwenden dasselbe Interface. Import-, Speicher-,
+Qualitäts- und Analyselogik bleibt in den tiefen internen Modulen.

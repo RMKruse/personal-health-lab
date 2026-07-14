@@ -8,13 +8,22 @@ from personal_health_lab.application import (
     AnalysisStatus,
     DataMode,
     HealthLab,
+    ImportHealthExport,
+    ImportReceipt,
     ModelMaturityStatus,
     OverviewSelection,
     OverviewStatus,
     RestingHeartRateAnalysisConfig,
     RuntimeConfig,
+    WriteNotStarted,
 )
 from personal_health_lab.synthetic_export import GenerationOptions, generate_export
+
+
+def _execute_import(health_lab: HealthLab, package_path: Path) -> ImportReceipt | WriteNotStarted:
+    request = ImportHealthExport(package_path)
+    plan = health_lab.preview_write(request)
+    return health_lab.execute_write(request, expected_plan=plan.fingerprint).result
 
 
 def test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis(tmp_path: Path) -> None:
@@ -30,7 +39,7 @@ def test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis(tmp_path: P
     )
 
     with HealthLab.open(runtime) as health_lab:
-        imported = health_lab.import_health_export(package.export_path)
+        imported = _execute_import(health_lab, package.export_path)
         first = health_lab.run_resting_hr_analysis(analysis)
         first_overview = health_lab.load_overview(OverviewSelection())
 
@@ -108,7 +117,7 @@ def test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis(tmp_path: P
             )
         )
         provisional_overview = health_lab.load_overview(provisional_selection)
-        newer_import = health_lab.import_health_export(newer_package.export_path)
+        newer_import = _execute_import(health_lab, newer_package.export_path)
         newer_overview = health_lab.load_overview(OverviewSelection())
         changed_snapshot = health_lab.run_resting_hr_analysis(analysis)
 
@@ -156,7 +165,7 @@ def test_null_scenario_does_not_present_a_stable_association(tmp_path: Path) -> 
     )
 
     with HealthLab.open(runtime) as health_lab:
-        health_lab.import_health_export(package.export_path)
+        _execute_import(health_lab, package.export_path)
         receipt = health_lab.run_resting_hr_analysis(
             RestingHeartRateAnalysisConfig(AnalysisDefinitionId("lag-signal-v1"))
         )
@@ -211,7 +220,7 @@ def test_analysis_reports_insufficient_and_unstable_inputs_with_stable_diagnosti
             real_store=tmp_path / f"{name}-real-store",
         )
         with HealthLab.open(runtime) as health_lab:
-            health_lab.import_health_export(package.export_path)
+            _execute_import(health_lab, package.export_path)
             receipts.append(
                 health_lab.run_resting_hr_analysis(
                     RestingHeartRateAnalysisConfig(AnalysisDefinitionId("lag-signal-v1"))

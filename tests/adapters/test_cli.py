@@ -26,12 +26,40 @@ _EXPECTED_RUNTIME_CONFIG = {
 
 
 def _assert_json_contract(output: object) -> None:
+    assert isinstance(output, dict)
     schema = json.loads(
         files("personal_health_lab.adapters.cli")
-        .joinpath("schemas/output-1.0.schema.json")
+        .joinpath(f"schemas/output-{output['schema_version']}.schema.json")
         .read_text(encoding="utf-8")
     )
     Draft202012Validator(schema).validate(output)
+
+
+def _execute_json_import(
+    common_args: list[str],
+    package: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> tuple[int, dict[str, object]]:
+    assert main([*common_args, "import", str(package), "--json"]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    _assert_json_contract(plan)
+    assert plan["kind"] == "write_plan"
+    exit_code = main(
+        [
+            *common_args,
+            "import",
+            str(package),
+            "--json",
+            "--execute",
+            "--expect-plan",
+            plan["fingerprint"],
+        ]
+    )
+    receipt = json.loads(capsys.readouterr().out)
+    _assert_json_contract(receipt)
+    assert receipt["kind"] == "write_receipt"
+    assert receipt["plan_fingerprint"] == plan["fingerprint"]
+    return exit_code, receipt
 
 
 def test_cli_returns_expected_incomplete_for_rejected_import(
@@ -42,7 +70,7 @@ def test_cli_returns_expected_incomplete_for_rejected_import(
         archive.writestr("apple_health_export/export.xml", "<HealthData/>")
         archive.writestr("../private-health-value", "181")
 
-    exit_code = main(
+    exit_code, output = _execute_json_import(
         [
             "--mode",
             "synthetic",
@@ -50,17 +78,14 @@ def test_cli_returns_expected_incomplete_for_rejected_import(
             str(tmp_path / "synthetic"),
             "--real-store",
             str(tmp_path / "real"),
-            "import",
-            str(package),
-            "--json",
-        ]
+        ],
+        package,
+        capsys,
     )
 
     captured = capsys.readouterr()
-    output = json.loads(captured.out)
     assert exit_code == 3
-    _assert_json_contract(output)
-    assert output["status"] == "rejected"
+    assert output["result"]["status"] == "rejected"
     assert captured.err == ""
 
 
@@ -77,17 +102,20 @@ def test_cli_returns_expected_incomplete_while_store_is_busy(
     ]
     assert main([*common_args, "overview"]) == 0
     capsys.readouterr()
+    package = tmp_path / "health.zip"
+    with ZipFile(package, "w") as archive:
+        archive.writestr("apple_health_export/export.xml", "<HealthData/>")
 
     with (tmp_path / "synthetic" / ".writer.lock").open("a+b") as writer_lock:
         fcntl.flock(writer_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        assert main([*common_args, "import", str(tmp_path / "missing.zip"), "--json"]) == 3
-        import_receipt = json.loads(capsys.readouterr().out)
+        exit_code, import_receipt = _execute_json_import(common_args, package, capsys)
+        assert exit_code == 3
         assert main([*common_args, "analyze", "--json"]) == 3
         analysis_receipt = json.loads(capsys.readouterr().out)
 
     _assert_json_contract(import_receipt)
     _assert_json_contract(analysis_receipt)
-    assert import_receipt["status"] == "store_busy"
+    assert import_receipt["result"]["status"] == "store_busy"
     assert analysis_receipt["status"] == "store_busy"
 
 
@@ -108,8 +136,7 @@ def test_cli_returns_expected_incomplete_for_unstable_analysis(
         "--real-store",
         str(tmp_path / "real"),
     ]
-    assert main([*common_args, "import", str(fixture.export_path)]) == 0
-    capsys.readouterr()
+    assert _execute_json_import(common_args, fixture.export_path, capsys)[0] == 0
 
     assert main([*common_args, "analyze", "--json"]) == 3
     receipt = json.loads(capsys.readouterr().out)
@@ -163,8 +190,7 @@ def test_installed_cli_contracts_streams_and_redacts_technical_errors(tmp_path: 
     assert failure.returncode == 1
     assert failure.stdout == ""
     assert failure.stderr == (
-        "ERROR healthlab_failed error_class=HealthLabError\n"
-        "Technischer HealthLab-Fehler.\n"
+        "ERROR healthlab_failed error_class=HealthLabError\nTechnischer HealthLab-Fehler.\n"
     )
 
 
@@ -178,6 +204,20 @@ def test_cli_returns_usage_error_for_unknown_arguments_and_invalid_config(
 
     for args in (
         ["--unknown"],
+        [
+            "--mode",
+            "synthetic",
+            "--synthetic-store",
+            str(tmp_path / "synthetic"),
+            "--real-store",
+            str(tmp_path / "real"),
+            "import",
+            str(tmp_path / "health.zip"),
+            "--json",
+            "--execute",
+            "--expect-plan",
+            "not-a-fingerprint",
+        ],
         ["--config", str(invalid_config), "overview"],
         ["--config", str(invalid_utf8), "overview"],
         ["--config", str(tmp_path / "missing.json"), "overview"],
@@ -242,18 +282,18 @@ def test_cli_imports_export_and_prints_daily_series(
         str(tmp_path / "real"),
     ]
 
-    assert main([*common_args, "import", str(fixture.export_path), "--json"]) == 0
-    receipt = json.loads(capsys.readouterr().out)
-    _assert_json_contract(receipt)
-    assert receipt["status"] == "committed"
-    assert receipt["anomaly_count"] == 0
-    assert receipt["record_count"] == 1_825
+    result = _execute_json_import(common_args, fixture.export_path, capsys)
+    assert result[0] == 0
+    receipt = result[1]
+    assert receipt["result"]["status"] == "committed"
+    assert receipt["result"]["anomaly_count"] == 0
+    assert receipt["result"]["record_count"] == 1_825
     assert receipt["runtime_config"] == _EXPECTED_RUNTIME_CONFIG
 
-    assert main([*common_args, "import", str(fixture.export_path), "--json"]) == 0
-    duplicate = json.loads(capsys.readouterr().out)
-    _assert_json_contract(duplicate)
-    assert duplicate["status"] == "duplicate"
+    result = _execute_json_import(common_args, fixture.export_path, capsys)
+    assert result[0] == 0
+    duplicate = result[1]
+    assert duplicate["result"]["status"] == "duplicate"
 
     assert main([*common_args, "overview", "--json"]) == 0
     overview = json.loads(capsys.readouterr().out)
@@ -267,7 +307,9 @@ def test_cli_imports_export_and_prints_daily_series(
 
 
 def test_cli_runs_and_exposes_the_built_in_lag_analysis(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = generate_export("lag-signal-v1", 42, tmp_path / "fixture")
     common_args = [
@@ -278,6 +320,7 @@ def test_cli_runs_and_exposes_the_built_in_lag_analysis(
         "--real-store",
         str(tmp_path / "real"),
     ]
+    monkeypatch.setattr("builtins.input", lambda _: "j")
     assert main([*common_args, "import", str(fixture.export_path)]) == 0
     human_import = capsys.readouterr().out
     assert "Konfiguration:" in human_import

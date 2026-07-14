@@ -5,6 +5,7 @@ from personal_health_lab.application import (
     AnalysisDefinitionId,
     DataMode,
     HealthLab,
+    ImportHealthExport,
     RestingHeartRateAnalysisConfig,
     RuntimeConfig,
     SnapshotRef,
@@ -20,7 +21,9 @@ def test_reuse_requires_every_reproduction_identity_to_match(tmp_path: Path) -> 
         real_store=tmp_path / "real-store",
     )
     with HealthLab.open(runtime) as health_lab:
-        health_lab.import_health_export(package.export_path)
+        request = ImportHealthExport(package.export_path)
+        plan = health_lab.preview_write(request)
+        health_lab.execute_write(request, expected_plan=plan.fingerprint)
         receipt = health_lab.run_resting_hr_analysis(
             RestingHeartRateAnalysisConfig(AnalysisDefinitionId("lag-signal-v1"))
         )

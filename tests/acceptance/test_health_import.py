@@ -12,10 +12,14 @@ import pytest
 from personal_health_lab.application import (
     DataMode,
     HealthLab,
+    ImportHealthExport,
+    ImportReceipt,
     ImportStatus,
     OverviewSelection,
     OverviewStatus,
     RuntimeConfig,
+    WriteNotStarted,
+    WriteNotStartedStatus,
 )
 from personal_health_lab.health_data import CanonicalHealthType, CanonicalUnit
 from personal_health_lab.synthetic_export import generate_export
@@ -48,9 +52,18 @@ def _record(
 def _import_in_process(config: RuntimeConfig, package_path: Path) -> None:
     while True:
         with HealthLab.open(config) as health_lab:
-            receipt = health_lab.import_health_export(package_path)
-        if receipt.status is not ImportStatus.STORE_BUSY:
+            receipt = _execute_import(health_lab, package_path)
+        if not (
+            isinstance(receipt, WriteNotStarted)
+            and receipt.status is WriteNotStartedStatus.STORE_BUSY
+        ):
             return
+
+
+def _execute_import(health_lab: HealthLab, package_path: Path) -> ImportReceipt | WriteNotStarted:
+    request = ImportHealthExport(package_path)
+    plan = health_lab.preview_write(request)
+    return health_lab.execute_write(request, expected_plan=plan.fingerprint).result
 
 
 def _large_export(path: Path, count: int = 50_000) -> Path:
@@ -76,11 +89,15 @@ def _negative_export_v1(path: Path, case: str, valid_xml: str) -> Path:
             link.external_attr = (stat.S_IFLNK | 0o777) << 16
             archive.writestr(link, valid_xml)
             return path
-        utf16_entity = valid_xml.replace(
-            "?>",
-            '?><!DOCTYPE HealthData [<!ENTITY private "private-health-value">]>',
-            1,
-        ).replace("Test Watch", "&private;").encode("utf-16")
+        utf16_entity = (
+            valid_xml.replace(
+                "?>",
+                '?><!DOCTYPE HealthData [<!ENTITY private "private-health-value">]>',
+                1,
+            )
+            .replace("Test Watch", "&private;")
+            .encode("utf-16")
+        )
         xml: str | bytes = {
             "xxe": (
                 '<!DOCTYPE HealthData [<!ENTITY secret SYSTEM "file:///etc/passwd">]>'
@@ -157,10 +174,10 @@ def test_negative_exports_v1_are_rejected_without_changing_the_snapshot(
     )
 
     with HealthLab.open(base_config) as health_lab:
-        committed = health_lab.import_health_export(base)
+        committed = _execute_import(health_lab, base)
     with HealthLab.open(config) as health_lab:
         before = health_lab.load_overview(OverviewSelection())
-        rejected = health_lab.import_health_export(malicious)
+        rejected = _execute_import(health_lab, malicious)
         after = health_lab.load_overview(OverviewSelection())
 
     assert committed.status is ImportStatus.COMMITTED
@@ -205,7 +222,7 @@ def test_valid_synthetic_export_is_published_as_daily_health_data(tmp_path: Path
     )
 
     with HealthLab.open(config) as health_lab:
-        receipt = health_lab.import_health_export(fixture.export_path)
+        receipt = _execute_import(health_lab, fixture.export_path)
         overview = health_lab.load_overview(OverviewSelection())
 
     assert receipt.status is ImportStatus.COMMITTED
@@ -288,9 +305,9 @@ def test_cumulative_exports_are_idempotent_and_preserve_measurement_versions(
     )
 
     with HealthLab.open(config) as health_lab:
-        first = health_lab.import_health_export(base)
-        duplicate = health_lab.import_health_export(base)
-        cumulative = health_lab.import_health_export(expanded)
+        first = _execute_import(health_lab, base)
+        duplicate = _execute_import(health_lab, base)
+        cumulative = _execute_import(health_lab, expanded)
         overview = health_lab.load_overview(OverviewSelection())
 
     assert first.status is ImportStatus.COMMITTED
@@ -339,7 +356,7 @@ def test_interrupted_import_keeps_snapshot_and_is_quarantined_on_restart(
         real_store=tmp_path / "real-store",
     )
     with HealthLab.open(config) as health_lab:
-        committed = health_lab.import_health_export(base)
+        committed = _execute_import(health_lab, base)
         before = health_lab.load_overview(OverviewSelection())
 
     process = get_context("spawn").Process(
@@ -353,8 +370,11 @@ def test_interrupted_import_keeps_snapshot_and_is_quarantined_on_restart(
     while time.monotonic() < deadline:
         with HealthLab.open(config) as health_lab:
             before_attempt = health_lab.load_overview(OverviewSelection())
-            candidate = health_lab.import_health_export(base)
-        if candidate.status is ImportStatus.STORE_BUSY:
+            candidate = _execute_import(health_lab, base)
+        if (
+            isinstance(candidate, WriteNotStarted)
+            and candidate.status is WriteNotStartedStatus.STORE_BUSY
+        ):
             busy = candidate
             before_busy = before_attempt
             os.kill(process.pid, signal.SIGSTOP)
@@ -372,7 +392,7 @@ def test_interrupted_import_keeps_snapshot_and_is_quarantined_on_restart(
         os.kill(process.pid, signal.SIGKILL)
         process.join(timeout=5)
     assert not process.is_alive()
-    assert busy.status is ImportStatus.STORE_BUSY
+    assert busy.status is WriteNotStartedStatus.STORE_BUSY
     assert during == before_busy
 
     with HealthLab.open(config) as health_lab:

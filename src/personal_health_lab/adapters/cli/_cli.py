@@ -4,7 +4,7 @@ import argparse
 import json
 import logging
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date
 from pathlib import Path
 
@@ -17,10 +17,17 @@ from personal_health_lab.application import (
     ConfigurationError,
     DataMode,
     HealthLab,
+    ImportHealthExport,
+    ImportReceipt,
     ImportStatus,
     Overview,
     OverviewSelection,
+    PlanFingerprint,
     RestingHeartRateAnalysisConfig,
+    WriteApprovalStatus,
+    WriteNotStarted,
+    WritePlan,
+    WriteReceipt,
 )
 
 
@@ -53,6 +60,8 @@ def _parser() -> argparse.ArgumentParser:
     import_command = commands.add_parser("import", help="Apple-Health-Export importieren")
     import_command.add_argument("package", type=Path)
     import_command.add_argument("--json", action="store_true", dest="as_json")
+    import_command.add_argument("--execute", action="store_true")
+    import_command.add_argument("--expect-plan", type=PlanFingerprint)
     analysis = commands.add_parser("analyze", help="Verzögerungsprofil analysieren")
     analysis.add_argument("--definition", default="lag-signal-v1")
     analysis.add_argument("--start-date", type=date.fromisoformat)
@@ -131,8 +140,75 @@ def _analysis_json(overview: Overview) -> dict[str, object] | None:
     }
 
 
+def _write_plan_json(plan: WritePlan, runtime_config: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "approval": {"status": plan.approval.status.value},
+        "details": {
+            "package_hash": plan.details.package_hash,
+            "package_size": plan.details.package_size,
+        },
+        "diagnostics": plan.diagnostics,
+        "fingerprint": str(plan.fingerprint),
+        "kind": "write_plan",
+        "request": {"package": "<redacted>", "type": "import_health_export"},
+        "runtime_config": dict(runtime_config),
+        "schema_version": "2.0",
+    }
+
+
+def _write_receipt_json(
+    receipt: WriteReceipt, runtime_config: Mapping[str, object]
+) -> dict[str, object]:
+    result = receipt.result
+    if isinstance(result, ImportReceipt):
+        result_json: dict[str, object] = {
+            "anomaly_count": result.anomaly_count,
+            "diagnostics": result.diagnostics,
+            "import_id": str(result.import_id),
+            "logical_measurement_count": result.logical_measurement_count,
+            "measurement_version_count": result.measurement_version_count,
+            "package_hash": result.package_hash,
+            "package_record_count": result.package_record_count,
+            "record_count": result.record_count,
+            "snapshot_ref": str(result.snapshot_ref) if result.snapshot_ref else None,
+            "status": result.status.value,
+            "type": "import_health_export",
+        }
+    else:
+        result_json = {
+            "diagnostics": result.diagnostics,
+            "status": result.status.value,
+            "type": "write_not_started",
+        }
+    return {
+        "diagnostics": receipt.diagnostics,
+        "final_preflight": {
+            "approval": {"status": receipt.final_preflight.approval.status.value},
+            "diagnostics": receipt.final_preflight.diagnostics,
+        },
+        "kind": "write_receipt",
+        "operation_id": str(receipt.operation_id),
+        "plan_fingerprint": str(receipt.plan_fingerprint),
+        "result": result_json,
+        "runtime_config": dict(runtime_config),
+        "schema_version": "2.0",
+    }
+
+
+def _print_write_plan(plan: WritePlan) -> None:
+    print(f"Schreibvorschau: {plan.approval.status.value}")
+    print(f"Plan-Fingerprint: {plan.fingerprint}")
+    print("Diagnosen: " + (", ".join(plan.diagnostics) or "-"))
+
+
 def main(args: Sequence[str] | None = None) -> int:
-    parsed = _parser().parse_args(args)
+    parser = _parser()
+    parsed = parser.parse_args(args)
+    if parsed.command == "import":
+        if parsed.execute and not parsed.as_json:
+            parser.error("--execute ist nur zusammen mit --json zulässig.")
+        if parsed.execute != (parsed.expect_plan is not None):
+            parser.error("--execute und --expect-plan müssen gemeinsam angegeben werden.")
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
     try:
         config = load_runtime_config(
@@ -143,7 +219,28 @@ def main(args: Sequence[str] | None = None) -> int:
         )
         with HealthLab.open(config) as health_lab:
             if parsed.command == "import":
-                import_receipt = health_lab.import_health_export(parsed.package)
+                import_request = ImportHealthExport(parsed.package)
+                import_plan = health_lab.preview_write(import_request)
+                import_write_receipt = None
+                if parsed.execute:
+                    assert parsed.expect_plan is not None
+                    import_write_receipt = health_lab.execute_write(
+                        import_request,
+                        expected_plan=parsed.expect_plan,
+                    )
+                elif (
+                    not parsed.as_json
+                    and import_plan.approval.status is not WriteApprovalStatus.BLOCKED
+                ):
+                    _print_write_plan(import_plan)
+                    if input("Health-Exportimport ausführen? [j/N] ").strip().lower() in {
+                        "j",
+                        "ja",
+                    }:
+                        import_write_receipt = health_lab.execute_write(
+                            import_request,
+                            expected_plan=import_plan.fingerprint,
+                        )
             elif parsed.command == "analyze":
                 analysis_receipt = health_lab.run_resting_hr_analysis(
                     RestingHeartRateAnalysisConfig(
@@ -176,10 +273,7 @@ def main(args: Sequence[str] | None = None) -> int:
         "synthetic_store": "<redacted>",
     }
     if not parsed.as_json:
-        print(
-            "Konfiguration: "
-            + json.dumps(runtime_config, ensure_ascii=False, sort_keys=True)
-        )
+        print("Konfiguration: " + json.dumps(runtime_config, ensure_ascii=False, sort_keys=True))
     if parsed.command == "analyze" and parsed.as_json:
         print(
             json.dumps(
@@ -237,32 +331,22 @@ def main(args: Sequence[str] | None = None) -> int:
                 f"Guardrail {diagnostics.association_guardrail}"
             )
     elif parsed.command == "import" and parsed.as_json:
-        print(
-            json.dumps(
-                {
-                    "anomaly_count": import_receipt.anomaly_count,
-                    "diagnostics": import_receipt.diagnostics,
-                    "import_id": str(import_receipt.import_id),
-                    "operation_id": str(import_receipt.operation_id),
-                    "package_hash": import_receipt.package_hash,
-                    "package_record_count": import_receipt.package_record_count,
-                    "record_count": import_receipt.record_count,
-                    "logical_measurement_count": import_receipt.logical_measurement_count,
-                    "measurement_version_count": import_receipt.measurement_version_count,
-                    "runtime_config": runtime_config,
-                    "schema_version": "1.0",
-                    "snapshot_ref": (
-                        str(import_receipt.snapshot_ref) if import_receipt.snapshot_ref else None
-                    ),
-                    "status": import_receipt.status.value,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            )
+        output = (
+            _write_plan_json(import_plan, runtime_config)
+            if import_write_receipt is None
+            else _write_receipt_json(import_write_receipt, runtime_config)
         )
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
     elif parsed.command == "import":
-        print(f"Health-Exportimport: {import_receipt.status.value}")
-        print(f"Importierte Records: {import_receipt.record_count}")
+        if import_plan.approval.status is WriteApprovalStatus.BLOCKED:
+            _print_write_plan(import_plan)
+        if import_write_receipt is None:
+            print("Health-Exportimport nicht ausgeführt.")
+        elif isinstance(import_write_receipt.result, ImportReceipt):
+            print(f"Health-Exportimport: {import_write_receipt.result.status.value}")
+            print(f"Importierte Records: {import_write_receipt.result.record_count}")
+        else:
+            print(f"Health-Exportimport: {import_write_receipt.result.status.value}")
     elif parsed.as_json:
         print(
             json.dumps(
@@ -331,9 +415,13 @@ def main(args: Sequence[str] | None = None) -> int:
         AnalysisStatus.REUSED,
     }:
         return 3
-    if parsed.command == "import" and import_receipt.status not in {
-        ImportStatus.COMMITTED,
-        ImportStatus.DUPLICATE,
-    }:
-        return 3
+    if parsed.command == "import":
+        if import_write_receipt is None:
+            return 3 if import_plan.approval.status is WriteApprovalStatus.BLOCKED else 0
+        result = import_write_receipt.result
+        if isinstance(result, WriteNotStarted) or result.status not in {
+            ImportStatus.COMMITTED,
+            ImportStatus.DUPLICATE,
+        }:
+            return 3
     return 0
