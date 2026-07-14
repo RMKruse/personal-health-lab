@@ -1,7 +1,13 @@
 """Public application interface used by every production adapter."""
 
 from personal_health_lab import DataMode
-from personal_health_lab.health_import import ImportId, OperationId
+from personal_health_lab.health_import import (
+    CanonicalHealthType,
+    CanonicalUnit,
+    ImportId,
+    MeasurementVersionId,
+    OperationId,
+)
 from personal_health_lab.health_import import SnapshotId as SnapshotRef
 from personal_health_lab.overview import (
     AssociationInterval,
@@ -32,6 +38,7 @@ from ._application import (
     AnalysisReceipt,
     AnalysisStatus,
     ConfigurationError,
+    CreatePlausibilityRuleVersion,
     DataQualityStatus,
     DataReview,
     DataReviewCase,
@@ -55,6 +62,13 @@ from ._application import (
     ModelMaturityStatus,
     PlanFingerprint,
     PlausibilityReason,
+    PlausibilityRule,
+    PlausibilityRuleRecommendation,
+    PlausibilityRules,
+    PlausibilityRuleSpecification,
+    PlausibilityRuleVersion,
+    PlausibilityRuleVersionPlan,
+    PlausibilityRuleVersionReceipt,
     ResolveDataReviewCase,
     RestingHeartRateAnalysisConfig,
     ReviewReasonCode,
@@ -89,10 +103,13 @@ __all__ = [
     "AnalysisRunId",
     "AnalysisStatus",
     "AssociationInterval",
+    "CanonicalHealthType",
+    "CanonicalUnit",
     "CapacityCheck",
     "CapacityReason",
     "CapacityStatus",
     "ConfigurationError",
+    "CreatePlausibilityRuleVersion",
     "DataMode",
     "DataQualityStatus",
     "DataReview",
@@ -118,6 +135,7 @@ __all__ = [
     "ImportId",
     "ImportReceipt",
     "ImportStatus",
+    "MeasurementVersionId",
     "ModelMaturityStatus",
     "OperationId",
     "Overview",
@@ -126,6 +144,13 @@ __all__ = [
     "PersonBindingStatus",
     "PlanFingerprint",
     "PlausibilityReason",
+    "PlausibilityRule",
+    "PlausibilityRuleRecommendation",
+    "PlausibilityRuleSpecification",
+    "PlausibilityRuleVersion",
+    "PlausibilityRuleVersionPlan",
+    "PlausibilityRuleVersionReceipt",
+    "PlausibilityRules",
     "ResolveDataReviewCase",
     "RestingHeartRateAnalysisConfig",
     "ReviewReasonCode",

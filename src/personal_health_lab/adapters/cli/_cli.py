@@ -5,7 +5,7 @@ import json
 import logging
 import sys
 from collections.abc import Mapping, Sequence
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from personal_health_lab.adapters._config import load_runtime_config
@@ -14,12 +14,17 @@ from personal_health_lab.application import (
     AnalysisProvenance,
     AnalysisStatus,
     AssociationInterval,
+    CanonicalHealthType,
+    CanonicalUnit,
     CapacityCheck,
     ConfigurationError,
+    CreatePlausibilityRuleVersion,
     DataMode,
     DataReview,
     DataReviewCaseDetail,
     DataReviewCaseId,
+    DataReviewDecisionId,
+    DataReviewDecisionPlan,
     DataReviewSelection,
     FileVaultCheck,
     HealthLab,
@@ -27,15 +32,29 @@ from personal_health_lab.application import (
     ImportHealthExportPlan,
     ImportReceipt,
     ImportStatus,
+    MeasurementVersionId,
     Overview,
     OverviewSelection,
     PlanFingerprint,
+    PlausibilityRules,
+    PlausibilityRuleSpecification,
+    PlausibilityRuleVersionPlan,
+    PlausibilityRuleVersionReceipt,
+    ResolveDataReviewCase,
     RestingHeartRateAnalysisConfig,
+    RevokeDataReviewDecision,
+    SingleDecisionTarget,
+    SourceConflictResolution,
+    SourceConflictStrategy,
+    SourceDeletionResolution,
+    SourceDeletionVerdict,
     WorkspaceStatus,
     WriteApprovalStatus,
+    WriteDecisionReceipt,
     WriteNotStarted,
     WritePlan,
     WriteReceipt,
+    WriteRequest,
 )
 
 
@@ -77,7 +96,76 @@ def _parser() -> argparse.ArgumentParser:
     analysis.add_argument("--json", action="store_true", dest="as_json")
     review = commands.add_parser("review", help="Offene Datenprüffälle laden")
     review.add_argument("--json", action="store_true", dest="as_json")
+    rules = commands.add_parser("rules", help="Plausibilitätsregeln laden")
+    rules.add_argument("--json", action="store_true", dest="as_json")
+    rule = commands.add_parser("rule", help="Neue Plausibilitätsregelversion anlegen")
+    rule.add_argument("data_type", type=CanonicalHealthType, choices=tuple(CanonicalHealthType))
+    rule.add_argument("--unit", required=True, type=CanonicalUnit, choices=tuple(CanonicalUnit))
+    rule.add_argument("--lower", type=float)
+    rule.add_argument("--upper", type=float)
+    rule.add_argument("--personal", action="store_true")
+    rule.add_argument("--effective-from", required=True, type=datetime.fromisoformat)
+    rule.add_argument("--recommendation")
+    rule.add_argument("--json", action="store_true", dest="as_json")
+    rule.add_argument("--execute", action="store_true")
+    rule.add_argument("--expect-plan", type=PlanFingerprint)
+    resolve = commands.add_parser("review-resolve", help="Datenprüffall auflösen")
+    resolve.add_argument("case_id", type=DataReviewCaseId)
+    resolve.add_argument("--deletion-verdict", type=SourceDeletionVerdict)
+    resolve.add_argument("--conflict-strategy", type=SourceConflictStrategy)
+    resolve.add_argument("--preferred-version")
+    resolve.add_argument("--note")
+    resolve.add_argument("--json", action="store_true", dest="as_json")
+    resolve.add_argument("--execute", action="store_true")
+    resolve.add_argument("--expect-plan", type=PlanFingerprint)
+    revoke = commands.add_parser("review-revoke", help="Datenprüfentscheidung widerrufen")
+    revoke.add_argument("decision_id", type=DataReviewDecisionId)
+    revoke.add_argument("--reason", required=True)
+    revoke.add_argument("--json", action="store_true", dest="as_json")
+    revoke.add_argument("--execute", action="store_true")
+    revoke.add_argument("--expect-plan", type=PlanFingerprint)
     return parser
+
+
+def _plausibility_rules_json(rules: PlausibilityRules) -> dict[str, object]:
+    return {
+        "rules": [
+            {
+                "data_type": rule.data_type.value,
+                "recommendation": {
+                    "recommendation_id": rule.recommendation.recommendation_id,
+                    "specification": _rule_specification_json(rule.recommendation.specification),
+                },
+                "versions": [
+                    {
+                        "created_at": version.created_at.isoformat(),
+                        "effective_from": (
+                            None
+                            if version.effective_from is None
+                            else version.effective_from.isoformat()
+                        ),
+                        "effective_offset_minutes": version.effective_offset_minutes,
+                        "effective_timezone": version.effective_timezone,
+                        "recommendation_id": version.recommendation_id,
+                        "specification": _rule_specification_json(version.specification),
+                        "version_id": version.version_id,
+                    }
+                    for version in rule.versions
+                ],
+            }
+            for rule in rules.rules
+        ]
+    }
+
+
+def _rule_specification_json(specification: PlausibilityRuleSpecification) -> dict[str, object]:
+    return {
+        "active": specification.active,
+        "fixed_lower_bound": specification.fixed_lower_bound,
+        "fixed_upper_bound": specification.fixed_upper_bound,
+        "personal_range_enabled": specification.personal_range_enabled,
+        "unit": specification.unit.value,
+    }
 
 
 def _data_review_json(
@@ -258,14 +346,42 @@ def _write_plan_json(
     runtime_config: Mapping[str, object],
     workspace: WorkspaceStatus,
 ) -> dict[str, object]:
-    assert isinstance(plan.details, ImportHealthExportPlan)
+    details = plan.details
+    if isinstance(details, ImportHealthExportPlan):
+        detail_json: dict[str, object] = {
+            "package_hash": details.package_hash,
+            "package_size": details.package_size,
+            "type": "import_health_export",
+        }
+        request_json: dict[str, object] = {
+            "package": "<redacted>",
+            "type": "import_health_export",
+        }
+    elif isinstance(details, PlausibilityRuleVersionPlan):
+        detail_json = {
+            "active_snapshot_ref": (
+                None if details.active_snapshot_ref is None else str(details.active_snapshot_ref)
+            ),
+            "previous_version_id": details.previous_version_id,
+            "proposed_version_id": details.proposed_version_id,
+            "type": "create_plausibility_rule_version",
+        }
+        request_json = {"type": "create_plausibility_rule_version"}
+    elif isinstance(details, DataReviewDecisionPlan):
+        detail_json = {
+            "active_snapshot_ref": (
+                None if details.active_snapshot_ref is None else str(details.active_snapshot_ref)
+            ),
+            "case_id": None if details.case_id is None else str(details.case_id),
+            "type": "data_review_decision",
+        }
+        request_json = {"type": "data_review_decision"}
+    else:
+        raise TypeError("Nicht unterstützte Schreibplandetails.")
     return {
         "approval": {"status": plan.approval.status.value},
         "confirmations": tuple(item.value for item in plan.confirmations),
-        "details": {
-            "package_hash": plan.details.package_hash,
-            "package_size": plan.details.package_size,
-        },
+        "details": detail_json,
         "diagnostics": plan.diagnostics,
         "fingerprint": str(plan.fingerprint),
         "kind": "write_plan",
@@ -273,7 +389,7 @@ def _write_plan_json(
             "capacity": _capacity_json(plan.preflight.capacity),
             "filevault": _filevault_json(plan.preflight.filevault),
         },
-        "request": {"package": "<redacted>", "type": "import_health_export"},
+        "request": request_json,
         "runtime_config": dict(runtime_config),
         "schema_version": "2.0",
         "workspace": _workspace_json(workspace),
@@ -298,6 +414,22 @@ def _write_receipt_json(
             "snapshot_ref": str(result.snapshot_ref) if result.snapshot_ref else None,
             "status": result.status.value,
             "type": "import_health_export",
+        }
+    elif isinstance(result, PlausibilityRuleVersionReceipt):
+        result_json = {
+            "diagnostics": result.diagnostics,
+            "rule_version_id": result.rule_version_id,
+            "snapshot_ref": None if result.snapshot_ref is None else str(result.snapshot_ref),
+            "status": result.status.value,
+            "type": "create_plausibility_rule_version",
+        }
+    elif isinstance(result, WriteDecisionReceipt):
+        result_json = {
+            "decision_id": str(result.decision_id),
+            "diagnostics": result.diagnostics,
+            "snapshot_ref": str(result.snapshot_ref),
+            "status": result.status.value,
+            "type": "data_review_decision",
         }
     else:
         result_json = {
@@ -359,12 +491,18 @@ def _print_write_plan(plan: WritePlan, workspace: WorkspaceStatus) -> None:
 def main(args: Sequence[str] | None = None) -> int:
     parser = _parser()
     parsed = parser.parse_args(args)
-    if parsed.command == "import":
+    write_commands = {"import", "rule", "review-resolve", "review-revoke"}
+    if parsed.command in write_commands:
         if parsed.execute and not parsed.as_json:
             parser.error("--execute ist nur zusammen mit --json zulässig.")
         if parsed.execute != (parsed.expect_plan is not None):
             parser.error("--execute und --expect-plan müssen gemeinsam angegeben werden.")
+    if parsed.command == "review-resolve" and (
+        (parsed.deletion_verdict is None) == (parsed.conflict_strategy is None)
+    ):
+        parser.error("Genau eine Auflösungsart muss angegeben werden.")
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
+    decision_request: WriteRequest
     try:
         config = load_runtime_config(
             explicit_mode=parsed.mode,
@@ -397,6 +535,80 @@ def main(args: Sequence[str] | None = None) -> int:
                             import_request,
                             expected_plan=import_plan.fingerprint,
                         )
+            elif parsed.command == "rule":
+                rule_request = CreatePlausibilityRuleVersion(
+                    parsed.data_type,
+                    PlausibilityRuleSpecification(
+                        parsed.unit, parsed.lower, parsed.upper, parsed.personal
+                    ),
+                    parsed.effective_from,
+                    parsed.recommendation,
+                )
+                rule_plan = health_lab.preview_write(rule_request)
+                rule_write_receipt = None
+                if parsed.execute:
+                    assert parsed.expect_plan is not None
+                    rule_write_receipt = health_lab.execute_write(
+                        rule_request, expected_plan=parsed.expect_plan
+                    )
+                elif (
+                    not parsed.as_json
+                    and rule_plan.approval.status is not WriteApprovalStatus.BLOCKED
+                    and input("Regelversion anlegen? [j/N] ").strip().lower() in {"j", "ja"}
+                ):
+                    rule_write_receipt = health_lab.execute_write(
+                        rule_request, expected_plan=rule_plan.fingerprint
+                    )
+            elif parsed.command == "review-resolve":
+                decision_request = ResolveDataReviewCase(
+                    parsed.case_id,
+                    SourceDeletionResolution(parsed.deletion_verdict, parsed.note)
+                    if parsed.deletion_verdict is not None
+                    else SourceConflictResolution(
+                        parsed.conflict_strategy,
+                        None
+                        if parsed.preferred_version is None
+                        else MeasurementVersionId(parsed.preferred_version),
+                        parsed.note,
+                    ),
+                )
+                decision_plan = health_lab.preview_write(decision_request)
+                decision_write_receipt = None
+                if parsed.execute:
+                    assert parsed.expect_plan is not None
+                    decision_write_receipt = health_lab.execute_write(
+                        decision_request, expected_plan=parsed.expect_plan
+                    )
+                elif (
+                    not parsed.as_json
+                    and decision_plan.approval.status is not WriteApprovalStatus.BLOCKED
+                    and input("Datenprüffall auflösen? [j/N] ").strip().lower() in {"j", "ja"}
+                ):
+                    decision_write_receipt = health_lab.execute_write(
+                        decision_request, expected_plan=decision_plan.fingerprint
+                    )
+            elif parsed.command == "review-revoke":
+                decision_request = RevokeDataReviewDecision(
+                    SingleDecisionTarget(parsed.decision_id), parsed.reason
+                )
+                decision_plan = health_lab.preview_write(decision_request)
+                decision_write_receipt = None
+                if parsed.execute:
+                    assert parsed.expect_plan is not None
+                    decision_write_receipt = health_lab.execute_write(
+                        decision_request, expected_plan=parsed.expect_plan
+                    )
+                elif (
+                    not parsed.as_json
+                    and decision_plan.approval.status is not WriteApprovalStatus.BLOCKED
+                    and input("Datenprüfentscheidung widerrufen? [j/N] ").strip().lower()
+                    in {"j", "ja"}
+                ):
+                    decision_write_receipt = health_lab.execute_write(
+                        decision_request, expected_plan=decision_plan.fingerprint
+                    )
+            elif parsed.command == "rules":
+                plausibility_rules = health_lab.load_plausibility_rules()
             elif parsed.command == "analyze":
                 analysis_receipt = health_lab.run_resting_hr_analysis(
                     RestingHeartRateAnalysisConfig(
@@ -508,6 +720,49 @@ def main(args: Sequence[str] | None = None) -> int:
             print(f"Importierte Records: {import_write_receipt.result.record_count}")
         else:
             print(f"Health-Exportimport: {import_write_receipt.result.status.value}")
+    elif parsed.command == "rule" and parsed.as_json:
+        output = (
+            _write_plan_json(rule_plan, runtime_config, workspace_status)
+            if rule_write_receipt is None
+            else _write_receipt_json(rule_write_receipt, runtime_config)
+        )
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+    elif parsed.command == "rule":
+        if rule_write_receipt is None:
+            _print_write_plan(rule_plan, workspace_status)
+        else:
+            print(f"Regelversion: {rule_write_receipt.result.status.value}")
+    elif parsed.command in {"review-resolve", "review-revoke"} and parsed.as_json:
+        output = (
+            _write_plan_json(decision_plan, runtime_config, workspace_status)
+            if decision_write_receipt is None
+            else _write_receipt_json(decision_write_receipt, runtime_config)
+        )
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+    elif parsed.command in {"review-resolve", "review-revoke"}:
+        if decision_write_receipt is None:
+            _print_write_plan(decision_plan, workspace_status)
+        else:
+            print(f"Datenprüfentscheidung: {decision_write_receipt.result.status.value}")
+    elif parsed.command == "rules" and parsed.as_json:
+        print(
+            json.dumps(
+                {
+                    **_plausibility_rules_json(plausibility_rules),
+                    "runtime_config": runtime_config,
+                    "schema_version": "2.0",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    elif parsed.command == "rules":
+        for rule in plausibility_rules.rules:
+            active = rule.active_version
+            print(
+                f"{rule.data_type.value}: {active.version_id} ab "
+                f"{active.effective_from or '-'} · aktiv {active.specification.active}"
+            )
     elif parsed.command == "review" and parsed.as_json:
         print(
             json.dumps(
@@ -608,7 +863,15 @@ def main(args: Sequence[str] | None = None) -> int:
         AnalysisStatus.REUSED,
     }:
         return 3
-    if parsed.command == "import":
+    if parsed.command in write_commands:
+        if parsed.command == "rule":
+            if rule_write_receipt is None:
+                return 3 if rule_plan.approval.status is WriteApprovalStatus.BLOCKED else 0
+            return 3 if isinstance(rule_write_receipt.result, WriteNotStarted) else 0
+        if parsed.command in {"review-resolve", "review-revoke"}:
+            if decision_write_receipt is None:
+                return 3 if decision_plan.approval.status is WriteApprovalStatus.BLOCKED else 0
+            return 3 if isinstance(decision_write_receipt.result, WriteNotStarted) else 0
         if import_write_receipt is None:
             return 3 if import_plan.approval.status is WriteApprovalStatus.BLOCKED else 0
         result = import_write_receipt.result

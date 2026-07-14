@@ -45,6 +45,21 @@ def test_streamlit_translates_invalid_configuration(
     )
 
 
+def test_streamlit_projects_plausibility_rules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
+    monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(tmp_path / "synthetic"))
+    monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(tmp_path / "real"))
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
+
+    app = AppTest.from_file(str(app_path)).run()
+
+    assert not app.exception
+    assert any(expander.label == "Plausibilitätsregeln" for expander in app.expander)
+    assert any("apple_resting_heart_rate" in item.value for item in app.caption)
+
+
 def test_streamlit_shows_imported_daily_series(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

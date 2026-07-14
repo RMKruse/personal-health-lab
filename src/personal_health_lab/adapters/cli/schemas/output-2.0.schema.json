@@ -11,6 +11,9 @@
     },
     {
       "$ref": "#/$defs/dataReviewOutput"
+    },
+    {
+      "$ref": "#/$defs/plausibilityRulesOutput"
     }
   ],
   "$defs": {
@@ -19,6 +22,16 @@
         "string",
         "null"
       ]
+    },
+    "plausibilityRulesOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rules", "runtime_config", "schema_version"],
+      "properties": {
+        "rules": {"type": "array", "items": {"type": "object"}},
+        "runtime_config": {"$ref": "#/$defs/runtimeConfig"},
+        "schema_version": {"const": "2.0"}
+      }
     },
     "runtimeConfig": {
       "type": "object",
@@ -384,6 +397,30 @@
         }
       }
     },
+    "plausibilityRuleResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["diagnostics", "rule_version_id", "snapshot_ref", "status", "type"],
+      "properties": {
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "rule_version_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "snapshot_ref": {"$ref": "#/$defs/nullableString"},
+        "status": {"const": "committed"},
+        "type": {"const": "create_plausibility_rule_version"}
+      }
+    },
+    "dataReviewDecisionResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision_id", "diagnostics", "snapshot_ref", "status", "type"],
+      "properties": {
+        "decision_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "snapshot_ref": {"type": "string"},
+        "status": {"const": "committed"},
+        "type": {"const": "data_review_decision"}
+      }
+    },
     "writePlanOutput": {
       "type": "object",
       "additionalProperties": false,
@@ -417,21 +454,36 @@
           }
         },
         "details": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "package_hash",
-            "package_size"
-          ],
-          "properties": {
-            "package_hash": {
-              "type": "string"
+          "oneOf": [
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["package_hash", "package_size", "type"],
+              "properties": {
+                "package_hash": {"type": "string"},
+                "package_size": {"type": "integer", "minimum": 0},
+                "type": {"const": "import_health_export"}
+              }
             },
-            "package_size": {
-              "type": "integer",
-              "minimum": 0
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["active_snapshot_ref", "previous_version_id", "proposed_version_id", "type"],
+              "properties": {
+                "active_snapshot_ref": {"$ref": "#/$defs/nullableString"},
+                "previous_version_id": {"$ref": "#/$defs/nullableString"},
+                "proposed_version_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "type": {"const": "create_plausibility_rule_version"}
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["active_snapshot_ref", "case_id", "type"],
+              "properties": {
+                "active_snapshot_ref": {"$ref": "#/$defs/nullableString"},
+                "case_id": {"$ref": "#/$defs/nullableString"},
+                "type": {"const": "data_review_decision"}
+              }
             }
-          }
+          ]
         },
         "diagnostics": {
           "type": "array",
@@ -456,20 +508,23 @@
           }
         },
         "request": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "package",
-            "type"
-          ],
-          "properties": {
-            "package": {
-              "const": "<redacted>"
+          "oneOf": [
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["package", "type"],
+              "properties": {
+                "package": {"const": "<redacted>"},
+                "type": {"const": "import_health_export"}
+              }
             },
-            "type": {
-              "const": "import_health_export"
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["type"],
+              "properties": {
+                "type": {"enum": ["create_plausibility_rule_version", "data_review_decision"]}
+              }
             }
-          }
+          ]
         },
         "runtime_config": {
           "$ref": "#/$defs/runtimeConfig"
@@ -559,6 +614,12 @@
             },
             {
               "$ref": "#/$defs/writeNotStarted"
+            },
+            {
+              "$ref": "#/$defs/plausibilityRuleResult"
+            },
+            {
+              "$ref": "#/$defs/dataReviewDecisionResult"
             }
           ]
         },

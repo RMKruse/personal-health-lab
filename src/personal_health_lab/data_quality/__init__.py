@@ -15,6 +15,8 @@ from personal_health_lab.storage import (
     LocalStore,
     MeasurementVersionFact,
     OpenDataReviewCase,
+    OperationId,
+    PlausibilityRuleRecord,
     ResolvedMeasurement,
     ReviewCaseId,
     ReviewCycleRecord,
@@ -48,59 +50,75 @@ class ReviewReason:
     unit: str
 
 
-@dataclass(frozen=True, slots=True)
-class _FixedPlausibilityRule:
-    version_id: str
-    source_type: str
-    effective_from: datetime
-    lower_bound: float
-    upper_bound: float | None
-
-
 _FIXED_RULES = (
-    _FixedPlausibilityRule(
+    PlausibilityRuleRecord(
         "fixed-plausibility/v1",
         "apple_resting_heart_rate",
-        datetime.min.replace(tzinfo=UTC),
+        "count/min",
         20.0,
         250.0,
+        True,
+        None,
+        datetime(1970, 1, 1, tzinfo=UTC),
     ),
-    _FixedPlausibilityRule(
+    PlausibilityRuleRecord(
         "fixed-plausibility/v1",
         "active_energy",
-        datetime.min.replace(tzinfo=UTC),
+        "kcal",
         0.0,
         None,
+        False,
+        None,
+        datetime(1970, 1, 1, tzinfo=UTC),
     ),
 )
 
 
-def _rule_at(source_type: str, measured_at: datetime) -> _FixedPlausibilityRule | None:
+def _rule_at(
+    source_type: str,
+    measured_at: datetime,
+    rules: tuple[PlausibilityRuleRecord, ...],
+) -> PlausibilityRuleRecord | None:
     return max(
         (
             rule
-            for rule in _FIXED_RULES
-            if rule.source_type == source_type and rule.effective_from <= measured_at
+            for rule in rules
+            if rule.data_type == source_type
+            and (rule.effective_from is None or rule.effective_from <= measured_at)
         ),
-        key=lambda rule: rule.effective_from,
+        key=lambda rule: datetime.min.replace(tzinfo=UTC)
+        if rule.effective_from is None
+        else rule.effective_from.astimezone(UTC),
         default=None,
     )
 
 
 def _plausibility_reasons(
-    rule: _FixedPlausibilityRule,
+    rule: PlausibilityRuleRecord,
     value: float,
     unit: str,
     personal_bounds: tuple[float, float] | None = None,
 ) -> tuple[ReviewReason, ...]:
     reasons = []
-    if value < rule.lower_bound:
+    if rule.fixed_lower_bound is not None and value < rule.fixed_lower_bound:
         reasons.append(
-            ReviewReason("below_fixed_lower_bound", rule.lower_bound, rule.upper_bound, unit)
+            ReviewReason(
+                "below_fixed_lower_bound",
+                rule.fixed_lower_bound,
+                rule.fixed_upper_bound,
+                unit,
+            )
         )
-    if rule.upper_bound is not None and value > rule.upper_bound:
+    if rule.fixed_upper_bound is not None and value > rule.fixed_upper_bound:
         reasons.append(
-            ReviewReason("above_fixed_upper_bound", rule.lower_bound, rule.upper_bound, unit)
+            ReviewReason(
+                "above_fixed_upper_bound",
+                rule.fixed_lower_bound
+                if rule.fixed_lower_bound is not None
+                else rule.fixed_upper_bound,
+                rule.fixed_upper_bound,
+                unit,
+            )
         )
     if personal_bounds is not None and value < personal_bounds[0]:
         reasons.append(ReviewReason("below_personal_lower_bound", *personal_bounds, unit))
@@ -110,7 +128,7 @@ def _plausibility_reasons(
 
 
 def _personal_bounds(
-    rule: _FixedPlausibilityRule,
+    rule: PlausibilityRuleRecord,
     current_day: date,
     daily_values: tuple[tuple[date, float], ...],
     unit: str,
@@ -196,6 +214,7 @@ def resolve_sources(
     imported_measurement_version_ids: tuple[str, ...] = (),
     unknown_source_types: tuple[str, ...] = (),
     suppressed_deletion_ids: frozenset[str] = frozenset(),
+    plausibility_rules: tuple[PlausibilityRuleRecord, ...] = _FIXED_RULES,
 ) -> SourceResolution:
     """Resolve effective source values and expose identity contradictions."""
     version_by_id = {item.measurement_version_id: item for item in versions}
@@ -306,7 +325,12 @@ def resolve_sources(
             governing_export_id,
             suppressed_deletion_ids,
         ),
-        *_plausibility_cases(version_by_id, measurements, imported_measurement_version_ids),
+        *_plausibility_cases(
+            version_by_id,
+            measurements,
+            imported_measurement_version_ids,
+            plausibility_rules,
+        ),
         *(_unknown_rule_case(source_type) for source_type in sorted(set(unknown_source_types))),
     )
     previous_case_ids = {item.review_case_id for item in previous_review_cases}
@@ -349,6 +373,7 @@ def _plausibility_cases(
     version_by_id: dict[str, MeasurementVersionFact],
     measurements: tuple[ResolvedMeasurement, ...],
     imported_measurement_version_ids: tuple[str, ...],
+    rules: tuple[PlausibilityRuleRecord, ...] = _FIXED_RULES,
 ) -> tuple[OpenDataReviewCase, ...]:
     cases = []
     daily = _effective_daily_resting_hr(version_by_id, measurements)
@@ -363,14 +388,15 @@ def _plausibility_cases(
     for version_id in sorted(set(imported_measurement_version_ids)):
         version = version_by_id[version_id]
         measured_at = datetime.fromisoformat(version.source_start_utc)
-        rule = _rule_at(version.canonical_type, measured_at)
+        rule = _rule_at(version.canonical_type, measured_at, rules)
         if rule is None:
             continue
         reasons = list(_plausibility_reasons(rule, version.canonical_value, version.canonical_unit))
         measurement = measurement_by_version.get(version_id)
         selected = daily.get(version.measurement_local_date)
         if (
-            version.canonical_type == "apple_resting_heart_rate"
+            rule.personal_range_enabled
+            and version.canonical_type == "apple_resting_heart_rate"
             and measurement is not None
             and measurement.effective_value is not None
             and selected is not None
@@ -414,6 +440,107 @@ def _plausibility_cases(
             )
         )
     return tuple(cases)
+
+
+def evaluate_plausibility_cases(
+    versions: tuple[MeasurementVersionFact, ...],
+    measurements: tuple[ResolvedMeasurement, ...],
+    measurement_version_ids: tuple[str, ...],
+    rules: tuple[PlausibilityRuleRecord, ...],
+) -> tuple[OpenDataReviewCase, ...]:
+    return _plausibility_cases(
+        {version.measurement_version_id: version for version in versions},
+        measurements,
+        measurement_version_ids,
+        rules,
+    )
+
+
+def plausibility_rule_recommendations() -> tuple[PlausibilityRuleRecord, ...]:
+    return tuple(
+        replace(rule, recommendation_id="builtin-plausibility/v1") for rule in _FIXED_RULES
+    )
+
+
+def load_plausibility_rule_state(store: LocalStore) -> tuple[PlausibilityRuleRecord, ...]:
+    return store.load_plausibility_rule_versions()
+
+
+def create_plausibility_rule_version(
+    store: LocalStore,
+    *,
+    operation_id: OperationId,
+    version_id: str,
+    data_type: str,
+    unit: str,
+    fixed_lower_bound: float | None,
+    fixed_upper_bound: float | None,
+    personal_range_enabled: bool,
+    effective_from: datetime | None,
+    recommendation_id: str | None,
+) -> tuple[PlausibilityRuleRecord, SnapshotId | None]:
+    timezone_name = (
+        None
+        if effective_from is None
+        else getattr(effective_from.tzinfo, "key", effective_from.tzname())
+    )
+    offset = None if effective_from is None else effective_from.utcoffset()
+    _active, versions, measurements = store.load_active_plausibility_facts()
+    selected_ids = {
+        measurement.selected_measurement_version_id
+        for measurement in measurements
+        if measurement.disposition.startswith("included")
+        and measurement.effective_value is not None
+    }
+    target_ids = tuple(
+        version.measurement_version_id
+        for version in versions
+        if version.measurement_version_id in selected_ids
+        and version.canonical_type == data_type
+        and (
+            effective_from is None
+            or datetime.fromisoformat(version.source_start_utc) >= effective_from
+        )
+    )
+    cases = evaluate_plausibility_cases(
+        versions,
+        measurements,
+        target_ids,
+        (
+            *store.load_plausibility_rule_versions(),
+            PlausibilityRuleRecord(
+                version_id=version_id,
+                data_type=data_type,
+                unit=unit,
+                fixed_lower_bound=fixed_lower_bound,
+                fixed_upper_bound=fixed_upper_bound,
+                personal_range_enabled=personal_range_enabled,
+                effective_from=effective_from,
+                created_at=datetime.now(UTC),
+                recommendation_id=recommendation_id,
+                effective_timezone=timezone_name,
+                effective_offset_minutes=(
+                    None if offset is None else int(offset.total_seconds() // 60)
+                ),
+            ),
+        ),
+    )
+    return store.create_plausibility_rule_version(
+        operation_id=operation_id,
+        version_id=version_id,
+        data_type=data_type,
+        unit=unit,
+        fixed_lower_bound=fixed_lower_bound,
+        fixed_upper_bound=fixed_upper_bound,
+        personal_range_enabled=personal_range_enabled,
+        effective_from=effective_from,
+        effective_timezone=timezone_name,
+        effective_offset_minutes=(None if offset is None else int(offset.total_seconds() // 60)),
+        recommendation_id=recommendation_id,
+        replaced_measurement_version_ids=target_ids,
+        cases=cases,
+        cycle_status="open" if cases else "closed",
+    )
 
 
 def _unknown_rule_case(source_type: str) -> OpenDataReviewCase:
@@ -600,7 +727,11 @@ def load_review_case_detail(store: LocalStore, review_case_id: str) -> ReviewCas
     version = store.load_measurement_version_fact(case.measurement_version_id)
     if version is None:
         raise ValueError("Quellmessungsversion des Datenprüffalls fehlt.")
-    rule = _rule_at(version.canonical_type, datetime.fromisoformat(version.source_start_utc))
+    rule = _rule_at(
+        version.canonical_type,
+        datetime.fromisoformat(version.source_start_utc),
+        store.load_plausibility_rule_versions(),
+    )
     if rule is None or rule.version_id != case.rule_version_id:
         raise ValueError("Plausibilitätsregel des Datenprüffalls fehlt.")
     resolved = store.load_resolved_measurement(version.logical_measurement_id)

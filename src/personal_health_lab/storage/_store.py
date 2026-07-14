@@ -746,6 +746,21 @@ class SourceTypeRuleRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class PlausibilityRuleRecord:
+    version_id: str
+    data_type: str
+    unit: str
+    fixed_lower_bound: float | None
+    fixed_upper_bound: float | None
+    personal_range_enabled: bool
+    effective_from: datetime | None
+    created_at: datetime
+    recommendation_id: str | None = None
+    effective_timezone: str | None = None
+    effective_offset_minutes: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class StoredReviewCycleId:
     value: str
 
@@ -819,7 +834,8 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             ),
             request_kind TEXT NOT NULL CHECK (
                 request_kind IN ('import_health_export', 'resolve_data_review_case',
-                                 'revoke_data_review_decision')
+                                 'revoke_data_review_decision',
+                                 'create_plausibility_rule_version')
             ),
             started_at_utc TEXT NOT NULL CHECK (
                 length(started_at_utc) >= 20 AND substr(started_at_utc, 11, 1) = 'T'
@@ -853,7 +869,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(snapshot_id),
             previous_snapshot_id TEXT REFERENCES dataset_snapshots(snapshot_id),
             activation_kind TEXT NOT NULL CHECK (
-                activation_kind IN ('import', 'data_review_decision')
+                activation_kind IN ('import', 'data_review_decision', 'rule_version')
             ),
             activated_at_utc TEXT NOT NULL CHECK (
                 length(activated_at_utc) >= 20 AND substr(activated_at_utc, 11, 1) = 'T'
@@ -902,6 +918,37 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                 rule_kind IN ('identity', 'mapping', 'plausibility')
             )
         ) STRICT;
+        CREATE TABLE IF NOT EXISTS plausibility_rule_versions (
+            rule_version_id TEXT NOT NULL REFERENCES rule_version_refs(rule_version_id),
+            data_type TEXT NOT NULL CHECK (
+                data_type IN ('active_energy', 'apple_resting_heart_rate')
+            ),
+            canonical_unit TEXT NOT NULL CHECK (canonical_unit IN ('kcal', 'count/min')),
+            fixed_lower_bound REAL,
+            fixed_upper_bound REAL,
+            personal_range_enabled INTEGER NOT NULL CHECK (personal_range_enabled IN (0, 1)),
+            effective_from TEXT,
+            effective_timezone TEXT,
+            effective_offset_minutes INTEGER,
+            created_at TEXT NOT NULL,
+            recommendation_id TEXT,
+            PRIMARY KEY (rule_version_id, data_type),
+            CHECK (fixed_lower_bound IS NULL OR fixed_lower_bound = fixed_lower_bound),
+            CHECK (fixed_upper_bound IS NULL OR fixed_upper_bound = fixed_upper_bound),
+            CHECK (fixed_lower_bound IS NULL OR fixed_upper_bound IS NULL
+                   OR fixed_lower_bound < fixed_upper_bound)
+        ) STRICT;
+        CREATE UNIQUE INDEX IF NOT EXISTS one_initial_plausibility_rule
+        ON plausibility_rule_versions(data_type) WHERE effective_from IS NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS one_plausibility_rule_per_boundary
+        ON plausibility_rule_versions(data_type, effective_from)
+        WHERE effective_from IS NOT NULL;
+        CREATE TRIGGER IF NOT EXISTS plausibility_rule_versions_no_update
+        BEFORE UPDATE ON plausibility_rule_versions
+        BEGIN SELECT RAISE(ABORT, 'plausibility rules are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS plausibility_rule_versions_no_delete
+        BEFORE DELETE ON plausibility_rule_versions
+        BEGIN SELECT RAISE(ABORT, 'plausibility rules are append-only'); END;
         CREATE TABLE IF NOT EXISTS source_type_catalog (
             source_type TEXT PRIMARY KEY,
             review_case_id TEXT NOT NULL UNIQUE CHECK (
@@ -914,7 +961,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                 length(cycle_id) = 32 AND cycle_id NOT GLOB '*[^0-9a-f]*'
             ),
             snapshot_id TEXT NOT NULL UNIQUE REFERENCES dataset_snapshots(snapshot_id),
-            cycle_kind TEXT NOT NULL CHECK (cycle_kind = 'import'),
+            cycle_kind TEXT NOT NULL CHECK (cycle_kind IN ('import', 'rule_version')),
             status TEXT NOT NULL CHECK (status IN ('open', 'closed')),
             open_case_count INTEGER NOT NULL CHECK (open_case_count >= 0),
             CHECK (
@@ -1048,6 +1095,38 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             (_IDENTITY_RULE_VERSION, "identity"),
             (_MAPPING_RULE_VERSION, "mapping"),
             (_FIXED_PLAUSIBILITY_RULE_VERSION, "plausibility"),
+        ),
+    )
+    metadata.executemany(
+        "INSERT OR IGNORE INTO plausibility_rule_versions VALUES "
+        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            (
+                _FIXED_PLAUSIBILITY_RULE_VERSION,
+                "apple_resting_heart_rate",
+                "count/min",
+                20.0,
+                250.0,
+                1,
+                None,
+                None,
+                None,
+                "1970-01-01T00:00:00+00:00",
+                None,
+            ),
+            (
+                _FIXED_PLAUSIBILITY_RULE_VERSION,
+                "active_energy",
+                "kcal",
+                0.0,
+                None,
+                0,
+                None,
+                None,
+                None,
+                "1970-01-01T00:00:00+00:00",
+                None,
+            ),
         ),
     )
     import_columns = {
@@ -2034,6 +2113,7 @@ class LocalStore:
                     "WHERE active = 1"
                 ).fetchall()
             ),
+            plausibility_rules=self.load_plausibility_rule_versions(),
         )
         self._query.execute(
             "CREATE OR REPLACE TEMP TABLE resolved_measurements ("
@@ -2928,6 +3008,8 @@ class LocalStore:
         selected_measurement_version_id: str | None,
         candidate_version_ids: tuple[str, ...],
         reopened_case: tuple[str, str, str] | None = None,
+        replacement_plausibility_cases: tuple[OpenDataReviewCase, ...] = (),
+        replaced_measurement_version_ids: tuple[str, ...] = (),
     ) -> str:
         parent = self._root / _PARQUET_DIRECTORY / "snapshots" / str(parent_snapshot_id)
         staging = self._root / "staging" / str(operation_id)
@@ -2938,7 +3020,34 @@ class LocalStore:
             self._query.execute(
                 f"CREATE OR REPLACE TEMP TABLE {table} AS SELECT * FROM read_parquet('{escaped}')"
             )
-        if action == "revoke":
+        if action == "rule_version":
+            if replaced_measurement_version_ids:
+                placeholders = ",".join("?" for _ in replaced_measurement_version_ids)
+                self._query.execute(
+                    f"DELETE FROM open_review_cases WHERE case_kind = 'plausibility' "
+                    f"AND measurement_version_id IN ({placeholders})",
+                    replaced_measurement_version_ids,
+                )
+            if replacement_plausibility_cases:
+                self._query.executemany(
+                    "INSERT INTO open_review_cases VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        (
+                            case.review_case_id,
+                            case.kind,
+                            None
+                            if case.logical_measurement_id is None
+                            else str(case.logical_measurement_id),
+                            None
+                            if case.measurement_version_id is None
+                            else str(case.measurement_version_id),
+                            case.rule_version_id,
+                            case.evidence_fingerprint,
+                        )
+                        for case in replacement_plausibility_cases
+                    ),
+                )
+        elif action == "revoke":
             self._query.execute(
                 "DELETE FROM resolved_measurements WHERE effective_decision_id = ? "
                 "OR conflict_resolution_decision_id = ?",
@@ -3151,6 +3260,10 @@ class LocalStore:
         previous_snapshot_id: SnapshotId,
         manifest_sha256: str,
         completed_at: str,
+        *,
+        activation_kind: Literal["data_review_decision", "rule_version"] = (
+            "data_review_decision"
+        ),
     ) -> None:
         staging = self._root / "staging" / str(operation_id)
         snapshot = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
@@ -3167,12 +3280,13 @@ class LocalStore:
             ),
         )
         self._metadata.execute(
-            "INSERT INTO snapshot_activations VALUES (?, ?, ?, ?, 'data_review_decision', ?)",
+            "INSERT INTO snapshot_activations VALUES (?, ?, ?, ?, ?, ?)",
             (
                 uuid4().hex,
                 str(operation_id),
                 str(snapshot_id),
                 str(previous_snapshot_id),
+                activation_kind,
                 completed_at,
             ),
         )
@@ -3349,6 +3463,194 @@ class LocalStore:
                 "FROM review_cycles ORDER BY rowid"
             ).fetchall()
         )
+
+    def load_plausibility_rule_versions(self) -> tuple[PlausibilityRuleRecord, ...]:
+        self._require_open()
+        return tuple(
+            PlausibilityRuleRecord(
+                version_id=str(row[0]),
+                data_type=str(row[1]),
+                unit=str(row[2]),
+                fixed_lower_bound=None if row[3] is None else float(row[3]),
+                fixed_upper_bound=None if row[4] is None else float(row[4]),
+                personal_range_enabled=bool(row[5]),
+                effective_from=None if row[6] is None else datetime.fromisoformat(str(row[6])),
+                created_at=datetime.fromisoformat(str(row[9])),
+                recommendation_id=None if row[10] is None else str(row[10]),
+                effective_timezone=None if row[7] is None else str(row[7]),
+                effective_offset_minutes=None if row[8] is None else int(row[8]),
+            )
+            for row in self._metadata.execute(
+                "SELECT rule_version_id, data_type, canonical_unit, fixed_lower_bound, "
+                "fixed_upper_bound, personal_range_enabled, effective_from, "
+                "effective_timezone, effective_offset_minutes, created_at, recommendation_id "
+                "FROM plausibility_rule_versions "
+                "ORDER BY data_type, effective_from IS NOT NULL, effective_from, created_at"
+            ).fetchall()
+        )
+
+    def create_plausibility_rule_version(
+        self,
+        *,
+        operation_id: OperationId,
+        version_id: str,
+        data_type: str,
+        unit: str,
+        fixed_lower_bound: float | None,
+        fixed_upper_bound: float | None,
+        personal_range_enabled: bool,
+        effective_from: datetime | None,
+        effective_timezone: str | None,
+        effective_offset_minutes: int | None,
+        recommendation_id: str | None,
+        replaced_measurement_version_ids: tuple[str, ...],
+        cases: tuple[OpenDataReviewCase, ...],
+        cycle_status: Literal["open", "closed"],
+    ) -> tuple[PlausibilityRuleRecord, SnapshotId | None]:
+        self._require_open()
+        self._require_writer()
+        existing = tuple(
+            rule
+            for rule in self.load_plausibility_rule_versions()
+            if rule.data_type == data_type
+        )
+        if (not existing) != (effective_from is None):
+            raise StoreError("Nur die erste Regelversion darf ohne Gültigkeitsbeginn sein.")
+        if existing and effective_from is not None:
+            latest = existing[-1].effective_from
+            if latest is not None and effective_from <= latest:
+                raise StoreError("Regelgültigkeitsgrenzen müssen streng steigen.")
+        created_at = datetime.now(UTC)
+        active = self.load_active_snapshot_id()
+        snapshot_id = None if active is None else SnapshotId(uuid4().hex)
+        manifest_sha256 = None
+        audit_position = int(
+            self._metadata.execute(
+                "SELECT COALESCE(MAX(audit_position), 0) FROM audit_events"
+            ).fetchone()[0]
+        )
+        try:
+            with self._metadata:
+                self._metadata.execute(
+                    "INSERT INTO write_operations VALUES "
+                    "(?, 'create_plausibility_rule_version', ?, ?, 'committed', 1)",
+                    (str(operation_id), created_at.isoformat(), created_at.isoformat()),
+                )
+                self._metadata.execute(
+                    "INSERT INTO rule_version_refs VALUES (?, 'plausibility')", (version_id,)
+                )
+                self._metadata.execute(
+                    "INSERT INTO plausibility_rule_versions VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        version_id,
+                        data_type,
+                        unit,
+                        fixed_lower_bound,
+                        fixed_upper_bound,
+                        int(personal_range_enabled),
+                        None if effective_from is None else effective_from.isoformat(),
+                        effective_timezone,
+                        effective_offset_minutes,
+                        created_at.isoformat(),
+                        recommendation_id,
+                    ),
+                )
+                if active is not None and snapshot_id is not None:
+                    manifest_sha256 = self._stage_review_snapshot(
+                        parent_snapshot_id=active,
+                        snapshot_id=snapshot_id,
+                        operation_id=operation_id,
+                        audit_position=audit_position,
+                        review_case_id="",
+                        decision_id="",
+                        action="rule_version",
+                        selected_measurement_version_id=None,
+                        candidate_version_ids=(),
+                        replacement_plausibility_cases=cases,
+                        replaced_measurement_version_ids=replaced_measurement_version_ids,
+                    )
+                    assert manifest_sha256 is not None
+                    self._activate_review_snapshot(
+                        operation_id,
+                        snapshot_id,
+                        active,
+                        manifest_sha256,
+                        created_at.isoformat(),
+                        activation_kind="rule_version",
+                    )
+                    self._metadata.execute(
+                        "INSERT INTO review_cycles VALUES (?, ?, 'rule_version', ?, ?)",
+                        (uuid4().hex, str(snapshot_id), cycle_status, len(cases)),
+                    )
+        except Exception:
+            shutil.rmtree(self._root / "staging" / str(operation_id), ignore_errors=True)
+            if snapshot_id is not None:
+                shutil.rmtree(
+                    self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id),
+                    ignore_errors=True,
+                )
+            raise
+        record = PlausibilityRuleRecord(
+            version_id,
+            data_type,
+            unit,
+            fixed_lower_bound,
+            fixed_upper_bound,
+            personal_range_enabled,
+            effective_from,
+            created_at,
+            recommendation_id,
+            effective_timezone,
+            effective_offset_minutes,
+        )
+        return record, snapshot_id
+
+    def load_active_plausibility_facts(
+        self,
+    ) -> tuple[
+        SnapshotId | None,
+        tuple[MeasurementVersionFact, ...],
+        tuple[ResolvedMeasurement, ...],
+    ]:
+        self._require_open()
+        active = self.load_active_snapshot_id()
+        if active is None:
+            return None, (), ()
+        directory = self._root / _PARQUET_DIRECTORY / "snapshots" / str(active)
+        versions_path = str(directory / "measurement_versions.parquet").replace("'", "''")
+        resolved_path = str(directory / "resolved_measurements.parquet").replace("'", "''")
+        versions = tuple(
+            MeasurementVersionFact(
+                measurement_version_id=str(row[0]),
+                logical_measurement_id=str(row[1]),
+                canonical_type=str(row[2]),
+                canonical_unit=str(row[3]),
+                canonical_value=float(row[4]),
+                source_start_utc=str(row[5]),
+                source_end_utc=str(row[6]),
+                source_updated_at_utc=str(row[7]),
+                source_version=str(row[8]),
+                source_name=str(row[9]),
+                device=str(row[10]),
+                strong_source_id_hash=None if row[11] is None else str(row[11]),
+                measurement_local_date=row[12],
+            )
+            for row in self._query.execute(
+                "SELECT measurement_version_id, identity_candidate_id, canonical_type, "
+                "canonical_unit, canonical_value, source_start_utc, source_end_utc, "
+                "source_updated_at_utc, source_version, source_name, device, "
+                "strong_source_id_hash, measurement_local_date "
+                f"FROM read_parquet('{versions_path}')"
+            ).fetchall()
+        )
+        measurements = tuple(
+            ResolvedMeasurement(*row)
+            for row in self._query.execute(
+                f"SELECT * FROM read_parquet('{resolved_path}')"
+            ).fetchall()
+        )
+        return active, versions, measurements
 
     def load_measurement_version_fact(
         self, measurement_version_id: MeasurementVersionId

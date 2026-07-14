@@ -1,28 +1,42 @@
 from __future__ import annotations
 
 import math
-from datetime import UTC, date, datetime, timedelta
+from collections.abc import Callable
+from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
+from zoneinfo import ZoneInfo
+
+import pytest
 
 from personal_health_lab.application import (
+    ConfigurationError,
+    CreatePlausibilityRuleVersion,
     DataMode,
     DataQualityStatus,
     DataReviewCaseKind,
     DataReviewCycleStatus,
     DataReviewSelection,
     HealthLab,
+    HealthLabError,
     ImportHealthExport,
     ImportReceipt,
     OverviewSelection,
+    PlausibilityRuleSpecification,
+    PlausibilityRuleVersionReceipt,
     RuntimeConfig,
+    WriteNotStarted,
+    WriteNotStartedStatus,
 )
 from personal_health_lab.data_quality import resolve_sources
+from personal_health_lab.health_data import CanonicalHealthType, CanonicalUnit
 from personal_health_lab.storage import (
     ExportFact,
+    LocalStore,
     MeasurementVersionFact,
     ResolvedMeasurement,
     SourceOccurrenceFact,
+    StoreError,
 )
 
 
@@ -40,10 +54,11 @@ def _package(
     *,
     export_date: datetime,
     measurement_start: datetime = datetime(2024, 1, 1, 7, tzinfo=UTC),
+    measurement_step: timedelta = timedelta(days=1),
 ) -> Path:
     rows = []
     for index, (source_type, unit, value, sync_id) in enumerate(records):
-        measured_at = measurement_start + timedelta(days=index)
+        measured_at = measurement_start + measurement_step * index
         rows.append(
             f'<Record type="{source_type}" sourceName="Test Watch" sourceVersion="1" '
             f'device="Test Device" unit="{unit}" '
@@ -380,3 +395,260 @@ def test_unknown_source_type_is_cataloged_and_requests_a_rule_once(tmp_path: Pat
         DataReviewCycleStatus.CLOSED,
     ]
     assert review.status is DataQualityStatus.PROVISIONAL
+
+
+def test_plausibility_rule_versions_are_typed_immutable_and_time_bound(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    monday = datetime(2024, 2, 12, tzinfo=datetime.now().astimezone().tzinfo)
+
+    with HealthLab.open(config) as health_lab:
+        initial = health_lab.load_plausibility_rules()
+        resting = next(
+            rule
+            for rule in initial.rules
+            if rule.data_type is CanonicalHealthType.APPLE_RESTING_HEART_RATE
+        )
+        original = resting.versions[0]
+        assert original.effective_from is None
+
+        for unit, lower, upper in (
+            (CanonicalUnit.BEATS_PER_MINUTE, math.nan, 200),
+            (CanonicalUnit.BEATS_PER_MINUTE, 30, math.inf),
+            (CanonicalUnit.KILOCALORIE, 30, 200),
+            (CanonicalUnit.BEATS_PER_MINUTE, 200, 30),
+        ):
+            with pytest.raises(ConfigurationError):
+                CreatePlausibilityRuleVersion(
+                    CanonicalHealthType.APPLE_RESTING_HEART_RATE,
+                    PlausibilityRuleSpecification(unit, lower, upper),
+                    monday,
+                )
+        assert health_lab.load_plausibility_rules() == initial
+
+        request = CreatePlausibilityRuleVersion(
+            CanonicalHealthType.APPLE_RESTING_HEART_RATE,
+            PlausibilityRuleSpecification(
+                CanonicalUnit.BEATS_PER_MINUTE,
+                30,
+                200,
+                personal_range_enabled=True,
+            ),
+            monday,
+        )
+        plan = health_lab.preview_write(request)
+        receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+        assert isinstance(receipt.result, PlausibilityRuleVersionReceipt)
+        assert receipt.result.status == "committed"
+
+        changed = health_lab.load_plausibility_rules()
+        resting = next(
+            rule
+            for rule in changed.rules
+            if rule.data_type is CanonicalHealthType.APPLE_RESTING_HEART_RATE
+        )
+        assert resting.versions[0] == original
+        assert resting.active_version.specification == request.specification
+        assert resting.active_version.effective_from == monday
+        assert resting.active_version.effective_timezone is not None
+        assert resting.active_version.effective_offset_minutes is not None
+        assert resting.recommendation.specification != resting.active_version.specification
+
+        adopt = CreatePlausibilityRuleVersion(
+            resting.data_type,
+            resting.recommendation.specification,
+            monday + timedelta(days=7),
+            resting.recommendation.recommendation_id,
+        )
+        plan = health_lab.preview_write(adopt)
+        receipt = health_lab.execute_write(adopt, expected_plan=plan.fingerprint)
+        assert isinstance(receipt.result, PlausibilityRuleVersionReceipt)
+        resting = next(
+            rule
+            for rule in health_lab.load_plausibility_rules().rules
+            if rule.data_type is CanonicalHealthType.APPLE_RESTING_HEART_RATE
+        )
+        assert resting.active_version.recommendation_id == "builtin-plausibility/v1"
+
+
+def test_rule_plan_fingerprint_binds_the_named_timezone(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    specification = PlausibilityRuleSpecification(
+        CanonicalUnit.BEATS_PER_MINUTE, 30, 200
+    )
+    previewed = CreatePlausibilityRuleVersion(
+        CanonicalHealthType.APPLE_RESTING_HEART_RATE,
+        specification,
+        datetime(2024, 2, 12, tzinfo=ZoneInfo("Europe/Berlin")),
+    )
+    changed = CreatePlausibilityRuleVersion(
+        CanonicalHealthType.APPLE_RESTING_HEART_RATE,
+        specification,
+        datetime(2024, 2, 12, tzinfo=timezone(timedelta(hours=1))),
+    )
+
+    with HealthLab.open(config) as health_lab:
+        plan = health_lab.preview_write(previewed)
+        receipt = health_lab.execute_write(changed, expected_plan=plan.fingerprint)
+        versions = next(
+            rule.versions
+            for rule in health_lab.load_plausibility_rules().rules
+            if rule.data_type is CanonicalHealthType.APPLE_RESTING_HEART_RATE
+        )
+
+    assert isinstance(receipt.result, WriteNotStarted)
+    assert receipt.result.status is WriteNotStartedStatus.PLAN_CHANGED
+    assert len(versions) == 1
+
+
+def test_rule_version_and_required_recheck_commit_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    package = _package(
+        tmp_path / "atomic.zip",
+        [("HKQuantityTypeIdentifierRestingHeartRate", "count/min", 25, "current")],
+        export_date=datetime(2024, 2, 15, tzinfo=UTC),
+        measurement_start=datetime(2024, 2, 13, 7, tzinfo=UTC),
+    )
+    with HealthLab.open(config) as health_lab:
+        _execute_import(health_lab, package)
+        before = health_lab.load_plausibility_rules()
+        request = CreatePlausibilityRuleVersion(
+            CanonicalHealthType.APPLE_RESTING_HEART_RATE,
+            PlausibilityRuleSpecification(CanonicalUnit.BEATS_PER_MINUTE, 30, 200),
+            datetime(2024, 2, 12, tzinfo=timezone(timedelta(hours=1))),
+        )
+        plan = health_lab.preview_write(request)
+        monkeypatch.setattr(
+            LocalStore,
+            "_stage_review_snapshot",
+            lambda *args, **kwargs: (_ for _ in ()).throw(StoreError("stage failed")),
+        )
+        with pytest.raises(HealthLabError, match="nicht gespeichert"):
+            health_lab.execute_write(request, expected_plan=plan.fingerprint)
+
+    with HealthLab.open(config) as health_lab:
+        assert health_lab.load_plausibility_rules() == before
+
+
+def test_deactivation_and_reactivation_leave_a_time_bound_gap(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    zone = datetime.now().astimezone().tzinfo
+    deactivated_at = datetime(2024, 2, 12, tzinfo=zone)
+    reactivated_at = datetime(2024, 2, 19, tzinfo=zone)
+
+    with HealthLab.open(config) as health_lab:
+        deactivate = CreatePlausibilityRuleVersion(
+            CanonicalHealthType.APPLE_RESTING_HEART_RATE,
+            PlausibilityRuleSpecification(CanonicalUnit.BEATS_PER_MINUTE),
+            deactivated_at,
+        )
+        plan = health_lab.preview_write(deactivate)
+        health_lab.execute_write(deactivate, expected_plan=plan.fingerprint)
+
+        reactivate = CreatePlausibilityRuleVersion(
+            CanonicalHealthType.APPLE_RESTING_HEART_RATE,
+            PlausibilityRuleSpecification(CanonicalUnit.BEATS_PER_MINUTE, 20, 250),
+            reactivated_at,
+        )
+        plan = health_lab.preview_write(reactivate)
+        health_lab.execute_write(reactivate, expected_plan=plan.fingerprint)
+        versions = next(
+            rule.versions
+            for rule in health_lab.load_plausibility_rules().rules
+            if rule.data_type is CanonicalHealthType.APPLE_RESTING_HEART_RATE
+        )
+
+    assert versions[-2].specification.active is False
+    assert versions[-1].specification.active is True
+    assert versions[-2].effective_from == deactivated_at
+    assert versions[-1].effective_from == reactivated_at
+
+
+def test_imports_use_the_stored_rule_timeline_without_backfilling_inactive_weeks(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    zone = timezone(timedelta(hours=1))
+
+    with HealthLab.open(config) as health_lab:
+        for effective_from, lower in (
+            (datetime(2024, 2, 12, tzinfo=zone), 30.0),
+            (datetime(2024, 2, 19, tzinfo=zone), None),
+            (datetime(2024, 2, 26, tzinfo=zone), 30.0),
+        ):
+            request = CreatePlausibilityRuleVersion(
+                CanonicalHealthType.APPLE_RESTING_HEART_RATE,
+                PlausibilityRuleSpecification(
+                    CanonicalUnit.BEATS_PER_MINUTE,
+                    lower,
+                    200.0 if lower is not None else None,
+                ),
+                effective_from,
+            )
+            plan = health_lab.preview_write(request)
+            health_lab.execute_write(request, expected_plan=plan.fingerprint)
+
+        package = _package(
+            tmp_path / "timeline.zip",
+            [
+                ("HKQuantityTypeIdentifierRestingHeartRate", "count/min", 10, "inactive"),
+                ("HKQuantityTypeIdentifierRestingHeartRate", "count/min", 10, "active"),
+            ],
+            export_date=datetime(2024, 3, 1, tzinfo=UTC),
+            measurement_start=datetime(2024, 2, 20, 7, tzinfo=UTC),
+            measurement_step=timedelta(days=7),
+        )
+        receipt = _execute_import(health_lab, package)
+        review = health_lab.load_data_review(DataReviewSelection())
+
+    assert receipt.anomaly_count == 1
+    assert len(review.cases) == 1
+
+
+def test_rule_change_reevaluates_only_measurements_since_its_local_week_boundary(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    package = _package(
+        tmp_path / "current-week.zip",
+        [("HKQuantityTypeIdentifierRestingHeartRate", "count/min", 25, "current")],
+        export_date=datetime(2024, 2, 15, tzinfo=UTC),
+        measurement_start=datetime(2024, 2, 13, 7, tzinfo=UTC),
+    )
+    with HealthLab.open(config) as health_lab:
+        imported = _execute_import(health_lab, package)
+        request = CreatePlausibilityRuleVersion(
+            CanonicalHealthType.APPLE_RESTING_HEART_RATE,
+            PlausibilityRuleSpecification(CanonicalUnit.BEATS_PER_MINUTE, 30, 200),
+            datetime(2024, 2, 12, tzinfo=timezone(timedelta(hours=1))),
+        )
+        plan = health_lab.preview_write(request)
+        receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+        review = health_lab.load_data_review(DataReviewSelection())
+
+    assert imported.anomaly_count == 0
+    assert isinstance(receipt.result, PlausibilityRuleVersionReceipt)
+    assert receipt.result.snapshot_ref != imported.snapshot_ref
+    assert len(review.cases) == 1
+    assert review.cases[0].rule_version_id == receipt.result.rule_version_id
+
+
+def test_rule_change_ignores_non_effective_conflict_candidates(
+    tmp_path: Path, source_conflict_package: Callable[[Path], Path]
+) -> None:
+    config = _config(tmp_path)
+    with HealthLab.open(config) as health_lab:
+        _execute_import(health_lab, source_conflict_package(tmp_path / "conflict.zip"))
+        request = CreatePlausibilityRuleVersion(
+            CanonicalHealthType.APPLE_RESTING_HEART_RATE,
+            PlausibilityRuleSpecification(CanonicalUnit.BEATS_PER_MINUTE, 20, 60.5),
+            datetime(2024, 1, 1, tzinfo=timezone(timedelta(hours=1))),
+        )
+        plan = health_lab.preview_write(request)
+        health_lab.execute_write(request, expected_plan=plan.fingerprint)
+        review = health_lab.load_data_review(DataReviewSelection())
+
+    assert [case.kind for case in review.cases] == [DataReviewCaseKind.SOURCE_CONFLICT]

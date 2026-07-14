@@ -94,7 +94,26 @@ REGISTERED_CASES.update(
         "V02-A-RULE-009": (
             "test_personal_range_uses_previous_effective_days_and_keeps_earlier_findings"
         ),
+        **{
+            f"V02-A-RULE-{number:03d}": (
+                "test_plausibility_rule_versions_are_typed_immutable_and_time_bound"
+            )
+            for number in range(10, 16)
+        },
+        "V02-A-RULE-016": (
+            "test_imports_use_the_stored_rule_timeline_without_backfilling_inactive_weeks"
+        ),
+        "V02-A-RULE-017": (
+            "test_rule_change_reevaluates_only_measurements_since_its_local_week_boundary"
+        ),
+        "V02-A-RULE-018": (
+            "test_deactivation_and_reactivation_leave_a_time_bound_gap"
+        ),
+        "V02-A-RULE-019": (
+            "test_imports_use_the_stored_rule_timeline_without_backfilling_inactive_weeks"
+        ),
         "V02-A-RULE-021": "test_late_measurement_uses_the_rule_for_its_measurement_time",
+        "V02-A-RULE-022": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
         "V02-A-RULE-025": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
         "V02-A-RULE-026": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
         "V02-A-RULE-027": "test_unknown_source_type_is_cataloged_and_requests_a_rule_once",

@@ -108,6 +108,57 @@ def test_cli_projects_source_conflicts_from_the_shared_data_review(
     assert output["cases"][0]["detail"]["reasons"] == []
 
 
+def test_cli_maps_data_review_plan_receipt_and_revocation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    source_conflict_package: Callable[[Path], Path],
+) -> None:
+    common = [
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(tmp_path / "synthetic"),
+        "--real-store",
+        str(tmp_path / "real"),
+    ]
+    package = source_conflict_package(tmp_path / "conflict.zip")
+    assert _execute_json_import(common, package, capsys)[0] == 0
+    assert main([*common, "review", "--json"]) == 0
+    case = json.loads(capsys.readouterr().out)["cases"][0]
+    args = [
+        *common,
+        "review-resolve",
+        case["case_id"],
+        "--conflict-strategy",
+        "prefer",
+        "--preferred-version",
+        case["candidate_version_ids"][0],
+        "--json",
+    ]
+    assert main(args) == 0
+    plan = json.loads(capsys.readouterr().out)
+    _assert_json_contract(plan)
+    assert plan["details"]["type"] == "data_review_decision"
+    assert main([*args, "--execute", "--expect-plan", plan["fingerprint"]]) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    _assert_json_contract(receipt)
+    decision_id = receipt["result"]["decision_id"]
+
+    revoke = [
+        *common,
+        "review-revoke",
+        decision_id,
+        "--reason",
+        "test",
+        "--json",
+    ]
+    assert main(revoke) == 0
+    plan = json.loads(capsys.readouterr().out)
+    _assert_json_contract(plan)
+    assert main([*revoke, "--execute", "--expect-plan", plan["fingerprint"]]) == 0
+    _assert_json_contract(json.loads(capsys.readouterr().out))
+
+
 def test_cli_projects_the_personal_range_finding(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -182,7 +233,50 @@ def test_real_json_import_renders_shared_confirmation_plan(
     assert plan["workspace"]["mode"] == "real"
     assert plan["workspace"]["person_binding"] == "unbound"
     assert len(plan["workspace"]["store_id"]) == 32
-    assert plan["workspace"]["allowed_writes"] == ["import_health_export"]
+    assert plan["workspace"]["allowed_writes"] == [
+        "import_health_export",
+        "create_plausibility_rule_version",
+    ]
+
+
+def test_cli_projects_and_creates_plausibility_rule_versions(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    common = [
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(tmp_path / "synthetic"),
+        "--real-store",
+        str(tmp_path / "real"),
+    ]
+    assert main([*common, "rules", "--json"]) == 0
+    rules = json.loads(capsys.readouterr().out)
+    _assert_json_contract(rules)
+    assert len(rules["rules"]) == 2
+
+    args = [
+        *common,
+        "rule",
+        "apple_resting_heart_rate",
+        "--unit",
+        "count/min",
+        "--lower",
+        "30",
+        "--upper",
+        "200",
+        "--effective-from",
+        "2024-02-12T00:00:00+01:00",
+        "--json",
+    ]
+    assert main(args) == 0
+    plan = json.loads(capsys.readouterr().out)
+    _assert_json_contract(plan)
+    assert plan["details"]["type"] == "create_plausibility_rule_version"
+    assert main([*args, "--execute", "--expect-plan", plan["fingerprint"]]) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    _assert_json_contract(receipt)
+    assert receipt["result"]["status"] == "committed"
 
 
 def test_cli_returns_expected_incomplete_for_rejected_import(

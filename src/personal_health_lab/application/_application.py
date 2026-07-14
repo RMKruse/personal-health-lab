@@ -13,8 +13,16 @@ from typing import Literal, Self
 from uuid import uuid4
 
 from personal_health_lab import DataMode
-from personal_health_lab.data_quality import load_review_case_detail, load_review_state
+from personal_health_lab.data_quality import (
+    create_plausibility_rule_version,
+    load_plausibility_rule_state,
+    load_review_case_detail,
+    load_review_state,
+    plausibility_rule_recommendations,
+)
 from personal_health_lab.health_import import (
+    CanonicalHealthType,
+    CanonicalUnit,
     HealthExportEstimate,
     HealthImportError,
     ImportId,
@@ -85,8 +93,12 @@ class WorkspaceStatus:
         "overview",
         "data_review",
         "data_review_case",
+        "plausibility_rules",
     )
-    allowed_writes: tuple[str, ...] = ("import_health_export",)
+    allowed_writes: tuple[str, ...] = (
+        "import_health_export",
+        "create_plausibility_rule_version",
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +178,93 @@ class ImportHealthExport:
         object.__setattr__(self, "package_path", self.package_path.expanduser().resolve())
 
 
+@dataclass(frozen=True, slots=True)
+class PlausibilityRuleSpecification:
+    unit: CanonicalUnit
+    fixed_lower_bound: float | None = None
+    fixed_upper_bound: float | None = None
+    personal_range_enabled: bool = False
+
+    def __post_init__(self) -> None:
+        bounds = (self.fixed_lower_bound, self.fixed_upper_bound)
+        if not isinstance(self.unit, CanonicalUnit):
+            raise ConfigurationError("Plausibilitätsregeleinheit hat einen ungültigen Typ.")
+        if any(value is not None and not math.isfinite(value) for value in bounds):
+            raise ConfigurationError("Plausibilitätsgrenzen müssen endlich sein.")
+        if (
+            self.fixed_lower_bound is not None
+            and self.fixed_upper_bound is not None
+            and self.fixed_lower_bound >= self.fixed_upper_bound
+        ):
+            raise ConfigurationError("Untere Plausibilitätsgrenze muss kleiner sein.")
+
+    @property
+    def active(self) -> bool:
+        return (
+            self.fixed_lower_bound is not None
+            or self.fixed_upper_bound is not None
+            or self.personal_range_enabled
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CreatePlausibilityRuleVersion:
+    data_type: CanonicalHealthType
+    specification: PlausibilityRuleSpecification
+    effective_from: datetime | None
+    recommendation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.data_type, CanonicalHealthType):
+            raise ConfigurationError("Plausibilitätsregeltyp hat einen ungültigen Typ.")
+        expected_unit = {
+            CanonicalHealthType.ACTIVE_ENERGY: CanonicalUnit.KILOCALORIE,
+            CanonicalHealthType.APPLE_RESTING_HEART_RATE: CanonicalUnit.BEATS_PER_MINUTE,
+        }[self.data_type]
+        if self.specification.unit is not expected_unit:
+            raise ConfigurationError("Plausibilitätsregel verwendet nicht die kanonische Einheit.")
+        if self.effective_from is not None and (
+            self.effective_from.tzinfo is None
+            or self.effective_from.weekday() != 0
+            or self.effective_from.time() != datetime.min.time()
+        ):
+            raise ConfigurationError("Regelgültigkeit muss lokaler ISO-Montag 00:00 sein.")
+
+
+@dataclass(frozen=True, slots=True)
+class PlausibilityRuleVersion:
+    version_id: str
+    data_type: CanonicalHealthType
+    specification: PlausibilityRuleSpecification
+    effective_from: datetime | None
+    created_at: datetime
+    recommendation_id: str | None = None
+    effective_timezone: str | None = None
+    effective_offset_minutes: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PlausibilityRuleRecommendation:
+    recommendation_id: str
+    specification: PlausibilityRuleSpecification
+
+
+@dataclass(frozen=True, slots=True)
+class PlausibilityRule:
+    data_type: CanonicalHealthType
+    versions: tuple[PlausibilityRuleVersion, ...]
+    recommendation: PlausibilityRuleRecommendation
+
+    @property
+    def active_version(self) -> PlausibilityRuleVersion:
+        return self.versions[-1]
+
+
+@dataclass(frozen=True, slots=True)
+class PlausibilityRules:
+    rules: tuple[PlausibilityRule, ...]
+
+
 class SourceDeletionVerdict(StrEnum):
     CONFIRM = "confirm"
     REJECT = "reject"
@@ -231,7 +330,12 @@ class RevokeDataReviewDecision:
             raise ConfigurationError("Widerruf verlangt einen Grund.")
 
 
-WriteRequest = ImportHealthExport | ResolveDataReviewCase | RevokeDataReviewDecision
+WriteRequest = (
+    ImportHealthExport
+    | ResolveDataReviewCase
+    | RevokeDataReviewDecision
+    | CreatePlausibilityRuleVersion
+)
 
 
 class WriteApprovalStatus(StrEnum):
@@ -267,7 +371,14 @@ class DataReviewDecisionPlan:
     active_snapshot_ref: SnapshotRef | None
 
 
-WritePlanDetails = ImportHealthExportPlan | DataReviewDecisionPlan
+@dataclass(frozen=True, slots=True)
+class PlausibilityRuleVersionPlan:
+    previous_version_id: str | None
+    proposed_version_id: str
+    active_snapshot_ref: SnapshotRef | None
+
+
+WritePlanDetails = ImportHealthExportPlan | DataReviewDecisionPlan | PlausibilityRuleVersionPlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -444,7 +555,18 @@ class WriteDecisionReceipt:
     diagnostics: tuple[str, ...] = ()
 
 
-WriteResult = ImportReceipt | WriteDecisionReceipt | WriteNotStarted
+@dataclass(frozen=True, slots=True)
+class PlausibilityRuleVersionReceipt:
+    operation_id: OperationId
+    rule_version_id: str
+    snapshot_ref: SnapshotRef | None
+    status: ImportStatus = ImportStatus.COMMITTED
+    diagnostics: tuple[str, ...] = ()
+
+
+WriteResult = (
+    ImportReceipt | WriteDecisionReceipt | PlausibilityRuleVersionReceipt | WriteNotStarted
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -544,6 +666,8 @@ class HealthLab:
 
     def preview_write(self, request: WriteRequest) -> WritePlan:
         self._require_open()
+        if isinstance(request, CreatePlausibilityRuleVersion):
+            return self._build_plausibility_rule_plan(request)
         if not isinstance(request, ImportHealthExport):
             return self._build_data_review_plan(request)
         filevault = (
@@ -552,6 +676,81 @@ class HealthLab:
             else None
         )
         return self._build_import_plan(request, filevault)
+
+    def _build_plausibility_rule_plan(
+        self, request: CreatePlausibilityRuleVersion
+    ) -> WritePlan:
+        rules = self.load_plausibility_rules()
+        versions = next(
+            (rule.versions for rule in rules.rules if rule.data_type is request.data_type), ()
+        )
+        previous = versions[-1] if versions else None
+        blocked = (previous is None) != (request.effective_from is None)
+        recommendation = next(
+            (rule.recommendation for rule in rules.rules if rule.data_type is request.data_type),
+            None,
+        )
+        if request.recommendation_id is not None and (
+            recommendation is None
+            or request.recommendation_id != recommendation.recommendation_id
+            or request.specification != recommendation.specification
+        ):
+            blocked = True
+        if (
+            previous is not None
+            and previous.effective_from is not None
+            and request.effective_from is not None
+            and request.effective_from <= previous.effective_from
+        ):
+            blocked = True
+        effective_timezone = (
+            None
+            if request.effective_from is None
+            else getattr(
+                request.effective_from.tzinfo,
+                "key",
+                request.effective_from.tzname(),
+            )
+        )
+        effective_offset = (
+            None if request.effective_from is None else request.effective_from.utcoffset()
+        )
+        payload = {
+            "data_type": request.data_type.value,
+            "effective_from": (
+                None if request.effective_from is None else request.effective_from.isoformat()
+            ),
+            "lower": request.specification.fixed_lower_bound,
+            "effective_offset_minutes": (
+                None
+                if effective_offset is None
+                else int(effective_offset.total_seconds() // 60)
+            ),
+            "effective_timezone": effective_timezone,
+            "upper": request.specification.fixed_upper_bound,
+            "personal": request.specification.personal_range_enabled,
+            "previous": None if previous is None else previous.version_id,
+            "recommendation_id": request.recommendation_id,
+            "unit": request.specification.unit.value,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        version_id = hashlib.sha256(b"plausibility-rule:" + encoded).hexdigest()
+        fingerprint = PlanFingerprint(hashlib.sha256(b"plan:" + encoded).hexdigest())
+        diagnostics = ("invalid_rule_boundary",) if blocked else ()
+        return WritePlan(
+            fingerprint,
+            PlausibilityRuleVersionPlan(
+                None if previous is None else previous.version_id,
+                version_id,
+                self._store.load_active_snapshot_id() if self._store is not None else None,
+            ),
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED if blocked else WriteApprovalStatus.READY
+                ),
+                diagnostics=diagnostics,
+            ),
+        )
 
     def _build_data_review_plan(
         self, request: ResolveDataReviewCase | RevokeDataReviewDecision
@@ -848,6 +1047,10 @@ class HealthLab:
                 current_plan.diagnostics,
                 expected_plan,
             )
+        if isinstance(request, CreatePlausibilityRuleVersion):
+            return self._execute_plausibility_rule_write(
+                request, authorization_plan, expected_plan
+            )
         if not isinstance(request, ImportHealthExport):
             return self._execute_data_review_write(request, authorization_plan, expected_plan)
         if not isinstance(authorization_plan.details, ImportHealthExportPlan):
@@ -994,6 +1197,50 @@ class HealthLab:
             final_preflight=final_preflight,
             diagnostics=result.diagnostics,
         )
+
+    def _execute_plausibility_rule_write(
+        self,
+        request: CreatePlausibilityRuleVersion,
+        plan: WritePlan,
+        expected_plan: PlanFingerprint,
+    ) -> WriteReceipt:
+        if not isinstance(plan.details, PlausibilityRuleVersionPlan):
+            return self._not_started(
+                plan,
+                WriteNotStartedStatus.PLAN_CHANGED,
+                ("plan_changed",),
+                expected_plan,
+            )
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        try:
+            operation_id = OperationId(uuid4().hex)
+            record, snapshot_ref = create_plausibility_rule_version(
+                writer,
+                operation_id=operation_id,
+                version_id=plan.details.proposed_version_id,
+                data_type=request.data_type.value,
+                unit=request.specification.unit.value,
+                fixed_lower_bound=request.specification.fixed_lower_bound,
+                fixed_upper_bound=request.specification.fixed_upper_bound,
+                personal_range_enabled=request.specification.personal_range_enabled,
+                effective_from=request.effective_from,
+                recommendation_id=request.recommendation_id,
+            )
+        except StoreError as error:
+            raise HealthLabError("Plausibilitätsregel konnte nicht gespeichert werden.") from error
+        finally:
+            writer.close()
+        result = PlausibilityRuleVersionReceipt(
+            operation_id,
+            record.version_id,
+            snapshot_ref,
+        )
+        return WriteReceipt(operation_id, expected_plan, result, plan.preflight)
 
     def _execute_data_review_write(
         self,
@@ -1250,6 +1497,53 @@ class HealthLab:
                 if identity.store_id is not None
                 else WorkspaceState.MIGRATION_REQUIRED
             ),
+        )
+
+    def load_plausibility_rules(self) -> PlausibilityRules:
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        grouped: dict[CanonicalHealthType, list[PlausibilityRuleVersion]] = {}
+        for record in load_plausibility_rule_state(self._store):
+            data_type = CanonicalHealthType(record.data_type)
+            grouped.setdefault(data_type, []).append(
+                PlausibilityRuleVersion(
+                    record.version_id,
+                    data_type,
+                    PlausibilityRuleSpecification(
+                        CanonicalUnit(record.unit),
+                        record.fixed_lower_bound,
+                        record.fixed_upper_bound,
+                        record.personal_range_enabled,
+                    ),
+                    record.effective_from,
+                    record.created_at,
+                    record.recommendation_id,
+                    record.effective_timezone,
+                    record.effective_offset_minutes,
+                )
+            )
+        recommendations = {
+            CanonicalHealthType(record.data_type): PlausibilityRuleRecommendation(
+                record.recommendation_id or "builtin-plausibility/v1",
+                PlausibilityRuleSpecification(
+                    CanonicalUnit(record.unit),
+                    record.fixed_lower_bound,
+                    record.fixed_upper_bound,
+                    record.personal_range_enabled,
+                ),
+            )
+            for record in plausibility_rule_recommendations()
+        }
+        return PlausibilityRules(
+            tuple(
+                PlausibilityRule(
+                    data_type,
+                    tuple(versions),
+                    recommendations[data_type],
+                )
+                for data_type, versions in sorted(grouped.items(), key=lambda item: item[0].value)
+            )
         )
 
     def _require_open(self) -> OverviewReader:

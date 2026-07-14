@@ -403,6 +403,8 @@ def import_health_export(
 
 
 __all__ = [
+    "CanonicalHealthType",
+    "CanonicalUnit",
     "HealthExportEstimate",
     "HealthImportError",
     "HealthImportResult",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from urllib.parse import quote
@@ -12,7 +13,10 @@ from personal_health_lab.adapters._config import load_runtime_config
 from personal_health_lab.application import (
     AnalysisDefinitionId,
     AnalysisStatus,
+    CanonicalHealthType,
     ConfigurationError,
+    CreatePlausibilityRuleVersion,
+    DataReviewDecisionId,
     DataReviewSelection,
     HealthLab,
     HealthLabError,
@@ -21,7 +25,15 @@ from personal_health_lab.application import (
     ImportStatus,
     OverviewSelection,
     OverviewStatus,
+    PlausibilityRuleSpecification,
+    ResolveDataReviewCase,
     RestingHeartRateAnalysisConfig,
+    RevokeDataReviewDecision,
+    SingleDecisionTarget,
+    SourceConflictResolution,
+    SourceConflictStrategy,
+    SourceDeletionResolution,
+    SourceDeletionVerdict,
     WriteApprovalStatus,
 )
 
@@ -185,6 +197,7 @@ try:
         data_review_details = tuple(
             health_lab.load_data_review_case(case.case_id) for case in data_review.cases
         )
+        plausibility_rules = health_lab.load_plausibility_rules()
 except (ConfigurationError, HealthLabError):
     st.error("HealthLab-Konfiguration oder lokaler Datenspeicher ist ungültig.")
     st.stop()
@@ -248,8 +261,150 @@ if data_review.cases:
             f"{detail.effective_value_source.value if detail.effective_value_source else '-'} · "
             f"Begründungen {reasons}"
         )
+        if case.kind.value == "suspected_source_deletion":
+            verdict = st.selectbox(
+                "Löschungsvermutung",
+                tuple(SourceDeletionVerdict),
+                key=f"verdict-{case.case_id}",
+                format_func=lambda item: item.value,
+            )
+            if st.button("Auflösung prüfen", key=f"resolve-{case.case_id}"):
+                assert verdict is not None
+                review_request_local = ResolveDataReviewCase(
+                    case.case_id, SourceDeletionResolution(verdict)
+                )
+                with HealthLab.open(config) as health_lab:
+                    st.session_state["review_plan"] = health_lab.preview_write(
+                        review_request_local
+                    )
+                st.session_state["review_request"] = review_request_local
+                st.rerun()
+        elif case.kind.value == "source_conflict":
+            strategy = st.selectbox(
+                "Konfliktauflösung",
+                tuple(SourceConflictStrategy),
+                key=f"strategy-{case.case_id}",
+                format_func=lambda item: item.value,
+            )
+            preferred = st.selectbox(
+                "Bevorzugte Quellversion",
+                case.candidate_version_ids,
+                key=f"preferred-{case.case_id}",
+                format_func=str,
+            )
+            if st.button("Auflösung prüfen", key=f"resolve-{case.case_id}"):
+                assert strategy is not None
+                review_request_local = ResolveDataReviewCase(
+                    case.case_id,
+                    SourceConflictResolution(
+                        strategy,
+                        preferred if strategy is SourceConflictStrategy.PREFER else None,
+                    ),
+                )
+                with HealthLab.open(config) as health_lab:
+                    st.session_state["review_plan"] = health_lab.preview_write(
+                        review_request_local
+                    )
+                st.session_state["review_request"] = review_request_local
+                st.rerun()
+    review_plan = st.session_state.get("review_plan")
+    if review_plan is not None:
+        st.code(str(review_plan.fingerprint))
+        if st.button("Datenprüfentscheidung ausführen"):
+            with HealthLab.open(config) as health_lab:
+                decision_result = health_lab.execute_write(
+                    st.session_state["review_request"],
+                    expected_plan=review_plan.fingerprint,
+                ).result
+            st.success(f"Datenprüfentscheidung: {decision_result.status.value}")
+            st.session_state.pop("review_plan", None)
+            st.session_state.pop("review_request", None)
+            st.rerun()
+
+with st.expander("Datenprüfentscheidung widerrufen"):
+    decision_id = st.text_input("Entscheidungs-ID")
+    revoke_reason = st.text_input("Widerrufsgrund")
+    if st.button("Widerruf prüfen"):
+        try:
+            revoke_request = RevokeDataReviewDecision(
+                SingleDecisionTarget(DataReviewDecisionId(decision_id)), revoke_reason
+            )
+            with HealthLab.open(config) as health_lab:
+                st.session_state["review_plan"] = health_lab.preview_write(revoke_request)
+            st.session_state["review_request"] = revoke_request
+            st.rerun()
+        except (ValueError, ConfigurationError):
+            st.error("Widerruf ist ungültig.")
 if overview.quarantined_import_count:
     st.warning("Mindestens ein unterbrochener Import wurde sicher quarantänisiert.")
+
+with st.expander("Plausibilitätsregeln"):
+    for rule in plausibility_rules.rules:
+        active = rule.active_version
+        st.caption(
+            f"{rule.data_type.value}: {active.version_id} · "
+            f"ab {active.effective_from or '-'} · aktiv {active.specification.active}"
+        )
+    selected_type = st.selectbox(
+        "Datentyp", tuple(CanonicalHealthType), format_func=lambda item: item.value
+    )
+    assert selected_type is not None
+    selected_rule = next(
+        rule for rule in plausibility_rules.rules if rule.data_type is selected_type
+    )
+    expected_unit = selected_rule.recommendation.specification.unit
+    lower_text = st.text_input("Untere Grenze", value="")
+    upper_text = st.text_input("Obere Grenze", value="")
+    personal = st.checkbox("Persönlichen Bereich aktivieren")
+    adopt_recommendation = st.checkbox("Ausgelieferte Empfehlung übernehmen")
+    effective_text = st.text_input("Gültig ab lokalem ISO-Montag", value="")
+    if st.button("Regelversion prüfen"):
+        try:
+            specification = (
+                selected_rule.recommendation.specification
+                if adopt_recommendation
+                else PlausibilityRuleSpecification(
+                    expected_unit,
+                    None if not lower_text else float(lower_text),
+                    None if not upper_text else float(upper_text),
+                    personal,
+                )
+            )
+            rule_request = CreatePlausibilityRuleVersion(
+                selected_type,
+                specification,
+                datetime.fromisoformat(effective_text),
+                (
+                    selected_rule.recommendation.recommendation_id
+                    if adopt_recommendation
+                    else None
+                ),
+            )
+            with HealthLab.open(config) as health_lab:
+                st.session_state["rule_plan"] = health_lab.preview_write(rule_request)
+            st.session_state["rule_request"] = rule_request
+            st.rerun()
+        except (ValueError, ConfigurationError, HealthLabError):
+            st.error("Plausibilitätsregel ist ungültig.")
+    rule_plan = st.session_state.get("rule_plan")
+    if rule_plan is not None:
+        st.code(str(rule_plan.fingerprint))
+        if st.button(
+            "Regelversion ausführen",
+            disabled=rule_plan.approval.status is WriteApprovalStatus.BLOCKED,
+        ):
+            try:
+                with HealthLab.open(config) as health_lab:
+                    rule_result = health_lab.execute_write(
+                        st.session_state["rule_request"],
+                        expected_plan=rule_plan.fingerprint,
+                    ).result
+                st.success(f"Regelversion: {rule_result.status.value}")
+                st.session_state.pop("rule_plan", None)
+                st.session_state.pop("rule_request", None)
+                st.rerun()
+            except HealthLabError:
+                st.error("Plausibilitätsregel konnte nicht gespeichert werden.")
 
 titles = {
     "active_energy": "Aktive Energie",

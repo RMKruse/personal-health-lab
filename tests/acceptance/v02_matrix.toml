@@ -20,10 +20,28 @@ statement = "Personal history uses effective prior values only."
 evidence = ["positive", "transition"]
 
 [[contract]]
+id = "V02-C-RULE-004"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Rule versions are complete, immutable, canonically typed, and recommendation adoption is explicit."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V02-C-RULE-005"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Rule validity uses one stored local ISO-Monday instant and rechecks only the current week."
+evidence = ["boundary", "transition"]
+
+[[contract]]
 id = "V02-C-RULE-006"
 source = "https://github.com/RMKruse/personal-health-lab/issues/33"
-statement = "Late measurements use the rule valid at measurement time."
+statement = "Deactivation, reactivation, and late imports use separate time-bound paths."
 evidence = ["transition"]
+
+[[contract]]
+id = "V02-C-RULE-007"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "The first rule evaluates the existing full history once."
+evidence = ["positive", "transition"]
 
 [[contract]]
 id = "V02-C-RULE-008"
@@ -51,6 +69,15 @@ seed = 0
 parameters = "resting-heart-rate 20..250 bpm; active-energy >=0 kcal; unknown source type"
 platform = "all"
 sha256 = "71f9350613043edb33cb8479c956e0388fde64dccce95d801e766779eab264fa"
+
+[[fixture]]
+id = "V02-F-DOM-RULE-VERSIONS-V1"
+kind = "domain"
+generator = "inline-rule-version-v1"
+seed = 0
+parameters = "typed bounds, recommendations, local Monday offsets, deactivation, reactivation, and existing history"
+platform = "all"
+sha256 = "3e02a09c4521e9347be1661f85c82a2704e67dfc8ddf0b82bd513728f4707c99"
 
 [[fixture]]
 id = "V02-F-DOM-PERSONAL-RANGE-V1"
@@ -168,6 +195,139 @@ level = "application"
 expected_result = "only prior local days define the range"
 expected_effect = "deterministic prior-only bounds"
 forbidden_side_effects = ["current leakage", "future leakage"]
+
+[[case]]
+id = "V02-A-RULE-010"
+contracts = ["V02-C-RULE-004"]
+fixtures = ["V02-F-DOM-RULE-VERSIONS-V1"]
+runner = "test_plausibility_rule_versions_are_typed_immutable_and_time_bound"
+initial_state = "initial canonical rule"
+operation = "create finite ascending canonical bounds"
+level = "application"
+expected_result = "committed immutable version"
+expected_effect = "new active version"
+forbidden_side_effects = ["old version mutation"]
+
+[[case]]
+id = "V02-A-RULE-011"
+contracts = ["V02-C-RULE-004"]
+fixtures = ["V02-F-DOM-RULE-VERSIONS-V1"]
+runner = "test_plausibility_rule_versions_are_typed_immutable_and_time_bound"
+initial_state = "initial canonical rule"
+operation = "submit invalid bounds or unit"
+level = "application"
+expected_result = "validation error"
+expected_effect = "none"
+forbidden_side_effects = ["new version"]
+
+[[case]]
+id = "V02-A-RULE-012"
+contracts = ["V02-C-RULE-004"]
+fixtures = ["V02-F-DOM-RULE-VERSIONS-V1"]
+runner = "test_plausibility_rule_versions_are_typed_immutable_and_time_bound"
+initial_state = "one rule version"
+operation = "change complete rule"
+level = "application"
+expected_result = "second version committed"
+expected_effect = "old version unchanged"
+forbidden_side_effects = ["in-place update"]
+
+[[case]]
+id = "V02-A-RULE-013"
+contracts = ["V02-C-RULE-004"]
+fixtures = ["V02-F-DOM-RULE-VERSIONS-V1"]
+runner = "test_plausibility_rule_versions_are_typed_immutable_and_time_bound"
+initial_state = "custom rule and built-in recommendation"
+operation = "inspect then explicitly adopt recommendation"
+level = "application"
+expected_result = "custom remains until adoption"
+expected_effect = "adopted version records recommendation"
+forbidden_side_effects = ["software overwrite"]
+
+[[case]]
+id = "V02-A-RULE-014"
+contracts = ["V02-C-RULE-005"]
+fixtures = ["V02-F-DOM-RULE-VERSIONS-V1"]
+runner = "test_plausibility_rule_versions_are_typed_immutable_and_time_bound"
+initial_state = "initial delivered rule"
+operation = "load first version"
+level = "application"
+expected_result = "no lower validity boundary"
+expected_effect = "full historical validity"
+forbidden_side_effects = ["artificial start date"]
+
+[[case]]
+id = "V02-A-RULE-015"
+contracts = ["V02-C-RULE-005"]
+fixtures = ["V02-F-DOM-RULE-VERSIONS-V1"]
+runner = "test_plausibility_rule_versions_are_typed_immutable_and_time_bound"
+initial_state = "existing rule"
+operation = "create later version at local ISO Monday"
+level = "application"
+expected_result = "stored aware Monday instant"
+expected_effect = "one unambiguous boundary"
+forbidden_side_effects = ["floating local date"]
+
+[[case]]
+id = "V02-A-RULE-016"
+contracts = ["V02-C-RULE-005"]
+fixtures = ["V02-F-DOM-RULE-VERSIONS-V1"]
+runner = "test_imports_use_the_stored_rule_timeline_without_backfilling_inactive_weeks"
+initial_state = "stored offset boundary"
+operation = "import while current timezone differs"
+level = "application"
+expected_result = "rule selected by stored instant"
+expected_effect = "travel does not shift boundary"
+forbidden_side_effects = ["current timezone reinterpretation"]
+
+[[case]]
+id = "V02-A-RULE-017"
+contracts = ["V02-C-RULE-005"]
+fixtures = ["V02-F-DOM-RULE-VERSIONS-V1"]
+runner = "test_rule_change_reevaluates_only_measurements_since_its_local_week_boundary"
+initial_state = "effective measurements in current week"
+operation = "tighten rule"
+level = "application"
+expected_result = "new rule-change review finding"
+expected_effect = "new snapshot covers current week"
+forbidden_side_effects = ["earlier-week recheck"]
+
+[[case]]
+id = "V02-A-RULE-018"
+contracts = ["V02-C-RULE-006"]
+fixtures = ["V02-F-DOM-RULE-VERSIONS-V1"]
+runner = "test_deactivation_and_reactivation_leave_a_time_bound_gap"
+initial_state = "active rule"
+operation = "deactivate"
+level = "application"
+expected_result = "empty immutable version"
+expected_effect = "inactive interval begins"
+forbidden_side_effects = ["rule deletion"]
+
+[[case]]
+id = "V02-A-RULE-019"
+contracts = ["V02-C-RULE-006"]
+fixtures = ["V02-F-DOM-RULE-VERSIONS-V1"]
+runner = "test_imports_use_the_stored_rule_timeline_without_backfilling_inactive_weeks"
+initial_state = "inactive interval followed by reactivation"
+operation = "import inactive and reactivated measurements"
+level = "application"
+expected_result = "only reactivated measurement flagged"
+expected_effect = "inactive interval remains unchecked"
+forbidden_side_effects = ["automatic backfill"]
+
+[[case]]
+id = "V02-A-RULE-022"
+contracts = ["V02-C-RULE-007"]
+fixtures = ["V02-F-DOM-FIXED-PLAUSIBILITY-V1"]
+runner = "test_fixed_rules_are_inclusive_and_keep_flagged_source_values"
+initial_state = "new store and first delivered rules"
+operation = "import existing full history"
+level = "application"
+expected_result = "history evaluated once"
+expected_effect = "deterministic initial findings"
+forbidden_side_effects = ["partial-history first review"]
+
 
 [[case]]
 id = "V02-A-RULE-021"
