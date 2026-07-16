@@ -159,6 +159,44 @@ def test_cli_maps_data_review_plan_receipt_and_revocation(
     _assert_json_contract(json.loads(capsys.readouterr().out))
 
 
+def test_cli_maps_correction_inputs(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    personal_range_package: Callable[[Path], Path],
+) -> None:
+    common = [
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(tmp_path / "synthetic"),
+        "--real-store",
+        str(tmp_path / "real"),
+    ]
+    assert _execute_json_import(
+        common, personal_range_package(tmp_path / "personal.zip"), capsys
+    )[0] == 0
+    assert main([*common, "review", "--json"]) == 0
+    case = json.loads(capsys.readouterr().out)["cases"][0]
+    args = [
+        *common,
+        "review-resolve",
+        case["case_id"],
+        "--correct",
+        "61",
+        "--unit",
+        "count/min",
+        "--measurement-version",
+        case["measurement_version_id"],
+        "--reason",
+        "falscher Wert",
+        "--json",
+    ]
+    assert main(args) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert main([*args, "--execute", "--expect-plan", plan["fingerprint"]]) == 0
+    _assert_json_contract(json.loads(capsys.readouterr().out))
+
+
 def test_cli_projects_the_personal_range_finding(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

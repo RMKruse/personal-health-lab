@@ -135,6 +135,41 @@ REGISTERED_CASES.update(
         "V02-A-REV-004": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
         "V02-A-REV-005": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
         "V02-A-REV-006": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
+        "V02-A-REV-007": (
+            "test_new_flagged_source_version_requires_confirmation_after_local_exclusion"
+        ),
+        "V02-A-REV-008": "test_correction_without_a_case_can_be_revoked_to_the_clean_source",
+        "V02-A-REV-009": (
+            "test_new_flagged_source_version_requires_confirmation_after_local_exclusion"
+        ),
+        "V02-A-REV-010": "test_corrections_supersede_forward_and_revocation_uses_source",
+        "V02-A-REV-011": "test_corrections_supersede_forward_and_revocation_uses_source",
+        "V02-A-REV-012": "test_deletion_decisions_and_reappearance_are_forward_only",
+        "V02-A-REV-013": (
+            "test_new_clean_source_version_can_replace_a_continued_correction"
+        ),
+        "V02-A-REV-014": (
+            "test_new_clean_source_version_can_replace_a_continued_correction"
+        ),
+        "V02-A-REV-015": (
+            "test_new_flagged_source_version_requires_confirmation_after_local_exclusion"
+        ),
+        "V02-A-REV-016": (
+            "test_new_flagged_source_version_requires_confirmation_after_local_exclusion"
+        ),
+        "V02-A-REV-022": "test_review_decision_requests_enforce_mandatory_reasons",
+        "V02-A-REV-023": (
+            "test_new_clean_source_version_can_replace_a_continued_correction"
+        ),
+        "V02-A-REV-024": (
+            "test_confirmation_stales_but_never_rewrites_an_existing_analysis"
+        ),
+        "V02-A-REV-025": (
+            "test_confirmation_stales_but_never_rewrites_an_existing_analysis"
+        ),
+        "V02-A-REV-026": (
+            "test_confirmation_stales_but_never_rewrites_an_existing_analysis"
+        ),
     }
 )
 REGISTERED_CASES.update(

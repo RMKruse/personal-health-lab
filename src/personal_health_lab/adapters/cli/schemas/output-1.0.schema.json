@@ -403,7 +403,7 @@
               "case_id": {"type": "string"},
               "allowed_actions": {
                 "type": "array",
-                "items": {"enum": ["confirm", "reject", "prefer", "split"]}
+                "items": {"enum": ["confirm", "correct", "exclude_local", "accept_source", "reject", "prefer", "split"]}
               },
               "candidate_version_ids": {
                 "type": "array",
@@ -411,7 +411,7 @@
               },
               "evidence_fingerprint": {"type": "string"},
               "kind": {
-                "enum": ["source_conflict", "suspected_source_deletion", "plausibility", "rule_definition"]
+                "enum": ["source_conflict", "suspected_source_deletion", "plausibility", "continued_override", "rule_definition"]
               },
               "logical_measurement_id": {"$ref": "#/$defs/nullableString"},
               "measurement_version_id": {"$ref": "#/$defs/nullableString"},

@@ -189,6 +189,7 @@ class ReviewCaseDetail:
     effective_value: float | None
     effective_value_source: str | None
     reasons: tuple[ReviewReason, ...]
+    canonical_unit: str | None
 
 
 def select_governing_export(exports: tuple[ExportFact, ...]) -> str:
@@ -320,6 +321,28 @@ def resolve_sources(
         )
     )
 
+    continued_overrides = tuple(
+        _continued_override_case(previous, source)
+        for previous in previous_measurements
+        if previous.disposition in {"included_correction", "excluded_local"}
+        for source in current
+        if source.logical_measurement_id == previous.logical_measurement_id
+        and source.selected_measurement_version_id != previous.selected_measurement_version_id
+    )
+    continued_version_ids = {
+        str(case.measurement_version_id) for case in continued_overrides
+    }
+    plausibility_cases = tuple(
+        case
+        for case in _plausibility_cases(
+            version_by_id,
+            measurements,
+            imported_measurement_version_ids,
+            plausibility_rules,
+        )
+        if str(case.measurement_version_id) not in continued_version_ids
+    )
+
     generated_cases = (
         *_source_conflicts(occurrences, version_by_id, conflict_keys),
         *_source_deletions(
@@ -330,19 +353,22 @@ def resolve_sources(
             governing_export_id,
             suppressed_deletion_ids,
         ),
-        *_plausibility_cases(
-            version_by_id,
-            measurements,
-            imported_measurement_version_ids,
-            plausibility_rules,
-        ),
+        *continued_overrides,
+        *plausibility_cases,
         *(_unknown_rule_case(source_type) for source_type in sorted(set(unknown_source_types))),
     )
     previous_case_ids = {item.review_case_id for item in previous_review_cases}
+    continued_logical_ids = {
+        str(case.logical_measurement_id) for case in continued_overrides
+    }
     cases_by_id = {
         item.review_case_id: item
         for item in previous_review_cases
         if item.kind != "suspected_source_deletion"
+        and not (
+            item.kind == "continued_override"
+            and str(item.logical_measurement_id) in continued_logical_ids
+        )
     }
     cases_by_id.update((item.review_case_id, item) for item in generated_cases)
     source_type_requests = tuple(
@@ -371,6 +397,23 @@ def resolve_sources(
             case.review_case_id in new_case_id_set and case.kind == "plausibility"
             for case in generated_cases
         ),
+    )
+
+
+def _continued_override_case(
+    previous: ResolvedMeasurement, source: ResolvedMeasurement
+) -> OpenDataReviewCase:
+    case_key = (
+        f"continued_override:{previous.effective_decision_id}:"
+        f"{source.selected_measurement_version_id}"
+    )
+    return OpenDataReviewCase(
+        review_case_id=hashlib.sha256(case_key.encode()).hexdigest()[:32],
+        kind="continued_override",
+        logical_measurement_id=LogicalMeasurementId(previous.logical_measurement_id),
+        measurement_version_id=MeasurementVersionId(source.selected_measurement_version_id),
+        rule_version_id=None,
+        evidence_fingerprint=hashlib.sha256(f"{case_key}:evidence".encode()).hexdigest(),
     )
 
 
@@ -403,14 +446,9 @@ def _plausibility_cases(
             else measurement.effective_value
         )
         reasons = list(_plausibility_reasons(rule, effective_value, version.canonical_unit))
-        selected = daily.get(version.measurement_local_date)
         if (
             rule.personal_range_enabled
             and version.canonical_type == "apple_resting_heart_rate"
-            and measurement is not None
-            and measurement.effective_value is not None
-            and selected is not None
-            and selected[0].measurement_version_id == version_id
         ):
             personal_bounds = _personal_bounds(
                 rule,
@@ -422,7 +460,7 @@ def _plausibility_cases(
                 reason
                 for reason in _plausibility_reasons(
                     rule,
-                    measurement.effective_value,
+                    effective_value,
                     version.canonical_unit,
                     personal_bounds,
                 )
@@ -829,9 +867,72 @@ def load_review_case_detail(store: LocalStore, review_case_id: str) -> ReviewCas
             effective_value=None,
             effective_value_source=None,
             reasons=(),
+            canonical_unit=None,
+        )
+    if case.kind == "continued_override" and case.measurement_version_id is not None:
+        version = store.load_measurement_version_fact(case.measurement_version_id)
+        if version is None:
+            raise ValueError("Quellmessungsversion des Datenprüffalls fehlt.")
+        rule = _rule_at(
+            version.canonical_type,
+            datetime.fromisoformat(version.source_start_utc),
+            store.load_plausibility_rule_versions(),
+        )
+        resolved = store.load_resolved_measurement(version.logical_measurement_id)
+        reasons = (
+            []
+            if rule is None
+            else list(
+                _plausibility_reasons(
+                    rule, version.canonical_value, version.canonical_unit
+                )
+            )
+        )
+        if rule is not None and version.canonical_type == "apple_resting_heart_rate":
+            series = next(
+                (
+                    item
+                    for item in store.load_daily_series(
+                        version.measurement_local_date - timedelta(days=42),
+                        version.measurement_local_date,
+                    )
+                    if item.data_type.value == "apple_resting_heart_rate"
+                ),
+                None,
+            )
+            personal_bounds = _personal_bounds(
+                rule,
+                version.measurement_local_date,
+                ()
+                if series is None
+                else tuple((item.day, item.value) for item in series.values),
+                version.canonical_unit,
+            )
+            reasons.extend(
+                reason
+                for reason in _plausibility_reasons(
+                    rule,
+                    version.canonical_value,
+                    version.canonical_unit,
+                    personal_bounds,
+                )
+                if reason.code in {
+                    "below_personal_lower_bound",
+                    "above_personal_upper_bound",
+                }
+            )
+        return ReviewCaseDetail(
+            source_type=version.canonical_type,
+            measured_at=datetime.fromisoformat(version.source_start_utc),
+            effective_value=None if resolved is None else resolved.effective_value,
+            effective_value_source=(
+                None if resolved is None else resolved.effective_value_source
+            ),
+            reasons=tuple(reasons),
+            canonical_unit=version.canonical_unit,
         )
     if case.kind != "plausibility" or case.measurement_version_id is None:
-        return ReviewCaseDetail(None, None, None, None, ())
+        return ReviewCaseDetail(None, None, None, None, (), None)
     version = store.load_measurement_version_fact(case.measurement_version_id)
     if version is None:
         raise ValueError("Quellmessungsversion des Datenprüffalls fehlt.")
@@ -892,6 +993,7 @@ def load_review_case_detail(store: LocalStore, review_case_id: str) -> ReviewCas
         effective_value=None if resolved is None else resolved.effective_value,
         effective_value_source=None if resolved is None else resolved.effective_value_source,
         reasons=tuple(reasons),
+        canonical_unit=version.canonical_unit,
     )
 
 

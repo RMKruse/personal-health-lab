@@ -20,6 +20,7 @@ from personal_health_lab.application import (
     ConfigurationError,
     CreatePlausibilityRuleVersion,
     DataConfirmation,
+    DataCorrection,
     DataMode,
     DataReview,
     DataReviewCaseDetail,
@@ -35,6 +36,7 @@ from personal_health_lab.application import (
     ImportHealthExportPlan,
     ImportReceipt,
     ImportStatus,
+    LocalMeasurementExclusion,
     MeasurementVersionId,
     Overview,
     OverviewSelection,
@@ -52,6 +54,7 @@ from personal_health_lab.application import (
     SourceConflictStrategy,
     SourceDeletionResolution,
     SourceDeletionVerdict,
+    SourceValueAcceptance,
     WorkspaceStatus,
     WriteApprovalStatus,
     WriteDecisionReceipt,
@@ -124,10 +127,16 @@ def _parser() -> argparse.ArgumentParser:
     historical.add_argument("--execute", action="store_true")
     historical.add_argument("--expect-plan", type=PlanFingerprint)
     resolve = commands.add_parser("review-resolve", help="Datenprüffall auflösen")
-    resolve.add_argument("case_id", type=DataReviewCaseId)
+    resolve.add_argument("case_id", nargs="?", type=DataReviewCaseId)
     resolve.add_argument("--deletion-verdict", type=SourceDeletionVerdict)
     resolve.add_argument("--conflict-strategy", type=SourceConflictStrategy)
     resolve.add_argument("--confirm", action="store_true")
+    resolve.add_argument("--correct", type=float)
+    resolve.add_argument("--unit", type=CanonicalUnit, choices=tuple(CanonicalUnit))
+    resolve.add_argument("--exclude-local", action="store_true")
+    resolve.add_argument("--accept-source", action="store_true")
+    resolve.add_argument("--measurement-version")
+    resolve.add_argument("--reason")
     resolve.add_argument("--preferred-version")
     resolve.add_argument("--note")
     resolve.add_argument("--json", action="store_true", dest="as_json")
@@ -196,6 +205,10 @@ def _data_review_json(
         value = detail_by_id[case_id].measured_at
         return None if value is None else value.isoformat()
 
+    def canonical_unit(case_id: DataReviewCaseId) -> str | None:
+        value = detail_by_id[case_id].canonical_unit
+        return None if value is None else value.value
+
     return {
         "cases": [
             {
@@ -216,6 +229,7 @@ def _data_review_json(
                 ),
                 "rule_version_id": case.rule_version_id,
                 "detail": {
+                    "canonical_unit": canonical_unit(case.case_id),
                     "effective_value": detail_by_id[case.case_id].effective_value,
                     "effective_value_source": effective_source(case.case_id),
                     "measured_at": measured_at(case.case_id),
@@ -552,11 +566,22 @@ def main(args: Sequence[str] | None = None) -> int:
                 parsed.deletion_verdict is not None,
                 parsed.conflict_strategy is not None,
                 parsed.confirm,
+                parsed.correct is not None,
+                parsed.exclude_local,
+                parsed.accept_source,
             )
         )
         != 1
     ):
         parser.error("Genau eine Auflösungsart muss angegeben werden.")
+    if parsed.command == "review-resolve" and (
+        (parsed.correct is not None and (parsed.unit is None or not parsed.reason))
+        or (parsed.exclude_local and (parsed.case_id is None or not parsed.reason))
+        or ((parsed.correct is not None or parsed.exclude_local or parsed.accept_source)
+            and parsed.measurement_version is None)
+        or (parsed.case_id is None and parsed.correct is None)
+    ):
+        parser.error("Messung, Einheit, Prüffall oder Pflichtgrund fehlt.")
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
     decision_request: WriteRequest
     try:
@@ -645,14 +670,43 @@ def main(args: Sequence[str] | None = None) -> int:
                         DataConfirmation(parsed.note)
                         if parsed.confirm
                         else (
-                            SourceDeletionResolution(parsed.deletion_verdict, parsed.note)
-                            if parsed.deletion_verdict is not None
-                            else SourceConflictResolution(
-                                parsed.conflict_strategy,
-                                None
-                                if parsed.preferred_version is None
-                                else MeasurementVersionId(parsed.preferred_version),
+                            DataCorrection(
+                                MeasurementVersionId(parsed.measurement_version),
+                                parsed.correct,
+                                parsed.unit,
+                                parsed.reason,
                                 parsed.note,
+                            )
+                            if parsed.correct is not None
+                            else (
+                                LocalMeasurementExclusion(
+                                    MeasurementVersionId(parsed.measurement_version),
+                                    parsed.reason,
+                                    parsed.note,
+                                )
+                                if parsed.exclude_local
+                                else (
+                                    SourceValueAcceptance(
+                                        MeasurementVersionId(parsed.measurement_version),
+                                        parsed.note,
+                                    )
+                                    if parsed.accept_source
+                                    else (
+                                        SourceDeletionResolution(
+                                            parsed.deletion_verdict, parsed.note
+                                        )
+                                        if parsed.deletion_verdict is not None
+                                        else SourceConflictResolution(
+                                            parsed.conflict_strategy,
+                                            None
+                                            if parsed.preferred_version is None
+                                            else MeasurementVersionId(
+                                                parsed.preferred_version
+                                            ),
+                                            parsed.note,
+                                        )
+                                    )
+                                )
                             )
                         )
                     ),

@@ -61,6 +61,45 @@ source = "https://github.com/RMKruse/personal-health-lab/issues/33"
 statement = "An open plausibility case keeps the effective value and makes data provisional."
 evidence = ["positive", "negative"]
 
+[[contract]]
+id = "V02-C-REV-003"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Confirmation, correction, and local exclusion bind the exact source version and preserve raw truth."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V02-C-REV-004"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Supersession and revocation never reactivate an older decision."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V02-C-REV-005"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "A new source version after correction or exclusion opens a continued-override review."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V02-C-REV-007"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Decision reasons and notes follow their closed mandatory logic."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V02-C-REV-008"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Review decisions affect only new snapshots and analyses."
+evidence = ["positive", "negative", "transition"]
+
+[[fixture]]
+id = "V02-F-DOM-REVIEW-DECISIONS-V1"
+kind = "domain"
+generator = "inline-health-export-v1"
+seed = 0
+parameters = "flagged and clean source versions, corrections, exclusions, confirmations, source acceptance, supersession, and revocation"
+platform = "all"
+sha256 = "128efab13af57f2ea420adf253955c14df9cdd53473fef4c5e58a028755cf77f"
+
 [[fixture]]
 id = "V02-F-DOM-FIXED-PLAUSIBILITY-V1"
 kind = "domain"
@@ -496,6 +535,187 @@ level = "application"
 expected_result = "value retained without explicit exclusion"
 expected_effect = "effective source projection unchanged"
 forbidden_side_effects = ["implicit exclusion"]
+
+[[case]]
+id = "V02-A-REV-007"
+contracts = ["V02-C-REV-003"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_new_flagged_source_version_requires_confirmation_after_local_exclusion"
+initial_state = "versioned source measurement and review history"
+operation = "resolve or revoke one data-review decision"
+level = "application"
+expected_result = "typed forward-only decision result"
+expected_effect = "one new immutable snapshot and explicit current review state"
+forbidden_side_effects = ["raw-value mutation", "old snapshot mutation", "older decision reactivation"]
+
+[[case]]
+id = "V02-A-REV-008"
+contracts = ["V02-C-REV-003"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_correction_without_a_case_can_be_revoked_to_the_clean_source"
+initial_state = "versioned source measurement and review history"
+operation = "resolve or revoke one data-review decision"
+level = "application"
+expected_result = "typed forward-only decision result"
+expected_effect = "one new immutable snapshot and explicit current review state"
+forbidden_side_effects = ["raw-value mutation", "old snapshot mutation", "older decision reactivation"]
+
+[[case]]
+id = "V02-A-REV-009"
+contracts = ["V02-C-REV-003"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_new_flagged_source_version_requires_confirmation_after_local_exclusion"
+initial_state = "versioned source measurement and review history"
+operation = "resolve or revoke one data-review decision"
+level = "application"
+expected_result = "typed forward-only decision result"
+expected_effect = "one new immutable snapshot and explicit current review state"
+forbidden_side_effects = ["raw-value mutation", "old snapshot mutation", "older decision reactivation"]
+
+[[case]]
+id = "V02-A-REV-010"
+contracts = ["V02-C-REV-004"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_corrections_supersede_forward_and_revocation_uses_source"
+initial_state = "versioned source measurement and review history"
+operation = "resolve or revoke one data-review decision"
+level = "application"
+expected_result = "typed forward-only decision result"
+expected_effect = "one new immutable snapshot and explicit current review state"
+forbidden_side_effects = ["raw-value mutation", "old snapshot mutation", "older decision reactivation"]
+
+[[case]]
+id = "V02-A-REV-011"
+contracts = ["V02-C-REV-004"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_corrections_supersede_forward_and_revocation_uses_source"
+initial_state = "versioned source measurement and review history"
+operation = "resolve or revoke one data-review decision"
+level = "application"
+expected_result = "typed forward-only decision result"
+expected_effect = "one new immutable snapshot and explicit current review state"
+forbidden_side_effects = ["raw-value mutation", "old snapshot mutation", "older decision reactivation"]
+
+[[case]]
+id = "V02-A-REV-012"
+contracts = ["V02-C-REV-004"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_deletion_decisions_and_reappearance_are_forward_only"
+initial_state = "versioned source measurement and review history"
+operation = "resolve or revoke one data-review decision"
+level = "application"
+expected_result = "typed forward-only decision result"
+expected_effect = "one new immutable snapshot and explicit current review state"
+forbidden_side_effects = ["raw-value mutation", "old snapshot mutation", "older decision reactivation"]
+
+[[case]]
+id = "V02-A-REV-013"
+contracts = ["V02-C-REV-005"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_new_clean_source_version_can_replace_a_continued_correction"
+initial_state = "versioned source measurement and review history"
+operation = "resolve or revoke one data-review decision"
+level = "application"
+expected_result = "typed forward-only decision result"
+expected_effect = "one new immutable snapshot and explicit current review state"
+forbidden_side_effects = ["raw-value mutation", "old snapshot mutation", "older decision reactivation"]
+
+[[case]]
+id = "V02-A-REV-014"
+contracts = ["V02-C-REV-005"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_new_clean_source_version_can_replace_a_continued_correction"
+initial_state = "versioned source measurement and review history"
+operation = "resolve or revoke one data-review decision"
+level = "application"
+expected_result = "typed forward-only decision result"
+expected_effect = "one new immutable snapshot and explicit current review state"
+forbidden_side_effects = ["raw-value mutation", "old snapshot mutation", "older decision reactivation"]
+
+[[case]]
+id = "V02-A-REV-015"
+contracts = ["V02-C-REV-005"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_new_flagged_source_version_requires_confirmation_after_local_exclusion"
+initial_state = "versioned source measurement and review history"
+operation = "resolve or revoke one data-review decision"
+level = "application"
+expected_result = "typed forward-only decision result"
+expected_effect = "one new immutable snapshot and explicit current review state"
+forbidden_side_effects = ["raw-value mutation", "old snapshot mutation", "older decision reactivation"]
+
+[[case]]
+id = "V02-A-REV-016"
+contracts = ["V02-C-REV-005"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_new_flagged_source_version_requires_confirmation_after_local_exclusion"
+initial_state = "versioned source measurement and review history"
+operation = "resolve or revoke one data-review decision"
+level = "application"
+expected_result = "typed forward-only decision result"
+expected_effect = "one new immutable snapshot and explicit current review state"
+forbidden_side_effects = ["raw-value mutation", "old snapshot mutation", "older decision reactivation"]
+
+[[case]]
+id = "V02-A-REV-022"
+contracts = ["V02-C-REV-007"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_review_decision_requests_enforce_mandatory_reasons"
+initial_state = "versioned source measurement and review history"
+operation = "resolve or revoke one data-review decision"
+level = "application"
+expected_result = "typed forward-only decision result"
+expected_effect = "one new immutable snapshot and explicit current review state"
+forbidden_side_effects = ["raw-value mutation", "old snapshot mutation", "older decision reactivation"]
+
+[[case]]
+id = "V02-A-REV-023"
+contracts = ["V02-C-REV-007"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_new_clean_source_version_can_replace_a_continued_correction"
+initial_state = "versioned source measurement and review history"
+operation = "resolve or revoke one data-review decision"
+level = "application"
+expected_result = "typed forward-only decision result"
+expected_effect = "one new immutable snapshot and explicit current review state"
+forbidden_side_effects = ["raw-value mutation", "old snapshot mutation", "older decision reactivation"]
+
+[[case]]
+id = "V02-A-REV-024"
+contracts = ["V02-C-REV-008"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_confirmation_stales_but_never_rewrites_an_existing_analysis"
+initial_state = "versioned source measurement and review history"
+operation = "resolve or revoke one data-review decision"
+level = "application"
+expected_result = "typed forward-only decision result"
+expected_effect = "one new immutable snapshot and explicit current review state"
+forbidden_side_effects = ["raw-value mutation", "old snapshot mutation", "older decision reactivation"]
+
+[[case]]
+id = "V02-A-REV-025"
+contracts = ["V02-C-REV-008"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_confirmation_stales_but_never_rewrites_an_existing_analysis"
+initial_state = "versioned source measurement and review history"
+operation = "resolve or revoke one data-review decision"
+level = "application"
+expected_result = "typed forward-only decision result"
+expected_effect = "one new immutable snapshot and explicit current review state"
+forbidden_side_effects = ["raw-value mutation", "old snapshot mutation", "older decision reactivation"]
+
+[[case]]
+id = "V02-A-REV-026"
+contracts = ["V02-C-REV-008"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_confirmation_stales_but_never_rewrites_an_existing_analysis"
+initial_state = "versioned source measurement and review history"
+operation = "resolve or revoke one data-review decision"
+level = "application"
+expected_result = "typed forward-only decision result"
+expected_effect = "one new immutable snapshot and explicit current review state"
+forbidden_side_effects = ["raw-value mutation", "old snapshot mutation", "older decision reactivation"]
+
 
 [[contract]]
 id = "V02-C-API-002"

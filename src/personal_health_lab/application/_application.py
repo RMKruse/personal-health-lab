@@ -56,6 +56,7 @@ from personal_health_lab.storage import (
     FileVaultReason,
     FileVaultStatus,
     LocalStore,
+    OpenDataReviewCase,
     PersonBindingStatus,
     StoreBusyError,
     StoreError,
@@ -319,13 +320,56 @@ class DataConfirmation:
     note: str | None = None
 
 
-DataReviewResolution = DataConfirmation | SourceDeletionResolution | SourceConflictResolution
+@dataclass(frozen=True, slots=True)
+class DataCorrection:
+    measurement_version_id: MeasurementVersionId
+    corrected_value: float
+    unit: CanonicalUnit
+    reason: str
+    note: str | None = None
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.corrected_value):
+            raise ConfigurationError("Korrekturwert muss endlich sein.")
+        if not self.reason.strip():
+            raise ConfigurationError("Datenkorrektur verlangt einen Grund.")
+
+
+@dataclass(frozen=True, slots=True)
+class LocalMeasurementExclusion:
+    measurement_version_id: MeasurementVersionId
+    reason: str
+    note: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ConfigurationError("Lokaler Messungsausschluss verlangt einen Grund.")
+
+
+@dataclass(frozen=True, slots=True)
+class SourceValueAcceptance:
+    measurement_version_id: MeasurementVersionId
+    note: str | None = None
+
+
+DataReviewResolution = (
+    DataConfirmation
+    | DataCorrection
+    | LocalMeasurementExclusion
+    | SourceValueAcceptance
+    | SourceDeletionResolution
+    | SourceConflictResolution
+)
 
 
 @dataclass(frozen=True, slots=True)
 class ResolveDataReviewCase:
-    case_id: DataReviewCaseId
+    case_id: DataReviewCaseId | None
     resolution: DataReviewResolution
+
+    def __post_init__(self) -> None:
+        if self.case_id is None and not isinstance(self.resolution, DataCorrection):
+            raise ConfigurationError("Nur eine Datenkorrektur darf ohne Prüffall erfolgen.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -466,9 +510,20 @@ class ImportReceipt:
 
 class DataReviewCaseKind(StrEnum):
     PLAUSIBILITY = "plausibility"
+    CONTINUED_OVERRIDE = "continued_override"
     RULE_DEFINITION = "rule_definition"
     SUSPECTED_SOURCE_DELETION = "suspected_source_deletion"
     SOURCE_CONFLICT = "source_conflict"
+
+
+class DataReviewAction(StrEnum):
+    CONFIRM = "confirm"
+    CORRECT = "correct"
+    EXCLUDE_LOCAL = "exclude_local"
+    ACCEPT_SOURCE = "accept_source"
+    REJECT = "reject"
+    PREFER = "prefer"
+    SPLIT = "split"
 
 
 class DataQualityStatus(StrEnum):
@@ -563,7 +618,7 @@ class DataReviewCase:
     rule_version_id: str | None
     evidence_fingerprint: str
     candidate_version_ids: tuple[MeasurementVersionId, ...] = ()
-    allowed_actions: tuple[str, ...] = ()
+    allowed_actions: tuple[DataReviewAction, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -582,6 +637,7 @@ class DataReviewCaseDetail:
     effective_value: float | None
     effective_value_source: EffectiveValueSource | None
     reasons: tuple[PlausibilityReason, ...]
+    canonical_unit: CanonicalUnit | None
 
 
 class WriteNotStartedStatus(StrEnum):
@@ -897,6 +953,28 @@ class HealthLab:
                     "type": "confirmation",
                     "note": resolution.note,
                 }
+            elif isinstance(resolution, DataCorrection):
+                resolution_payload = {
+                    "type": "correction",
+                    "measurement_version_id": str(resolution.measurement_version_id),
+                    "corrected_value": resolution.corrected_value,
+                    "unit": resolution.unit.value,
+                    "reason": resolution.reason,
+                    "note": resolution.note,
+                }
+            elif isinstance(resolution, LocalMeasurementExclusion):
+                resolution_payload = {
+                    "type": "local_exclusion",
+                    "measurement_version_id": str(resolution.measurement_version_id),
+                    "reason": resolution.reason,
+                    "note": resolution.note,
+                }
+            elif isinstance(resolution, SourceValueAcceptance):
+                resolution_payload = {
+                    "type": "source_value_acceptance",
+                    "measurement_version_id": str(resolution.measurement_version_id),
+                    "note": resolution.note,
+                }
             elif isinstance(resolution, SourceDeletionResolution):
                 resolution_payload = {
                     "type": "source_deletion",
@@ -916,7 +994,7 @@ class HealthLab:
                 }
             request_payload: dict[str, object] = {
                 "type": "resolve_data_review_case",
-                "case_id": str(case_id),
+                "case_id": None if case_id is None else str(case_id),
                 "resolution": resolution_payload,
             }
         else:
@@ -1445,10 +1523,15 @@ class HealthLab:
         try:
             if isinstance(request, ResolveDataReviewCase):
                 review = self.load_data_review(DataReviewSelection())
-                case = next(
-                    (item for item in review.cases if item.case_id == request.case_id), None
+                case = (
+                    None
+                    if request.case_id is None
+                    else next(
+                        (item for item in review.cases if item.case_id == request.case_id),
+                        None,
+                    )
                 )
-                if case is None:
+                if case is None and request.case_id is not None:
                     return self._not_started(
                         plan,
                         WriteNotStartedStatus.PLAN_CHANGED,
@@ -1456,9 +1539,25 @@ class HealthLab:
                         expected_plan,
                     )
                 resolution = request.resolution
-                action: Literal["confirm", "reject", "prefer", "split"]
+                action: Literal[
+                    "confirm",
+                    "reject",
+                    "prefer",
+                    "split",
+                    "correct",
+                    "exclude_local",
+                    "accept_source",
+                ]
+                corrected_value: float | None = None
+                canonical_unit: str | None = None
+                reason: str | None = None
+                direct_logical_id: str | None = None
                 if isinstance(resolution, DataConfirmation):
-                    if case.kind is not DataReviewCaseKind.PLAUSIBILITY:
+                    assert case is not None
+                    if case.kind not in {
+                        DataReviewCaseKind.PLAUSIBILITY,
+                        DataReviewCaseKind.CONTINUED_OVERRIDE,
+                    }:
                         return self._not_started(
                             plan,
                             WriteNotStartedStatus.BLOCKED,
@@ -1468,7 +1567,71 @@ class HealthLab:
                     action = "confirm"
                     selected = None
                     note = resolution.note
+                    if case.kind is DataReviewCaseKind.CONTINUED_OVERRIDE:
+                        selected = (
+                            None
+                            if case.measurement_version_id is None
+                            else str(case.measurement_version_id)
+                        )
+                        if not self.load_data_review_case(case.case_id).reasons:
+                            return self._not_started(
+                                plan,
+                                WriteNotStartedStatus.BLOCKED,
+                                ("resolution_not_allowed",),
+                                expected_plan,
+                            )
+                elif isinstance(resolution, DataCorrection):
+                    version = writer.load_measurement_version_fact(
+                        resolution.measurement_version_id
+                    )
+                    if version is None or (
+                        case is not None
+                        and case.measurement_version_id != resolution.measurement_version_id
+                    ) or resolution.unit.value != version.canonical_unit:
+                        return self._not_started(
+                            plan,
+                            WriteNotStartedStatus.BLOCKED,
+                            ("resolution_not_allowed",),
+                            expected_plan,
+                        )
+                    action = "correct"
+                    selected = str(resolution.measurement_version_id)
+                    corrected_value = resolution.corrected_value
+                    canonical_unit = resolution.unit.value
+                    direct_logical_id = version.logical_measurement_id
+                    reason = resolution.reason
+                    note = resolution.note
+                elif isinstance(resolution, LocalMeasurementExclusion):
+                    assert case is not None
+                    if case.measurement_version_id != resolution.measurement_version_id:
+                        return self._not_started(
+                            plan,
+                            WriteNotStartedStatus.BLOCKED,
+                            ("resolution_not_allowed",),
+                            expected_plan,
+                        )
+                    action = "exclude_local"
+                    selected = str(resolution.measurement_version_id)
+                    reason = resolution.reason
+                    note = resolution.note
+                elif isinstance(resolution, SourceValueAcceptance):
+                    assert case is not None
+                    if (
+                        case.kind is not DataReviewCaseKind.CONTINUED_OVERRIDE
+                        or case.measurement_version_id != resolution.measurement_version_id
+                        or self.load_data_review_case(case.case_id).reasons
+                    ):
+                        return self._not_started(
+                            plan,
+                            WriteNotStartedStatus.BLOCKED,
+                            ("resolution_not_allowed",),
+                            expected_plan,
+                        )
+                    action = "accept_source"
+                    selected = str(resolution.measurement_version_id)
+                    note = resolution.note
                 elif isinstance(resolution, SourceDeletionResolution):
+                    assert case is not None
                     if case.kind is not DataReviewCaseKind.SUSPECTED_SOURCE_DELETION:
                         return self._not_started(
                             plan,
@@ -1480,6 +1643,7 @@ class HealthLab:
                     selected = None
                     note = resolution.note
                 else:
+                    assert case is not None
                     if case.kind is not DataReviewCaseKind.SOURCE_CONFLICT:
                         return self._not_started(
                             plan,
@@ -1497,12 +1661,32 @@ class HealthLab:
                 result = writer.publish_data_review_resolution(
                     operation_id=operation_id,
                     snapshot_id=SnapshotId(uuid4().hex),
-                    review_case_id=str(case.case_id),
+                    review_case_id=None if case is None else str(case.case_id),
+                    logical_measurement_id=(
+                        direct_logical_id
+                        if case is None
+                        else (
+                            None
+                            if case.logical_measurement_id is None
+                            else str(case.logical_measurement_id)
+                        )
+                    ),
                     action=action,
                     selected_measurement_version_id=selected,
-                    candidate_version_ids=tuple(str(item) for item in case.candidate_version_ids),
+                    candidate_version_ids=(
+                        ()
+                        if case is None
+                        else tuple(str(item) for item in case.candidate_version_ids)
+                    ),
                     note=note,
-                    cycle_updates=close_review_cycle_updates(writer, str(case.case_id)),
+                    reason=reason,
+                    corrected_value=corrected_value,
+                    canonical_unit=canonical_unit,
+                    cycle_updates=(
+                        ()
+                        if case is None
+                        else close_review_cycle_updates(writer, str(case.case_id))
+                    ),
                 )
             else:
                 decision_id = str(request.target.decision_id)
@@ -1617,6 +1801,34 @@ class HealthLab:
         if self._store is None:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
         snapshot, stored_cases, stored_cycles = load_review_state(self._store)
+        store = self._store
+
+        def allowed_actions(case: OpenDataReviewCase) -> tuple[DataReviewAction, ...]:
+            kind = case.kind
+            if kind == "plausibility":
+                return (
+                    DataReviewAction.CONFIRM,
+                    DataReviewAction.CORRECT,
+                    DataReviewAction.EXCLUDE_LOCAL,
+                )
+            if kind == "continued_override":
+                detail = load_review_case_detail(store, case.review_case_id)
+                first = (
+                    DataReviewAction.CONFIRM
+                    if detail.reasons
+                    else DataReviewAction.ACCEPT_SOURCE
+                )
+                return (
+                    first,
+                    DataReviewAction.CORRECT,
+                    DataReviewAction.EXCLUDE_LOCAL,
+                )
+            if kind == "suspected_source_deletion":
+                return (DataReviewAction.CONFIRM, DataReviewAction.REJECT)
+            if kind == "source_conflict":
+                return (DataReviewAction.PREFER, DataReviewAction.SPLIT)
+            return ()
+
         cases = tuple(
             DataReviewCase(
                 case_id=DataReviewCaseId(case.review_case_id),
@@ -1630,15 +1842,7 @@ class HealthLab:
                     if case.kind == "source_conflict" and case.logical_measurement_id is not None
                     else ()
                 ),
-                allowed_actions=(
-                    ("confirm",)
-                    if case.kind == "plausibility"
-                    else (
-                        ("confirm", "reject")
-                        if case.kind == "suspected_source_deletion"
-                        else (("prefer", "split") if case.kind == "source_conflict" else ())
-                    )
-                ),
+                allowed_actions=allowed_actions(case),
             )
             for case in stored_cases
             if selection.kind is None or case.kind == selection.kind.value
@@ -1690,6 +1894,9 @@ class HealthLab:
                     unit=reason.unit,
                 )
                 for reason in detail.reasons
+            ),
+            canonical_unit=(
+                None if detail.canonical_unit is None else CanonicalUnit(detail.canonical_unit)
             ),
         )
 

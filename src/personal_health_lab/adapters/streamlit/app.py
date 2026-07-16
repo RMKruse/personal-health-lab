@@ -14,9 +14,11 @@ from personal_health_lab.application import (
     AnalysisDefinitionId,
     AnalysisStatus,
     CanonicalHealthType,
+    CanonicalUnit,
     ConfigurationError,
     CreatePlausibilityRuleVersion,
     DataConfirmation,
+    DataCorrection,
     DataReviewDecisionId,
     DataReviewSelection,
     HealthLab,
@@ -24,6 +26,8 @@ from personal_health_lab.application import (
     ImportHealthExport,
     ImportReceipt,
     ImportStatus,
+    LocalMeasurementExclusion,
+    MeasurementVersionId,
     OverviewSelection,
     OverviewStatus,
     PlausibilityRuleSpecification,
@@ -36,6 +40,7 @@ from personal_health_lab.application import (
     SourceConflictStrategy,
     SourceDeletionResolution,
     SourceDeletionVerdict,
+    SourceValueAcceptance,
     WriteApprovalStatus,
 )
 
@@ -261,6 +266,9 @@ if data_review.cases:
             f"{detail.effective_value_source.value if detail.effective_value_source else '-'} · "
             f"Begründungen {reasons}"
         )
+        decision_note = st.text_input(
+            "Optionale Entscheidungsnotiz", key=f"decision-note-{case.case_id}"
+        )
         if case.kind.value == "suspected_source_deletion":
             verdict = st.selectbox(
                 "Löschungsvermutung",
@@ -271,7 +279,7 @@ if data_review.cases:
             if st.button("Auflösung prüfen", key=f"resolve-{case.case_id}"):
                 assert verdict is not None
                 review_request_local = ResolveDataReviewCase(
-                    case.case_id, SourceDeletionResolution(verdict)
+                    case.case_id, SourceDeletionResolution(verdict, decision_note or None)
                 )
                 with HealthLab.open(config) as health_lab:
                     st.session_state["review_plan"] = health_lab.preview_write(review_request_local)
@@ -279,7 +287,9 @@ if data_review.cases:
                 st.rerun()
         elif case.kind.value == "plausibility":
             if st.button("Auffälligkeit bestätigen", key=f"confirm-{case.case_id}"):
-                review_request_local = ResolveDataReviewCase(case.case_id, DataConfirmation())
+                review_request_local = ResolveDataReviewCase(
+                    case.case_id, DataConfirmation(decision_note or None)
+                )
                 with HealthLab.open(config) as health_lab:
                     st.session_state["review_plan"] = health_lab.preview_write(review_request_local)
                 st.session_state["review_request"] = review_request_local
@@ -304,26 +314,93 @@ if data_review.cases:
                     SourceConflictResolution(
                         strategy,
                         preferred if strategy is SourceConflictStrategy.PREFER else None,
+                        decision_note or None,
                     ),
                 )
                 with HealthLab.open(config) as health_lab:
                     st.session_state["review_plan"] = health_lab.preview_write(review_request_local)
                 st.session_state["review_request"] = review_request_local
                 st.rerun()
-    review_plan = st.session_state.get("review_plan")
-    if review_plan is not None:
-        st.code(str(review_plan.fingerprint))
-        if st.button("Datenprüfentscheidung ausführen"):
-            with HealthLab.open(config) as health_lab:
-                decision_result = health_lab.execute_write(
-                    st.session_state["review_request"],
-                    expected_plan=review_plan.fingerprint,
-                ).result
-            st.success(f"Datenprüfentscheidung: {decision_result.status.value}")
-            st.session_state.pop("review_plan", None)
-            st.session_state.pop("review_request", None)
-            st.rerun()
-
+        elif case.kind.value == "continued_override":
+            if "confirm" in case.allowed_actions:
+                if st.button("Neue Quellversion bestätigen", key=f"confirm-{case.case_id}"):
+                    review_request_local = ResolveDataReviewCase(
+                        case.case_id, DataConfirmation(decision_note or None)
+                    )
+                    with HealthLab.open(config) as health_lab:
+                        st.session_state["review_plan"] = health_lab.preview_write(
+                            review_request_local
+                        )
+                    st.session_state["review_request"] = review_request_local
+                    st.rerun()
+            elif st.button("Neue Quellversion übernehmen", key=f"accept-{case.case_id}"):
+                assert case.measurement_version_id is not None
+                review_request_local = ResolveDataReviewCase(
+                    case.case_id,
+                    SourceValueAcceptance(
+                        case.measurement_version_id, decision_note or None
+                    ),
+                )
+                with HealthLab.open(config) as health_lab:
+                    st.session_state["review_plan"] = health_lab.preview_write(
+                        review_request_local
+                    )
+                st.session_state["review_request"] = review_request_local
+                st.rerun()
+        if case.measurement_version_id is not None and case.kind.value in {
+            "plausibility",
+            "continued_override",
+        }:
+            correction_value = st.number_input(
+                "Korrekturwert",
+                value=float(detail.effective_value or 0),
+                key=f"correction-value-{case.case_id}",
+            )
+            correction_reason = st.text_input(
+                "Korrekturgrund", key=f"correction-reason-{case.case_id}"
+            )
+            assert detail.canonical_unit is not None
+            if st.button("Korrektur prüfen", key=f"correct-{case.case_id}"):
+                try:
+                    review_request_local = ResolveDataReviewCase(
+                        case.case_id,
+                        DataCorrection(
+                            case.measurement_version_id,
+                            correction_value,
+                            detail.canonical_unit,
+                            correction_reason,
+                            decision_note or None,
+                        ),
+                    )
+                    with HealthLab.open(config) as health_lab:
+                        st.session_state["review_plan"] = health_lab.preview_write(
+                            review_request_local
+                        )
+                    st.session_state["review_request"] = review_request_local
+                    st.rerun()
+                except ConfigurationError:
+                    st.error("Korrekturgrund fehlt.")
+            exclusion_reason = st.text_input(
+                "Ausschlussgrund", key=f"exclusion-reason-{case.case_id}"
+            )
+            if st.button("Lokal ausschließen", key=f"exclude-{case.case_id}"):
+                try:
+                    review_request_local = ResolveDataReviewCase(
+                        case.case_id,
+                        LocalMeasurementExclusion(
+                            case.measurement_version_id,
+                            exclusion_reason,
+                            decision_note or None,
+                        ),
+                    )
+                    with HealthLab.open(config) as health_lab:
+                        st.session_state["review_plan"] = health_lab.preview_write(
+                            review_request_local
+                        )
+                    st.session_state["review_request"] = review_request_local
+                    st.rerun()
+                except ConfigurationError:
+                    st.error("Ausschlussgrund fehlt.")
 with st.expander("Datenprüfentscheidung widerrufen"):
     decision_id = st.text_input("Entscheidungs-ID")
     revoke_reason = st.text_input("Widerrufsgrund")
@@ -338,6 +415,48 @@ with st.expander("Datenprüfentscheidung widerrufen"):
             st.rerun()
         except (ValueError, ConfigurationError):
             st.error("Widerruf ist ungültig.")
+
+with st.expander("Quellmessung direkt korrigieren"):
+    direct_version = st.text_input("Quellversions-ID")
+    direct_value = st.number_input("Direkter Korrekturwert", value=0.0)
+    direct_unit = st.selectbox(
+        "Kanonische Einheit", tuple(CanonicalUnit), format_func=lambda item: item.value
+    )
+    direct_reason = st.text_input("Direkter Korrekturgrund")
+    direct_note = st.text_input("Optionale direkte Korrekturnotiz")
+    if st.button("Direkte Korrektur prüfen"):
+        try:
+            assert direct_unit is not None
+            direct_request = ResolveDataReviewCase(
+                None,
+                DataCorrection(
+                    MeasurementVersionId(direct_version),
+                    direct_value,
+                    direct_unit,
+                    direct_reason,
+                    direct_note or None,
+                ),
+            )
+            with HealthLab.open(config) as health_lab:
+                st.session_state["review_plan"] = health_lab.preview_write(direct_request)
+            st.session_state["review_request"] = direct_request
+            st.rerun()
+        except (ValueError, ConfigurationError):
+            st.error("Direkte Korrektur ist ungültig.")
+
+review_plan = st.session_state.get("review_plan")
+if review_plan is not None:
+    st.code(str(review_plan.fingerprint))
+    if st.button("Datenprüfentscheidung ausführen"):
+        with HealthLab.open(config) as health_lab:
+            decision_result = health_lab.execute_write(
+                st.session_state["review_request"],
+                expected_plan=review_plan.fingerprint,
+            ).result
+        st.success(f"Datenprüfentscheidung: {decision_result.status.value}")
+        st.session_state.pop("review_plan", None)
+        st.session_state.pop("review_request", None)
+        st.rerun()
 if overview.quarantined_import_count:
     st.warning("Mindestens ein unterbrochener Import wurde sicher quarantänisiert.")
 

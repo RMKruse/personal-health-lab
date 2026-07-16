@@ -99,7 +99,7 @@
             "properties": {
               "allowed_actions": {
                 "type": "array",
-                "items": {"enum": ["confirm", "reject", "prefer", "split"]}
+                "items": {"enum": ["confirm", "correct", "exclude_local", "accept_source", "reject", "prefer", "split"]}
               },
               "candidate_version_ids": {
                 "type": "array",
@@ -109,8 +109,9 @@
               "detail": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["effective_value", "effective_value_source", "measured_at", "reasons", "source_type"],
+                "required": ["canonical_unit", "effective_value", "effective_value_source", "measured_at", "reasons", "source_type"],
                 "properties": {
+                  "canonical_unit": {"enum": ["kcal", "count/min", null]},
                   "effective_value": {"type": ["number", "null"]},
                   "effective_value_source": {"enum": ["source", "correction", "none", null]},
                   "measured_at": {"$ref": "#/$defs/nullableString"},
@@ -132,7 +133,7 @@
                 }
               },
               "evidence_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-              "kind": {"enum": ["plausibility", "rule_definition", "suspected_source_deletion", "source_conflict"]},
+              "kind": {"enum": ["plausibility", "continued_override", "rule_definition", "suspected_source_deletion", "source_conflict"]},
               "logical_measurement_id": {"$ref": "#/$defs/nullableString"},
               "measurement_version_id": {"$ref": "#/$defs/nullableString"},
               "rule_version_id": {"$ref": "#/$defs/nullableString"}

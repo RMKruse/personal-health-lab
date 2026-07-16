@@ -947,7 +947,8 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             decision_kind TEXT NOT NULL CHECK (
                 decision_kind IN (
                     'correction', 'local_exclusion',
-                    'source_deletion', 'conflict_resolution', 'confirmation'
+                    'source_deletion', 'conflict_resolution', 'confirmation',
+                    'source_value_acceptance'
                 )
             )
         ) STRICT;
@@ -1044,19 +1045,26 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS data_review_decisions (
             audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
             decision_id TEXT NOT NULL UNIQUE REFERENCES decision_refs(decision_id),
-            review_case_id TEXT NOT NULL,
+            review_case_id TEXT,
             case_kind TEXT NOT NULL CHECK (
-                case_kind IN ('plausibility', 'suspected_source_deletion', 'source_conflict')
+                case_kind IN (
+                    'plausibility', 'continued_override', 'suspected_source_deletion',
+                    'source_conflict', 'direct_correction'
+                )
             ),
             logical_measurement_id TEXT NOT NULL,
             evidence_fingerprint TEXT NOT NULL,
             action TEXT NOT NULL CHECK (
-                action IN ('confirm', 'reject', 'prefer', 'split')
+                action IN (
+                    'confirm', 'reject', 'prefer', 'split', 'correct',
+                    'exclude_local', 'accept_source'
+                )
             ),
             selected_measurement_version_id TEXT,
             previous_measurement_version_id TEXT NOT NULL,
             candidate_version_ids TEXT NOT NULL,
-            note TEXT
+            note TEXT,
+            mandatory_reason TEXT
         ) STRICT;
         CREATE TABLE IF NOT EXISTS source_absence_suppressions (
             logical_measurement_id TEXT PRIMARY KEY,
@@ -2866,11 +2874,23 @@ class LocalStore:
         *,
         operation_id: OperationId,
         snapshot_id: SnapshotId,
-        review_case_id: str,
-        action: Literal["confirm", "reject", "prefer", "split"],
+        review_case_id: str | None,
+        logical_measurement_id: str | None,
+        action: Literal[
+            "confirm",
+            "reject",
+            "prefer",
+            "split",
+            "correct",
+            "exclude_local",
+            "accept_source",
+        ],
         selected_measurement_version_id: str | None,
         candidate_version_ids: tuple[str, ...],
         note: str | None,
+        reason: str | None,
+        corrected_value: float | None,
+        canonical_unit: str | None,
         cycle_updates: tuple[ReviewCycleUpdate, ...],
     ) -> PublishDecisionResult:
         self._require_open()
@@ -2882,14 +2902,30 @@ class LocalStore:
             (
                 item
                 for item in self.load_open_data_review_cases()
-                if item.review_case_id == review_case_id
+                if review_case_id is not None and item.review_case_id == review_case_id
             ),
             None,
         )
-        if case is None or case.logical_measurement_id is None:
+        if review_case_id is not None and (case is None or case.logical_measurement_id is None):
             raise StoreError("Datenprüffall ist nicht mehr offen.")
-        candidates = candidate_version_ids or self.load_source_conflict_candidates(
-            case.logical_measurement_id
+        logical_id = (
+            logical_measurement_id
+            if case is None
+            else str(case.logical_measurement_id)
+        )
+        if logical_id is None:
+            raise StoreError("Logische Quellmessung fehlt.")
+        case_logical_id = None if case is None else case.logical_measurement_id
+        if case is not None:
+            assert case_logical_id is not None
+        candidates = (
+            candidate_version_ids
+            if candidate_version_ids
+            else (
+                ()
+                if case_logical_id is None
+                else self.load_source_conflict_candidates(case_logical_id)
+            )
         )
         if action == "prefer" and selected_measurement_version_id not in {
             str(item) for item in candidates
@@ -2902,7 +2938,42 @@ class LocalStore:
                 "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
             ).fetchone()[0]
         )
-        previous_version = self._resolved_version(active, str(case.logical_measurement_id))
+        previous_version = self._resolved_version(active, logical_id)
+        resolved = self.load_resolved_measurement(logical_id)
+        case_kind = "direct_correction" if case is None else case.kind
+        superseded_decision_id = (
+            None
+            if resolved is None
+            or (
+                action not in {"correct", "exclude_local", "accept_source"}
+                and not (action == "confirm" and case_kind == "continued_override")
+            )
+            else resolved.effective_decision_id
+        )
+        superseded_audit = (
+            None
+            if superseded_decision_id is None
+            else self._metadata.execute(
+                "SELECT d.audit_event_id FROM data_review_decisions d "
+                "WHERE d.decision_id = ? AND NOT EXISTS ("
+                "SELECT 1 FROM metadata_tombstones t "
+                "WHERE t.target_audit_event_id = d.audit_event_id)",
+                (superseded_decision_id,),
+            ).fetchone()
+        )
+        decision_kind = {
+            "correct": "correction",
+            "exclude_local": "local_exclusion",
+            "accept_source": "source_value_acceptance",
+            "prefer": "conflict_resolution",
+            "split": "conflict_resolution",
+            "reject": "source_deletion",
+        }.get(
+            action,
+            "source_deletion"
+            if case_kind == "suspected_source_deletion"
+            else "confirmation",
+        )
         completed_at = datetime.now(UTC).isoformat()
         with self._metadata:
             self._metadata.execute(
@@ -2912,45 +2983,59 @@ class LocalStore:
             )
             self._metadata.execute(
                 "INSERT INTO decision_refs VALUES (?, ?)",
-                (
-                    decision_id,
-                    (
-                        "confirmation"
-                        if case.kind == "plausibility"
-                        else (
-                            "source_deletion"
-                            if case.kind == "suspected_source_deletion"
-                            else "conflict_resolution"
-                        )
-                    ),
-                ),
+                (decision_id, decision_kind),
             )
             self._metadata.execute(
                 "INSERT INTO audit_events VALUES (?, ?, ?, 'data_review_decision', ?)",
                 (audit_position, audit_event_id, str(operation_id), completed_at),
             )
             self._metadata.execute(
-                "INSERT INTO data_review_decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO data_review_decisions VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     audit_event_id,
                     decision_id,
                     review_case_id,
-                    case.kind,
-                    str(case.logical_measurement_id),
-                    case.evidence_fingerprint,
+                    case_kind,
+                    logical_id,
+                    (
+                        hashlib.sha256(
+                            f"direct_correction:{selected_measurement_version_id}".encode()
+                        ).hexdigest()
+                        if case is None
+                        else case.evidence_fingerprint
+                    ),
                     action,
                     selected_measurement_version_id,
                     previous_version,
                     json.dumps([str(item) for item in candidates], separators=(",", ":")),
                     note,
+                    reason,
                 ),
             )
-            if case.kind == "suspected_source_deletion" and action in {"confirm", "reject"}:
+            snapshot_audit_position = audit_position
+            if superseded_audit is not None:
+                tombstone_audit_id = uuid4().hex
+                snapshot_audit_position += 1
+                self._metadata.execute(
+                    "INSERT INTO audit_events VALUES (?, ?, ?, 'metadata_tombstone', ?)",
+                    (
+                        snapshot_audit_position,
+                        tombstone_audit_id,
+                        str(operation_id),
+                        completed_at,
+                    ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO metadata_tombstones VALUES (?, ?, ?, 'superseded', ?, NULL)",
+                    (uuid4().hex, tombstone_audit_id, str(superseded_audit[0]), audit_event_id),
+                )
+            if case_kind == "suspected_source_deletion" and action in {"confirm", "reject"}:
                 self._metadata.execute(
                     "INSERT INTO source_absence_suppressions VALUES (?, ?, 1) "
                     "ON CONFLICT(logical_measurement_id) DO UPDATE SET "
                     "decision_id = excluded.decision_id, active = 1",
-                    (str(case.logical_measurement_id), decision_id),
+                    (logical_id, decision_id),
                 )
             self._metadata.executemany(
                 "UPDATE review_cycles SET open_case_count = ?, status = ? WHERE cycle_id = ?",
@@ -2963,12 +3048,14 @@ class LocalStore:
                 parent_snapshot_id=active,
                 snapshot_id=snapshot_id,
                 operation_id=operation_id,
-                audit_position=audit_position,
+                audit_position=snapshot_audit_position,
                 review_case_id=review_case_id,
                 decision_id=decision_id,
                 action=action,
                 selected_measurement_version_id=selected_measurement_version_id,
                 candidate_version_ids=tuple(str(item) for item in candidates),
+                corrected_value=corrected_value,
+                canonical_unit=canonical_unit,
             )
             self._activate_review_snapshot(
                 operation_id, snapshot_id, active, manifest_sha256, completed_at
@@ -2993,34 +3080,44 @@ class LocalStore:
             """
             SELECT d.audit_event_id, d.review_case_id, d.case_kind,
                    d.logical_measurement_id, d.evidence_fingerprint, d.action,
+                   d.selected_measurement_version_id,
                    d.previous_measurement_version_id, d.candidate_version_ids
             FROM data_review_decisions d
             WHERE d.decision_id = ?
               AND NOT EXISTS (
                   SELECT 1 FROM metadata_tombstones t
                   WHERE t.target_audit_event_id = d.audit_event_id
-                    AND t.tombstone_kind = 'revoked'
               )
             """,
             (decision_id,),
         ).fetchone()
         if row is None:
             raise StoreError("Entscheidung ist nicht wirksam.")
-        (
-            target_audit_id,
-            review_case_id,
-            _case_kind,
-            _logical_id,
-            _evidence,
-            _action,
-            previous_version,
-            candidates_json,
-        ) = map(str, row)
+        target_audit_id = str(row[0])
+        review_case_id = None if row[1] is None else str(row[1])
+        _case_kind = str(row[2])
+        _logical_id = str(row[3])
+        _evidence = str(row[4])
+        _action = str(row[5])
+        selected_version = None if row[6] is None else str(row[6])
+        previous_version = str(row[7])
+        candidates_json = str(row[8])
+        case_audit_id = target_audit_id
+        if review_case_id is None:
+            prior_case = self._metadata.execute(
+                "SELECT d.review_case_id, d.audit_event_id "
+                "FROM data_review_decisions d JOIN audit_events e USING (audit_event_id) "
+                "WHERE d.logical_measurement_id = ? AND d.review_case_id IS NOT NULL "
+                "ORDER BY e.audit_position DESC LIMIT 1",
+                (_logical_id,),
+            ).fetchone()
+            if prior_case is not None:
+                review_case_id, case_audit_id = map(str, prior_case)
         basis = self._metadata.execute(
             "SELECT a.previous_snapshot_id FROM snapshot_activations a "
             "JOIN audit_events e ON e.operation_id = a.operation_id "
             "WHERE e.audit_event_id = ?",
-            (target_audit_id,),
+            (case_audit_id,),
         ).fetchone()
         if basis is None or basis[0] is None:
             raise StoreError("Entscheidungsbasis fehlt.")
@@ -3038,26 +3135,30 @@ class LocalStore:
             f"FROM read_parquet('{escaped_case_path}') WHERE review_case_id = ?",
             (review_case_id,),
         ).fetchone()
-        if case_row is None:
+        if case_row is None and review_case_id is not None:
             raise StoreError("Ursprünglicher Datenprüffall fehlt.")
-        reopened_case = OpenDataReviewCase(
-            review_case_id=str(case_row[0]),
-            kind=cast(
-                Literal[
-                    "plausibility",
-                    "continued_override",
-                    "suspected_source_deletion",
-                    "source_conflict",
-                    "rule_definition",
-                ],
-                str(case_row[1]),
-            ),
-            logical_measurement_id=LogicalMeasurementId(str(case_row[2])),
-            measurement_version_id=(
-                None if case_row[3] is None else MeasurementVersionId(str(case_row[3]))
-            ),
-            rule_version_id=None if case_row[4] is None else str(case_row[4]),
-            evidence_fingerprint=str(case_row[5]),
+        reopened_case = (
+            None
+            if case_row is None
+            else OpenDataReviewCase(
+                review_case_id=str(case_row[0]),
+                kind=cast(
+                    Literal[
+                        "plausibility",
+                        "continued_override",
+                        "suspected_source_deletion",
+                        "source_conflict",
+                        "rule_definition",
+                    ],
+                    str(case_row[1]),
+                ),
+                logical_measurement_id=LogicalMeasurementId(str(case_row[2])),
+                measurement_version_id=(
+                    None if case_row[3] is None else MeasurementVersionId(str(case_row[3]))
+                ),
+                rule_version_id=None if case_row[4] is None else str(case_row[4]),
+                evidence_fingerprint=str(case_row[5]),
+            )
         )
         audit_event_id = uuid4().hex
         audit_position = int(
@@ -3099,7 +3200,11 @@ class LocalStore:
                 review_case_id=review_case_id,
                 decision_id=decision_id,
                 action="revoke",
-                selected_measurement_version_id=previous_version,
+                selected_measurement_version_id=(
+                    selected_version
+                    if _action in {"correct", "exclude_local", "accept_source"}
+                    else previous_version
+                ),
                 candidate_version_ids=tuple(json.loads(candidates_json)),
                 reopened_case=reopened_case,
             )
@@ -3120,6 +3225,108 @@ class LocalStore:
             raise StoreError("Aufgelöste Quellmessung fehlt.")
         return str(row[0])
 
+    def _include_source(self, logical_id: str, version_id: str) -> None:
+        version = self._query.execute(
+            "SELECT canonical_value, canonical_unit FROM measurement_versions "
+            "WHERE measurement_version_id = ?",
+            (version_id,),
+        ).fetchone()
+        if version is None:
+            raise StoreError("Quellmessungsversion fehlt.")
+        self._query.execute(
+            "UPDATE resolved_measurements SET selected_measurement_version_id = ?, "
+            "disposition = 'included_source', effective_value = ?, canonical_unit = ?, "
+            "effective_value_source = 'source', effective_decision_id = NULL, "
+            "correction_decision_id = NULL, source_deletion_decision_id = NULL, "
+            "conflict_resolution_decision_id = NULL WHERE logical_measurement_id = ?",
+            (version_id, float(version[0]), str(version[1]), logical_id),
+        )
+
+    def _reopen_review_case(
+        self,
+        case: OpenDataReviewCase,
+        selected_version_id: str | None,
+        candidate_version_ids: tuple[str, ...],
+        review_case_id: str | None,
+    ) -> None:
+        assert selected_version_id is not None
+        logical_id = str(case.logical_measurement_id)
+        if case.kind in {"plausibility", "continued_override"}:
+            self._query.execute(
+                "DELETE FROM resolved_measurements WHERE logical_measurement_id = ?",
+                (logical_id,),
+            )
+            version = self._query.execute(
+                "SELECT canonical_value, canonical_unit FROM measurement_versions "
+                "WHERE measurement_version_id = ?",
+                (selected_version_id,),
+            ).fetchone()
+            assert version is not None
+            self._query.execute(
+                "INSERT INTO resolved_measurements VALUES (?, ?, 'included_source', ?, ?, "
+                "'source', NULL, NULL, NULL, NULL)",
+                (logical_id, selected_version_id, float(version[0]), str(version[1])),
+            )
+            self._query.execute(
+                "INSERT INTO open_review_cases VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    case.review_case_id,
+                    case.kind,
+                    logical_id,
+                    str(case.measurement_version_id),
+                    case.rule_version_id,
+                    case.evidence_fingerprint,
+                ),
+            )
+            return
+        self._query.execute(
+            "DELETE FROM resolved_measurements WHERE logical_measurement_id = ?",
+            (logical_id,),
+        )
+        restore_ids = (
+            (selected_version_id,)
+            if case.kind == "suspected_source_deletion"
+            else candidate_version_ids
+        )
+        restored_identities: set[str] = set()
+        previous_identity = self._query.execute(
+            "SELECT identity_candidate_id FROM measurement_versions "
+            "WHERE measurement_version_id = ?",
+            (selected_version_id,),
+        ).fetchone()
+        assert previous_identity is not None
+        for candidate_id in (selected_version_id, *restore_ids):
+            version = self._query.execute(
+                "SELECT identity_candidate_id, canonical_value, canonical_unit "
+                "FROM measurement_versions WHERE measurement_version_id = ?",
+                (candidate_id,),
+            ).fetchone()
+            assert version is not None
+            identity_id = str(version[0])
+            if identity_id in restored_identities:
+                continue
+            restored_identities.add(identity_id)
+            version_id = (
+                selected_version_id
+                if identity_id == str(previous_identity[0])
+                else candidate_id
+            )
+            chosen = self._query.execute(
+                "SELECT canonical_value, canonical_unit FROM measurement_versions "
+                "WHERE measurement_version_id = ?",
+                (version_id,),
+            ).fetchone()
+            assert chosen is not None
+            self._query.execute(
+                "INSERT INTO resolved_measurements VALUES (?, ?, 'included_source', ?, ?, "
+                "'source', NULL, NULL, NULL, NULL)",
+                (identity_id, version_id, float(chosen[0]), str(chosen[1])),
+            )
+        self._query.execute(
+            "INSERT INTO open_review_cases VALUES (?, ?, ?, NULL, NULL, ?)",
+            (review_case_id, case.kind, logical_id, case.evidence_fingerprint),
+        )
+
     def _stage_review_snapshot(
         self,
         *,
@@ -3127,11 +3334,13 @@ class LocalStore:
         snapshot_id: SnapshotId,
         operation_id: OperationId,
         audit_position: int,
-        review_case_id: str,
+        review_case_id: str | None,
         decision_id: str,
         action: str,
         selected_measurement_version_id: str | None,
         candidate_version_ids: tuple[str, ...],
+        corrected_value: float | None = None,
+        canonical_unit: str | None = None,
         reopened_case: OpenDataReviewCase | None = None,
         replacement_plausibility_cases: tuple[OpenDataReviewCase, ...] | None = None,
         replaced_measurement_version_ids: tuple[str, ...] = (),
@@ -3184,83 +3393,62 @@ class LocalStore:
                 "OR conflict_resolution_decision_id = ?",
                 (decision_id, decision_id),
             )
-            assert reopened_case is not None
-            reopened_kind = reopened_case.kind
-            logical_id = str(reopened_case.logical_measurement_id)
-            evidence = reopened_case.evidence_fingerprint
-            if reopened_kind == "plausibility":
+            if reopened_case is None:
+                assert selected_measurement_version_id is not None
+                version = self._query.execute(
+                    "SELECT identity_candidate_id, canonical_value, canonical_unit "
+                    "FROM measurement_versions WHERE measurement_version_id = ?",
+                    (selected_measurement_version_id,),
+                ).fetchone()
+                assert version is not None
                 self._query.execute(
-                    "INSERT INTO open_review_cases VALUES (?, ?, ?, ?, ?, ?)",
+                    "DELETE FROM resolved_measurements WHERE logical_measurement_id = ?",
+                    (str(version[0]),),
+                )
+                self._query.execute(
+                    "INSERT INTO resolved_measurements VALUES (?, ?, 'included_source', ?, ?, "
+                    "'source', NULL, NULL, NULL, NULL)",
                     (
-                        reopened_case.review_case_id,
-                        reopened_case.kind,
-                        logical_id,
-                        str(reopened_case.measurement_version_id),
-                        reopened_case.rule_version_id,
-                        evidence,
+                        str(version[0]),
+                        selected_measurement_version_id,
+                        float(version[1]),
+                        str(version[2]),
                     ),
                 )
             else:
-                assert selected_measurement_version_id is not None
-                self._query.execute(
-                    "DELETE FROM resolved_measurements WHERE logical_measurement_id = ?",
-                    (logical_id,),
+                self._reopen_review_case(
+                    reopened_case,
+                    selected_measurement_version_id,
+                    candidate_version_ids,
+                    review_case_id,
                 )
-                restore_ids = (
-                    (selected_measurement_version_id,)
-                    if reopened_kind == "suspected_source_deletion"
-                    else candidate_version_ids
-                )
-                restored_identities: set[str] = set()
-                previous_identity = self._query.execute(
+        else:
+            case = (
+                None
+                if review_case_id is None
+                else self._query.execute(
+                    "SELECT case_kind, logical_measurement_id FROM open_review_cases "
+                    "WHERE review_case_id = ?",
+                    (review_case_id,),
+                ).fetchone()
+            )
+            if case is None and review_case_id is not None:
+                raise StoreError("Datenprüffall ist nicht mehr offen.")
+            if case is None:
+                version_row = self._query.execute(
                     "SELECT identity_candidate_id FROM measurement_versions "
                     "WHERE measurement_version_id = ?",
                     (selected_measurement_version_id,),
                 ).fetchone()
-                assert previous_identity is not None
-                for candidate_id in (selected_measurement_version_id, *restore_ids):
-                    version = self._query.execute(
-                        "SELECT identity_candidate_id, canonical_value, canonical_unit "
-                        "FROM measurement_versions WHERE measurement_version_id = ?",
-                        (candidate_id,),
-                    ).fetchone()
-                    assert version is not None
-                    identity_id = str(version[0])
-                    if identity_id in restored_identities:
-                        continue
-                    restored_identities.add(identity_id)
-                    version_id = (
-                        selected_measurement_version_id
-                        if identity_id == str(previous_identity[0])
-                        else candidate_id
-                    )
-                    chosen = self._query.execute(
-                        "SELECT canonical_value, canonical_unit FROM measurement_versions "
-                        "WHERE measurement_version_id = ?",
-                        (version_id,),
-                    ).fetchone()
-                    assert chosen is not None
-                    self._query.execute(
-                        "INSERT INTO resolved_measurements VALUES (?, ?, 'included_source', ?, ?, "
-                        "'source', NULL, NULL, NULL, NULL)",
-                        (identity_id, version_id, float(chosen[0]), str(chosen[1])),
-                    )
+                if version_row is None:
+                    raise StoreError("Quellmessungsversion fehlt.")
+                case_kind, logical_id = "direct_correction", str(version_row[0])
+            else:
+                case_kind, logical_id = map(str, case)
                 self._query.execute(
-                    "INSERT INTO open_review_cases VALUES (?, ?, ?, NULL, NULL, ?)",
-                    (review_case_id, reopened_kind, logical_id, evidence),
+                    "DELETE FROM open_review_cases WHERE review_case_id = ?",
+                    (review_case_id,),
                 )
-        else:
-            case = self._query.execute(
-                "SELECT case_kind, logical_measurement_id FROM open_review_cases "
-                "WHERE review_case_id = ?",
-                (review_case_id,),
-            ).fetchone()
-            if case is None:
-                raise StoreError("Datenprüffall ist nicht mehr offen.")
-            case_kind, logical_id = map(str, case)
-            self._query.execute(
-                "DELETE FROM open_review_cases WHERE review_case_id = ?", (review_case_id,)
-            )
             if action == "confirm":
                 if case_kind == "suspected_source_deletion":
                     self._query.execute(
@@ -3273,6 +3461,44 @@ class LocalStore:
                         """,
                         (decision_id, decision_id, logical_id),
                     )
+                elif case_kind == "continued_override":
+                    assert selected_measurement_version_id is not None
+                    self._include_source(logical_id, selected_measurement_version_id)
+            elif action == "correct":
+                assert selected_measurement_version_id is not None
+                assert corrected_value is not None
+                assert canonical_unit is not None
+                self._query.execute(
+                    "UPDATE resolved_measurements SET selected_measurement_version_id = ?, "
+                    "disposition = 'included_correction', effective_value = ?, "
+                    "canonical_unit = ?, effective_value_source = 'correction', "
+                    "effective_decision_id = ?, correction_decision_id = ?, "
+                    "source_deletion_decision_id = NULL, "
+                    "conflict_resolution_decision_id = NULL "
+                    "WHERE logical_measurement_id = ?",
+                    (
+                        selected_measurement_version_id,
+                        corrected_value,
+                        canonical_unit,
+                        decision_id,
+                        decision_id,
+                        logical_id,
+                    ),
+                )
+            elif action == "exclude_local":
+                assert selected_measurement_version_id is not None
+                self._query.execute(
+                    "UPDATE resolved_measurements SET selected_measurement_version_id = ?, "
+                    "disposition = 'excluded_local', effective_value = NULL, "
+                    "effective_value_source = 'none', effective_decision_id = ?, "
+                    "correction_decision_id = NULL, source_deletion_decision_id = NULL, "
+                    "conflict_resolution_decision_id = NULL "
+                    "WHERE logical_measurement_id = ?",
+                    (selected_measurement_version_id, decision_id, logical_id),
+                )
+            elif action == "accept_source":
+                assert selected_measurement_version_id is not None
+                self._include_source(logical_id, selected_measurement_version_id)
             elif action == "prefer":
                 assert selected_measurement_version_id is not None
                 version = self._query.execute(
@@ -3683,13 +3909,25 @@ class LocalStore:
     def load_effective_decision_case_id(self, decision_id: str) -> str | None:
         self._require_open()
         row = self._metadata.execute(
-            "SELECT d.review_case_id FROM data_review_decisions d "
+            "SELECT d.review_case_id, d.logical_measurement_id "
+            "FROM data_review_decisions d "
             "WHERE d.decision_id = ? AND NOT EXISTS ("
             "SELECT 1 FROM metadata_tombstones t "
             "WHERE t.target_audit_event_id = d.audit_event_id) LIMIT 1",
             (decision_id,),
         ).fetchone()
-        return None if row is None else str(row[0])
+        if row is None:
+            return None
+        if row[0] is not None:
+            return str(row[0])
+        prior = self._metadata.execute(
+            "SELECT d.review_case_id FROM data_review_decisions d "
+            "JOIN audit_events e USING (audit_event_id) "
+            "WHERE d.logical_measurement_id = ? AND d.review_case_id IS NOT NULL "
+            "ORDER BY e.audit_position DESC LIMIT 1",
+            (str(row[1]),),
+        ).fetchone()
+        return None if prior is None else str(prior[0])
 
     def publish_historical_review(
         self, publication: HistoricalReviewPublication
