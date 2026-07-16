@@ -19,6 +19,7 @@ from personal_health_lab.application import (
     CapacityCheck,
     ConfigurationError,
     CreatePlausibilityRuleVersion,
+    DataConfirmation,
     DataMode,
     DataReview,
     DataReviewCaseDetail,
@@ -28,6 +29,8 @@ from personal_health_lab.application import (
     DataReviewSelection,
     FileVaultCheck,
     HealthLab,
+    HistoricalReviewPlan,
+    HistoricalReviewReceipt,
     ImportHealthExport,
     ImportHealthExportPlan,
     ImportReceipt,
@@ -43,6 +46,7 @@ from personal_health_lab.application import (
     ResolveDataReviewCase,
     RestingHeartRateAnalysisConfig,
     RevokeDataReviewDecision,
+    RunHistoricalReview,
     SingleDecisionTarget,
     SourceConflictResolution,
     SourceConflictStrategy,
@@ -109,10 +113,21 @@ def _parser() -> argparse.ArgumentParser:
     rule.add_argument("--json", action="store_true", dest="as_json")
     rule.add_argument("--execute", action="store_true")
     rule.add_argument("--expect-plan", type=PlanFingerprint)
+    historical = commands.add_parser("historical-review", help="Historische Datenprüfung ausführen")
+    historical.add_argument(
+        "data_type", type=CanonicalHealthType, choices=tuple(CanonicalHealthType)
+    )
+    historical.add_argument("--start-date", required=True, type=date.fromisoformat)
+    historical.add_argument("--end-date", required=True, type=date.fromisoformat)
+    historical.add_argument("--rule-version")
+    historical.add_argument("--json", action="store_true", dest="as_json")
+    historical.add_argument("--execute", action="store_true")
+    historical.add_argument("--expect-plan", type=PlanFingerprint)
     resolve = commands.add_parser("review-resolve", help="Datenprüffall auflösen")
     resolve.add_argument("case_id", type=DataReviewCaseId)
     resolve.add_argument("--deletion-verdict", type=SourceDeletionVerdict)
     resolve.add_argument("--conflict-strategy", type=SourceConflictStrategy)
+    resolve.add_argument("--confirm", action="store_true")
     resolve.add_argument("--preferred-version")
     resolve.add_argument("--note")
     resolve.add_argument("--json", action="store_true", dest="as_json")
@@ -223,9 +238,16 @@ def _data_review_json(
         "status": review.status.value,
         "cycles": [
             {
+                "base_snapshot_ref": (
+                    None if cycle.base_snapshot_ref is None else str(cycle.base_snapshot_ref)
+                ),
                 "cycle_id": str(cycle.cycle_id),
+                "end_date": None if cycle.end_date is None else cycle.end_date.isoformat(),
+                "kind": cycle.kind.value,
                 "open_case_count": cycle.open_case_count,
+                "rule_version_id": cycle.rule_version_id,
                 "snapshot_ref": str(cycle.snapshot_ref),
+                "start_date": (None if cycle.start_date is None else cycle.start_date.isoformat()),
                 "status": cycle.status.value,
             }
             for cycle in review.cycles
@@ -376,6 +398,17 @@ def _write_plan_json(
             "type": "data_review_decision",
         }
         request_json = {"type": "data_review_decision"}
+    elif isinstance(details, HistoricalReviewPlan):
+        detail_json = {
+            "base_snapshot_ref": (
+                None if details.base_snapshot_ref is None else str(details.base_snapshot_ref)
+            ),
+            "end_date": details.end_date.isoformat(),
+            "rule_version_id": details.rule_version_id,
+            "start_date": details.start_date.isoformat(),
+            "type": "run_historical_review",
+        }
+        request_json = {"type": "run_historical_review"}
     else:
         raise TypeError("Nicht unterstützte Schreibplandetails.")
     return {
@@ -430,6 +463,15 @@ def _write_receipt_json(
             "snapshot_ref": str(result.snapshot_ref),
             "status": result.status.value,
             "type": "data_review_decision",
+        }
+    elif isinstance(result, HistoricalReviewReceipt):
+        result_json = {
+            "cycle_id": str(result.cycle_id),
+            "diagnostics": result.diagnostics,
+            "open_case_count": result.open_case_count,
+            "snapshot_ref": str(result.snapshot_ref),
+            "status": result.status.value,
+            "type": "run_historical_review",
         }
     else:
         result_json = {
@@ -491,14 +533,28 @@ def _print_write_plan(plan: WritePlan, workspace: WorkspaceStatus) -> None:
 def main(args: Sequence[str] | None = None) -> int:
     parser = _parser()
     parsed = parser.parse_args(args)
-    write_commands = {"import", "rule", "review-resolve", "review-revoke"}
+    write_commands = {
+        "historical-review",
+        "import",
+        "rule",
+        "review-resolve",
+        "review-revoke",
+    }
     if parsed.command in write_commands:
         if parsed.execute and not parsed.as_json:
             parser.error("--execute ist nur zusammen mit --json zulässig.")
         if parsed.execute != (parsed.expect_plan is not None):
             parser.error("--execute und --expect-plan müssen gemeinsam angegeben werden.")
-    if parsed.command == "review-resolve" and (
-        (parsed.deletion_verdict is None) == (parsed.conflict_strategy is None)
+    if (
+        parsed.command == "review-resolve"
+        and sum(
+            (
+                parsed.deletion_verdict is not None,
+                parsed.conflict_strategy is not None,
+                parsed.confirm,
+            )
+        )
+        != 1
     ):
         parser.error("Genau eine Auflösungsart muss angegeben werden.")
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
@@ -559,17 +615,46 @@ def main(args: Sequence[str] | None = None) -> int:
                     rule_write_receipt = health_lab.execute_write(
                         rule_request, expected_plan=rule_plan.fingerprint
                     )
+            elif parsed.command == "historical-review":
+                historical_request = RunHistoricalReview(
+                    parsed.data_type,
+                    parsed.start_date,
+                    parsed.end_date,
+                    parsed.rule_version,
+                )
+                historical_plan = health_lab.preview_write(historical_request)
+                historical_write_receipt = None
+                if parsed.execute:
+                    assert parsed.expect_plan is not None
+                    historical_write_receipt = health_lab.execute_write(
+                        historical_request, expected_plan=parsed.expect_plan
+                    )
+                elif (
+                    not parsed.as_json
+                    and historical_plan.approval.status is not WriteApprovalStatus.BLOCKED
+                    and input("Historische Datenprüfung ausführen? [j/N] ").strip().lower()
+                    in {"j", "ja"}
+                ):
+                    historical_write_receipt = health_lab.execute_write(
+                        historical_request, expected_plan=historical_plan.fingerprint
+                    )
             elif parsed.command == "review-resolve":
                 decision_request = ResolveDataReviewCase(
                     parsed.case_id,
-                    SourceDeletionResolution(parsed.deletion_verdict, parsed.note)
-                    if parsed.deletion_verdict is not None
-                    else SourceConflictResolution(
-                        parsed.conflict_strategy,
-                        None
-                        if parsed.preferred_version is None
-                        else MeasurementVersionId(parsed.preferred_version),
-                        parsed.note,
+                    (
+                        DataConfirmation(parsed.note)
+                        if parsed.confirm
+                        else (
+                            SourceDeletionResolution(parsed.deletion_verdict, parsed.note)
+                            if parsed.deletion_verdict is not None
+                            else SourceConflictResolution(
+                                parsed.conflict_strategy,
+                                None
+                                if parsed.preferred_version is None
+                                else MeasurementVersionId(parsed.preferred_version),
+                                parsed.note,
+                            )
+                        )
                     ),
                 )
                 decision_plan = health_lab.preview_write(decision_request)
@@ -732,6 +817,18 @@ def main(args: Sequence[str] | None = None) -> int:
             _print_write_plan(rule_plan, workspace_status)
         else:
             print(f"Regelversion: {rule_write_receipt.result.status.value}")
+    elif parsed.command == "historical-review" and parsed.as_json:
+        output = (
+            _write_plan_json(historical_plan, runtime_config, workspace_status)
+            if historical_write_receipt is None
+            else _write_receipt_json(historical_write_receipt, runtime_config)
+        )
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+    elif parsed.command == "historical-review":
+        if historical_write_receipt is None:
+            _print_write_plan(historical_plan, workspace_status)
+        else:
+            print(f"Historische Datenprüfung: {historical_write_receipt.result.status.value}")
     elif parsed.command in {"review-resolve", "review-revoke"} and parsed.as_json:
         output = (
             _write_plan_json(decision_plan, runtime_config, workspace_status)
@@ -780,9 +877,7 @@ def main(args: Sequence[str] | None = None) -> int:
         print(f"Offene Datenprüffälle: {len(data_review.cases)}")
         for detail in data_review_details:
             case = detail.case
-            source = (
-                detail.effective_value_source.value if detail.effective_value_source else "-"
-            )
+            source = detail.effective_value_source.value if detail.effective_value_source else "-"
             reasons = ", ".join(reason.code.value for reason in detail.reasons) or "-"
             print(
                 f"{case.case_id}: {case.kind.value} · "
@@ -868,6 +963,10 @@ def main(args: Sequence[str] | None = None) -> int:
             if rule_write_receipt is None:
                 return 3 if rule_plan.approval.status is WriteApprovalStatus.BLOCKED else 0
             return 3 if isinstance(rule_write_receipt.result, WriteNotStarted) else 0
+        if parsed.command == "historical-review":
+            if historical_write_receipt is None:
+                return 3 if historical_plan.approval.status is WriteApprovalStatus.BLOCKED else 0
+            return 3 if isinstance(historical_write_receipt.result, WriteNotStarted) else 0
         if parsed.command in {"review-resolve", "review-revoke"}:
             if decision_write_receipt is None:
                 return 3 if decision_plan.approval.status is WriteApprovalStatus.BLOCKED else 0

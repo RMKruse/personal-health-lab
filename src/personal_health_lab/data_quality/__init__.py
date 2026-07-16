@@ -12,6 +12,8 @@ from typing import Literal
 from personal_health_lab.health_data import LogicalMeasurementId, MeasurementVersionId
 from personal_health_lab.storage import (
     ExportFact,
+    HistoricalReviewPublication,
+    HistoricalReviewResult,
     LocalStore,
     MeasurementVersionFact,
     OpenDataReviewCase,
@@ -20,6 +22,7 @@ from personal_health_lab.storage import (
     ResolvedMeasurement,
     ReviewCaseId,
     ReviewCycleRecord,
+    ReviewCycleUpdate,
     SnapshotId,
     SourceOccurrenceFact,
     SourceResolution,
@@ -86,9 +89,11 @@ def _rule_at(
             if rule.data_type == source_type
             and (rule.effective_from is None or rule.effective_from <= measured_at)
         ),
-        key=lambda rule: datetime.min.replace(tzinfo=UTC)
-        if rule.effective_from is None
-        else rule.effective_from.astimezone(UTC),
+        key=lambda rule: (
+            datetime.min.replace(tzinfo=UTC)
+            if rule.effective_from is None
+            else rule.effective_from.astimezone(UTC)
+        ),
         default=None,
     )
 
@@ -391,8 +396,13 @@ def _plausibility_cases(
         rule = _rule_at(version.canonical_type, measured_at, rules)
         if rule is None:
             continue
-        reasons = list(_plausibility_reasons(rule, version.canonical_value, version.canonical_unit))
         measurement = measurement_by_version.get(version_id)
+        effective_value = (
+            version.canonical_value
+            if measurement is None or measurement.effective_value is None
+            else measurement.effective_value
+        )
+        reasons = list(_plausibility_reasons(rule, effective_value, version.canonical_unit))
         selected = daily.get(version.measurement_local_date)
         if (
             rule.personal_range_enabled
@@ -541,6 +551,104 @@ def create_plausibility_rule_version(
         cases=cases,
         cycle_status="open" if cases else "closed",
     )
+
+
+class DataQualityError(ValueError):
+    """A data-quality operation cannot preserve its requested basis."""
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalReviewRequest:
+    operation_id: OperationId
+    data_type: str
+    start_date: date
+    end_date: date
+    rule_version_id: str
+    base_snapshot_id: SnapshotId
+
+
+def run_historical_review(
+    store: LocalStore, request: HistoricalReviewRequest
+) -> HistoricalReviewResult:
+    active, versions, measurements = store.load_active_plausibility_facts()
+    if active != request.base_snapshot_id:
+        raise DataQualityError("Historische Reproduktionsbasis ist nicht mehr aktiv.")
+    rule = next(
+        (
+            item
+            for item in store.load_plausibility_rule_versions()
+            if item.data_type == request.data_type and item.version_id == request.rule_version_id
+        ),
+        None,
+    )
+    if rule is None:
+        raise DataQualityError("Historische Regelversion fehlt.")
+    effective_ids = {
+        item.selected_measurement_version_id
+        for item in measurements
+        if item.disposition.startswith("included") and item.effective_value is not None
+    }
+    target_ids = tuple(
+        item.measurement_version_id
+        for item in versions
+        if item.measurement_version_id in effective_ids
+        and item.canonical_type == request.data_type
+        and request.start_date <= item.measurement_local_date <= request.end_date
+    )
+    confirmed_case_ids = store.load_effective_confirmation_case_ids()
+    reproduced_cases = evaluate_plausibility_cases(
+        versions,
+        measurements,
+        target_ids,
+        (replace(rule, effective_from=None),),
+    )
+    open_cases = tuple(
+        case for case in reproduced_cases if case.review_case_id not in confirmed_case_ids
+    )
+    return store.publish_historical_review(
+        HistoricalReviewPublication(
+            operation_id=request.operation_id,
+            base_snapshot_id=request.base_snapshot_id,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            rule_version_id=request.rule_version_id,
+            reproduced_cases=reproduced_cases,
+            open_cases=open_cases,
+            cycle_status="open" if open_cases else "closed",
+        )
+    )
+
+
+def close_review_cycle_updates(
+    store: LocalStore, review_case_id: str
+) -> tuple[ReviewCycleUpdate, ...]:
+    return tuple(
+        ReviewCycleUpdate(
+            cycle.cycle_id,
+            cycle.open_case_count - 1,
+            "closed" if cycle.open_case_count == 1 else "open",
+        )
+        for cycle in store.load_review_cycles_for_case(review_case_id)
+        if cycle.status == "open"
+    )
+
+
+def reopen_review_cycle_updates(
+    store: LocalStore, review_case_id: str
+) -> tuple[ReviewCycleUpdate, ...]:
+    return tuple(
+        ReviewCycleUpdate(cycle.cycle_id, cycle.open_case_count + 1, "open")
+        for cycle in store.load_review_cycles_for_case(review_case_id)
+    )
+
+
+def reopen_decision_cycle_updates(
+    store: LocalStore, decision_id: str
+) -> tuple[ReviewCycleUpdate, ...]:
+    review_case_id = store.load_effective_decision_case_id(decision_id)
+    if review_case_id is None:
+        return ()
+    return reopen_review_cycle_updates(store, review_case_id)
 
 
 def _unknown_rule_case(source_type: str) -> OpenDataReviewCase:
@@ -727,15 +835,23 @@ def load_review_case_detail(store: LocalStore, review_case_id: str) -> ReviewCas
     version = store.load_measurement_version_fact(case.measurement_version_id)
     if version is None:
         raise ValueError("Quellmessungsversion des Datenprüffalls fehlt.")
-    rule = _rule_at(
-        version.canonical_type,
-        datetime.fromisoformat(version.source_start_utc),
-        store.load_plausibility_rule_versions(),
+    rule = next(
+        (
+            item
+            for item in store.load_plausibility_rule_versions()
+            if item.data_type == version.canonical_type and item.version_id == case.rule_version_id
+        ),
+        None,
     )
-    if rule is None or rule.version_id != case.rule_version_id:
+    if rule is None:
         raise ValueError("Plausibilitätsregel des Datenprüffalls fehlt.")
     resolved = store.load_resolved_measurement(version.logical_measurement_id)
-    reasons = list(_plausibility_reasons(rule, version.canonical_value, version.canonical_unit))
+    effective_value = (
+        version.canonical_value
+        if resolved is None or resolved.effective_value is None
+        else resolved.effective_value
+    )
+    reasons = list(_plausibility_reasons(rule, effective_value, version.canonical_unit))
     if version.canonical_type == "apple_resting_heart_rate":
         series = next(
             (

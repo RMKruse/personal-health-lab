@@ -60,6 +60,42 @@ def test_streamlit_projects_plausibility_rules(
     assert any("apple_resting_heart_rate" in item.value for item in app.caption)
 
 
+def test_streamlit_shows_the_pinned_historical_review_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = generate_export("lag-signal-v1", 42, tmp_path / "fixture")
+    synthetic_store = tmp_path / "synthetic"
+    config = RuntimeConfig(DataMode.SYNTHETIC, synthetic_store, tmp_path / "real")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(fixture.export_path)
+        plan = health_lab.preview_write(request)
+        receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+        snapshot_ref = receipt.result.snapshot_ref
+
+    monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
+    monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(synthetic_store))
+    monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(tmp_path / "real"))
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
+    app = AppTest.from_file(str(app_path)).run()
+
+    next(item for item in app.date_input if item.label == "Historische Prüfung von").set_value(
+        date(2024, 1, 1)
+    )
+    next(item for item in app.date_input if item.label == "Historische Prüfung bis").set_value(
+        date(2024, 1, 31)
+    )
+    next(button for button in app.button if button.label == "Historische Prüfung planen").click()
+    app.run()
+
+    assert not app.exception
+    assert any(
+        f"Gepinnte Basis: {snapshot_ref}" in item.value
+        and "Zeitraum 2024-01-01 bis 2024-01-31" in item.value
+        for item in app.caption
+    )
+    assert any(button.label == "Historische Prüfung ausführen" for button in app.button)
+
+
 def test_streamlit_shows_imported_daily_series(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -95,7 +131,12 @@ def test_streamlit_shows_imported_daily_series(
     assert not app.exception
     assert any("Importstatus: committed" in message.value for message in app.success)
     assert app.markdown[0].value == "Status: ready"
-    assert [item.label for item in app.date_input] == ["Von", "Bis"]
+    assert [item.label for item in app.date_input] == [
+        "Von",
+        "Bis",
+        "Historische Prüfung von",
+        "Historische Prüfung bis",
+    ]
     assert len(app.get("vega_lite_chart")) == 2
 
     app.button[1].click().run(timeout=10)

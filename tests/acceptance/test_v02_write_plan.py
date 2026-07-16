@@ -112,13 +112,25 @@ REGISTERED_CASES.update(
         "V02-A-RULE-019": (
             "test_imports_use_the_stored_rule_timeline_without_backfilling_inactive_weeks"
         ),
+        "V02-A-RULE-020": (
+            "test_historical_review_pins_its_basis_and_reuses_only_identical_confirmations"
+        ),
         "V02-A-RULE-021": "test_late_measurement_uses_the_rule_for_its_measurement_time",
         "V02-A-RULE-022": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
+        "V02-A-RULE-023": (
+            "test_historical_review_pins_its_basis_and_reuses_only_identical_confirmations"
+        ),
+        "V02-A-RULE-024": (
+            "test_historical_review_pins_its_basis_and_reuses_only_identical_confirmations"
+        ),
         "V02-A-RULE-025": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
         "V02-A-RULE-026": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
         "V02-A-RULE-027": "test_unknown_source_type_is_cataloged_and_requests_a_rule_once",
         "V02-A-RULE-028": "test_unknown_source_type_is_cataloged_and_requests_a_rule_once",
         "V02-A-REV-001": "test_clean_import_cycle_closes_immediately",
+        "V02-A-REV-002": (
+            "test_import_rule_change_and_historical_cycles_close_independently"
+        ),
         "V02-A-REV-003": "test_clean_import_cycle_closes_immediately",
         "V02-A-REV-004": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
         "V02-A-REV-005": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",

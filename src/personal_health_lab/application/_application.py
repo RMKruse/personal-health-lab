@@ -14,11 +14,16 @@ from uuid import uuid4
 
 from personal_health_lab import DataMode
 from personal_health_lab.data_quality import (
+    DataQualityError,
+    HistoricalReviewRequest,
+    close_review_cycle_updates,
     create_plausibility_rule_version,
     load_plausibility_rule_state,
     load_review_case_detail,
     load_review_state,
     plausibility_rule_recommendations,
+    reopen_decision_cycle_updates,
+    run_historical_review,
 )
 from personal_health_lab.health_import import (
     CanonicalHealthType,
@@ -98,6 +103,7 @@ class WorkspaceStatus:
     allowed_writes: tuple[str, ...] = (
         "import_health_export",
         "create_plausibility_rule_version",
+        "run_historical_review",
     )
 
 
@@ -232,6 +238,20 @@ class CreatePlausibilityRuleVersion:
 
 
 @dataclass(frozen=True, slots=True)
+class RunHistoricalReview:
+    data_type: CanonicalHealthType
+    start_date: date
+    end_date: date
+    rule_version_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.data_type, CanonicalHealthType):
+            raise ConfigurationError("Historischer Prüftyp hat einen ungültigen Typ.")
+        if self.start_date > self.end_date:
+            raise ConfigurationError("Historischer Prüfzeitraum ist ungültig.")
+
+
+@dataclass(frozen=True, slots=True)
 class PlausibilityRuleVersion:
     version_id: str
     data_type: CanonicalHealthType
@@ -294,7 +314,12 @@ class SourceConflictResolution:
             raise ConfigurationError("'prefer' verlangt genau eine Quellversion.")
 
 
-DataReviewResolution = SourceDeletionResolution | SourceConflictResolution
+@dataclass(frozen=True, slots=True)
+class DataConfirmation:
+    note: str | None = None
+
+
+DataReviewResolution = DataConfirmation | SourceDeletionResolution | SourceConflictResolution
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,6 +360,7 @@ WriteRequest = (
     | ResolveDataReviewCase
     | RevokeDataReviewDecision
     | CreatePlausibilityRuleVersion
+    | RunHistoricalReview
 )
 
 
@@ -378,7 +404,20 @@ class PlausibilityRuleVersionPlan:
     active_snapshot_ref: SnapshotRef | None
 
 
-WritePlanDetails = ImportHealthExportPlan | DataReviewDecisionPlan | PlausibilityRuleVersionPlan
+@dataclass(frozen=True, slots=True)
+class HistoricalReviewPlan:
+    start_date: date
+    end_date: date
+    rule_version_id: str
+    base_snapshot_ref: SnapshotRef | None
+
+
+WritePlanDetails = (
+    ImportHealthExportPlan
+    | DataReviewDecisionPlan
+    | PlausibilityRuleVersionPlan
+    | HistoricalReviewPlan
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,6 +481,12 @@ class DataReviewCycleStatus(StrEnum):
     CLOSED = "closed"
 
 
+class DataReviewCycleKind(StrEnum):
+    IMPORT = "import"
+    RULE_VERSION = "rule_version"
+    HISTORICAL = "historical"
+
+
 @dataclass(frozen=True, slots=True)
 class DataReviewCycleId:
     _value: str
@@ -460,6 +505,11 @@ class DataReviewCycle:
     snapshot_ref: SnapshotRef
     status: DataReviewCycleStatus
     open_case_count: int
+    kind: DataReviewCycleKind = DataReviewCycleKind.IMPORT
+    base_snapshot_ref: SnapshotRef | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    rule_version_id: str | None = None
 
 
 class ReviewReasonCode(StrEnum):
@@ -564,8 +614,22 @@ class PlausibilityRuleVersionReceipt:
     diagnostics: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class HistoricalReviewReceipt:
+    operation_id: OperationId
+    cycle_id: DataReviewCycleId
+    snapshot_ref: SnapshotRef
+    open_case_count: int
+    status: ImportStatus = ImportStatus.COMMITTED
+    diagnostics: tuple[str, ...] = ()
+
+
 WriteResult = (
-    ImportReceipt | WriteDecisionReceipt | PlausibilityRuleVersionReceipt | WriteNotStarted
+    ImportReceipt
+    | WriteDecisionReceipt
+    | PlausibilityRuleVersionReceipt
+    | HistoricalReviewReceipt
+    | WriteNotStarted
 )
 
 
@@ -666,6 +730,8 @@ class HealthLab:
 
     def preview_write(self, request: WriteRequest) -> WritePlan:
         self._require_open()
+        if isinstance(request, RunHistoricalReview):
+            return self._build_historical_review_plan(request)
         if isinstance(request, CreatePlausibilityRuleVersion):
             return self._build_plausibility_rule_plan(request)
         if not isinstance(request, ImportHealthExport):
@@ -677,9 +743,68 @@ class HealthLab:
         )
         return self._build_import_plan(request, filevault)
 
-    def _build_plausibility_rule_plan(
-        self, request: CreatePlausibilityRuleVersion
-    ) -> WritePlan:
+    def _build_historical_review_plan(self, request: RunHistoricalReview) -> WritePlan:
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        migration_required = self.load_workspace_status().state is WorkspaceState.MIGRATION_REQUIRED
+        snapshot = self._store.load_active_snapshot_id()
+        versions = next(
+            (
+                rule.versions
+                for rule in self.load_plausibility_rules().rules
+                if rule.data_type is request.data_type
+            ),
+            (),
+        )
+        selected = next(
+            (version for version in versions if version.version_id == request.rule_version_id),
+            versions[-1] if versions and request.rule_version_id is None else None,
+        )
+        blocked = (
+            migration_required
+            or snapshot is None
+            or selected is None
+            or not selected.specification.active
+        )
+        rule_version_id = request.rule_version_id or (
+            "" if selected is None else selected.version_id
+        )
+        payload = {
+            "base_snapshot_ref": None if snapshot is None else str(snapshot),
+            "data_type": request.data_type.value,
+            "end_date": request.end_date.isoformat(),
+            "operation": "run_historical_review",
+            "rule_version_id": rule_version_id,
+            "start_date": request.start_date.isoformat(),
+            "version": 1,
+        }
+        fingerprint = PlanFingerprint(
+            hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+        )
+        diagnostics = (
+            ("migration_required",)
+            if migration_required
+            else (("historical_review_unavailable",) if blocked else ())
+        )
+        return WritePlan(
+            fingerprint,
+            HistoricalReviewPlan(
+                request.start_date,
+                request.end_date,
+                rule_version_id,
+                snapshot,
+            ),
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED if blocked else WriteApprovalStatus.READY
+                ),
+                diagnostics=diagnostics,
+            ),
+        )
+
+    def _build_plausibility_rule_plan(self, request: CreatePlausibilityRuleVersion) -> WritePlan:
         rules = self.load_plausibility_rules()
         versions = next(
             (rule.versions for rule in rules.rules if rule.data_type is request.data_type), ()
@@ -722,9 +847,7 @@ class HealthLab:
             ),
             "lower": request.specification.fixed_lower_bound,
             "effective_offset_minutes": (
-                None
-                if effective_offset is None
-                else int(effective_offset.total_seconds() // 60)
+                None if effective_offset is None else int(effective_offset.total_seconds() // 60)
             ),
             "effective_timezone": effective_timezone,
             "upper": request.specification.fixed_upper_bound,
@@ -769,27 +892,32 @@ class HealthLab:
         if isinstance(request, ResolveDataReviewCase):
             case_id = request.case_id
             resolution = request.resolution
+            if isinstance(resolution, DataConfirmation):
+                resolution_payload: dict[str, object] = {
+                    "type": "confirmation",
+                    "note": resolution.note,
+                }
+            elif isinstance(resolution, SourceDeletionResolution):
+                resolution_payload = {
+                    "type": "source_deletion",
+                    "verdict": resolution.verdict.value,
+                    "note": resolution.note,
+                }
+            else:
+                resolution_payload = {
+                    "type": "source_conflict",
+                    "strategy": resolution.strategy.value,
+                    "preferred_version_id": (
+                        None
+                        if resolution.preferred_version_id is None
+                        else str(resolution.preferred_version_id)
+                    ),
+                    "note": resolution.note,
+                }
             request_payload: dict[str, object] = {
                 "type": "resolve_data_review_case",
                 "case_id": str(case_id),
-                "resolution": (
-                    {
-                        "type": "source_deletion",
-                        "verdict": resolution.verdict.value,
-                        "note": resolution.note,
-                    }
-                    if isinstance(resolution, SourceDeletionResolution)
-                    else {
-                        "type": "source_conflict",
-                        "strategy": resolution.strategy.value,
-                        "preferred_version_id": (
-                            None
-                            if resolution.preferred_version_id is None
-                            else str(resolution.preferred_version_id)
-                        ),
-                        "note": resolution.note,
-                    }
-                ),
+                "resolution": resolution_payload,
             }
         else:
             case_id = None
@@ -875,7 +1003,11 @@ class HealthLab:
             approval = WriteApproval(WriteApprovalStatus.READY)
             confirmations = ()
             diagnostics = ()
-        if capacity.status is not CapacityStatus.READY:
+        if workspace.state is WorkspaceState.MIGRATION_REQUIRED and workspace.store_id is not None:
+            approval = WriteApproval(WriteApprovalStatus.BLOCKED)
+            confirmations = ()
+            diagnostics = ("migration_required",)
+        elif capacity.status is not CapacityStatus.READY:
             approval = WriteApproval(WriteApprovalStatus.BLOCKED)
             confirmations = ()
             diagnostics = (
@@ -1048,9 +1180,9 @@ class HealthLab:
                 expected_plan,
             )
         if isinstance(request, CreatePlausibilityRuleVersion):
-            return self._execute_plausibility_rule_write(
-                request, authorization_plan, expected_plan
-            )
+            return self._execute_plausibility_rule_write(request, authorization_plan, expected_plan)
+        if isinstance(request, RunHistoricalReview):
+            return self._execute_historical_review_write(request, authorization_plan, expected_plan)
         if not isinstance(request, ImportHealthExport):
             return self._execute_data_review_write(request, authorization_plan, expected_plan)
         if not isinstance(authorization_plan.details, ImportHealthExportPlan):
@@ -1152,7 +1284,7 @@ class HealthLab:
                     filevault=final_filevault,
                     capacity=final_capacity,
                 )
-            if workspace.store_id is None:
+            if workspace.state is WorkspaceState.MIGRATION_REQUIRED:
                 writer.initialize_identity(
                     confirm_existing_person=self._config.mode is DataMode.REAL
                 )
@@ -1242,6 +1374,61 @@ class HealthLab:
         )
         return WriteReceipt(operation_id, expected_plan, result, plan.preflight)
 
+    def _execute_historical_review_write(
+        self,
+        request: RunHistoricalReview,
+        plan: WritePlan,
+        expected_plan: PlanFingerprint,
+    ) -> WriteReceipt:
+        if (
+            not isinstance(plan.details, HistoricalReviewPlan)
+            or plan.details.base_snapshot_ref is None
+        ):
+            return self._not_started(
+                plan,
+                WriteNotStartedStatus.PLAN_CHANGED,
+                ("plan_changed",),
+                expected_plan,
+            )
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        try:
+            if writer.load_active_snapshot_id() != plan.details.base_snapshot_ref:
+                return self._not_started(
+                    plan,
+                    WriteNotStartedStatus.PLAN_CHANGED,
+                    ("plan_changed",),
+                    expected_plan,
+                )
+            result = run_historical_review(
+                writer,
+                HistoricalReviewRequest(
+                    operation_id=OperationId(uuid4().hex),
+                    data_type=request.data_type.value,
+                    start_date=request.start_date,
+                    end_date=request.end_date,
+                    rule_version_id=plan.details.rule_version_id,
+                    base_snapshot_id=plan.details.base_snapshot_ref,
+                ),
+            )
+        except (DataQualityError, StoreError) as error:
+            raise HealthLabError(
+                "Historische Datenprüfung konnte nicht ausgeführt werden."
+            ) from error
+        finally:
+            writer.close()
+        receipt = HistoricalReviewReceipt(
+            result.operation_id,
+            DataReviewCycleId(str(result.cycle_id)),
+            result.snapshot_id,
+            result.open_case_count,
+        )
+        return WriteReceipt(result.operation_id, expected_plan, receipt, plan.preflight)
+
     def _execute_data_review_write(
         self,
         request: ResolveDataReviewCase | RevokeDataReviewDecision,
@@ -1270,7 +1457,18 @@ class HealthLab:
                     )
                 resolution = request.resolution
                 action: Literal["confirm", "reject", "prefer", "split"]
-                if isinstance(resolution, SourceDeletionResolution):
+                if isinstance(resolution, DataConfirmation):
+                    if case.kind is not DataReviewCaseKind.PLAUSIBILITY:
+                        return self._not_started(
+                            plan,
+                            WriteNotStartedStatus.BLOCKED,
+                            ("resolution_not_allowed",),
+                            expected_plan,
+                        )
+                    action = "confirm"
+                    selected = None
+                    note = resolution.note
+                elif isinstance(resolution, SourceDeletionResolution):
                     if case.kind is not DataReviewCaseKind.SUSPECTED_SOURCE_DELETION:
                         return self._not_started(
                             plan,
@@ -1304,13 +1502,16 @@ class HealthLab:
                     selected_measurement_version_id=selected,
                     candidate_version_ids=tuple(str(item) for item in case.candidate_version_ids),
                     note=note,
+                    cycle_updates=close_review_cycle_updates(writer, str(case.case_id)),
                 )
             else:
+                decision_id = str(request.target.decision_id)
                 result = writer.revoke_data_review_decision(
                     operation_id=operation_id,
                     snapshot_id=SnapshotId(uuid4().hex),
-                    decision_id=str(request.target.decision_id),
+                    decision_id=decision_id,
                     reason=request.reason,
+                    cycle_updates=reopen_decision_cycle_updates(writer, decision_id),
                 )
         except StoreError:
             return self._not_started(
@@ -1430,9 +1631,13 @@ class HealthLab:
                     else ()
                 ),
                 allowed_actions=(
-                    ("confirm", "reject")
-                    if case.kind == "suspected_source_deletion"
-                    else (("prefer", "split") if case.kind == "source_conflict" else ())
+                    ("confirm",)
+                    if case.kind == "plausibility"
+                    else (
+                        ("confirm", "reject")
+                        if case.kind == "suspected_source_deletion"
+                        else (("prefer", "split") if case.kind == "source_conflict" else ())
+                    )
                 ),
             )
             for case in stored_cases
@@ -1448,6 +1653,11 @@ class HealthLab:
                     snapshot_ref=cycle.snapshot_id,
                     status=DataReviewCycleStatus(cycle.status),
                     open_case_count=cycle.open_case_count,
+                    kind=DataReviewCycleKind(cycle.kind),
+                    base_snapshot_ref=cycle.base_snapshot_id,
+                    start_date=cycle.start_date,
+                    end_date=cycle.end_date,
+                    rule_version_id=cycle.rule_version_id,
                 )
                 for cycle in stored_cycles
             ),
@@ -1494,7 +1704,7 @@ class HealthLab:
             person_binding=identity.person_binding,
             state=(
                 WorkspaceState.READY
-                if identity.store_id is not None
+                if identity.store_id is not None and identity.is_current
                 else WorkspaceState.MIGRATION_REQUIRED
             ),
         )

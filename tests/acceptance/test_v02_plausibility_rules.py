@@ -12,6 +12,7 @@ import pytest
 from personal_health_lab.application import (
     ConfigurationError,
     CreatePlausibilityRuleVersion,
+    DataConfirmation,
     DataMode,
     DataQualityStatus,
     DataReviewCaseKind,
@@ -24,16 +25,21 @@ from personal_health_lab.application import (
     OverviewSelection,
     PlausibilityRuleSpecification,
     PlausibilityRuleVersionReceipt,
+    ResolveDataReviewCase,
+    RevokeDataReviewDecision,
+    RunHistoricalReview,
     RuntimeConfig,
+    SingleDecisionTarget,
     WriteNotStarted,
     WriteNotStartedStatus,
 )
-from personal_health_lab.data_quality import resolve_sources
+from personal_health_lab.data_quality import evaluate_plausibility_cases, resolve_sources
 from personal_health_lab.health_data import CanonicalHealthType, CanonicalUnit
 from personal_health_lab.storage import (
     ExportFact,
     LocalStore,
     MeasurementVersionFact,
+    PlausibilityRuleRecord,
     ResolvedMeasurement,
     SourceOccurrenceFact,
     StoreError,
@@ -292,6 +298,82 @@ def test_personal_range_uses_corrections_instead_of_source_values() -> None:
     assert len(result.review_cases) == 1
 
 
+def test_changed_anomaly_evidence_opens_a_new_case_for_the_same_measurement_and_rule() -> None:
+    start = datetime(2024, 1, 1, tzinfo=UTC)
+    target = MeasurementVersionFact(
+        "target-version",
+        "target-logical",
+        "apple_resting_heart_rate",
+        "count/min",
+        100.0,
+        (start + timedelta(days=28)).isoformat(),
+        (start + timedelta(days=28)).isoformat(),
+        (start + timedelta(days=28)).isoformat(),
+        "1",
+        "Test Watch",
+        "Test Device",
+        "target-source",
+        date(2024, 1, 29),
+    )
+    rule = PlausibilityRuleRecord(
+        "same-rule-version",
+        "apple_resting_heart_rate",
+        "count/min",
+        20.0,
+        250.0,
+        True,
+        None,
+        start,
+    )
+
+    def cases_for(baseline: tuple[float, ...]):
+        history = tuple(
+            MeasurementVersionFact(
+                f"history-version-{index}",
+                f"history-logical-{index}",
+                "apple_resting_heart_rate",
+                "count/min",
+                value,
+                (start + timedelta(days=index)).isoformat(),
+                (start + timedelta(days=index)).isoformat(),
+                (start + timedelta(days=index)).isoformat(),
+                "1",
+                "Test Watch",
+                "Test Device",
+                f"history-source-{index}",
+                date(2024, 1, 1) + timedelta(days=index),
+            )
+            for index, value in enumerate(baseline)
+        )
+        versions = (*history, target)
+        measurements = tuple(
+            ResolvedMeasurement(
+                item.logical_measurement_id,
+                item.measurement_version_id,
+                "included_source",
+                item.canonical_value,
+                item.canonical_unit,
+                "source",
+                None,
+                None,
+                None,
+                None,
+            )
+            for item in versions
+        )
+        return evaluate_plausibility_cases(
+            versions, measurements, (target.measurement_version_id,), (rule,)
+        )
+
+    first = cases_for(tuple(60.0 if index % 2 == 0 else 61.0 for index in range(28)))[0]
+    changed = cases_for(tuple(70.0 if index % 2 == 0 else 72.0 for index in range(28)))[0]
+
+    assert changed.measurement_version_id == first.measurement_version_id
+    assert changed.rule_version_id == first.rule_version_id
+    assert changed.evidence_fingerprint != first.evidence_fingerprint
+    assert changed.review_case_id != first.review_case_id
+
+
 def test_personal_range_checks_only_the_effective_value_for_each_day() -> None:
     start = datetime(2024, 1, 1, tzinfo=UTC)
     values = [60.0, 61.0] * 14 + [251.0, 63.0]
@@ -474,9 +556,7 @@ def test_plausibility_rule_versions_are_typed_immutable_and_time_bound(
 
 def test_rule_plan_fingerprint_binds_the_named_timezone(tmp_path: Path) -> None:
     config = _config(tmp_path)
-    specification = PlausibilityRuleSpecification(
-        CanonicalUnit.BEATS_PER_MINUTE, 30, 200
-    )
+    specification = PlausibilityRuleSpecification(CanonicalUnit.BEATS_PER_MINUTE, 30, 200)
     previewed = CreatePlausibilityRuleVersion(
         CanonicalHealthType.APPLE_RESTING_HEART_RATE,
         specification,
@@ -606,6 +686,197 @@ def test_imports_use_the_stored_rule_timeline_without_backfilling_inactive_weeks
 
     assert receipt.anomaly_count == 1
     assert len(review.cases) == 1
+
+
+def test_historical_review_pins_its_basis_and_reuses_only_identical_confirmations(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    zone = timezone(timedelta(hours=1))
+    inactive_at = datetime(2024, 2, 12, tzinfo=zone)
+    active_at = datetime(2024, 2, 26, tzinfo=zone)
+
+    with HealthLab.open(config) as health_lab:
+        for effective_from, lower in ((inactive_at, None), (active_at, 30.0)):
+            change = CreatePlausibilityRuleVersion(
+                CanonicalHealthType.APPLE_RESTING_HEART_RATE,
+                PlausibilityRuleSpecification(
+                    CanonicalUnit.BEATS_PER_MINUTE,
+                    lower,
+                    200.0 if lower is not None else None,
+                ),
+                effective_from,
+            )
+            change_plan = health_lab.preview_write(change)
+            change_receipt = health_lab.execute_write(change, expected_plan=change_plan.fingerprint)
+        assert isinstance(change_receipt.result, PlausibilityRuleVersionReceipt)
+        rule_version_id = change_receipt.result.rule_version_id
+
+        package = _package(
+            tmp_path / "inactive.zip",
+            [("HKQuantityTypeIdentifierRestingHeartRate", "count/min", 10, "inactive")],
+            export_date=datetime(2024, 3, 1, tzinfo=UTC),
+            measurement_start=datetime(2024, 2, 20, 7, tzinfo=UTC),
+        )
+        imported = _execute_import(health_lab, package)
+        assert health_lab.load_data_review(DataReviewSelection()).cases == ()
+
+        request = RunHistoricalReview(
+            CanonicalHealthType.APPLE_RESTING_HEART_RATE,
+            date(2024, 2, 19),
+            date(2024, 2, 25),
+            rule_version_id,
+        )
+        plan = health_lab.preview_write(request)
+        assert plan.details.base_snapshot_ref == imported.snapshot_ref
+        assert plan.details.rule_version_id == rule_version_id
+        assert plan.details.start_date == date(2024, 2, 19)
+        assert plan.details.end_date == date(2024, 2, 25)
+
+        receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+        review = health_lab.load_data_review(DataReviewSelection())
+        assert receipt.result.status == "committed"
+        assert len(review.cases) == 1
+        first = review.cases[0]
+        historical_cycle = review.cycles[-1]
+        assert historical_cycle.kind.value == "historical"
+        assert historical_cycle.base_snapshot_ref == imported.snapshot_ref
+        assert historical_cycle.rule_version_id == rule_version_id
+
+        confirm = ResolveDataReviewCase(first.case_id, DataConfirmation())
+        confirm_plan = health_lab.preview_write(confirm)
+        confirmation_receipt = health_lab.execute_write(
+            confirm, expected_plan=confirm_plan.fingerprint
+        )
+        assert hasattr(confirmation_receipt.result, "decision_id")
+
+        repeated_plan = health_lab.preview_write(request)
+        health_lab.execute_write(request, expected_plan=repeated_plan.fingerprint)
+        repeated_review = health_lab.load_data_review(DataReviewSelection())
+        assert repeated_review.cases == ()
+        reused_cycle = repeated_review.cycles[-1]
+        assert reused_cycle.status is DataReviewCycleStatus.CLOSED
+
+        revoke = RevokeDataReviewDecision(
+            SingleDecisionTarget(confirmation_receipt.result.decision_id),
+            "confirmation withdrawn",
+        )
+        revoke_plan = health_lab.preview_write(revoke)
+        health_lab.execute_write(revoke, expected_plan=revoke_plan.fingerprint)
+        revoked_review = health_lab.load_data_review(DataReviewSelection())
+        assert revoked_review.cases[0].case_id == first.case_id
+        reopened_cycles = {
+            cycle.cycle_id: cycle
+            for cycle in revoked_review.cycles
+            if cycle.cycle_id in {historical_cycle.cycle_id, reused_cycle.cycle_id}
+        }
+        assert len(reopened_cycles) == 2
+        assert all(
+            cycle.status is DataReviewCycleStatus.OPEN and cycle.open_case_count == 1
+            for cycle in reopened_cycles.values()
+        )
+
+        reconfirm = ResolveDataReviewCase(first.case_id, DataConfirmation())
+        reconfirm_plan = health_lab.preview_write(reconfirm)
+        health_lab.execute_write(reconfirm, expected_plan=reconfirm_plan.fingerprint)
+
+        assert health_lab.load_data_review(DataReviewSelection()).cases == ()
+
+        changed_package = _package(
+            tmp_path / "inactive-changed.zip",
+            [("HKQuantityTypeIdentifierRestingHeartRate", "count/min", 9, "inactive")],
+            export_date=datetime(2024, 4, 1, tzinfo=UTC),
+            measurement_start=datetime(2024, 2, 20, 7, tzinfo=UTC),
+        )
+        _execute_import(health_lab, changed_package)
+        changed_plan = health_lab.preview_write(request)
+        health_lab.execute_write(request, expected_plan=changed_plan.fingerprint)
+        changed_review = health_lab.load_data_review(DataReviewSelection())
+        assert len(changed_review.cases) == 1
+        changed_case = changed_review.cases[0]
+        assert changed_case.measurement_version_id != first.measurement_version_id
+        assert changed_case.case_id != first.case_id
+
+        changed_confirmation = ResolveDataReviewCase(changed_case.case_id, DataConfirmation())
+        changed_confirmation_plan = health_lab.preview_write(changed_confirmation)
+        health_lab.execute_write(
+            changed_confirmation, expected_plan=changed_confirmation_plan.fingerprint
+        )
+
+        different_rule = RunHistoricalReview(
+            request.data_type,
+            request.start_date,
+            request.end_date,
+            "fixed-plausibility/v1",
+        )
+        different_plan = health_lab.preview_write(different_rule)
+        health_lab.execute_write(different_rule, expected_plan=different_plan.fingerprint)
+        reopened = health_lab.load_data_review(DataReviewSelection())
+
+    assert len(reopened.cases) == 1
+    assert reopened.cases[0].rule_version_id == "fixed-plausibility/v1"
+    assert reopened.cases[0].case_id != first.case_id
+
+
+def test_import_rule_change_and_historical_cycles_close_independently(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    package = _package(
+        tmp_path / "three-cycles.zip",
+        [
+            ("HKQuantityTypeIdentifierRestingHeartRate", "count/min", 10, "old"),
+            ("HKQuantityTypeIdentifierRestingHeartRate", "count/min", 25, "current"),
+        ],
+        export_date=datetime(2024, 2, 15, tzinfo=UTC),
+        measurement_start=datetime(2024, 1, 1, 7, tzinfo=UTC),
+        measurement_step=timedelta(days=43),
+    )
+
+    with HealthLab.open(config) as health_lab:
+        _execute_import(health_lab, package)
+        change = CreatePlausibilityRuleVersion(
+            CanonicalHealthType.APPLE_RESTING_HEART_RATE,
+            PlausibilityRuleSpecification(CanonicalUnit.BEATS_PER_MINUTE, 30, 200),
+            datetime(2024, 2, 12, tzinfo=timezone(timedelta(hours=1))),
+        )
+        change_plan = health_lab.preview_write(change)
+        change_result = health_lab.execute_write(
+            change, expected_plan=change_plan.fingerprint
+        ).result
+        assert isinstance(change_result, PlausibilityRuleVersionReceipt)
+
+        historical = RunHistoricalReview(
+            CanonicalHealthType.APPLE_RESTING_HEART_RATE,
+            date(2024, 1, 1),
+            date(2024, 1, 1),
+            change_result.rule_version_id,
+        )
+        historical_plan = health_lab.preview_write(historical)
+        health_lab.execute_write(historical, expected_plan=historical_plan.fingerprint)
+        review = health_lab.load_data_review(DataReviewSelection())
+        open_cycles = [cycle for cycle in review.cycles if cycle.status.value == "open"]
+        assert [cycle.kind.value for cycle in open_cycles] == [
+            "import",
+            "rule_version",
+            "historical",
+        ]
+
+        historical_case = next(
+            case
+            for case in review.cases
+            if case.rule_version_id == change_result.rule_version_id
+            and health_lab.load_data_review_case(case.case_id).measured_at.date()
+            == date(2024, 1, 1)
+        )
+        confirmation = ResolveDataReviewCase(historical_case.case_id, DataConfirmation())
+        confirmation_plan = health_lab.preview_write(confirmation)
+        health_lab.execute_write(confirmation, expected_plan=confirmation_plan.fingerprint)
+        after = health_lab.load_data_review(DataReviewSelection())
+
+    assert [cycle.status.value for cycle in after.cycles[-3:]] == [
+        "open",
+        "open",
+        "closed",
+    ]
 
 
 def test_rule_change_reevaluates_only_measurements_since_its_local_week_boundary(

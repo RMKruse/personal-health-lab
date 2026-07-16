@@ -144,11 +144,16 @@
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["cycle_id", "open_case_count", "snapshot_ref", "status"],
+            "required": ["base_snapshot_ref", "cycle_id", "end_date", "kind", "open_case_count", "rule_version_id", "snapshot_ref", "start_date", "status"],
             "properties": {
+              "base_snapshot_ref": {"$ref": "#/$defs/nullableString"},
               "cycle_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+              "end_date": {"$ref": "#/$defs/nullableString"},
+              "kind": {"enum": ["import", "rule_version", "historical"]},
               "open_case_count": {"type": "integer", "minimum": 0},
+              "rule_version_id": {"$ref": "#/$defs/nullableString"},
               "snapshot_ref": {"type": "string"},
+              "start_date": {"$ref": "#/$defs/nullableString"},
               "status": {"enum": ["open", "closed"]}
             }
           }
@@ -421,6 +426,19 @@
         "type": {"const": "data_review_decision"}
       }
     },
+    "historicalReviewResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cycle_id", "diagnostics", "open_case_count", "snapshot_ref", "status", "type"],
+      "properties": {
+        "cycle_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "open_case_count": {"type": "integer", "minimum": 0},
+        "snapshot_ref": {"type": "string"},
+        "status": {"const": "committed"},
+        "type": {"const": "run_historical_review"}
+      }
+    },
     "writePlanOutput": {
       "type": "object",
       "additionalProperties": false,
@@ -482,6 +500,17 @@
                 "case_id": {"$ref": "#/$defs/nullableString"},
                 "type": {"const": "data_review_decision"}
               }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["base_snapshot_ref", "end_date", "rule_version_id", "start_date", "type"],
+              "properties": {
+                "base_snapshot_ref": {"$ref": "#/$defs/nullableString"},
+                "end_date": {"type": "string"},
+                "rule_version_id": {"type": "string"},
+                "start_date": {"type": "string"},
+                "type": {"const": "run_historical_review"}
+              }
             }
           ]
         },
@@ -521,7 +550,7 @@
               "type": "object", "additionalProperties": false,
               "required": ["type"],
               "properties": {
-                "type": {"enum": ["create_plausibility_rule_version", "data_review_decision"]}
+                "type": {"enum": ["create_plausibility_rule_version", "data_review_decision", "run_historical_review"]}
               }
             }
           ]
@@ -620,6 +649,9 @@
             },
             {
               "$ref": "#/$defs/dataReviewDecisionResult"
+            },
+            {
+              "$ref": "#/$defs/historicalReviewResult"
             }
           ]
         },

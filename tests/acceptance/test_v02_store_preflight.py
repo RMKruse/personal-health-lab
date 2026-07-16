@@ -619,6 +619,35 @@ def test_legacy_identity_schema_is_not_changed_on_open(tmp_path: Path) -> None:
     assert columns == {"singleton", "mode", "schema_version"}
 
 
+def test_previous_store_version_requires_explicit_migration_and_is_unchanged_on_open(
+    tmp_path: Path,
+) -> None:
+    config = RuntimeConfig(
+        mode=DataMode.SYNTHETIC,
+        synthetic_store=tmp_path / "previous-schema",
+        real_store=tmp_path / "real",
+    )
+    with HealthLab.open(config):
+        pass
+    metadata_path = config.active_store / "metadata.sqlite3"
+    with sqlite3.connect(metadata_path) as metadata:
+        metadata.execute("UPDATE store_identity SET schema_version = 2 WHERE singleton = 1")
+
+    with HealthLab.open(config) as health_lab:
+        status = health_lab.load_workspace_status()
+        plan = health_lab.preview_write(
+            ImportHealthExport(_package(tmp_path / "blocked-migration.zip"))
+        )
+
+    assert status.state is WorkspaceState.MIGRATION_REQUIRED
+    assert plan.approval.status is WriteApprovalStatus.BLOCKED
+    assert plan.diagnostics == ("migration_required",)
+    with sqlite3.connect(metadata_path) as metadata:
+        assert metadata.execute(
+            "SELECT schema_version FROM store_identity WHERE singleton = 1"
+        ).fetchone() == (2,)
+
+
 def test_store_identity_constraints_reject_invalid_persisted_values(tmp_path: Path) -> None:
     config = RuntimeConfig(
         mode=DataMode.SYNTHETIC,

@@ -33,7 +33,7 @@ from personal_health_lab.health_data import (
 _METADATA_FILE = "metadata.sqlite3"
 _PARQUET_DIRECTORY = "parquet"
 _QUERY_FILE = "query.duckdb"
-_STORE_SCHEMA_VERSION = 2
+_STORE_SCHEMA_VERSION = 3
 _WRITER_LOCK_FILE = ".writer.lock"
 _FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
 _SNAPSHOT_SCHEMA_VERSION = 1
@@ -519,6 +519,10 @@ class StoreIdentity:
     person_binding: PersonBindingStatus
     schema_version: str
 
+    @property
+    def is_current(self) -> bool:
+        return self.schema_version == str(_STORE_SCHEMA_VERSION)
+
 
 @dataclass(frozen=True, slots=True)
 class AnalysisRunId(_OpaqueStoreId):
@@ -785,6 +789,38 @@ class ReviewCycleRecord:
     snapshot_id: SnapshotId
     status: Literal["open", "closed"]
     open_case_count: int
+    kind: Literal["import", "rule_version", "historical"] = "import"
+    base_snapshot_id: SnapshotId | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    rule_version_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalReviewResult:
+    operation_id: OperationId
+    cycle_id: StoredReviewCycleId
+    snapshot_id: SnapshotId
+    open_case_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewCycleUpdate:
+    cycle_id: StoredReviewCycleId
+    open_case_count: int
+    status: Literal["open", "closed"]
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalReviewPublication:
+    operation_id: OperationId
+    base_snapshot_id: SnapshotId
+    start_date: date
+    end_date: date
+    rule_version_id: str
+    reproduced_cases: tuple[OpenDataReviewCase, ...]
+    open_cases: tuple[OpenDataReviewCase, ...]
+    cycle_status: Literal["open", "closed"]
 
 
 type SourceResolver = Callable[..., SourceResolution]
@@ -835,7 +871,8 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             request_kind TEXT NOT NULL CHECK (
                 request_kind IN ('import_health_export', 'resolve_data_review_case',
                                  'revoke_data_review_decision',
-                                 'create_plausibility_rule_version')
+                                 'create_plausibility_rule_version',
+                                 'run_historical_review')
             ),
             started_at_utc TEXT NOT NULL CHECK (
                 length(started_at_utc) >= 20 AND substr(started_at_utc, 11, 1) = 'T'
@@ -869,7 +906,9 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(snapshot_id),
             previous_snapshot_id TEXT REFERENCES dataset_snapshots(snapshot_id),
             activation_kind TEXT NOT NULL CHECK (
-                activation_kind IN ('import', 'data_review_decision', 'rule_version')
+                activation_kind IN (
+                    'import', 'data_review_decision', 'rule_version', 'historical'
+                )
             ),
             activated_at_utc TEXT NOT NULL CHECK (
                 length(activated_at_utc) >= 20 AND substr(activated_at_utc, 11, 1) = 'T'
@@ -908,7 +947,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             decision_kind TEXT NOT NULL CHECK (
                 decision_kind IN (
                     'correction', 'local_exclusion',
-                    'source_deletion', 'conflict_resolution'
+                    'source_deletion', 'conflict_resolution', 'confirmation'
                 )
             )
         ) STRICT;
@@ -961,13 +1000,28 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                 length(cycle_id) = 32 AND cycle_id NOT GLOB '*[^0-9a-f]*'
             ),
             snapshot_id TEXT NOT NULL UNIQUE REFERENCES dataset_snapshots(snapshot_id),
-            cycle_kind TEXT NOT NULL CHECK (cycle_kind IN ('import', 'rule_version')),
+            cycle_kind TEXT NOT NULL CHECK (
+                cycle_kind IN ('import', 'rule_version', 'historical')
+            ),
             status TEXT NOT NULL CHECK (status IN ('open', 'closed')),
             open_case_count INTEGER NOT NULL CHECK (open_case_count >= 0),
             CHECK (
                 (status = 'open' AND open_case_count > 0)
                 OR (status = 'closed' AND open_case_count = 0)
             )
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS review_cycle_cases (
+            cycle_id TEXT NOT NULL REFERENCES review_cycles(cycle_id),
+            review_case_id TEXT NOT NULL,
+            PRIMARY KEY (cycle_id, review_case_id)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS historical_review_cycles (
+            cycle_id TEXT PRIMARY KEY REFERENCES review_cycles(cycle_id),
+            base_snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(snapshot_id),
+            start_date TEXT NOT NULL,
+            end_date TEXT NOT NULL,
+            rule_version_id TEXT NOT NULL REFERENCES rule_version_refs(rule_version_id),
+            CHECK (start_date <= end_date)
         ) STRICT;
         CREATE TABLE IF NOT EXISTS audit_events (
             audit_position INTEGER PRIMARY KEY CHECK (audit_position > 0),
@@ -992,7 +1046,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             decision_id TEXT NOT NULL UNIQUE REFERENCES decision_refs(decision_id),
             review_case_id TEXT NOT NULL,
             case_kind TEXT NOT NULL CHECK (
-                case_kind IN ('suspected_source_deletion', 'source_conflict')
+                case_kind IN ('plausibility', 'suspected_source_deletion', 'source_conflict')
             ),
             logical_measurement_id TEXT NOT NULL,
             evidence_fingerprint TEXT NOT NULL,
@@ -1098,8 +1152,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
         ),
     )
     metadata.executemany(
-        "INSERT OR IGNORE INTO plausibility_rule_versions VALUES "
-        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO plausibility_rule_versions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             (
                 _FIXED_PLAUSIBILITY_RULE_VERSION,
@@ -1302,11 +1355,12 @@ class LocalStore:
                     store_id = str(StoreId(str(candidate)))
                 except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
                     pass
-        if identity.schema_version in {"1", "1.0"}:
+        if identity.schema_version != str(_STORE_SCHEMA_VERSION):
             backup_directory = self._root / "migration-backups"
             backup_directory.mkdir(exist_ok=True)
             backup_path = backup_directory / (
-                f"metadata-v1.0-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}.sqlite3"
+                f"metadata-v{identity.schema_version}-"
+                f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}.sqlite3"
             )
             with sqlite3.connect(backup_path) as backup:
                 self._metadata.backup(backup)
@@ -1399,6 +1453,7 @@ class LocalStore:
                     "1.0",
                     "1.1",
                     "1.2",
+                    "2",
                     str(_STORE_SCHEMA_VERSION),
                 }:
                     raise StoreConfigurationError(
@@ -1435,7 +1490,8 @@ class LocalStore:
                 metadata.commit()
             elif (
                 str(identity[0]) != mode.value
-                or str(identity[1]) not in {"1", "1.0", "1.1", "1.2", str(_STORE_SCHEMA_VERSION)}
+                or str(identity[1])
+                not in {"1", "1.0", "1.1", "1.2", "2", str(_STORE_SCHEMA_VERSION)}
                 or (
                     str(identity[1]) == str(_STORE_SCHEMA_VERSION)
                     and (identity[2] is None or not str(identity[2]))
@@ -1856,6 +1912,10 @@ class LocalStore:
                     resolution.cycle_status,
                     resolution.cycle_open_case_count,
                 ),
+            )
+            self._metadata.executemany(
+                "INSERT INTO review_cycle_cases VALUES (?, ?)",
+                ((str(snapshot_id), str(case_id)) for case_id in resolution.new_review_case_ids),
             )
             self._metadata.execute(
                 "INSERT INTO snapshot_activations VALUES (?, ?, ?, ?, 'import', ?)",
@@ -2811,6 +2871,7 @@ class LocalStore:
         selected_measurement_version_id: str | None,
         candidate_version_ids: tuple[str, ...],
         note: str | None,
+        cycle_updates: tuple[ReviewCycleUpdate, ...],
     ) -> PublishDecisionResult:
         self._require_open()
         self._require_writer()
@@ -2853,9 +2914,15 @@ class LocalStore:
                 "INSERT INTO decision_refs VALUES (?, ?)",
                 (
                     decision_id,
-                    "source_deletion"
-                    if case.kind == "suspected_source_deletion"
-                    else "conflict_resolution",
+                    (
+                        "confirmation"
+                        if case.kind == "plausibility"
+                        else (
+                            "source_deletion"
+                            if case.kind == "suspected_source_deletion"
+                            else "conflict_resolution"
+                        )
+                    ),
                 ),
             )
             self._metadata.execute(
@@ -2878,13 +2945,20 @@ class LocalStore:
                     note,
                 ),
             )
-            if action in {"confirm", "reject"}:
+            if case.kind == "suspected_source_deletion" and action in {"confirm", "reject"}:
                 self._metadata.execute(
                     "INSERT INTO source_absence_suppressions VALUES (?, ?, 1) "
                     "ON CONFLICT(logical_measurement_id) DO UPDATE SET "
                     "decision_id = excluded.decision_id, active = 1",
                     (str(case.logical_measurement_id), decision_id),
                 )
+            self._metadata.executemany(
+                "UPDATE review_cycles SET open_case_count = ?, status = ? WHERE cycle_id = ?",
+                (
+                    (update.open_case_count, update.status, str(update.cycle_id))
+                    for update in cycle_updates
+                ),
+            )
             manifest_sha256 = self._stage_review_snapshot(
                 parent_snapshot_id=active,
                 snapshot_id=snapshot_id,
@@ -2908,6 +2982,7 @@ class LocalStore:
         snapshot_id: SnapshotId,
         decision_id: str,
         reason: str,
+        cycle_updates: tuple[ReviewCycleUpdate, ...],
     ) -> PublishDecisionResult:
         self._require_open()
         self._require_writer()
@@ -2934,13 +3009,56 @@ class LocalStore:
         (
             target_audit_id,
             review_case_id,
-            case_kind,
-            logical_id,
-            evidence,
+            _case_kind,
+            _logical_id,
+            _evidence,
             _action,
             previous_version,
             candidates_json,
         ) = map(str, row)
+        basis = self._metadata.execute(
+            "SELECT a.previous_snapshot_id FROM snapshot_activations a "
+            "JOIN audit_events e ON e.operation_id = a.operation_id "
+            "WHERE e.audit_event_id = ?",
+            (target_audit_id,),
+        ).fetchone()
+        if basis is None or basis[0] is None:
+            raise StoreError("Entscheidungsbasis fehlt.")
+        case_path = (
+            self._root
+            / _PARQUET_DIRECTORY
+            / "snapshots"
+            / str(basis[0])
+            / "open_review_cases.parquet"
+        )
+        escaped_case_path = str(case_path).replace("'", "''")
+        case_row = self._query.execute(
+            "SELECT review_case_id, case_kind, logical_measurement_id, "
+            "measurement_version_id, rule_version_id, evidence_fingerprint "
+            f"FROM read_parquet('{escaped_case_path}') WHERE review_case_id = ?",
+            (review_case_id,),
+        ).fetchone()
+        if case_row is None:
+            raise StoreError("Ursprünglicher Datenprüffall fehlt.")
+        reopened_case = OpenDataReviewCase(
+            review_case_id=str(case_row[0]),
+            kind=cast(
+                Literal[
+                    "plausibility",
+                    "continued_override",
+                    "suspected_source_deletion",
+                    "source_conflict",
+                    "rule_definition",
+                ],
+                str(case_row[1]),
+            ),
+            logical_measurement_id=LogicalMeasurementId(str(case_row[2])),
+            measurement_version_id=(
+                None if case_row[3] is None else MeasurementVersionId(str(case_row[3]))
+            ),
+            rule_version_id=None if case_row[4] is None else str(case_row[4]),
+            evidence_fingerprint=str(case_row[5]),
+        )
         audit_event_id = uuid4().hex
         audit_position = int(
             self._metadata.execute(
@@ -2966,6 +3084,13 @@ class LocalStore:
                 "UPDATE source_absence_suppressions SET active = 0 WHERE decision_id = ?",
                 (decision_id,),
             )
+            self._metadata.executemany(
+                "UPDATE review_cycles SET open_case_count = ?, status = ? WHERE cycle_id = ?",
+                (
+                    (update.open_case_count, update.status, str(update.cycle_id))
+                    for update in cycle_updates
+                ),
+            )
             manifest_sha256 = self._stage_review_snapshot(
                 parent_snapshot_id=active,
                 snapshot_id=snapshot_id,
@@ -2976,7 +3101,7 @@ class LocalStore:
                 action="revoke",
                 selected_measurement_version_id=previous_version,
                 candidate_version_ids=tuple(json.loads(candidates_json)),
-                reopened_case=(case_kind, logical_id, evidence),
+                reopened_case=reopened_case,
             )
             self._activate_review_snapshot(
                 operation_id, snapshot_id, active, manifest_sha256, completed_at
@@ -3007,8 +3132,8 @@ class LocalStore:
         action: str,
         selected_measurement_version_id: str | None,
         candidate_version_ids: tuple[str, ...],
-        reopened_case: tuple[str, str, str] | None = None,
-        replacement_plausibility_cases: tuple[OpenDataReviewCase, ...] = (),
+        reopened_case: OpenDataReviewCase | None = None,
+        replacement_plausibility_cases: tuple[OpenDataReviewCase, ...] | None = None,
         replaced_measurement_version_ids: tuple[str, ...] = (),
     ) -> str:
         parent = self._root / _PARQUET_DIRECTORY / "snapshots" / str(parent_snapshot_id)
@@ -3020,7 +3145,7 @@ class LocalStore:
             self._query.execute(
                 f"CREATE OR REPLACE TEMP TABLE {table} AS SELECT * FROM read_parquet('{escaped}')"
             )
-        if action == "rule_version":
+        if replacement_plausibility_cases is not None:
             if replaced_measurement_version_ids:
                 placeholders = ",".join("?" for _ in replaced_measurement_version_ids)
                 self._query.execute(
@@ -3029,6 +3154,12 @@ class LocalStore:
                     replaced_measurement_version_ids,
                 )
             if replacement_plausibility_cases:
+                case_ids = tuple(case.review_case_id for case in replacement_plausibility_cases)
+                placeholders = ",".join("?" for _ in case_ids)
+                self._query.execute(
+                    f"DELETE FROM open_review_cases WHERE review_case_id IN ({placeholders})",
+                    case_ids,
+                )
                 self._query.executemany(
                     "INSERT INTO open_review_cases VALUES (?, ?, ?, ?, ?, ?)",
                     (
@@ -3053,55 +3184,71 @@ class LocalStore:
                 "OR conflict_resolution_decision_id = ?",
                 (decision_id, decision_id),
             )
-            assert reopened_case is not None and selected_measurement_version_id is not None
-            case_kind, logical_id, evidence = reopened_case
-            self._query.execute(
-                "DELETE FROM resolved_measurements WHERE logical_measurement_id = ?",
-                (logical_id,),
-            )
-            restore_ids = (
-                (selected_measurement_version_id,)
-                if case_kind == "suspected_source_deletion"
-                else candidate_version_ids
-            )
-            restored_identities: set[str] = set()
-            previous_identity = self._query.execute(
-                "SELECT identity_candidate_id FROM measurement_versions "
-                "WHERE measurement_version_id = ?",
-                (selected_measurement_version_id,),
-            ).fetchone()
-            assert previous_identity is not None
-            for candidate_id in (selected_measurement_version_id, *restore_ids):
-                version = self._query.execute(
-                    "SELECT identity_candidate_id, canonical_value, canonical_unit "
-                    "FROM measurement_versions WHERE measurement_version_id = ?",
-                    (candidate_id,),
-                ).fetchone()
-                assert version is not None
-                identity_id = str(version[0])
-                if identity_id in restored_identities:
-                    continue
-                restored_identities.add(identity_id)
-                version_id = (
-                    selected_measurement_version_id
-                    if identity_id == str(previous_identity[0])
-                    else candidate_id
-                )
-                chosen = self._query.execute(
-                    "SELECT canonical_value, canonical_unit FROM measurement_versions "
-                    "WHERE measurement_version_id = ?",
-                    (version_id,),
-                ).fetchone()
-                assert chosen is not None
+            assert reopened_case is not None
+            reopened_kind = reopened_case.kind
+            logical_id = str(reopened_case.logical_measurement_id)
+            evidence = reopened_case.evidence_fingerprint
+            if reopened_kind == "plausibility":
                 self._query.execute(
-                    "INSERT INTO resolved_measurements VALUES (?, ?, 'included_source', ?, ?, "
-                    "'source', NULL, NULL, NULL, NULL)",
-                    (identity_id, version_id, float(chosen[0]), str(chosen[1])),
+                    "INSERT INTO open_review_cases VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        reopened_case.review_case_id,
+                        reopened_case.kind,
+                        logical_id,
+                        str(reopened_case.measurement_version_id),
+                        reopened_case.rule_version_id,
+                        evidence,
+                    ),
                 )
-            self._query.execute(
-                "INSERT INTO open_review_cases VALUES (?, ?, ?, NULL, NULL, ?)",
-                (review_case_id, case_kind, logical_id, evidence),
-            )
+            else:
+                assert selected_measurement_version_id is not None
+                self._query.execute(
+                    "DELETE FROM resolved_measurements WHERE logical_measurement_id = ?",
+                    (logical_id,),
+                )
+                restore_ids = (
+                    (selected_measurement_version_id,)
+                    if reopened_kind == "suspected_source_deletion"
+                    else candidate_version_ids
+                )
+                restored_identities: set[str] = set()
+                previous_identity = self._query.execute(
+                    "SELECT identity_candidate_id FROM measurement_versions "
+                    "WHERE measurement_version_id = ?",
+                    (selected_measurement_version_id,),
+                ).fetchone()
+                assert previous_identity is not None
+                for candidate_id in (selected_measurement_version_id, *restore_ids):
+                    version = self._query.execute(
+                        "SELECT identity_candidate_id, canonical_value, canonical_unit "
+                        "FROM measurement_versions WHERE measurement_version_id = ?",
+                        (candidate_id,),
+                    ).fetchone()
+                    assert version is not None
+                    identity_id = str(version[0])
+                    if identity_id in restored_identities:
+                        continue
+                    restored_identities.add(identity_id)
+                    version_id = (
+                        selected_measurement_version_id
+                        if identity_id == str(previous_identity[0])
+                        else candidate_id
+                    )
+                    chosen = self._query.execute(
+                        "SELECT canonical_value, canonical_unit FROM measurement_versions "
+                        "WHERE measurement_version_id = ?",
+                        (version_id,),
+                    ).fetchone()
+                    assert chosen is not None
+                    self._query.execute(
+                        "INSERT INTO resolved_measurements VALUES (?, ?, 'included_source', ?, ?, "
+                        "'source', NULL, NULL, NULL, NULL)",
+                        (identity_id, version_id, float(chosen[0]), str(chosen[1])),
+                    )
+                self._query.execute(
+                    "INSERT INTO open_review_cases VALUES (?, ?, ?, NULL, NULL, ?)",
+                    (review_case_id, reopened_kind, logical_id, evidence),
+                )
         else:
             case = self._query.execute(
                 "SELECT case_kind, logical_measurement_id FROM open_review_cases "
@@ -3115,16 +3262,17 @@ class LocalStore:
                 "DELETE FROM open_review_cases WHERE review_case_id = ?", (review_case_id,)
             )
             if action == "confirm":
-                self._query.execute(
-                    """
-                    UPDATE resolved_measurements
-                    SET disposition = 'excluded_source_deletion', effective_value = NULL,
-                        effective_value_source = 'none', effective_decision_id = ?,
-                        source_deletion_decision_id = ?
-                    WHERE logical_measurement_id = ?
-                    """,
-                    (decision_id, decision_id, logical_id),
-                )
+                if case_kind == "suspected_source_deletion":
+                    self._query.execute(
+                        """
+                        UPDATE resolved_measurements
+                        SET disposition = 'excluded_source_deletion', effective_value = NULL,
+                            effective_value_source = 'none', effective_decision_id = ?,
+                            source_deletion_decision_id = ?
+                        WHERE logical_measurement_id = ?
+                        """,
+                        (decision_id, decision_id, logical_id),
+                    )
             elif action == "prefer":
                 assert selected_measurement_version_id is not None
                 version = self._query.execute(
@@ -3261,7 +3409,7 @@ class LocalStore:
         manifest_sha256: str,
         completed_at: str,
         *,
-        activation_kind: Literal["data_review_decision", "rule_version"] = (
+        activation_kind: Literal["data_review_decision", "rule_version", "historical"] = (
             "data_review_decision"
         ),
     ) -> None:
@@ -3457,11 +3605,42 @@ class LocalStore:
                 snapshot_id=SnapshotId(str(snapshot_id)),
                 status=cast(Literal["open", "closed"], status),
                 open_case_count=int(open_case_count),
+                kind=cast(Literal["import", "rule_version", "historical"], kind),
+                base_snapshot_id=(
+                    None if base_snapshot_id is None else SnapshotId(str(base_snapshot_id))
+                ),
+                start_date=None if start_date is None else date.fromisoformat(str(start_date)),
+                end_date=None if end_date is None else date.fromisoformat(str(end_date)),
+                rule_version_id=None if rule_version_id is None else str(rule_version_id),
             )
-            for cycle_id, snapshot_id, status, open_case_count in self._metadata.execute(
-                "SELECT cycle_id, snapshot_id, status, open_case_count "
-                "FROM review_cycles ORDER BY rowid"
+            for (
+                cycle_id,
+                snapshot_id,
+                kind,
+                status,
+                open_case_count,
+                base_snapshot_id,
+                start_date,
+                end_date,
+                rule_version_id,
+            ) in self._metadata.execute(
+                "SELECT c.cycle_id, c.snapshot_id, c.cycle_kind, c.status, "
+                "c.open_case_count, h.base_snapshot_id, h.start_date, h.end_date, "
+                "h.rule_version_id FROM review_cycles c LEFT JOIN historical_review_cycles h "
+                "USING (cycle_id) ORDER BY c.rowid"
             ).fetchall()
+        )
+
+    def load_review_cycles_for_case(self, review_case_id: str) -> tuple[ReviewCycleRecord, ...]:
+        cycle_ids = frozenset(
+            str(row[0])
+            for row in self._metadata.execute(
+                "SELECT cycle_id FROM review_cycle_cases WHERE review_case_id = ?",
+                (review_case_id,),
+            ).fetchall()
+        )
+        return tuple(
+            cycle for cycle in self.load_review_cycles() if str(cycle.cycle_id) in cycle_ids
         )
 
     def load_plausibility_rule_versions(self) -> tuple[PlausibilityRuleRecord, ...]:
@@ -3489,6 +3668,112 @@ class LocalStore:
             ).fetchall()
         )
 
+    def load_effective_confirmation_case_ids(self) -> frozenset[str]:
+        self._require_open()
+        return frozenset(
+            str(row[0])
+            for row in self._metadata.execute(
+                "SELECT d.review_case_id FROM data_review_decisions d "
+                "WHERE d.case_kind = 'plausibility' AND d.action = 'confirm' "
+                "AND NOT EXISTS (SELECT 1 FROM metadata_tombstones t "
+                "WHERE t.target_audit_event_id = d.audit_event_id)"
+            ).fetchall()
+        )
+
+    def load_effective_decision_case_id(self, decision_id: str) -> str | None:
+        self._require_open()
+        row = self._metadata.execute(
+            "SELECT d.review_case_id FROM data_review_decisions d "
+            "WHERE d.decision_id = ? AND NOT EXISTS ("
+            "SELECT 1 FROM metadata_tombstones t "
+            "WHERE t.target_audit_event_id = d.audit_event_id) LIMIT 1",
+            (decision_id,),
+        ).fetchone()
+        return None if row is None else str(row[0])
+
+    def publish_historical_review(
+        self, publication: HistoricalReviewPublication
+    ) -> HistoricalReviewResult:
+        self._require_open()
+        self._require_writer()
+        operation_id = publication.operation_id
+        base_snapshot_id = publication.base_snapshot_id
+        if self.load_active_snapshot_id() != base_snapshot_id:
+            raise StoreError("Historische Reproduktionsbasis ist nicht mehr aktiv.")
+        if not any(
+            rule.version_id == publication.rule_version_id
+            for rule in self.load_plausibility_rule_versions()
+        ):
+            raise StoreError("Historische Regelversion fehlt.")
+        snapshot_id = SnapshotId(uuid4().hex)
+        cycle_id = StoredReviewCycleId(uuid4().hex)
+        created_at = datetime.now(UTC).isoformat()
+        audit_position = int(
+            self._metadata.execute(
+                "SELECT COALESCE(MAX(audit_position), 0) FROM audit_events"
+            ).fetchone()[0]
+        )
+        try:
+            with self._metadata:
+                self._metadata.execute(
+                    "INSERT INTO write_operations VALUES "
+                    "(?, 'run_historical_review', ?, ?, 'committed', 1)",
+                    (str(operation_id), created_at, created_at),
+                )
+                manifest = self._stage_review_snapshot(
+                    parent_snapshot_id=base_snapshot_id,
+                    snapshot_id=snapshot_id,
+                    operation_id=operation_id,
+                    audit_position=audit_position,
+                    review_case_id="",
+                    decision_id="",
+                    action="historical",
+                    selected_measurement_version_id=None,
+                    candidate_version_ids=(),
+                    replacement_plausibility_cases=publication.open_cases,
+                )
+                self._activate_review_snapshot(
+                    operation_id,
+                    snapshot_id,
+                    base_snapshot_id,
+                    manifest,
+                    created_at,
+                    activation_kind="historical",
+                )
+                self._metadata.execute(
+                    "INSERT INTO review_cycles VALUES (?, ?, 'historical', ?, ?)",
+                    (
+                        str(cycle_id),
+                        str(snapshot_id),
+                        publication.cycle_status,
+                        len(publication.open_cases),
+                    ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO historical_review_cycles VALUES (?, ?, ?, ?, ?)",
+                    (
+                        str(cycle_id),
+                        str(base_snapshot_id),
+                        publication.start_date.isoformat(),
+                        publication.end_date.isoformat(),
+                        publication.rule_version_id,
+                    ),
+                )
+                self._metadata.executemany(
+                    "INSERT INTO review_cycle_cases VALUES (?, ?)",
+                    ((str(cycle_id), case.review_case_id) for case in publication.reproduced_cases),
+                )
+        except Exception:
+            shutil.rmtree(self._root / "staging" / str(operation_id), ignore_errors=True)
+            shutil.rmtree(
+                self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id),
+                ignore_errors=True,
+            )
+            raise
+        return HistoricalReviewResult(
+            operation_id, cycle_id, snapshot_id, len(publication.open_cases)
+        )
+
     def create_plausibility_rule_version(
         self,
         *,
@@ -3510,9 +3795,7 @@ class LocalStore:
         self._require_open()
         self._require_writer()
         existing = tuple(
-            rule
-            for rule in self.load_plausibility_rule_versions()
-            if rule.data_type == data_type
+            rule for rule in self.load_plausibility_rule_versions() if rule.data_type == data_type
         )
         if (not existing) != (effective_from is None):
             raise StoreError("Nur die erste Regelversion darf ohne Gültigkeitsbeginn sein.")
@@ -3579,9 +3862,14 @@ class LocalStore:
                         created_at.isoformat(),
                         activation_kind="rule_version",
                     )
+                    cycle_id = uuid4().hex
                     self._metadata.execute(
                         "INSERT INTO review_cycles VALUES (?, ?, 'rule_version', ?, ?)",
-                        (uuid4().hex, str(snapshot_id), cycle_status, len(cases)),
+                        (cycle_id, str(snapshot_id), cycle_status, len(cases)),
+                    )
+                    self._metadata.executemany(
+                        "INSERT INTO review_cycle_cases VALUES (?, ?)",
+                        ((cycle_id, case.review_case_id) for case in cases),
                     )
         except Exception:
             shutil.rmtree(self._root / "staging" / str(operation_id), ignore_errors=True)

@@ -317,6 +317,18 @@ expected_effect = "inactive interval remains unchecked"
 forbidden_side_effects = ["automatic backfill"]
 
 [[case]]
+id = "V02-A-RULE-020"
+contracts = ["V02-C-RULE-006"]
+fixtures = ["V02-F-DOM-RULE-VERSIONS-V1"]
+runner = "test_historical_review_pins_its_basis_and_reuses_only_identical_confirmations"
+initial_state = "measurement in an inactive rule interval"
+operation = "run explicit historical review"
+level = "application"
+expected_result = "measurement evaluated with the selected active rule version"
+expected_effect = "historical review case opened"
+forbidden_side_effects = ["automatic inactive-interval review"]
+
+[[case]]
 id = "V02-A-RULE-022"
 contracts = ["V02-C-RULE-007"]
 fixtures = ["V02-F-DOM-FIXED-PLAUSIBILITY-V1"]
@@ -327,6 +339,30 @@ level = "application"
 expected_result = "history evaluated once"
 expected_effect = "deterministic initial findings"
 forbidden_side_effects = ["partial-history first review"]
+
+[[case]]
+id = "V02-A-RULE-023"
+contracts = ["V02-C-RULE-007"]
+fixtures = ["V02-F-DOM-RULE-VERSIONS-V1"]
+runner = "test_historical_review_pins_its_basis_and_reuses_only_identical_confirmations"
+initial_state = "active snapshot with stored rule versions"
+operation = "preview and execute a historical review"
+level = "application"
+expected_result = "period, rule version, and base snapshot pinned"
+expected_effect = "reproducible historical cycle persisted"
+forbidden_side_effects = ["preview persistence", "unpinned current state"]
+
+[[case]]
+id = "V02-A-RULE-024"
+contracts = ["V02-C-RULE-007"]
+fixtures = ["V02-F-DOM-RULE-VERSIONS-V1"]
+runner = "test_historical_review_pins_its_basis_and_reuses_only_identical_confirmations"
+initial_state = "confirmed historical plausibility finding"
+operation = "repeat with identical and changed reproduction identity"
+level = "application"
+expected_result = "identical confirmation reused; changed rule opens a case"
+expected_effect = "confirmation remains bound to measurement, rule, and evidence"
+forbidden_side_effects = ["broad confirmation reuse"]
 
 
 [[case]]
@@ -400,6 +436,18 @@ level = "application"
 expected_result = "cycle closed"
 expected_effect = "reviewed data status"
 forbidden_side_effects = ["open empty cycle"]
+
+[[case]]
+id = "V02-A-REV-002"
+contracts = ["V02-C-REV-001"]
+fixtures = ["V02-F-DOM-RULE-VERSIONS-V1"]
+runner = "test_import_rule_change_and_historical_cycles_close_independently"
+initial_state = "simultaneous import, rule-change, and historical findings"
+operation = "confirm the historical finding"
+level = "application"
+expected_result = "three cycle kinds remain separately visible"
+expected_effect = "only the historical cycle closes"
+forbidden_side_effects = ["closing unrelated cycles", "merged cycle identity"]
 
 [[case]]
 id = "V02-A-REV-003"

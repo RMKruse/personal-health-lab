@@ -194,6 +194,45 @@ def test_cli_projects_the_personal_range_finding(
     assert reason["lower_bound"] < 64 < reason["upper_bound"] + 1
 
 
+def test_cli_maps_the_pinned_historical_review_plan(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fixture = generate_export("lag-signal-v1", 42, tmp_path / "fixture")
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "synthetic", tmp_path / "real")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(fixture.export_path)
+        plan = health_lab.preview_write(request)
+        imported = health_lab.execute_write(request, expected_plan=plan.fingerprint).result
+
+    common = [
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(config.synthetic_store),
+        "--real-store",
+        str(config.real_store),
+        "historical-review",
+        "apple_resting_heart_rate",
+        "--start-date",
+        "2024-01-01",
+        "--end-date",
+        "2024-01-31",
+        "--json",
+    ]
+    assert main(common) == 0
+    output = json.loads(capsys.readouterr().out)
+
+    _assert_json_contract(output)
+    assert output["details"]["type"] == "run_historical_review"
+    assert output["details"]["base_snapshot_ref"] == str(imported.snapshot_ref)
+    assert output["details"]["rule_version_id"] == "fixed-plausibility/v1"
+
+    assert main([*common, "--execute", "--expect-plan", output["fingerprint"]]) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    _assert_json_contract(receipt)
+    assert receipt["result"]["type"] == "run_historical_review"
+
+
 def test_real_json_import_renders_shared_confirmation_plan(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -202,19 +241,22 @@ def test_real_json_import_renders_shared_confirmation_plan(
     fixture = generate_export("lag-signal-v1", 42, tmp_path / "fixture")
     monkeypatch.setattr(platform, "system", lambda: "Linux")
 
-    assert main(
-        [
-            "--mode",
-            "real",
-            "--synthetic-store",
-            str(tmp_path / "synthetic"),
-            "--real-store",
-            str(tmp_path / "real"),
-            "import",
-            str(fixture.export_path),
-            "--json",
-        ]
-    ) == 0
+    assert (
+        main(
+            [
+                "--mode",
+                "real",
+                "--synthetic-store",
+                str(tmp_path / "synthetic"),
+                "--real-store",
+                str(tmp_path / "real"),
+                "import",
+                str(fixture.export_path),
+                "--json",
+            ]
+        )
+        == 0
+    )
     plan = json.loads(capsys.readouterr().out)
 
     _assert_json_contract(plan)
@@ -236,6 +278,7 @@ def test_real_json_import_renders_shared_confirmation_plan(
     assert plan["workspace"]["allowed_writes"] == [
         "import_health_export",
         "create_plausibility_rule_version",
+        "run_historical_review",
     ]
 
 

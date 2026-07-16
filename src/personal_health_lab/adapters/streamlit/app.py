@@ -16,6 +16,7 @@ from personal_health_lab.application import (
     CanonicalHealthType,
     ConfigurationError,
     CreatePlausibilityRuleVersion,
+    DataConfirmation,
     DataReviewDecisionId,
     DataReviewSelection,
     HealthLab,
@@ -29,6 +30,7 @@ from personal_health_lab.application import (
     ResolveDataReviewCase,
     RestingHeartRateAnalysisConfig,
     RevokeDataReviewDecision,
+    RunHistoricalReview,
     SingleDecisionTarget,
     SourceConflictResolution,
     SourceConflictStrategy,
@@ -59,9 +61,7 @@ st.caption(
     f"Datenmodus: {workspace_status.mode.value} · Datenspeicher-ID: "
     f"{workspace_status.store_id or '-'} · Bindung: {workspace_status.person_binding.value}"
 )
-st.caption(
-    "Zulässige Schreibaktionen: " + ", ".join(workspace_status.allowed_writes)
-)
+st.caption("Zulässige Schreibaktionen: " + ", ".join(workspace_status.allowed_writes))
 
 import_plan = st.session_state.get("import_plan")
 uploaded = st.file_uploader(
@@ -274,9 +274,14 @@ if data_review.cases:
                     case.case_id, SourceDeletionResolution(verdict)
                 )
                 with HealthLab.open(config) as health_lab:
-                    st.session_state["review_plan"] = health_lab.preview_write(
-                        review_request_local
-                    )
+                    st.session_state["review_plan"] = health_lab.preview_write(review_request_local)
+                st.session_state["review_request"] = review_request_local
+                st.rerun()
+        elif case.kind.value == "plausibility":
+            if st.button("Auffälligkeit bestätigen", key=f"confirm-{case.case_id}"):
+                review_request_local = ResolveDataReviewCase(case.case_id, DataConfirmation())
+                with HealthLab.open(config) as health_lab:
+                    st.session_state["review_plan"] = health_lab.preview_write(review_request_local)
                 st.session_state["review_request"] = review_request_local
                 st.rerun()
         elif case.kind.value == "source_conflict":
@@ -302,9 +307,7 @@ if data_review.cases:
                     ),
                 )
                 with HealthLab.open(config) as health_lab:
-                    st.session_state["review_plan"] = health_lab.preview_write(
-                        review_request_local
-                    )
+                    st.session_state["review_plan"] = health_lab.preview_write(review_request_local)
                 st.session_state["review_request"] = review_request_local
                 st.rerun()
     review_plan = st.session_state.get("review_plan")
@@ -374,11 +377,7 @@ with st.expander("Plausibilitätsregeln"):
                 selected_type,
                 specification,
                 datetime.fromisoformat(effective_text),
-                (
-                    selected_rule.recommendation.recommendation_id
-                    if adopt_recommendation
-                    else None
-                ),
+                (selected_rule.recommendation.recommendation_id if adopt_recommendation else None),
             )
             with HealthLab.open(config) as health_lab:
                 st.session_state["rule_plan"] = health_lab.preview_write(rule_request)
@@ -405,6 +404,59 @@ with st.expander("Plausibilitätsregeln"):
                 st.rerun()
             except HealthLabError:
                 st.error("Plausibilitätsregel konnte nicht gespeichert werden.")
+
+    st.divider()
+    historical_start = st.date_input("Historische Prüfung von", value=None)
+    historical_end = st.date_input("Historische Prüfung bis", value=None)
+    historical_version = st.selectbox(
+        "Historische Regelversion",
+        selected_rule.versions,
+        format_func=lambda item: item.version_id,
+    )
+    if st.button("Historische Prüfung planen"):
+        if historical_start is None or historical_end is None:
+            st.error("Historischer Prüfzeitraum fehlt.")
+        else:
+            try:
+                historical_request = RunHistoricalReview(
+                    selected_type,
+                    historical_start,
+                    historical_end,
+                    historical_version.version_id,
+                )
+                with HealthLab.open(config) as health_lab:
+                    st.session_state["historical_plan"] = health_lab.preview_write(
+                        historical_request
+                    )
+                st.session_state["historical_request"] = historical_request
+                st.rerun()
+            except (ConfigurationError, HealthLabError):
+                st.error("Historische Datenprüfung ist ungültig.")
+    historical_plan = st.session_state.get("historical_plan")
+    if historical_plan is not None:
+        details = historical_plan.details
+        st.code(str(historical_plan.fingerprint))
+        st.caption(
+            f"Gepinnte Basis: {details.base_snapshot_ref or '-'} · "
+            f"Zeitraum {details.start_date} bis {details.end_date} · "
+            f"Regel {details.rule_version_id}"
+        )
+        if st.button(
+            "Historische Prüfung ausführen",
+            disabled=historical_plan.approval.status is WriteApprovalStatus.BLOCKED,
+        ):
+            try:
+                with HealthLab.open(config) as health_lab:
+                    historical_result = health_lab.execute_write(
+                        st.session_state["historical_request"],
+                        expected_plan=historical_plan.fingerprint,
+                    ).result
+                st.success(f"Historische Datenprüfung: {historical_result.status.value}")
+                st.session_state.pop("historical_plan", None)
+                st.session_state.pop("historical_request", None)
+                st.rerun()
+            except HealthLabError:
+                st.error("Historische Datenprüfung konnte nicht ausgeführt werden.")
 
 titles = {
     "active_energy": "Aktive Energie",
