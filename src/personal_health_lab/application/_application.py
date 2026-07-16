@@ -27,6 +27,7 @@ from personal_health_lab.data_quality import (
     reopen_decision_cycle_updates,
     run_historical_review,
 )
+from personal_health_lab.health_data import DataQualityStatus, ModelMaturityStatus
 from personal_health_lab.health_import import (
     CanonicalHealthType,
     CanonicalUnit,
@@ -635,11 +636,6 @@ class DataReviewAction(StrEnum):
     SPLIT = "split"
 
 
-class DataQualityStatus(StrEnum):
-    REVIEWED = "reviewed"
-    PROVISIONAL = "provisional"
-
-
 class DataReviewCycleStatus(StrEnum):
     OPEN = "open"
     CLOSED = "closed"
@@ -804,11 +800,6 @@ class AnalysisStatus(StrEnum):
     REUSED = "reused"
     INSUFFICIENT_DATA = "insufficient_data"
     UNSTABLE = "unstable"
-
-
-class ModelMaturityStatus(StrEnum):
-    EXPLORATORY = "exploratory"
-    ROBUST = "robust"
 
 
 @dataclass(frozen=True, slots=True)
@@ -2084,6 +2075,10 @@ class HealthLab:
                 end_date=request.end_date,
                 config_schema_version=request.schema_version,
                 expected_snapshot_id=plan.details.base_snapshot_ref,
+                open_review_case_ids=tuple(
+                    str(case.case_id)
+                    for case in self.load_data_review(DataReviewSelection()).cases
+                ),
             )
         except AnalysisInputChanged:
             return self._not_started(

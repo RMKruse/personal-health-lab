@@ -1,6 +1,16 @@
 """Public application interface used by every production adapter."""
 
 from personal_health_lab import DataMode
+from personal_health_lab.health_data import (
+    AnalysisDataStatusReason,
+    AnalysisFreshness,
+    DataQualityStatus,
+    DataStatusReasonCode,
+    ModelMaturityCriterion,
+    ModelMaturityCriterionCode,
+    ModelMaturityStatus,
+    ReproducibilityStatus,
+)
 from personal_health_lab.health_import import (
     CanonicalHealthType,
     CanonicalUnit,
@@ -31,6 +41,7 @@ from personal_health_lab.storage import (
     FileVaultReason,
     FileVaultStatus,
     PersonBindingStatus,
+    RestingHeartRateAnalysisResult,
     StoreId,
 )
 
@@ -43,7 +54,6 @@ from ._application import (
     CreatePlausibilityRuleVersion,
     DataConfirmation,
     DataCorrection,
-    DataQualityStatus,
     DataReview,
     DataReviewAction,
     DataReviewBatchActionId,
@@ -72,7 +82,6 @@ from ._application import (
     ImportReceipt,
     ImportStatus,
     LocalMeasurementExclusion,
-    ModelMaturityStatus,
     PlanFingerprint,
     PlausibilityReason,
     PlausibilityRule,
@@ -113,7 +122,9 @@ from ._application import (
 )
 
 __all__ = [
+    "AnalysisDataStatusReason",
     "AnalysisDefinitionId",
+    "AnalysisFreshness",
     "AnalysisProvenance",
     "AnalysisReceipt",
     "AnalysisResultRef",
@@ -150,6 +161,7 @@ __all__ = [
     "DataReviewDecisionId",
     "DataReviewDecisionPlan",
     "DataReviewSelection",
+    "DataStatusReasonCode",
     "EffectiveValueSource",
     "FeatureNotAvailableError",
     "FileVaultCheck",
@@ -166,6 +178,8 @@ __all__ = [
     "ImportStatus",
     "LocalMeasurementExclusion",
     "MeasurementVersionId",
+    "ModelMaturityCriterion",
+    "ModelMaturityCriterionCode",
     "ModelMaturityStatus",
     "OperationId",
     "Overview",
@@ -181,8 +195,10 @@ __all__ = [
     "PlausibilityRuleVersionPlan",
     "PlausibilityRuleVersionReceipt",
     "PlausibilityRules",
+    "ReproducibilityStatus",
     "ResolveDataReviewCase",
     "RestingHeartRateAnalysisPlan",
+    "RestingHeartRateAnalysisResult",
     "ReviewReasonCode",
     "RevokeDataReviewDecision",
     "RunHistoricalReview",

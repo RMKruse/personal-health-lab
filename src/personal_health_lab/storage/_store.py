@@ -21,19 +21,27 @@ import duckdb
 
 from personal_health_lab import DataMode
 from personal_health_lab.health_data import (
+    AnalysisDataStatusReason,
+    AnalysisFreshness,
     CanonicalHealthRecord,
     CanonicalHealthType,
     CanonicalUnit,
     DailyHealthSeries,
     DailyHealthValue,
+    DataQualityStatus,
+    DataStatusReasonCode,
     LogicalMeasurementId,
     MeasurementVersionId,
+    ModelMaturityCriterion,
+    ModelMaturityCriterionCode,
+    ModelMaturityStatus,
+    ReproducibilityStatus,
 )
 
 _METADATA_FILE = "metadata.sqlite3"
 _PARQUET_DIRECTORY = "parquet"
 _QUERY_FILE = "query.duckdb"
-_STORE_SCHEMA_VERSION = 3
+_STORE_SCHEMA_VERSION = 4
 _WRITER_LOCK_FILE = ".writer.lock"
 _FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
 _SNAPSHOT_SCHEMA_VERSION = 1
@@ -620,6 +628,11 @@ class AnalysisMethodology:
     resample_count: int
     random_seed: int
     interval_level: float
+    minimum_input_completeness: float | None
+    max_feature_dependency: float | None
+    minimum_bootstrap_success_rate: float | None
+    minimum_outcome_standard_deviation: float | None
+    maximum_time_series_gap_days: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -632,6 +645,9 @@ class AnalysisDiagnostics:
     association_guardrail: Literal[
         "simultaneous_band_includes_zero", "simultaneous_band_excludes_zero"
     ]
+    input_completeness: float | None
+    outcome_standard_deviation: float | None
+    maximum_time_series_gap_days: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -641,16 +657,26 @@ class RestingHeartRateAnalysisResult:
     personal_standard_deviation_kcal: float
     lag_associations: tuple[AssociationEstimate, ...]
     cumulative_association: AssociationEstimate
-    model_maturity: Literal["exploratory", "robust"]
+    model_maturity: ModelMaturityStatus
     diagnostics: AnalysisDiagnostics
     methodology: AnalysisMethodology
     provenance: AnalysisProvenance | None = None
+    data_status: DataQualityStatus = DataQualityStatus.REVIEWED
+    data_status_reasons: tuple[AnalysisDataStatusReason, ...] = ()
+    maturity_criteria: tuple[ModelMaturityCriterion, ...] = ()
+    freshness: AnalysisFreshness = AnalysisFreshness.CURRENT
+    completed_at: datetime | None = None
+    reproducibility: ReproducibilityStatus = ReproducibilityStatus.REPRODUCIBLE
+
+    @property
+    def status_facts_recorded(self) -> bool:
+        return bool(self.maturity_criteria)
 
 
 @dataclass(frozen=True, slots=True)
 class AnalysisRunRecord:
     provenance: AnalysisProvenance
-    model_maturity: Literal["exploratory", "robust"]
+    model_maturity: ModelMaturityStatus
     diagnostics: tuple[str, ...]
 
 
@@ -1253,6 +1279,10 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                 environment_lock_hash TEXT NOT NULL,
                 reuse_key TEXT NOT NULL,
                 model_maturity TEXT NOT NULL,
+                data_status TEXT NOT NULL,
+                data_status_reasons TEXT NOT NULL,
+                maturity_criteria TEXT NOT NULL,
+                reproducibility TEXT NOT NULL,
                 diagnostics TEXT NOT NULL,
                 status TEXT NOT NULL,
                 completed_at TEXT NOT NULL
@@ -1273,6 +1303,10 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
         "environment_lock_hash": "TEXT NOT NULL DEFAULT ''",
         "reuse_key": "TEXT NOT NULL DEFAULT ''",
         "model_maturity": "TEXT",
+        "data_status": "TEXT NOT NULL DEFAULT 'reviewed'",
+        "data_status_reasons": "TEXT NOT NULL DEFAULT '[]'",
+        "maturity_criteria": "TEXT NOT NULL DEFAULT '[]'",
+        "reproducibility": "TEXT NOT NULL DEFAULT 'not_recorded'",
         "diagnostics": "TEXT NOT NULL DEFAULT '[]'",
     }
     for column, declaration in migrations.items():
@@ -1497,6 +1531,7 @@ class LocalStore:
                     "1.1",
                     "1.2",
                     "2",
+                    "3",
                     str(_STORE_SCHEMA_VERSION),
                 }:
                     raise StoreConfigurationError(
@@ -1534,7 +1569,7 @@ class LocalStore:
             elif (
                 str(identity[0]) != mode.value
                 or str(identity[1])
-                not in {"1", "1.0", "1.1", "1.2", "2", str(_STORE_SCHEMA_VERSION)}
+                not in {"1", "1.0", "1.1", "1.2", "2", "3", str(_STORE_SCHEMA_VERSION)}
                 or (
                     str(identity[1]) == str(_STORE_SCHEMA_VERSION)
                     and (identity[2] is None or not str(identity[2]))
@@ -4705,7 +4740,7 @@ class LocalStore:
                 code_diff_hash=None if code_diff_hash is None else str(code_diff_hash),
                 environment_lock_hash=str(environment_lock_hash),
             ),
-            model_maturity=cast(Literal["exploratory", "robust"], model_maturity),
+            model_maturity=ModelMaturityStatus(str(model_maturity)),
             diagnostics=tuple(cast(list[str], json.loads(str(diagnostics)))),
         )
 
@@ -4780,9 +4815,13 @@ class LocalStore:
                     analysis_definition_id, analysis_start_date, analysis_end_date,
                     config_json, config_hash, config_schema_version,
                     code_commit, code_dirty, code_diff_hash, environment_lock_hash, reuse_key,
-                    model_maturity, diagnostics,
+                    model_maturity, data_status, data_status_reasons, maturity_criteria,
+                    reproducibility, diagnostics,
                     status, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    'running', ?
+                )
                 """,
                 (
                     str(provenance.analysis_run_id),
@@ -4800,7 +4839,31 @@ class LocalStore:
                     provenance.code_diff_hash,
                     provenance.environment_lock_hash,
                     provenance.reuse_key,
-                    result.model_maturity,
+                    result.model_maturity.value,
+                    result.data_status.value,
+                    json.dumps(
+                        [
+                            {
+                                "code": reason.code.value,
+                                "evidence_ids": reason.evidence_ids,
+                            }
+                            for reason in result.data_status_reasons
+                        ],
+                        sort_keys=True,
+                    ),
+                    json.dumps(
+                        [
+                            {
+                                "code": criterion.code.value,
+                                "passed": criterion.passed,
+                                "observed_value": criterion.observed_value,
+                                "threshold": criterion.threshold,
+                            }
+                            for criterion in result.maturity_criteria
+                        ],
+                        sort_keys=True,
+                    ),
+                    result.reproducibility.value,
                     json.dumps(receipt_diagnostics),
                     datetime.now().astimezone().isoformat(),
                 ),
@@ -4867,6 +4930,13 @@ class LocalStore:
                             "bootstrap_resamples": result.diagnostics.bootstrap_resamples,
                             "model_readiness": result.diagnostics.model_readiness,
                             "association_guardrail": result.diagnostics.association_guardrail,
+                            "input_completeness": result.diagnostics.input_completeness,
+                            "outcome_standard_deviation": (
+                                result.diagnostics.outcome_standard_deviation
+                            ),
+                            "maximum_time_series_gap_days": (
+                                result.diagnostics.maximum_time_series_gap_days
+                            ),
                         },
                         sort_keys=True,
                     ),
@@ -4880,6 +4950,21 @@ class LocalStore:
                             "resample_count": result.methodology.resample_count,
                             "random_seed": result.methodology.random_seed,
                             "interval_level": result.methodology.interval_level,
+                            "minimum_input_completeness": (
+                                result.methodology.minimum_input_completeness
+                            ),
+                            "max_feature_dependency": (
+                                result.methodology.max_feature_dependency
+                            ),
+                            "minimum_bootstrap_success_rate": (
+                                result.methodology.minimum_bootstrap_success_rate
+                            ),
+                            "minimum_outcome_standard_deviation": (
+                                result.methodology.minimum_outcome_standard_deviation
+                            ),
+                            "maximum_time_series_gap_days": (
+                                result.methodology.maximum_time_series_gap_days
+                            ),
                         },
                         sort_keys=True,
                     ),
@@ -4907,7 +4992,10 @@ class LocalStore:
                    analysis_runs.snapshot_id, analysis_runs.analysis_definition_id,
                    analysis_runs.config_hash, analysis_runs.config_schema_version,
                    analysis_runs.code_commit, analysis_runs.code_dirty,
-                   analysis_runs.code_diff_hash, analysis_runs.environment_lock_hash
+                   analysis_runs.code_diff_hash, analysis_runs.environment_lock_hash,
+                   analysis_runs.model_maturity, analysis_runs.data_status,
+                   analysis_runs.data_status_reasons, analysis_runs.maturity_criteria,
+                   analysis_runs.reproducibility, analysis_runs.completed_at
             FROM analysis_runs, active_snapshot
             WHERE analysis_runs.status = 'completed'
               AND analysis_runs.snapshot_id = active_snapshot.snapshot_id
@@ -4923,6 +5011,41 @@ class LocalStore:
         ).fetchone()
         if row is None:
             return None
+        return self._load_resting_hr_analysis_row(row, AnalysisFreshness.CURRENT)
+
+    def load_resting_hr_analysis_history(
+        self, start_date: date | None, end_date: date | None
+    ) -> tuple[RestingHeartRateAnalysisResult, ...]:
+        self._require_open()
+        rows = self._metadata.execute(
+            """
+            SELECT analysis_runs.analysis_run_id, analysis_runs.result_id,
+                   analysis_runs.snapshot_id, analysis_runs.analysis_definition_id,
+                   analysis_runs.config_hash, analysis_runs.config_schema_version,
+                   analysis_runs.code_commit, analysis_runs.code_dirty,
+                   analysis_runs.code_diff_hash, analysis_runs.environment_lock_hash,
+                   analysis_runs.model_maturity, analysis_runs.data_status,
+                   analysis_runs.data_status_reasons, analysis_runs.maturity_criteria,
+                   analysis_runs.reproducibility, analysis_runs.completed_at
+            FROM analysis_runs, active_snapshot
+            WHERE analysis_runs.status = 'completed'
+              AND analysis_runs.snapshot_id != active_snapshot.snapshot_id
+              AND analysis_runs.analysis_start_date IS ?
+              AND analysis_runs.analysis_end_date IS ?
+            ORDER BY analysis_runs.completed_at DESC, analysis_runs.rowid DESC
+            """,
+            (
+                start_date.isoformat() if start_date else None,
+                end_date.isoformat() if end_date else None,
+            ),
+        ).fetchall()
+        return tuple(
+            self._load_resting_hr_analysis_row(row, AnalysisFreshness.STALE) for row in rows
+        )
+
+    def _load_resting_hr_analysis_row(
+        self, row: tuple[object, ...], freshness: AnalysisFreshness
+    ) -> RestingHeartRateAnalysisResult:
         result_id = str(row[1])
         snapshot_id = str(row[2])
         definition_id = str(row[3])
@@ -4983,7 +5106,7 @@ class LocalStore:
             personal_standard_deviation_kcal=float(rows[0][6]),
             lag_associations=estimates[:-1],
             cumulative_association=estimates[-1],
-            model_maturity=cast(Literal["exploratory", "robust"], rows[0][9]),
+            model_maturity=ModelMaturityStatus(str(row[10])),
             diagnostics=AnalysisDiagnostics(
                 complete_days=cast(int, diagnostic_values["complete_days"]),
                 feature_dependency=cast(
@@ -4998,6 +5121,15 @@ class LocalStore:
                     Literal["simultaneous_band_includes_zero", "simultaneous_band_excludes_zero"],
                     diagnostic_values["association_guardrail"],
                 ),
+                input_completeness=cast(
+                    float | None, diagnostic_values.get("input_completeness")
+                ),
+                outcome_standard_deviation=cast(
+                    float | None, diagnostic_values.get("outcome_standard_deviation")
+                ),
+                maximum_time_series_gap_days=cast(
+                    int | None, diagnostic_values.get("maximum_time_series_gap_days")
+                ),
             ),
             methodology=AnalysisMethodology(
                 ridge_penalty=cast(float, methodology_values["ridge_penalty"]),
@@ -5010,10 +5142,47 @@ class LocalStore:
                 resample_count=cast(int, methodology_values["resample_count"]),
                 random_seed=cast(int, methodology_values["random_seed"]),
                 interval_level=cast(float, methodology_values["interval_level"]),
+                minimum_input_completeness=cast(
+                    float | None, methodology_values.get("minimum_input_completeness")
+                ),
+                max_feature_dependency=cast(
+                    float | None, methodology_values.get("max_feature_dependency")
+                ),
+                minimum_bootstrap_success_rate=cast(
+                    float | None,
+                    methodology_values.get("minimum_bootstrap_success_rate"),
+                ),
+                minimum_outcome_standard_deviation=cast(
+                    float | None,
+                    methodology_values.get("minimum_outcome_standard_deviation"),
+                ),
+                maximum_time_series_gap_days=cast(
+                    int | None, methodology_values.get("maximum_time_series_gap_days")
+                ),
             ),
             provenance=(
                 None if not row[4] or not row[6] or not row[9] else _analysis_provenance(row)
             ),
+            data_status=DataQualityStatus(str(row[11])),
+            data_status_reasons=tuple(
+                AnalysisDataStatusReason(
+                    DataStatusReasonCode(str(reason["code"])),
+                    tuple(cast(list[str], reason["evidence_ids"])),
+                )
+                for reason in cast(list[dict[str, object]], json.loads(str(row[12])))
+            ),
+            maturity_criteria=tuple(
+                ModelMaturityCriterion(
+                    ModelMaturityCriterionCode(str(criterion["code"])),
+                    bool(criterion["passed"]),
+                    cast(float | str, criterion["observed_value"]),
+                    cast(float | str, criterion["threshold"]),
+                )
+                for criterion in cast(list[dict[str, object]], json.loads(str(row[13])))
+            ),
+            freshness=freshness,
+            reproducibility=ReproducibilityStatus(str(row[14])),
+            completed_at=datetime.fromisoformat(str(row[15])),
         )
 
     def load_latest_robust_analysis_provenance(self) -> AnalysisProvenance | None:

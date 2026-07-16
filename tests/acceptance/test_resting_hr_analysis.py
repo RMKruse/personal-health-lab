@@ -47,7 +47,7 @@ def test_analysis_preview_is_read_only_and_execution_rechecks_the_request(tmp_pa
         synthetic_store=tmp_path / "store",
         real_store=tmp_path / "real-store",
     )
-    request = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v1"))
+    request = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v2"))
 
     with HealthLab.open(runtime) as health_lab:
         before = health_lab.load_overview(OverviewSelection())
@@ -55,7 +55,7 @@ def test_analysis_preview_is_read_only_and_execution_rechecks_the_request(tmp_pa
         after = health_lab.load_overview(OverviewSelection())
         changed = health_lab.execute_write(
             RunRestingHeartRateAnalysis(
-                AnalysisDefinitionId("lag-signal-v1"), start_date=date(2024, 1, 1)
+                AnalysisDefinitionId("lag-signal-v2"), start_date=date(2024, 1, 1)
             ),
             expected_plan=plan.fingerprint,
         ).result
@@ -76,7 +76,7 @@ def test_analysis_store_busy_is_write_not_started(tmp_path: Path) -> None:
         synthetic_store=tmp_path / "store",
         real_store=tmp_path / "real-store",
     )
-    request = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v1"))
+    request = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v2"))
 
     with HealthLab.open(runtime) as health_lab:
         plan = health_lab.preview_write(request)
@@ -98,7 +98,7 @@ def test_analysis_rechecks_the_snapshot_under_the_writer_lock(
         synthetic_store=tmp_path / "store",
         real_store=tmp_path / "real-store",
     )
-    request = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v1"))
+    request = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v2"))
     with HealthLab.open(runtime) as health_lab:
         _execute_import(health_lab, first_package.export_path)
         plan = health_lab.preview_write(request)
@@ -146,7 +146,7 @@ def test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis(tmp_path: P
         real_store=tmp_path / "real-store",
     )
     analysis = RunRestingHeartRateAnalysis(
-        analysis_definition_id=AnalysisDefinitionId("lag-signal-v1")
+        analysis_definition_id=AnalysisDefinitionId("lag-signal-v2")
     )
 
     with HealthLab.open(runtime) as health_lab:
@@ -285,7 +285,7 @@ def test_null_scenario_does_not_present_a_stable_association(tmp_path: Path) -> 
     with HealthLab.open(runtime) as health_lab:
         _execute_import(health_lab, package.export_path)
         receipt = _execute_analysis(
-            health_lab, RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v1"))
+            health_lab, RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v2"))
         )
         result = health_lab.load_overview(OverviewSelection()).resting_hr_analysis
 
@@ -342,7 +342,7 @@ def test_analysis_reports_insufficient_and_unstable_inputs_with_stable_diagnosti
             receipts.append(
                 _execute_analysis(
                     health_lab,
-                    RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v1")),
+                    RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v2")),
                 )
             )
 

@@ -46,7 +46,6 @@ from personal_health_lab.application import (
     ImportStatus,
     LocalMeasurementExclusion,
     MeasurementVersionId,
-    Overview,
     OverviewSelection,
     PlanFingerprint,
     PlausibilityRules,
@@ -55,6 +54,7 @@ from personal_health_lab.application import (
     PlausibilityRuleVersionReceipt,
     ResolveDataReviewCase,
     RestingHeartRateAnalysisPlan,
+    RestingHeartRateAnalysisResult,
     RevokeDataReviewDecision,
     RunHistoricalReview,
     RunRestingHeartRateAnalysis,
@@ -107,7 +107,7 @@ def _parser() -> argparse.ArgumentParser:
     import_command.add_argument("--execute", action="store_true")
     import_command.add_argument("--expect-plan", type=PlanFingerprint)
     analysis = commands.add_parser("analyze", help="Verzögerungsprofil analysieren")
-    analysis.add_argument("--definition", default="lag-signal-v1")
+    analysis.add_argument("--definition", default="lag-signal-v2")
     analysis.add_argument("--start-date", type=date.fromisoformat)
     analysis.add_argument("--end-date", type=date.fromisoformat)
     analysis.add_argument("--json", action="store_true", dest="as_json")
@@ -288,8 +288,7 @@ def _data_review_json(
     }
 
 
-def _analysis_json(overview: Overview) -> dict[str, object] | None:
-    result = overview.resting_hr_analysis
+def _analysis_json(result: RestingHeartRateAnalysisResult | None) -> dict[str, object] | None:
     if result is None:
         return None
 
@@ -310,6 +309,9 @@ def _analysis_json(overview: Overview) -> dict[str, object] | None:
     cumulative = result.cumulative_association
     return {
         "analysis_definition_id": str(result.analysis_definition_id),
+        "completed_at": (
+            None if result.completed_at is None else result.completed_at.isoformat()
+        ),
         "cumulative_association": {
             "direction": cumulative.direction.value,
             "estimate_per_100_kcal": cumulative.estimate_per_100_kcal,
@@ -325,7 +327,22 @@ def _analysis_json(overview: Overview) -> dict[str, object] | None:
             "complete_days": result.diagnostics.complete_days,
             "feature_dependency": result.diagnostics.feature_dependency,
             "model_readiness": result.diagnostics.model_readiness,
+            "input_completeness": result.diagnostics.input_completeness,
+            "outcome_standard_deviation": result.diagnostics.outcome_standard_deviation,
+            "maximum_time_series_gap_days": (
+                result.diagnostics.maximum_time_series_gap_days
+            ),
         },
+        "data_status": result.data_status.value,
+        "status_facts_recorded": result.status_facts_recorded,
+        "data_status_reasons": [
+            {
+                "code": reason.code.value,
+                "evidence_ids": reason.evidence_ids,
+            }
+            for reason in result.data_status_reasons
+        ],
+        "freshness": result.freshness.value,
         "lag_associations": [
             {
                 "direction": item.direction.value,
@@ -342,11 +359,31 @@ def _analysis_json(overview: Overview) -> dict[str, object] | None:
             for item in result.lag_associations
         ],
         "model_maturity": result.model_maturity,
+        "maturity_criteria": [
+            {
+                "code": criterion.code.value,
+                "observed_value": criterion.observed_value,
+                "passed": criterion.passed,
+                "threshold": criterion.threshold,
+            }
+            for criterion in result.maturity_criteria
+        ],
         "methodology": {
             "block_length_days": result.methodology.block_length_days,
             "bootstrap_method": result.methodology.bootstrap_method,
             "interval_level": result.methodology.interval_level,
+            "max_feature_dependency": result.methodology.max_feature_dependency,
+            "minimum_bootstrap_success_rate": (
+                result.methodology.minimum_bootstrap_success_rate
+            ),
+            "minimum_input_completeness": result.methodology.minimum_input_completeness,
             "minimum_observations": result.methodology.minimum_observations,
+            "minimum_outcome_standard_deviation": (
+                result.methodology.minimum_outcome_standard_deviation
+            ),
+            "maximum_time_series_gap_days": (
+                result.methodology.maximum_time_series_gap_days
+            ),
             "random_seed": result.methodology.random_seed,
             "resample_count": result.methodology.resample_count,
             "ridge_penalty": result.methodology.ridge_penalty,
@@ -354,6 +391,7 @@ def _analysis_json(overview: Overview) -> dict[str, object] | None:
         },
         "personal_standard_deviation_kcal": result.personal_standard_deviation_kcal,
         "provenance": _provenance_json(result.provenance),
+        "reproducibility": result.reproducibility.value,
         "snapshot_ref": str(result.snapshot_id),
     }
 
@@ -949,7 +987,7 @@ def main(args: Sequence[str] | None = None) -> int:
                 analysis_write_receipt,
                 runtime_config,
                 (
-                    _analysis_json(overview)
+                    _analysis_json(overview.resting_hr_analysis)
                     if isinstance(analysis_write_receipt.result, AnalysisReceipt)
                     and analysis_write_receipt.result.status
                     in {AnalysisStatus.COMPLETED, AnalysisStatus.REUSED}
@@ -1146,7 +1184,13 @@ def main(args: Sequence[str] | None = None) -> int:
                         for series in overview.daily_series
                     ],
                     "message": overview.message,
-                    "resting_hr_analysis": _analysis_json(overview),
+                    "analysis_history": [
+                        _analysis_json(result) for result in overview.analysis_history
+                    ],
+                    "last_reviewed_analysis": _analysis_json(
+                        overview.last_reviewed_analysis
+                    ),
+                    "resting_hr_analysis": _analysis_json(overview.resting_hr_analysis),
                     "provenance": {
                         "import_count": overview.import_count,
                         "logical_measurement_count": overview.logical_measurement_count,
@@ -1178,9 +1222,20 @@ def main(args: Sequence[str] | None = None) -> int:
     else:
         print(f"HealthLab Übersicht: {overview.status.value}")
         print(overview.message)
-        if overview.resting_hr_analysis is not None:
+        if overview.resting_hr_analysis is None:
+            print("Kein aktuelles Analyseergebnis.")
+        else:
             estimate = overview.resting_hr_analysis.cumulative_association
             print(f"Kumulativer Zusammenhang: {estimate.estimate_per_100_kcal:.2f} bpm/100 kcal")
+        for historical in overview.analysis_history:
+            provenance = historical.provenance
+            print(
+                f"Historisch: {historical.freshness.value} · "
+                f"Run {provenance.analysis_run_id if provenance else '-'} · "
+                f"Snapshot {historical.snapshot_id} · "
+                "Ausgeführt "
+                f"{historical.completed_at.isoformat() if historical.completed_at else '-'}"
+            )
     if parsed.command in write_commands:
         if parsed.command == "analyze":
             if analysis_write_receipt is None:

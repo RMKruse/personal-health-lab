@@ -186,7 +186,7 @@ except ValueError as error:
 if st.button("Ruhepulsanalyse prüfen", disabled=analysis_plan is not None):
     try:
         analysis_request = RunRestingHeartRateAnalysis(
-            AnalysisDefinitionId("lag-signal-v1"),
+            AnalysisDefinitionId("lag-signal-v2"),
             start_date=selection.start_date,
             end_date=selection.end_date,
         )
@@ -670,12 +670,25 @@ for series in overview.daily_series:
 if overview.status is OverviewStatus.PROVISIONAL:
     previous = overview.last_ready_analysis_provenance
     if previous is None:
-        st.warning("Dieses Analyseergebnis ist vorläufig; ein belastbares Ergebnis fehlt.")
+        st.warning("Dieses Analyseergebnis ist explorativ; ein robustes Ergebnis fehlt.")
     else:
         st.warning(
-            f"Dieses Analyseergebnis ist vorläufig. Letztes belastbares Ergebnis: "
-            f"Run {previous.analysis_run_id} · Snapshot {previous.snapshot_id} · "
-            f"Ergebnis {previous.result_id}."
+            f"Dieses Analyseergebnis ist explorativ. Letztes robustes Ergebnis: "
+            f"Run {previous.analysis_run_id} · Snapshot {previous.snapshot_id}."
+        )
+
+if overview.resting_hr_analysis is None:
+    st.info("Kein aktuelles Analyseergebnis.")
+if overview.analysis_history:
+    st.subheader("Analysehistorie")
+    for historical in overview.analysis_history:
+        provenance = historical.provenance
+        st.caption(
+            f"{historical.freshness.value} · Datenstatus {historical.data_status.value} · "
+            f"Modellreife {historical.model_maturity.value} · "
+            f"Run {provenance.analysis_run_id if provenance else '-'} · "
+            f"Snapshot {historical.snapshot_id} · "
+            f"Ausgeführt {historical.completed_at.isoformat() if historical.completed_at else '-'}"
         )
 
 if overview.resting_hr_analysis is not None:
@@ -686,7 +699,11 @@ if overview.resting_hr_analysis is not None:
         "Assoziation zwischen aktiver Energie und Apple-Ruhepuls; "
         "keine kausale oder medizinische Aussage."
     )
-    st.caption(f"Modellreife: {result.model_maturity}")
+    st.caption(
+        f"Aktualität: {result.freshness.value} · Datenstatus: {result.data_status.value} · "
+        f"Modellreife: {result.model_maturity.value}"
+    )
+    st.caption(f"Reproduzierbarkeit: {result.reproducibility.value}")
     if provenance is not None:
         st.caption(
             f"Run {provenance.analysis_run_id} · Snapshot {provenance.snapshot_id} · "

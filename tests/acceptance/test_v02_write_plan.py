@@ -96,6 +96,28 @@ REGISTERED_CASES.update(
 )
 REGISTERED_CASES.update(
     {
+        "V02-A-RES-001": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
+        "V02-A-RES-002": "test_incomplete_analysis_creates_no_result_or_maturity",
+        "V02-A-RES-003": "test_incomplete_analysis_creates_no_result_or_maturity",
+        "V02-A-RES-004": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
+        "V02-A-RES-005": "test_reactivating_an_immutable_snapshot_rederives_current_freshness",
+        "V02-A-RES-006": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
+        "V02-A-RES-007": "test_passive_coverage_gaps_only_mark_results_that_use_them",
+        "V02-A-RES-008": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
+        "V02-A-RES-009": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
+        "V02-A-RES-010": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
+        "V02-A-RES-011": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
+        "V02-A-RES-012": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
+        "V02-A-RES-013": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
+        "V02-A-RES-014": "test_reuse_requires_every_reproduction_identity_to_match",
+        "V02-A-RES-015": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
+        "V02-A-STO-013": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
+        "V02-A-STO-014": "test_incomplete_analysis_creates_no_result_or_maturity",
+        "V02-A-ADP-008": "test_cli_and_streamlit_project_analysis_status_axes",
+    }
+)
+REGISTERED_CASES.update(
+    {
         "V02-A-RULE-001": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
         "V02-A-RULE-002": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
         "V02-A-RULE-003": (

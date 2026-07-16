@@ -1,6 +1,16 @@
 """Intent-oriented local storage interface."""
 
 from personal_health_lab import DataMode
+from personal_health_lab.health_data import (
+    AnalysisDataStatusReason,
+    AnalysisFreshness,
+    DataQualityStatus,
+    DataStatusReasonCode,
+    ModelMaturityCriterion,
+    ModelMaturityCriterionCode,
+    ModelMaturityStatus,
+    ReproducibilityStatus,
+)
 
 from ._store import (
     AnalysisDefinitionId,
@@ -53,8 +63,10 @@ from ._store import (
 )
 
 __all__ = [
+    "AnalysisDataStatusReason",
     "AnalysisDefinitionId",
     "AnalysisDiagnostics",
+    "AnalysisFreshness",
     "AnalysisMethodology",
     "AnalysisProvenance",
     "AnalysisResultId",
@@ -67,6 +79,8 @@ __all__ = [
     "CapacityReason",
     "CapacityStatus",
     "DataMode",
+    "DataQualityStatus",
+    "DataStatusReasonCode",
     "ExportFact",
     "FileVaultCheck",
     "FileVaultReason",
@@ -76,6 +90,9 @@ __all__ = [
     "ImportId",
     "LocalStore",
     "MeasurementVersionFact",
+    "ModelMaturityCriterion",
+    "ModelMaturityCriterionCode",
+    "ModelMaturityStatus",
     "OpenDataReviewCase",
     "OperationId",
     "PersonBindingStatus",
@@ -84,6 +101,7 @@ __all__ = [
     "PublishBatchDecisionResult",
     "PublishDecisionResult",
     "PublishImportResult",
+    "ReproducibilityStatus",
     "ResolvedMeasurement",
     "RestingHeartRateAnalysisResult",
     "ReviewCaseId",

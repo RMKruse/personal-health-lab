@@ -478,7 +478,7 @@ def test_confirmation_stales_but_never_rewrites_an_existing_analysis(
 ) -> None:
     config = _config(tmp_path)
     fixture = generate_export("lag-signal-v1", 42, tmp_path / "fixture")
-    analysis = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v1"))
+    analysis = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v2"))
     with HealthLab.open(config) as health_lab:
         _execute_import(health_lab, fixture.export_path)
         first_plan = health_lab.preview_write(analysis)

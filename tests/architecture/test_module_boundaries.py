@@ -21,6 +21,7 @@ ALLOWED_DEPENDENCIES = {
     "adapters": {"application", "package_root", "synthetic_export"},
     "application": {
         "health_import",
+        "health_data",
         "data_quality",
         "overview",
         "package_root",

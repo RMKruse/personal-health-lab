@@ -720,7 +720,9 @@ def test_cli_prints_empty_overview_as_versioned_json(
     assert exit_code == 0
     _assert_json_contract(output)
     assert output == {
+        "analysis_history": [],
         "daily_series": [],
+        "last_reviewed_analysis": None,
         "message": "Keine Gesundheitsdaten vorhanden.",
         "resting_hr_analysis": None,
         "provenance": {
@@ -800,7 +802,7 @@ def test_cli_runs_and_exposes_the_built_in_lag_analysis(
     _assert_json_contract(receipt)
     analysis_receipt = receipt["result"]
     assert analysis_receipt["status"] == "completed"
-    assert analysis_receipt["analysis_definition_id"] == "lag-signal-v1"
+    assert analysis_receipt["analysis_definition_id"] == "lag-signal-v2"
     analysis_result = analysis_receipt["analysis"]
     assert len(analysis_result["lag_associations"]) == 7
     assert analysis_result["model_maturity"] == "robust"

@@ -2230,3 +2230,264 @@ level = "application"
 expected_result = "earlier manifest remains byte-identical"
 expected_effect = "new snapshots only"
 forbidden_side_effects = ["historical snapshot or run mutation"]
+
+[[contract]]
+id = "V02-C-RES-001"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Freshness, data status, model maturity, and run status remain independent."
+evidence = ["positive", "negative"]
+
+[[contract]]
+id = "V02-C-RES-002"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Freshness is derived only from the active snapshot ID."
+evidence = ["transition"]
+
+[[contract]]
+id = "V02-C-RES-003"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Data-status and maturity facts are frozen with each result."
+evidence = ["positive", "transition"]
+
+[[contract]]
+id = "V02-C-RES-004"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Current, last reviewed, and historical result slots never mix."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V02-C-RES-005"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Historical results retain their complete reproduction basis."
+evidence = ["positive", "transition"]
+
+[[contract]]
+id = "V02-C-STO-005"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Analysis results store frozen status facts but never freshness."
+evidence = ["positive", "negative"]
+
+[[fixture]]
+id = "V02-F-DOM-ANALYSIS-STATUS-V1"
+kind = "domain"
+generator = "lag-signal-v1"
+seed = 42
+parameters = "lag-signal analysis, open and reviewed snapshots, stale history, reactivation, and incomplete runs"
+platform = "all"
+sha256 = "50732b61f987810e09de2269eab411050a0116c39292066168feabe51b8b91f2"
+
+[[case]]
+id = "V02-A-RES-001"
+contracts = ["V02-C-RES-001"]
+fixtures = ["V02-F-DOM-ANALYSIS-STATUS-V1"]
+runner = "test_analysis_results_keep_frozen_status_facts_and_separate_history"
+initial_state = "formal robust result with open review cases"
+operation = "load current and historical projections"
+level = "application"
+expected_result = "independent freshness, provisional data, and robust maturity"
+expected_effect = "none"
+forbidden_side_effects = ["cross-product status"]
+
+[[case]]
+id = "V02-A-RES-002"
+contracts = ["V02-C-RES-001"]
+fixtures = ["V02-F-DOM-ANALYSIS-STATUS-V1"]
+runner = "test_incomplete_analysis_creates_no_result_or_maturity"
+initial_state = "empty store"
+operation = "run analysis"
+level = "application"
+expected_result = "insufficient_data run status"
+expected_effect = "receipt only"
+forbidden_side_effects = ["result status conflation"]
+
+[[case]]
+id = "V02-A-RES-003"
+contracts = ["V02-C-RES-001"]
+fixtures = ["V02-F-DOM-ANALYSIS-STATUS-V1"]
+runner = "test_incomplete_analysis_creates_no_result_or_maturity"
+initial_state = "insufficient inputs"
+operation = "run analysis"
+level = "application"
+expected_result = "no result and no maturity"
+expected_effect = "failed run receipt"
+forbidden_side_effects = ["exploratory result"]
+
+[[case]]
+id = "V02-A-RES-004"
+contracts = ["V02-C-RES-002"]
+fixtures = ["V02-F-DOM-ANALYSIS-STATUS-V1"]
+runner = "test_analysis_results_keep_frozen_status_facts_and_separate_history"
+initial_state = "current result"
+operation = "activate a different snapshot"
+level = "application"
+expected_result = "old result is stale"
+expected_effect = "historical slot only"
+forbidden_side_effects = ["persisted freshness"]
+
+[[case]]
+id = "V02-A-RES-005"
+contracts = ["V02-C-RES-002"]
+fixtures = ["V02-F-DOM-ANALYSIS-STATUS-V1"]
+runner = "test_reactivating_an_immutable_snapshot_rederives_current_freshness"
+initial_state = "stale result"
+operation = "reactivate its immutable snapshot"
+level = "application"
+expected_result = "same result is current again"
+expected_effect = "derived projection change"
+forbidden_side_effects = ["result mutation"]
+
+[[case]]
+id = "V02-A-RES-006"
+contracts = ["V02-C-RES-003"]
+fixtures = ["V02-F-DOM-ANALYSIS-STATUS-V1"]
+runner = "test_analysis_results_keep_frozen_status_facts_and_separate_history"
+initial_state = "open review cases"
+operation = "run analysis"
+level = "application"
+expected_result = "provisional with case evidence IDs"
+expected_effect = "frozen reason facts"
+forbidden_side_effects = ["case-type filtering"]
+
+[[case]]
+id = "V02-A-RES-007"
+contracts = ["V02-C-RES-003"]
+fixtures = ["V02-F-DOM-ANALYSIS-STATUS-V1"]
+runner = "test_passive_coverage_gaps_only_mark_results_that_use_them"
+initial_state = "activity gaps in the selected analysis period"
+operation = "run analysis"
+level = "application"
+expected_result = "provisional with activity-date evidence"
+expected_effect = "targeted frozen coverage reason"
+forbidden_side_effects = ["unrelated type coverage"]
+
+[[case]]
+id = "V02-A-RES-008"
+contracts = ["V02-C-RES-003"]
+fixtures = ["V02-F-DOM-ANALYSIS-STATUS-V1"]
+runner = "test_analysis_results_keep_frozen_status_facts_and_separate_history"
+initial_state = "reviewed snapshot without coverage gaps"
+operation = "run analysis"
+level = "application"
+expected_result = "reviewed"
+expected_effect = "empty data-status reasons"
+forbidden_side_effects = ["maturity coupling"]
+
+[[case]]
+id = "V02-A-RES-009"
+contracts = ["V02-C-RES-003"]
+fixtures = ["V02-F-DOM-ANALYSIS-STATUS-V1"]
+runner = "test_analysis_results_keep_frozen_status_facts_and_separate_history"
+initial_state = "versioned analysis definition"
+operation = "run then stale the result"
+level = "application"
+expected_result = "all criterion values and thresholds remain unchanged"
+expected_effect = "frozen maturity facts"
+forbidden_side_effects = ["reinterpretation"]
+
+[[case]]
+id = "V02-A-RES-010"
+contracts = ["V02-C-RES-004"]
+fixtures = ["V02-F-DOM-ANALYSIS-STATUS-V1"]
+runner = "test_analysis_results_keep_frozen_status_facts_and_separate_history"
+initial_state = "active snapshot without a run"
+operation = "load overview"
+level = "application"
+expected_result = "no current result plus separate history"
+expected_effect = "explicit empty current slot"
+forbidden_side_effects = ["historical fallback"]
+
+[[case]]
+id = "V02-A-RES-011"
+contracts = ["V02-C-RES-004"]
+fixtures = ["V02-F-DOM-ANALYSIS-STATUS-V1"]
+runner = "test_analysis_results_keep_frozen_status_facts_and_separate_history"
+initial_state = "current provisional and previous reviewed results"
+operation = "load overview"
+level = "application"
+expected_result = "separate current and last-reviewed slots"
+expected_effect = "typed comparison"
+forbidden_side_effects = ["slot replacement"]
+
+[[case]]
+id = "V02-A-RES-012"
+contracts = ["V02-C-RES-004"]
+fixtures = ["V02-F-DOM-ANALYSIS-STATUS-V1"]
+runner = "test_analysis_results_keep_frozen_status_facts_and_separate_history"
+initial_state = "historical result"
+operation = "load overview"
+level = "application"
+expected_result = "stale in history"
+expected_effect = "none"
+forbidden_side_effects = ["current presentation"]
+
+[[case]]
+id = "V02-A-RES-013"
+contracts = ["V02-C-RES-005"]
+fixtures = ["V02-F-DOM-ANALYSIS-STATUS-V1"]
+runner = "test_analysis_results_keep_frozen_status_facts_and_separate_history"
+initial_state = "completed clean run"
+operation = "load it after later snapshots"
+level = "application"
+expected_result = "snapshot, run, result, definition, config, commit, lock, and reasons retained"
+expected_effect = "reproducible history"
+forbidden_side_effects = ["provenance loss"]
+
+[[case]]
+id = "V02-A-RES-014"
+contracts = ["V02-C-RES-005"]
+fixtures = ["V02-F-DOM-ANALYSIS-STATUS-V1"]
+runner = "test_reuse_requires_every_reproduction_identity_to_match"
+initial_state = "dirty local run"
+operation = "evaluate reuse identity"
+level = "analysis"
+expected_result = "reuse only with identical diff hash"
+expected_effect = "local-development provenance"
+forbidden_side_effects = ["diff content persistence"]
+
+[[case]]
+id = "V02-A-RES-015"
+contracts = ["V02-C-RES-005"]
+fixtures = ["V02-F-DOM-ANALYSIS-STATUS-V1"]
+runner = "test_analysis_results_keep_frozen_status_facts_and_separate_history"
+initial_state = "multiple completed runs and snapshots"
+operation = "activate another snapshot"
+level = "application"
+expected_result = "all historical results retained"
+expected_effect = "append-only history"
+forbidden_side_effects = ["automatic deletion"]
+
+[[case]]
+id = "V02-A-STO-013"
+contracts = ["V02-C-STO-005"]
+fixtures = ["V02-F-DOM-ANALYSIS-STATUS-V1"]
+runner = "test_analysis_results_keep_frozen_status_facts_and_separate_history"
+initial_state = "completed result"
+operation = "persist and reload"
+level = "storage"
+expected_result = "snapshot, run, definition, data status, and maturity facts retained"
+expected_effect = "freshness derived on load"
+forbidden_side_effects = ["persistent freshness"]
+
+[[case]]
+id = "V02-A-STO-014"
+contracts = ["V02-C-STO-005"]
+fixtures = ["V02-F-DOM-ANALYSIS-STATUS-V1"]
+runner = "test_incomplete_analysis_creates_no_result_or_maturity"
+initial_state = "failed formal analysis"
+operation = "persist failure receipt"
+level = "storage"
+expected_result = "no result row"
+expected_effect = "receipt retained"
+forbidden_side_effects = ["result artifact"]
+
+[[case]]
+id = "V02-A-ADP-008"
+contracts = ["V02-C-ADP-004"]
+fixtures = ["V02-F-DOM-ANALYSIS-STATUS-V1"]
+runner = "test_cli_and_streamlit_project_analysis_status_axes"
+initial_state = "import, review decision, snapshot, and analysis history"
+operation = "render through CLI and Streamlit"
+level = "adapter"
+expected_result = "both adapters separate current and historical status axes"
+expected_effect = "shared application values"
+forbidden_side_effects = ["adapter domain logic", "historical current fallback"]

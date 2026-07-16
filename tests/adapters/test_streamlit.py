@@ -1,4 +1,5 @@
 import fcntl
+import json
 import platform
 from collections.abc import Callable
 from datetime import date
@@ -7,7 +8,13 @@ from pathlib import Path
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from personal_health_lab.application import DataMode, HealthLab, ImportHealthExport, RuntimeConfig
+from personal_health_lab.adapters.cli import main as cli_main
+from personal_health_lab.application import (
+    DataMode,
+    HealthLab,
+    ImportHealthExport,
+    RuntimeConfig,
+)
 from personal_health_lab.synthetic_export import GenerationOptions, generate_export
 
 
@@ -208,7 +215,7 @@ def test_streamlit_shows_imported_daily_series(
 
     assert not app.exception
     assert app.markdown[0].value == "Status: provisional"
-    assert any("Letztes belastbares Ergebnis" in item.value for item in app.warning)
+    assert any("Letztes robustes Ergebnis" in item.value for item in app.warning)
 
 
 def test_streamlit_maps_unstable_analysis(
@@ -427,3 +434,86 @@ def test_streamlit_can_plan_a_data_correction(
 
     assert not app.exception
     assert any(button.label == "Datenprüfentscheidung ausführen" for button in app.button)
+
+
+def test_cli_and_streamlit_project_analysis_status_axes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    first = generate_export("lag-signal-v1", 42, tmp_path / "first")
+    second = generate_export("lag-signal-v1", 43, tmp_path / "second")
+    cli_store = tmp_path / "cli-synthetic"
+
+    common = [
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(cli_store),
+        "--real-store",
+        str(tmp_path / "cli-real"),
+    ]
+
+    def execute_cli(command: list[str]) -> dict[str, object]:
+        assert cli_main([*common, *command, "--json"]) == 0
+        plan = json.loads(capsys.readouterr().out)
+        assert cli_main(
+            [
+                *common,
+                *command,
+                "--json",
+                "--execute",
+                "--expect-plan",
+                plan["fingerprint"],
+            ]
+        ) == 0
+        return json.loads(capsys.readouterr().out)
+
+    execute_cli(["import", str(first.export_path)])
+    execute_cli(["review-confirm-batch", "--note", "geprüft"])
+    execute_cli(["analyze"])
+    assert cli_main([*common, "overview", "--json"]) == 0
+    cli_current = json.loads(capsys.readouterr().out)["resting_hr_analysis"]
+    assert cli_current["freshness"] == "current"
+    assert cli_current["data_status"] == "reviewed"
+    assert cli_current["model_maturity"] == "robust"
+    assert cli_current["reproducibility"] in {"reproducible", "local_development"}
+
+    execute_cli(["import", str(second.export_path)])
+    assert cli_main([*common, "overview", "--json"]) == 0
+    cli_overview = json.loads(capsys.readouterr().out)
+    assert cli_overview["resting_hr_analysis"] is None
+    assert cli_overview["analysis_history"][0]["freshness"] == "stale"
+    assert cli_overview["analysis_history"][0]["data_status"] == "reviewed"
+
+    streamlit_store = tmp_path / "streamlit-synthetic"
+    monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
+    monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(streamlit_store))
+    monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(tmp_path / "streamlit-real"))
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
+    app = AppTest.from_file(str(app_path)).run()
+
+    app.file_uploader[0].set_value(
+        ("apple-health-export.zip", first.export_path.read_bytes(), "application/zip")
+    )
+    next(button for button in app.button if button.label == "Health-Export prüfen").click().run()
+    next(button for button in app.button if button.label == "Vorschau ausführen").click().run()
+    next(
+        button for button in app.button if button.label == "Sammelbestätigung prüfen"
+    ).click().run()
+    next(
+        button for button in app.button if button.label == "Datenprüfentscheidung ausführen"
+    ).click().run()
+    app = AppTest.from_file(str(app_path)).run()
+    next(button for button in app.button if button.label == "Ruhepulsanalyse prüfen").click().run()
+    next(
+        button for button in app.button if button.label == "Ruhepulsanalyse ausführen"
+    ).click().run()
+
+    assert not app.exception
+    assert any(
+        "current" in item.value
+        and "Datenstatus: reviewed" in item.value
+        and "Modellreife: robust" in item.value
+        for item in app.caption
+    )
