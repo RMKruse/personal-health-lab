@@ -98,10 +98,22 @@ statement = "Review decisions affect only new snapshots and analyses."
 evidence = ["positive", "negative", "transition"]
 
 [[contract]]
+id = "V02-C-ADP-001"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Production adapters map every public union branch without domain logic."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
 id = "V02-C-ADP-002"
 source = "https://github.com/RMKruse/personal-health-lab/issues/33"
 statement = "Human and JSON CLI preserve their separate complete interaction contracts."
 evidence = ["positive", "negative", "boundary"]
+
+[[contract]]
+id = "V02-C-ADP-003"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Streamlit keeps only transient preview state and locks previewed inputs."
+evidence = ["positive", "negative", "transition"]
 
 [[contract]]
 id = "V02-C-ADP-004"
@@ -1084,7 +1096,7 @@ expected_effect = "none"
 forbidden_side_effects = ["technical defect encoded as business outcome"]
 
 [[case]]
-id = "V02-A-API-015"
+id = "V02-A-RHR-001"
 contracts = ["V02-C-API-002", "V02-C-API-004"]
 fixtures = []
 runner = "test_analysis_preview_is_read_only_and_execution_rechecks_the_request"
@@ -1096,7 +1108,7 @@ expected_effect = "none"
 forbidden_side_effects = ["analysis receipt", "writer lock"]
 
 [[case]]
-id = "V02-A-API-016"
+id = "V02-A-RHR-002"
 contracts = ["V02-C-API-002", "V02-C-API-004"]
 fixtures = []
 runner = "test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis"
@@ -1108,10 +1120,10 @@ expected_effect = "one immutable analysis result"
 forbidden_side_effects = ["rebuilt statistical methodology"]
 
 [[case]]
-id = "V02-A-API-017"
+id = "V02-A-RHR-003"
 contracts = ["V02-C-API-003", "V02-C-API-004"]
 fixtures = []
-runner = "test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis"
+runner = "test_analysis_rechecks_the_snapshot_under_the_writer_lock"
 initial_state = "previewed analysis followed by a newer active snapshot"
 operation = "execute with the stale analysis fingerprint"
 level = "application"
@@ -1120,7 +1132,7 @@ expected_effect = "none"
 forbidden_side_effects = ["analysis of a snapshot not authorized by the plan"]
 
 [[case]]
-id = "V02-A-API-018"
+id = "V02-A-RHR-004"
 contracts = ["V02-C-API-004"]
 fixtures = []
 runner = "test_analysis_store_busy_is_write_not_started"
@@ -1132,7 +1144,7 @@ expected_effect = "none"
 forbidden_side_effects = ["AnalysisReceipt store_busy", "analysis persistence"]
 
 [[case]]
-id = "V02-A-API-019"
+id = "V02-A-RHR-005"
 contracts = ["V02-C-API-004"]
 fixtures = []
 runner = "test_analysis_reports_insufficient_and_unstable_inputs_with_stable_diagnostics"
@@ -1142,6 +1154,42 @@ level = "application"
 expected_result = "typed insufficient_data, unstable, and completed AnalysisReceipt values"
 expected_effect = "result only for completed analysis"
 forbidden_side_effects = ["result row for insufficient or unstable analysis"]
+
+[[case]]
+id = "V02-A-RHR-006"
+contracts = ["V02-C-ADP-001", "V02-C-ADP-002"]
+fixtures = []
+runner = "test_cli_runs_and_exposes_the_built_in_lag_analysis"
+initial_state = "active lag-signal snapshot"
+operation = "preview, confirm, and execute the human CLI analysis"
+level = "adapter"
+expected_result = "typed completed or reused analysis receipt"
+expected_effect = "shared application analysis execution"
+forbidden_side_effects = ["adapter statistical logic"]
+
+[[case]]
+id = "V02-A-RHR-007"
+contracts = ["V02-C-ADP-001", "V02-C-ADP-002"]
+fixtures = []
+runner = "test_cli_runs_and_exposes_the_built_in_lag_analysis"
+initial_state = "active lag-signal snapshot"
+operation = "JSON preview followed by identical --execute --expect-plan call"
+level = "adapter"
+expected_result = "versioned typed WritePlan then WriteReceipt JSON"
+expected_effect = "shared application analysis execution"
+forbidden_side_effects = ["one-call JSON execution", "adapter statistical logic"]
+
+[[case]]
+id = "V02-A-RHR-008"
+contracts = ["V02-C-ADP-001", "V02-C-ADP-003"]
+fixtures = []
+runner = "test_streamlit_shows_imported_daily_series"
+initial_state = "active lag-signal snapshot"
+operation = "preview and explicitly execute analysis in Streamlit"
+level = "adapter"
+expected_result = "inline pinned preview with locked inputs and discard action"
+expected_effect = "shared application analysis execution"
+forbidden_side_effects = ["persistent UI plan", "adapter statistical logic"]
 
 [[case]]
 id = "V02-A-PRE-001"

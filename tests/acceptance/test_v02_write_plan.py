@@ -58,15 +58,18 @@ REGISTERED_CASES = {
 }
 REGISTERED_CASES.update(
     {
-        "V02-A-API-015": (
+        "V02-A-RHR-001": (
             "test_analysis_preview_is_read_only_and_execution_rechecks_the_request"
         ),
-        "V02-A-API-016": "test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis",
-        "V02-A-API-017": "test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis",
-        "V02-A-API-018": "test_analysis_store_busy_is_write_not_started",
-        "V02-A-API-019": (
+        "V02-A-RHR-002": "test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis",
+        "V02-A-RHR-003": "test_analysis_rechecks_the_snapshot_under_the_writer_lock",
+        "V02-A-RHR-004": "test_analysis_store_busy_is_write_not_started",
+        "V02-A-RHR-005": (
             "test_analysis_reports_insufficient_and_unstable_inputs_with_stable_diagnostics"
         ),
+        "V02-A-RHR-006": "test_cli_runs_and_exposes_the_built_in_lag_analysis",
+        "V02-A-RHR-007": "test_cli_runs_and_exposes_the_built_in_lag_analysis",
+        "V02-A-RHR-008": "test_streamlit_shows_imported_daily_series",
         "V02-A-PRE-001": "test_new_store_has_stable_identity_and_immutable_mode",
         "V02-A-PRE-002": "test_complete_store_copy_retains_the_same_identity",
         "V02-A-PRE-003": (

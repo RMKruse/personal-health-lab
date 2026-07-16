@@ -1,6 +1,7 @@
 import fcntl
 from datetime import date
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 
@@ -21,6 +22,7 @@ from personal_health_lab.application import (
     WriteNotStarted,
     WriteNotStartedStatus,
 )
+from personal_health_lab.application import _application as application_module
 from personal_health_lab.synthetic_export import GenerationOptions, generate_export
 
 
@@ -84,6 +86,55 @@ def test_analysis_store_busy_is_write_not_started(tmp_path: Path) -> None:
 
     assert isinstance(result, WriteNotStarted)
     assert result.status is WriteNotStartedStatus.STORE_BUSY
+
+
+def test_analysis_rechecks_the_snapshot_under_the_writer_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_package = generate_export("null-v1", 42, tmp_path / "first")
+    second_package = generate_export("null-v1", 43, tmp_path / "second")
+    runtime = RuntimeConfig(
+        mode=DataMode.SYNTHETIC,
+        synthetic_store=tmp_path / "store",
+        real_store=tmp_path / "real-store",
+    )
+    request = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v1"))
+    with HealthLab.open(runtime) as health_lab:
+        _execute_import(health_lab, first_package.export_path)
+        plan = health_lab.preview_write(request)
+
+    execution_started = Event()
+    continue_execution = Event()
+    original_execute = application_module.execute_analysis
+
+    def delayed_execute(**kwargs):
+        execution_started.set()
+        assert continue_execution.wait(10)
+        return original_execute(**kwargs)
+
+    monkeypatch.setattr(application_module, "execute_analysis", delayed_execute)
+    results: list[object] = []
+
+    def execute() -> None:
+        with HealthLab.open(runtime) as health_lab:
+            results.append(
+                health_lab.execute_write(request, expected_plan=plan.fingerprint).result
+            )
+
+    thread = Thread(target=execute)
+    thread.start()
+    assert execution_started.wait(10)
+    try:
+        with HealthLab.open(runtime) as health_lab:
+            _execute_import(health_lab, second_package.export_path)
+    finally:
+        continue_execution.set()
+        thread.join(10)
+
+    assert not thread.is_alive()
+    assert len(results) == 1
+    assert isinstance(results[0], WriteNotStarted)
+    assert results[0].status is WriteNotStartedStatus.PLAN_CHANGED
 
 
 def test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis(tmp_path: Path) -> None:
