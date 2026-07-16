@@ -37,9 +37,9 @@ from personal_health_lab.application import (
     OverviewStatus,
     PlausibilityRuleSpecification,
     ResolveDataReviewCase,
-    RestingHeartRateAnalysisConfig,
     RevokeDataReviewDecision,
     RunHistoricalReview,
+    RunRestingHeartRateAnalysis,
     SingleDecisionTarget,
     SourceConflictResolution,
     SourceConflictStrategy,
@@ -174,31 +174,58 @@ if import_plan is not None:
         st.session_state.pop("import_plan", None)
         st.rerun()
 
-start_date = st.date_input("Von", value=None)
-end_date = st.date_input("Bis", value=None)
+analysis_plan = st.session_state.get("analysis_plan")
+start_date = st.date_input("Von", value=None, disabled=analysis_plan is not None)
+end_date = st.date_input("Bis", value=None, disabled=analysis_plan is not None)
 try:
     selection = OverviewSelection(start_date=start_date, end_date=end_date)
 except ValueError as error:
     st.error(str(error))
     st.stop()
 
-if st.button("Zeitraum analysieren"):
+if st.button("Ruhepulsanalyse prüfen", disabled=analysis_plan is not None):
     try:
-        with HealthLab.open(config) as health_lab:
-            analysis_receipt = health_lab.run_resting_hr_analysis(
-                RestingHeartRateAnalysisConfig(
-                    AnalysisDefinitionId("lag-signal-v1"),
-                    start_date=selection.start_date,
-                    end_date=selection.end_date,
-                )
-            )
-        st.session_state["last_analysis_status"] = analysis_receipt.status
-        st.session_state["last_analysis_diagnostics"] = (
-            ", ".join(analysis_receipt.diagnostics) or "-"
+        analysis_request = RunRestingHeartRateAnalysis(
+            AnalysisDefinitionId("lag-signal-v1"),
+            start_date=selection.start_date,
+            end_date=selection.end_date,
         )
+        with HealthLab.open(config) as health_lab:
+            st.session_state["analysis_plan"] = health_lab.preview_write(analysis_request)
+        st.session_state["analysis_request"] = analysis_request
         st.rerun()
     except (ConfigurationError, HealthLabError):
         st.error("Ruhepulsanalyse konnte nicht abgeschlossen werden.")
+
+analysis_plan = st.session_state.get("analysis_plan")
+if analysis_plan is not None:
+    st.subheader("Analysevorschau")
+    st.code(str(analysis_plan.fingerprint))
+    st.caption(f"Gepinnter Snapshot: {analysis_plan.details.base_snapshot_ref or '-'}")
+    st.caption("Diagnosen: " + (", ".join(analysis_plan.diagnostics) or "-"))
+    if st.button(
+        "Ruhepulsanalyse ausführen",
+        disabled=analysis_plan.approval.status is WriteApprovalStatus.BLOCKED,
+    ):
+        try:
+            with HealthLab.open(config) as health_lab:
+                analysis_result = health_lab.execute_write(
+                    st.session_state["analysis_request"],
+                    expected_plan=analysis_plan.fingerprint,
+                ).result
+            st.session_state["last_analysis_status"] = analysis_result.status
+            st.session_state["last_analysis_diagnostics"] = (
+                ", ".join(analysis_result.diagnostics) or "-"
+            )
+            st.session_state.pop("analysis_plan", None)
+            st.session_state.pop("analysis_request", None)
+            st.rerun()
+        except (ConfigurationError, HealthLabError):
+            st.error("Ruhepulsanalyse konnte nicht abgeschlossen werden.")
+    if st.button("Analysevorschau verwerfen und bearbeiten"):
+        st.session_state.pop("analysis_plan", None)
+        st.session_state.pop("analysis_request", None)
+        st.rerun()
 
 try:
     with HealthLab.open(config) as health_lab:

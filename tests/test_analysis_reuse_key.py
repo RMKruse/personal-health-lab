@@ -6,7 +6,7 @@ from personal_health_lab.application import (
     DataMode,
     HealthLab,
     ImportHealthExport,
-    RestingHeartRateAnalysisConfig,
+    RunRestingHeartRateAnalysis,
     RuntimeConfig,
     SnapshotRef,
 )
@@ -24,9 +24,9 @@ def test_reuse_requires_every_reproduction_identity_to_match(tmp_path: Path) -> 
         request = ImportHealthExport(package.export_path)
         plan = health_lab.preview_write(request)
         health_lab.execute_write(request, expected_plan=plan.fingerprint)
-        receipt = health_lab.run_resting_hr_analysis(
-            RestingHeartRateAnalysisConfig(AnalysisDefinitionId("lag-signal-v1"))
-        )
+        request = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v1"))
+        plan = health_lab.preview_write(request)
+        receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint).result
 
     provenance = receipt.provenance
     assert provenance is not None

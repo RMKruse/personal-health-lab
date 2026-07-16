@@ -65,6 +65,32 @@ def _execute_json_import(
     return exit_code, receipt
 
 
+def _execute_json_analysis(
+    common_args: list[str],
+    capsys: pytest.CaptureFixture[str],
+    *analysis_args: str,
+) -> tuple[int, dict[str, object]]:
+    assert main([*common_args, "analyze", *analysis_args, "--json"]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    _assert_json_contract(plan)
+    assert plan["details"]["type"] == "run_resting_heart_rate_analysis"
+    exit_code = main(
+        [
+            *common_args,
+            "analyze",
+            *analysis_args,
+            "--json",
+            "--execute",
+            "--expect-plan",
+            plan["fingerprint"],
+        ]
+    )
+    receipt = json.loads(capsys.readouterr().out)
+    _assert_json_contract(receipt)
+    assert receipt["kind"] == "write_receipt"
+    return exit_code, receipt
+
+
 def test_cli_projects_source_conflicts_from_the_shared_data_review(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -420,9 +446,10 @@ def test_real_json_import_renders_shared_confirmation_plan(
         "resolve_data_review_case",
         "confirm_data_review_batch",
         "revoke_data_review_decision",
-        "create_plausibility_rule_version",
-        "run_historical_review",
-    ]
+            "create_plausibility_rule_version",
+            "run_historical_review",
+            "run_resting_heart_rate_analysis",
+        ]
 
 
 def test_cli_projects_and_creates_plausibility_rule_versions(
@@ -513,13 +540,13 @@ def test_cli_returns_expected_incomplete_while_store_is_busy(
         fcntl.flock(writer_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         exit_code, import_receipt = _execute_json_import(common_args, package, capsys)
         assert exit_code == 3
-        assert main([*common_args, "analyze", "--json"]) == 3
-        analysis_receipt = json.loads(capsys.readouterr().out)
+        analysis_exit, analysis_receipt = _execute_json_analysis(common_args, capsys)
+        assert analysis_exit == 3
 
     _assert_json_contract(import_receipt)
     _assert_json_contract(analysis_receipt)
     assert import_receipt["result"]["status"] == "store_busy"
-    assert analysis_receipt["status"] == "store_busy"
+    assert analysis_receipt["result"]["status"] == "store_busy"
 
 
 def test_cli_returns_expected_incomplete_for_unstable_analysis(
@@ -541,10 +568,10 @@ def test_cli_returns_expected_incomplete_for_unstable_analysis(
     ]
     assert _execute_json_import(common_args, fixture.export_path, capsys)[0] == 0
 
-    assert main([*common_args, "analyze", "--json"]) == 3
-    receipt = json.loads(capsys.readouterr().out)
+    exit_code, receipt = _execute_json_analysis(common_args, capsys)
+    assert exit_code == 3
     _assert_json_contract(receipt)
-    assert receipt["status"] == "unstable"
+    assert receipt["result"]["status"] == "unstable"
 
 
 def test_installed_cli_contracts_streams_and_redacts_technical_errors(tmp_path: Path) -> None:
@@ -729,17 +756,19 @@ def test_cli_runs_and_exposes_the_built_in_lag_analysis(
     assert "Konfiguration:" in human_import
     assert str(tmp_path) not in human_import
 
-    assert main([*common_args, "analyze", "--json"]) == 0
-    receipt = json.loads(capsys.readouterr().out)
+    analysis_exit, receipt = _execute_json_analysis(common_args, capsys)
+    assert analysis_exit == 0
     _assert_json_contract(receipt)
-    assert receipt["status"] == "completed"
-    assert receipt["analysis_definition_id"] == "lag-signal-v1"
-    assert len(receipt["result"]["lag_associations"]) == 7
-    assert receipt["result"]["model_maturity"] == "robust"
-    assert receipt["result"]["methodology"]["bootstrap_method"] == "moving_block"
-    assert receipt["result"]["diagnostics"]
-    provenance = receipt["provenance"]
-    assert provenance == receipt["result"]["provenance"]
+    analysis_receipt = receipt["result"]
+    assert analysis_receipt["status"] == "completed"
+    assert analysis_receipt["analysis_definition_id"] == "lag-signal-v1"
+    analysis_result = analysis_receipt["analysis"]
+    assert len(analysis_result["lag_associations"]) == 7
+    assert analysis_result["model_maturity"] == "robust"
+    assert analysis_result["methodology"]["bootstrap_method"] == "moving_block"
+    assert analysis_result["diagnostics"]
+    provenance = analysis_receipt["provenance"]
+    assert provenance == analysis_result["provenance"]
     assert set(provenance) == {
         "analysis_definition_id",
         "analysis_run_id",
@@ -756,10 +785,10 @@ def test_cli_runs_and_exposes_the_built_in_lag_analysis(
     assert len(provenance["environment_lock_hash"]) == 64
     assert all(
         item["pointwise_interval"] and item["simultaneous_band"]
-        for item in receipt["result"]["lag_associations"]
+        for item in analysis_result["lag_associations"]
     )
 
-    structured_result = json.dumps(receipt["result"], ensure_ascii=False).lower()
+    structured_result = json.dumps(analysis_result, ensure_ascii=False).lower()
     assert all(
         forbidden not in structured_result
         for forbidden in (
@@ -789,10 +818,10 @@ def test_cli_runs_and_exposes_the_built_in_lag_analysis(
     assert "Konfiguration:" in human_overview
     assert str(tmp_path) not in human_overview
 
-    assert main([*common_args, "analyze", "--json"]) == 0
-    reused = json.loads(capsys.readouterr().out)
+    reused_exit, reused = _execute_json_analysis(common_args, capsys)
+    assert reused_exit == 0
     _assert_json_contract(reused)
-    assert reused["status"] == "reused"
+    assert reused["result"]["status"] == "reused"
 
     assert main([*common_args, "analyze"]) == 0
     human_output = capsys.readouterr().out
@@ -801,10 +830,12 @@ def test_cli_runs_and_exposes_the_built_in_lag_analysis(
     assert "simultan" in human_output
     assert "Diagnosen:" in human_output
 
-    assert main([*common_args, "analyze", "--start-date", "2024-12-20", "--json"]) == 3
-    insufficient = json.loads(capsys.readouterr().out)
+    insufficient_exit, insufficient = _execute_json_analysis(
+        common_args, capsys, "--start-date", "2024-12-20"
+    )
+    assert insufficient_exit == 3
     _assert_json_contract(insufficient)
-    assert insufficient["status"] == "insufficient_data"
-    assert insufficient["result"] is None
-    assert insufficient["provenance"]["snapshot_ref"] == provenance["snapshot_ref"]
-    assert insufficient["provenance"]["result_ref"] is None
+    assert insufficient["result"]["status"] == "insufficient_data"
+    assert insufficient["result"]["analysis"] is None
+    assert insufficient["result"]["provenance"]["snapshot_ref"] == provenance["snapshot_ref"]
+    assert insufficient["result"]["provenance"]["result_ref"] is None

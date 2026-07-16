@@ -456,6 +456,23 @@
         "type": {"const": "run_historical_review"}
       }
     },
+    "restingHeartRateAnalysisResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["analysis", "analysis_definition_id", "analysis_run_id", "diagnostics", "model_maturity", "provenance", "result_ref", "snapshot_ref", "status", "type"],
+      "properties": {
+        "analysis": {"type": ["object", "null"]},
+        "analysis_definition_id": {"type": "string"},
+        "analysis_run_id": {"type": "string"},
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "model_maturity": {"enum": ["exploratory", "robust", null]},
+        "provenance": {"type": ["object", "null"]},
+        "result_ref": {"$ref": "#/$defs/nullableString"},
+        "snapshot_ref": {"$ref": "#/$defs/nullableString"},
+        "status": {"enum": ["completed", "reused", "insufficient_data", "unstable", "store_busy"]},
+        "type": {"const": "run_resting_heart_rate_analysis"}
+      }
+    },
     "writePlanOutput": {
       "type": "object",
       "additionalProperties": false,
@@ -569,6 +586,18 @@
                 "start_date": {"type": "string"},
                 "type": {"const": "run_historical_review"}
               }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["analysis_definition_id", "base_snapshot_ref", "end_date", "schema_version", "start_date", "type"],
+              "properties": {
+                "analysis_definition_id": {"type": "string"},
+                "base_snapshot_ref": {"$ref": "#/$defs/nullableString"},
+                "end_date": {"$ref": "#/$defs/nullableString"},
+                "schema_version": {"const": "1.0"},
+                "start_date": {"$ref": "#/$defs/nullableString"},
+                "type": {"const": "run_resting_heart_rate_analysis"}
+              }
             }
           ]
         },
@@ -608,7 +637,7 @@
               "type": "object", "additionalProperties": false,
               "required": ["type"],
               "properties": {
-                "type": {"enum": ["confirm_data_review_batch", "create_plausibility_rule_version", "data_review_decision", "revoke_data_review_batch", "run_historical_review"]}
+                "type": {"enum": ["confirm_data_review_batch", "create_plausibility_rule_version", "data_review_decision", "revoke_data_review_batch", "run_historical_review", "run_resting_heart_rate_analysis"]}
               }
             }
           ]
@@ -713,6 +742,9 @@
             },
             {
               "$ref": "#/$defs/historicalReviewResult"
+            },
+            {
+              "$ref": "#/$defs/restingHeartRateAnalysisResult"
             }
           ]
         },

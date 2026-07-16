@@ -112,6 +112,7 @@ class WorkspaceStatus:
         "revoke_data_review_decision",
         "create_plausibility_rule_version",
         "run_historical_review",
+        "run_resting_heart_rate_analysis",
     )
 
 
@@ -257,6 +258,26 @@ class RunHistoricalReview:
             raise ConfigurationError("Historischer Prüftyp hat einen ungültigen Typ.")
         if self.start_date > self.end_date:
             raise ConfigurationError("Historischer Prüfzeitraum ist ungültig.")
+
+
+@dataclass(frozen=True, slots=True)
+class RunRestingHeartRateAnalysis:
+    analysis_definition_id: AnalysisDefinitionId
+    start_date: date | None = None
+    end_date: date | None = None
+    schema_version: str = "1.0"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.analysis_definition_id, AnalysisDefinitionId):
+            raise ConfigurationError("analysis_definition_id hat einen ungültigen Typ.")
+        if self.schema_version != "1.0":
+            raise ConfigurationError("Unbekannte Analyseschemaversion.")
+        if (
+            self.start_date is not None
+            and self.end_date is not None
+            and self.start_date > self.end_date
+        ):
+            raise ConfigurationError("Startdatum darf nicht nach dem Enddatum liegen.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -436,6 +457,7 @@ WriteRequest = (
     | RevokeDataReviewDecision
     | CreatePlausibilityRuleVersion
     | RunHistoricalReview
+    | RunRestingHeartRateAnalysis
 )
 
 
@@ -530,6 +552,15 @@ class HistoricalReviewPlan:
     base_snapshot_ref: SnapshotRef | None
 
 
+@dataclass(frozen=True, slots=True)
+class RestingHeartRateAnalysisPlan:
+    analysis_definition_id: AnalysisDefinitionId
+    start_date: date | None
+    end_date: date | None
+    schema_version: str
+    base_snapshot_ref: SnapshotRef | None
+
+
 WritePlanDetails = (
     ImportHealthExportPlan
     | DataReviewDecisionPlan
@@ -537,6 +568,7 @@ WritePlanDetails = (
     | DataReviewBatchRevokePlan
     | PlausibilityRuleVersionPlan
     | HistoricalReviewPlan
+    | RestingHeartRateAnalysisPlan
 )
 
 
@@ -766,25 +798,6 @@ class HistoricalReviewReceipt:
     diagnostics: tuple[str, ...] = ()
 
 
-WriteResult = (
-    ImportReceipt
-    | WriteDecisionReceipt
-    | WriteBatchDecisionReceipt
-    | PlausibilityRuleVersionReceipt
-    | HistoricalReviewReceipt
-    | WriteNotStarted
-)
-
-
-@dataclass(frozen=True, slots=True)
-class WriteReceipt:
-    operation_id: OperationId
-    plan_fingerprint: PlanFingerprint
-    result: WriteResult
-    final_preflight: WritePreflight
-    diagnostics: tuple[str, ...] = ()
-
-
 class AnalysisStatus(StrEnum):
     COMPLETED = "completed"
     REUSED = "reused"
@@ -799,26 +812,6 @@ class ModelMaturityStatus(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class RestingHeartRateAnalysisConfig:
-    analysis_definition_id: AnalysisDefinitionId
-    start_date: date | None = None
-    end_date: date | None = None
-    schema_version: str = "1.0"
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.analysis_definition_id, AnalysisDefinitionId):
-            raise ConfigurationError("analysis_definition_id hat einen ungültigen Typ.")
-        if self.schema_version != "1.0":
-            raise ConfigurationError("Unbekannte Analyseschemaversion.")
-        if (
-            self.start_date is not None
-            and self.end_date is not None
-            and self.start_date > self.end_date
-        ):
-            raise ConfigurationError("Startdatum darf nicht nach dem Enddatum liegen.")
-
-
-@dataclass(frozen=True, slots=True)
 class AnalysisReceipt:
     operation_id: OperationId
     analysis_run_id: AnalysisRunId
@@ -829,6 +822,26 @@ class AnalysisReceipt:
     result_ref: AnalysisResultRef | None
     diagnostics: tuple[str, ...] = ()
     provenance: AnalysisProvenance | None = None
+
+
+WriteResult = (
+    ImportReceipt
+    | WriteDecisionReceipt
+    | WriteBatchDecisionReceipt
+    | PlausibilityRuleVersionReceipt
+    | HistoricalReviewReceipt
+    | AnalysisReceipt
+    | WriteNotStarted
+)
+
+
+@dataclass(frozen=True, slots=True)
+class WriteReceipt:
+    operation_id: OperationId
+    plan_fingerprint: PlanFingerprint
+    result: WriteResult
+    final_preflight: WritePreflight
+    diagnostics: tuple[str, ...] = ()
 
 
 class HealthLab:
@@ -873,6 +886,8 @@ class HealthLab:
 
     def preview_write(self, request: WriteRequest) -> WritePlan:
         self._require_open()
+        if isinstance(request, RunRestingHeartRateAnalysis):
+            return self._build_resting_heart_rate_analysis_plan(request)
         if isinstance(request, RunHistoricalReview):
             return self._build_historical_review_plan(request)
         if isinstance(request, CreatePlausibilityRuleVersion):
@@ -885,6 +900,43 @@ class HealthLab:
             else None
         )
         return self._build_import_plan(request, filevault)
+
+    def _build_resting_heart_rate_analysis_plan(
+        self, request: RunRestingHeartRateAnalysis
+    ) -> WritePlan:
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        snapshot = self._store.load_active_snapshot_id()
+        blocked = self.load_workspace_status().state is WorkspaceState.MIGRATION_REQUIRED
+        payload = {
+            "analysis_definition_id": str(request.analysis_definition_id),
+            "base_snapshot_ref": None if snapshot is None else str(snapshot),
+            "end_date": None if request.end_date is None else request.end_date.isoformat(),
+            "operation": "run_resting_heart_rate_analysis",
+            "schema_version": request.schema_version,
+            "start_date": None if request.start_date is None else request.start_date.isoformat(),
+            "version": 1,
+        }
+        return WritePlan(
+            PlanFingerprint(
+                hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+            ),
+            RestingHeartRateAnalysisPlan(
+                request.analysis_definition_id,
+                request.start_date,
+                request.end_date,
+                request.schema_version,
+                snapshot,
+            ),
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED if blocked else WriteApprovalStatus.READY
+                ),
+                diagnostics=("migration_required",) if blocked else (),
+            ),
+        )
 
     def _build_historical_review_plan(self, request: RunHistoricalReview) -> WritePlan:
         if self._store is None:
@@ -1419,6 +1471,10 @@ class HealthLab:
             return self._execute_plausibility_rule_write(request, authorization_plan, expected_plan)
         if isinstance(request, RunHistoricalReview):
             return self._execute_historical_review_write(request, authorization_plan, expected_plan)
+        if isinstance(request, RunRestingHeartRateAnalysis):
+            return self._execute_resting_heart_rate_analysis(
+                request, authorization_plan, expected_plan
+            )
         if not isinstance(request, ImportHealthExport):
             return self._execute_data_review_write(request, authorization_plan, expected_plan)
         if not isinstance(authorization_plan.details, ImportHealthExportPlan):
@@ -2006,22 +2062,26 @@ class HealthLab:
             diagnostics=diagnostics,
         )
 
-    def run_resting_hr_analysis(self, config: RestingHeartRateAnalysisConfig) -> AnalysisReceipt:
-        self._require_open()
+    def _execute_resting_heart_rate_analysis(
+        self,
+        request: RunRestingHeartRateAnalysis,
+        plan: WritePlan,
+        expected_plan: PlanFingerprint,
+    ) -> WriteReceipt:
         try:
             result = execute_analysis(
                 root=self._config.active_store,
                 mode=self._config.mode,
-                analysis_definition_id=config.analysis_definition_id,
-                start_date=config.start_date,
-                end_date=config.end_date,
-                config_schema_version=config.schema_version,
+                analysis_definition_id=request.analysis_definition_id,
+                start_date=request.start_date,
+                end_date=request.end_date,
+                config_schema_version=request.schema_version,
             )
         except ValueError as error:
             raise ConfigurationError(str(error)) from error
         except AnalysisError as error:
             raise HealthLabError(str(error)) from error
-        return AnalysisReceipt(
+        receipt = AnalysisReceipt(
             operation_id=result.operation_id,
             analysis_run_id=result.analysis_run_id,
             status=AnalysisStatus(result.status),
@@ -2035,6 +2095,13 @@ class HealthLab:
             result_ref=result.result_id,
             diagnostics=result.diagnostics,
             provenance=result.provenance,
+        )
+        return WriteReceipt(
+            result.operation_id,
+            expected_plan,
+            receipt,
+            plan.preflight,
+            result.diagnostics,
         )
 
     def load_overview(self, selection: OverviewSelection) -> Overview:

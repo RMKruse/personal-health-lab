@@ -25,7 +25,15 @@ def test_streamlit_shows_the_same_empty_overview(
     assert any(item.value == "Status: empty" for item in app.markdown)
     assert app.info[0].value == "Keine Gesundheitsdaten vorhanden."
 
-    app.button[1].click().run()
+    next(button for button in app.button if button.label == "Ruhepulsanalyse prüfen").click().run()
+
+    assert any(button.label == "Ruhepulsanalyse ausführen" for button in app.button)
+    assert any("Gepinnter Snapshot: -" in item.value for item in app.caption)
+
+    execute = next(
+        button for button in app.button if button.label == "Ruhepulsanalyse ausführen"
+    )
+    execute.click().run()
 
     assert any("Analysestatus: insufficient_data" in item.value for item in app.warning)
     assert not app.get("vega_lite_chart")
@@ -139,7 +147,15 @@ def test_streamlit_shows_imported_daily_series(
     ]
     assert len(app.get("vega_lite_chart")) == 2
 
-    app.button[1].click().run(timeout=10)
+    next(button for button in app.button if button.label == "Ruhepulsanalyse prüfen").click().run()
+
+    assert any(button.label == "Ruhepulsanalyse ausführen" for button in app.button)
+    assert any("Gepinnter Snapshot:" in item.value for item in app.caption)
+
+    execute = next(
+        button for button in app.button if button.label == "Ruhepulsanalyse ausführen"
+    )
+    execute.click().run(timeout=10)
 
     assert not app.exception
     assert any("Analysestatus: completed" in message.value for message in app.success)
@@ -163,7 +179,11 @@ def test_streamlit_shows_imported_daily_series(
 
     app.date_input[0].set_value(date(2024, 1, 1))
     app.date_input[1].set_value(date(2024, 6, 30))
-    app.button[1].click().run(timeout=10)
+    next(button for button in app.button if button.label == "Ruhepulsanalyse prüfen").click().run()
+    execute = next(
+        button for button in app.button if button.label == "Ruhepulsanalyse ausführen"
+    )
+    execute.click().run(timeout=10)
 
     assert not app.exception
     assert app.markdown[0].value == "Status: provisional"

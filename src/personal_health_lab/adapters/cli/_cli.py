@@ -13,6 +13,7 @@ from personal_health_lab.adapters._config import load_runtime_config
 from personal_health_lab.application import (
     AnalysisDefinitionId,
     AnalysisProvenance,
+    AnalysisReceipt,
     AnalysisStatus,
     AssociationInterval,
     BatchDecisionTarget,
@@ -53,9 +54,10 @@ from personal_health_lab.application import (
     PlausibilityRuleVersionPlan,
     PlausibilityRuleVersionReceipt,
     ResolveDataReviewCase,
-    RestingHeartRateAnalysisConfig,
+    RestingHeartRateAnalysisPlan,
     RevokeDataReviewDecision,
     RunHistoricalReview,
+    RunRestingHeartRateAnalysis,
     SingleDecisionTarget,
     SourceConflictResolution,
     SourceConflictStrategy,
@@ -109,6 +111,8 @@ def _parser() -> argparse.ArgumentParser:
     analysis.add_argument("--start-date", type=date.fromisoformat)
     analysis.add_argument("--end-date", type=date.fromisoformat)
     analysis.add_argument("--json", action="store_true", dest="as_json")
+    analysis.add_argument("--execute", action="store_true")
+    analysis.add_argument("--expect-plan", type=PlanFingerprint)
     review = commands.add_parser("review", help="Offene Datenprüffälle laden")
     review.add_argument("--json", action="store_true", dest="as_json")
     rules = commands.add_parser("rules", help="Plausibilitätsregeln laden")
@@ -479,6 +483,18 @@ def _write_plan_json(
             "type": "run_historical_review",
         }
         request_json = {"type": "run_historical_review"}
+    elif isinstance(details, RestingHeartRateAnalysisPlan):
+        detail_json = {
+            "analysis_definition_id": str(details.analysis_definition_id),
+            "base_snapshot_ref": (
+                None if details.base_snapshot_ref is None else str(details.base_snapshot_ref)
+            ),
+            "end_date": None if details.end_date is None else details.end_date.isoformat(),
+            "schema_version": details.schema_version,
+            "start_date": None if details.start_date is None else details.start_date.isoformat(),
+            "type": "run_resting_heart_rate_analysis",
+        }
+        request_json = {"type": "run_resting_heart_rate_analysis"}
     else:
         raise TypeError("Nicht unterstützte Schreibplandetails.")
     return {
@@ -500,7 +516,9 @@ def _write_plan_json(
 
 
 def _write_receipt_json(
-    receipt: WriteReceipt, runtime_config: Mapping[str, object]
+    receipt: WriteReceipt,
+    runtime_config: Mapping[str, object],
+    analysis: dict[str, object] | None = None,
 ) -> dict[str, object]:
     result = receipt.result
     if isinstance(result, ImportReceipt):
@@ -551,6 +569,21 @@ def _write_receipt_json(
             "snapshot_ref": str(result.snapshot_ref),
             "status": result.status.value,
             "type": "run_historical_review",
+        }
+    elif isinstance(result, AnalysisReceipt):
+        result_json = {
+            "analysis": analysis,
+            "analysis_definition_id": str(result.analysis_definition_id),
+            "analysis_run_id": str(result.analysis_run_id),
+            "diagnostics": result.diagnostics,
+            "model_maturity": (
+                None if result.model_maturity is None else result.model_maturity.value
+            ),
+            "provenance": _provenance_json(result.provenance),
+            "result_ref": None if result.result_ref is None else str(result.result_ref),
+            "snapshot_ref": None if result.snapshot_ref is None else str(result.snapshot_ref),
+            "status": result.status.value,
+            "type": "run_resting_heart_rate_analysis",
         }
     else:
         result_json = {
@@ -613,6 +646,7 @@ def main(args: Sequence[str] | None = None) -> int:
     parser = _parser()
     parsed = parser.parse_args(args)
     write_commands = {
+        "analyze",
         "historical-review",
         "import",
         "rule",
@@ -855,13 +889,28 @@ def main(args: Sequence[str] | None = None) -> int:
             elif parsed.command == "rules":
                 plausibility_rules = health_lab.load_plausibility_rules()
             elif parsed.command == "analyze":
-                analysis_receipt = health_lab.run_resting_hr_analysis(
-                    RestingHeartRateAnalysisConfig(
-                        analysis_definition_id=AnalysisDefinitionId(parsed.definition),
-                        start_date=parsed.start_date,
-                        end_date=parsed.end_date,
-                    )
+                analysis_request = RunRestingHeartRateAnalysis(
+                    analysis_definition_id=AnalysisDefinitionId(parsed.definition),
+                    start_date=parsed.start_date,
+                    end_date=parsed.end_date,
                 )
+                analysis_plan = health_lab.preview_write(analysis_request)
+                analysis_write_receipt = None
+                if parsed.execute:
+                    assert parsed.expect_plan is not None
+                    analysis_write_receipt = health_lab.execute_write(
+                        analysis_request, expected_plan=parsed.expect_plan
+                    )
+                elif not parsed.as_json:
+                    _print_write_plan(analysis_plan, workspace_status)
+                    if (
+                        analysis_plan.approval.status is not WriteApprovalStatus.BLOCKED
+                        and input("Ruhepulsanalyse ausführen? [j/N] ").strip().lower()
+                        in {"j", "ja"}
+                    ):
+                        analysis_write_receipt = health_lab.execute_write(
+                            analysis_request, expected_plan=analysis_plan.fingerprint
+                        )
                 overview = health_lab.load_overview(
                     OverviewSelection(parsed.start_date, parsed.end_date)
                 )
@@ -893,43 +942,47 @@ def main(args: Sequence[str] | None = None) -> int:
     if not parsed.as_json:
         print("Konfiguration: " + json.dumps(runtime_config, ensure_ascii=False, sort_keys=True))
     if parsed.command == "analyze" and parsed.as_json:
-        print(
-            json.dumps(
-                {
-                    "analysis_definition_id": str(analysis_receipt.analysis_definition_id),
-                    "analysis_run_id": str(analysis_receipt.analysis_run_id),
-                    "diagnostics": analysis_receipt.diagnostics,
-                    "model_maturity": (
-                        None
-                        if analysis_receipt.model_maturity is None
-                        else analysis_receipt.model_maturity.value
-                    ),
-                    "operation_id": str(analysis_receipt.operation_id),
-                    "provenance": _provenance_json(analysis_receipt.provenance),
-                    "result_ref": (
-                        str(analysis_receipt.result_ref) if analysis_receipt.result_ref else None
-                    ),
-                    "result": _analysis_json(overview),
-                    "runtime_config": runtime_config,
-                    "schema_version": "1.0",
-                    "snapshot_ref": (
-                        str(analysis_receipt.snapshot_ref)
-                        if analysis_receipt.snapshot_ref
-                        else None
-                    ),
-                    "status": analysis_receipt.status.value,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
+        output = (
+            _write_plan_json(analysis_plan, runtime_config, workspace_status)
+            if analysis_write_receipt is None
+            else _write_receipt_json(
+                analysis_write_receipt,
+                runtime_config,
+                (
+                    _analysis_json(overview)
+                    if isinstance(analysis_write_receipt.result, AnalysisReceipt)
+                    and analysis_write_receipt.result.status
+                    in {AnalysisStatus.COMPLETED, AnalysisStatus.REUSED}
+                    else None
+                ),
             )
         )
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
     elif parsed.command == "analyze":
-        print(f"Ruhepulsanalyse: {analysis_receipt.status.value}")
-        print(
-            "Modellreife: "
-            f"{analysis_receipt.model_maturity.value if analysis_receipt.model_maturity else '-'}"
-        )
-        if overview.resting_hr_analysis is not None:
+        if analysis_plan.approval.status is WriteApprovalStatus.BLOCKED:
+            _print_write_plan(analysis_plan, workspace_status)
+        if analysis_write_receipt is None:
+            print("Ruhepulsanalyse nicht ausgeführt.")
+        elif isinstance(analysis_write_receipt.result, AnalysisReceipt):
+            analysis_receipt = analysis_write_receipt.result
+            print(f"Ruhepulsanalyse: {analysis_receipt.status.value}")
+            print(
+                "Modellreife: "
+                + (
+                    analysis_receipt.model_maturity.value
+                    if analysis_receipt.model_maturity
+                    else "-"
+                )
+            )
+        else:
+            print(f"Ruhepulsanalyse: {analysis_write_receipt.result.status.value}")
+        if (
+            analysis_write_receipt is not None
+            and isinstance(analysis_write_receipt.result, AnalysisReceipt)
+            and analysis_write_receipt.result.status
+            in {AnalysisStatus.COMPLETED, AnalysisStatus.REUSED}
+            and overview.resting_hr_analysis is not None
+        ):
             for item in overview.resting_hr_analysis.lag_associations:
                 band = item.simultaneous_band
                 assert band is not None
@@ -1128,12 +1181,17 @@ def main(args: Sequence[str] | None = None) -> int:
         if overview.resting_hr_analysis is not None:
             estimate = overview.resting_hr_analysis.cumulative_association
             print(f"Kumulativer Zusammenhang: {estimate.estimate_per_100_kcal:.2f} bpm/100 kcal")
-    if parsed.command == "analyze" and analysis_receipt.status not in {
-        AnalysisStatus.COMPLETED,
-        AnalysisStatus.REUSED,
-    }:
-        return 3
     if parsed.command in write_commands:
+        if parsed.command == "analyze":
+            if analysis_write_receipt is None:
+                return 3 if analysis_plan.approval.status is WriteApprovalStatus.BLOCKED else 0
+            result = analysis_write_receipt.result
+            return (
+                0
+                if isinstance(result, AnalysisReceipt)
+                and result.status in {AnalysisStatus.COMPLETED, AnalysisStatus.REUSED}
+                else 3
+            )
         if parsed.command == "rule":
             if rule_write_receipt is None:
                 return 3 if rule_plan.approval.status is WriteApprovalStatus.BLOCKED else 0

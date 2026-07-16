@@ -9,6 +9,7 @@ import pytest
 
 from personal_health_lab.application import (
     AnalysisDefinitionId,
+    AnalysisReceipt,
     BatchDecisionTarget,
     CanonicalUnit,
     ConfigurationError,
@@ -24,8 +25,8 @@ from personal_health_lab.application import (
     LocalMeasurementExclusion,
     OverviewSelection,
     ResolveDataReviewCase,
-    RestingHeartRateAnalysisConfig,
     RevokeDataReviewDecision,
+    RunRestingHeartRateAnalysis,
     RuntimeConfig,
     SingleDecisionTarget,
     SourceValueAcceptance,
@@ -477,10 +478,12 @@ def test_confirmation_stales_but_never_rewrites_an_existing_analysis(
 ) -> None:
     config = _config(tmp_path)
     fixture = generate_export("lag-signal-v1", 42, tmp_path / "fixture")
-    analysis = RestingHeartRateAnalysisConfig(AnalysisDefinitionId("lag-signal-v1"))
+    analysis = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v1"))
     with HealthLab.open(config) as health_lab:
         _execute_import(health_lab, fixture.export_path)
-        first = health_lab.run_resting_hr_analysis(analysis)
+        first_plan = health_lab.preview_write(analysis)
+        first = health_lab.execute_write(analysis, expected_plan=first_plan.fingerprint).result
+        assert isinstance(first, AnalysisReceipt)
         old_result = health_lab.load_overview(OverviewSelection()).resting_hr_analysis
         case = next(
             item
@@ -492,7 +495,9 @@ def test_confirmation_stales_but_never_rewrites_an_existing_analysis(
             ResolveDataReviewCase(case.case_id, DataConfirmation("geprüft")),
         )
         stale = health_lab.load_overview(OverviewSelection())
-        rerun = health_lab.run_resting_hr_analysis(analysis)
+        rerun_plan = health_lab.preview_write(analysis)
+        rerun = health_lab.execute_write(analysis, expected_plan=rerun_plan.fingerprint).result
+        assert isinstance(rerun, AnalysisReceipt)
 
     assert old_result is not None
     assert stale.resting_hr_analysis is None
