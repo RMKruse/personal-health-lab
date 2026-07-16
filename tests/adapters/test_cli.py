@@ -546,6 +546,7 @@ def test_cli_returns_expected_incomplete_while_store_is_busy(
     _assert_json_contract(import_receipt)
     _assert_json_contract(analysis_receipt)
     assert import_receipt["result"]["status"] == "store_busy"
+    assert analysis_receipt["result"]["type"] == "write_not_started"
     assert analysis_receipt["result"]["status"] == "store_busy"
 
 

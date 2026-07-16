@@ -1084,6 +1084,66 @@ expected_effect = "none"
 forbidden_side_effects = ["technical defect encoded as business outcome"]
 
 [[case]]
+id = "V02-A-API-015"
+contracts = ["V02-C-API-002", "V02-C-API-004"]
+fixtures = []
+runner = "test_analysis_preview_is_read_only_and_execution_rechecks_the_request"
+initial_state = "empty temporary store"
+operation = "preview RunRestingHeartRateAnalysis"
+level = "application"
+expected_result = "ready WritePlan with RestingHeartRateAnalysisPlan"
+expected_effect = "none"
+forbidden_side_effects = ["analysis receipt", "writer lock"]
+
+[[case]]
+id = "V02-A-API-016"
+contracts = ["V02-C-API-002", "V02-C-API-004"]
+fixtures = []
+runner = "test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis"
+initial_state = "active lag-signal snapshot"
+operation = "execute identical analysis request and expected fingerprint twice"
+level = "application"
+expected_result = "completed then reused AnalysisReceipt"
+expected_effect = "one immutable analysis result"
+forbidden_side_effects = ["rebuilt statistical methodology"]
+
+[[case]]
+id = "V02-A-API-017"
+contracts = ["V02-C-API-003", "V02-C-API-004"]
+fixtures = []
+runner = "test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis"
+initial_state = "previewed analysis followed by a newer active snapshot"
+operation = "execute with the stale analysis fingerprint"
+level = "application"
+expected_result = "WriteNotStarted plan_changed"
+expected_effect = "none"
+forbidden_side_effects = ["analysis of a snapshot not authorized by the plan"]
+
+[[case]]
+id = "V02-A-API-018"
+contracts = ["V02-C-API-004"]
+fixtures = []
+runner = "test_analysis_store_busy_is_write_not_started"
+initial_state = "previewed analysis with unavailable writer"
+operation = "execute RunRestingHeartRateAnalysis"
+level = "application"
+expected_result = "WriteNotStarted store_busy"
+expected_effect = "none"
+forbidden_side_effects = ["AnalysisReceipt store_busy", "analysis persistence"]
+
+[[case]]
+id = "V02-A-API-019"
+contracts = ["V02-C-API-004"]
+fixtures = []
+runner = "test_analysis_reports_insufficient_and_unstable_inputs_with_stable_diagnostics"
+initial_state = "sparse, constant, and incomplete synthetic analysis inputs"
+operation = "execute RunRestingHeartRateAnalysis"
+level = "application"
+expected_result = "typed insufficient_data, unstable, and completed AnalysisReceipt values"
+expected_effect = "result only for completed analysis"
+forbidden_side_effects = ["result row for insufficient or unstable analysis"]
+
+[[case]]
 id = "V02-A-PRE-001"
 contracts = ["V02-C-PRE-001"]
 fixtures = []

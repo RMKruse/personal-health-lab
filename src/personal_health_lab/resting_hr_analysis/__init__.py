@@ -98,6 +98,10 @@ class AnalysisError(RuntimeError):
     """The built-in analysis could not be completed safely."""
 
 
+class AnalysisInputChanged(AnalysisError):
+    """The active snapshot no longer matches the authorized analysis plan."""
+
+
 class _InsufficientData(RuntimeError):
     pass
 
@@ -393,6 +397,7 @@ def run_resting_hr_analysis(
     start_date: date | None,
     end_date: date | None,
     config_schema_version: str,
+    expected_snapshot_id: SnapshotId | None,
 ) -> AnalysisExecution:
     definition = _DEFINITIONS.get(analysis_definition_id)
     if definition is None:
@@ -417,6 +422,8 @@ def run_resting_hr_analysis(
     try:
         input_start = None if start_date is None else start_date - timedelta(days=7)
         snapshot_id, series = store.load_analysis_input(input_start, end_date)
+        if snapshot_id != expected_snapshot_id:
+            raise AnalysisInputChanged
         if snapshot_id is None:
             store.persist_analysis_receipt(
                 operation_id=operation_id,
@@ -554,6 +561,8 @@ def run_resting_hr_analysis(
             diagnostics,
             failed_provenance,
         )
+    except AnalysisInputChanged:
+        raise
     except Exception as error:
         raise AnalysisError("Ruhepulsanalyse konnte nicht abgeschlossen werden.") from error
     finally:
@@ -564,6 +573,7 @@ __all__ = [
     "AnalysisDefinitionId",
     "AnalysisError",
     "AnalysisExecution",
+    "AnalysisInputChanged",
     "AnalysisProvenance",
     "AnalysisResultId",
     "AnalysisRunId",

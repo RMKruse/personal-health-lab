@@ -44,6 +44,7 @@ from personal_health_lab.overview import Overview, OverviewReader, OverviewSelec
 from personal_health_lab.resting_hr_analysis import (
     AnalysisDefinitionId,
     AnalysisError,
+    AnalysisInputChanged,
     AnalysisProvenance,
     AnalysisResultId,
     AnalysisRunId,
@@ -803,7 +804,6 @@ class AnalysisStatus(StrEnum):
     REUSED = "reused"
     INSUFFICIENT_DATA = "insufficient_data"
     UNSTABLE = "unstable"
-    STORE_BUSY = "store_busy"
 
 
 class ModelMaturityStatus(StrEnum):
@@ -2068,6 +2068,13 @@ class HealthLab:
         plan: WritePlan,
         expected_plan: PlanFingerprint,
     ) -> WriteReceipt:
+        if not isinstance(plan.details, RestingHeartRateAnalysisPlan):
+            return self._not_started(
+                plan,
+                WriteNotStartedStatus.PLAN_CHANGED,
+                ("plan_changed",),
+                expected_plan,
+            )
         try:
             result = execute_analysis(
                 root=self._config.active_store,
@@ -2076,11 +2083,26 @@ class HealthLab:
                 start_date=request.start_date,
                 end_date=request.end_date,
                 config_schema_version=request.schema_version,
+                expected_snapshot_id=plan.details.base_snapshot_ref,
+            )
+        except AnalysisInputChanged:
+            return self._not_started(
+                plan,
+                WriteNotStartedStatus.PLAN_CHANGED,
+                ("plan_changed",),
+                expected_plan,
             )
         except ValueError as error:
             raise ConfigurationError(str(error)) from error
         except AnalysisError as error:
             raise HealthLabError(str(error)) from error
+        if result.status == "store_busy":
+            return self._not_started(
+                plan,
+                WriteNotStartedStatus.STORE_BUSY,
+                ("store_busy",),
+                expected_plan,
+            )
         receipt = AnalysisReceipt(
             operation_id=result.operation_id,
             analysis_run_id=result.analysis_run_id,

@@ -1,3 +1,4 @@
+import fcntl
 from datetime import date
 from pathlib import Path
 
@@ -65,6 +66,24 @@ def test_analysis_preview_is_read_only_and_execution_rechecks_the_request(tmp_pa
     assert changed.status is WriteNotStartedStatus.PLAN_CHANGED
     assert isinstance(receipt, AnalysisReceipt)
     assert receipt.status is AnalysisStatus.INSUFFICIENT_DATA
+
+
+def test_analysis_store_busy_is_write_not_started(tmp_path: Path) -> None:
+    runtime = RuntimeConfig(
+        mode=DataMode.SYNTHETIC,
+        synthetic_store=tmp_path / "store",
+        real_store=tmp_path / "real-store",
+    )
+    request = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v1"))
+
+    with HealthLab.open(runtime) as health_lab:
+        plan = health_lab.preview_write(request)
+        with (runtime.active_store / ".writer.lock").open("a+b") as writer_lock:
+            fcntl.flock(writer_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = health_lab.execute_write(request, expected_plan=plan.fingerprint).result
+
+    assert isinstance(result, WriteNotStarted)
+    assert result.status is WriteNotStartedStatus.STORE_BUSY
 
 
 def test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis(tmp_path: Path) -> None:

@@ -469,7 +469,7 @@
         "provenance": {"type": ["object", "null"]},
         "result_ref": {"$ref": "#/$defs/nullableString"},
         "snapshot_ref": {"$ref": "#/$defs/nullableString"},
-        "status": {"enum": ["completed", "reused", "insufficient_data", "unstable", "store_busy"]},
+        "status": {"enum": ["completed", "reused", "insufficient_data", "unstable"]},
         "type": {"const": "run_resting_heart_rate_analysis"}
       }
     },
