@@ -1,3 +1,4 @@
+import fcntl
 import platform
 from collections.abc import Callable
 from datetime import date
@@ -7,7 +8,7 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from personal_health_lab.application import DataMode, HealthLab, ImportHealthExport, RuntimeConfig
-from personal_health_lab.synthetic_export import generate_export
+from personal_health_lab.synthetic_export import GenerationOptions, generate_export
 
 
 def test_streamlit_shows_the_same_empty_overview(
@@ -151,6 +152,18 @@ def test_streamlit_shows_imported_daily_series(
 
     assert any(button.label == "Ruhepulsanalyse ausführen" for button in app.button)
     assert any("Gepinnter Snapshot:" in item.value for item in app.caption)
+    assert app.date_input[0].disabled
+    assert app.date_input[1].disabled
+
+    next(
+        button
+        for button in app.button
+        if button.label == "Analysevorschau verwerfen und bearbeiten"
+    ).click().run()
+
+    assert not app.date_input[0].disabled
+    assert not app.date_input[1].disabled
+    next(button for button in app.button if button.label == "Ruhepulsanalyse prüfen").click().run()
 
     execute = next(
         button for button in app.button if button.label == "Ruhepulsanalyse ausführen"
@@ -177,6 +190,14 @@ def test_streamlit_shows_imported_daily_series(
     assert any("Commit " in caption.value and "Diff " in caption.value for caption in app.caption)
     assert any("Moving-Block-Bootstrap" in caption.value for caption in app.caption)
 
+    next(button for button in app.button if button.label == "Ruhepulsanalyse prüfen").click().run()
+    execute = next(
+        button for button in app.button if button.label == "Ruhepulsanalyse ausführen"
+    )
+    execute.click().run(timeout=10)
+
+    assert any("Analysestatus: reused" in message.value for message in app.success)
+
     app.date_input[0].set_value(date(2024, 1, 1))
     app.date_input[1].set_value(date(2024, 6, 30))
     next(button for button in app.button if button.label == "Ruhepulsanalyse prüfen").click().run()
@@ -188,6 +209,85 @@ def test_streamlit_shows_imported_daily_series(
     assert not app.exception
     assert app.markdown[0].value == "Status: provisional"
     assert any("Letztes belastbares Ergebnis" in item.value for item in app.warning)
+
+
+def test_streamlit_maps_unstable_analysis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = generate_export(
+        "null-v1",
+        42,
+        tmp_path / "fixture",
+        options=GenerationOptions(resting_heart_rate_noise_standard_deviation=0.0),
+    )
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "synthetic", tmp_path / "real")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(fixture.export_path)
+        plan = health_lab.preview_write(request)
+        health_lab.execute_write(request, expected_plan=plan.fingerprint)
+    monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
+    monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(config.synthetic_store))
+    monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(config.real_store))
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
+
+    app = AppTest.from_file(str(app_path)).run()
+    next(button for button in app.button if button.label == "Ruhepulsanalyse prüfen").click().run()
+    next(
+        button for button in app.button if button.label == "Ruhepulsanalyse ausführen"
+    ).click().run(timeout=10)
+
+    assert not app.exception
+    assert any("Analysestatus: unstable" in message.value for message in app.warning)
+
+
+def test_streamlit_maps_store_busy_analysis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    synthetic_store = tmp_path / "synthetic"
+    monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
+    monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(synthetic_store))
+    monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(tmp_path / "real"))
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
+    app = AppTest.from_file(str(app_path)).run()
+    next(button for button in app.button if button.label == "Ruhepulsanalyse prüfen").click().run()
+
+    with (synthetic_store / ".writer.lock").open("a+b") as writer_lock:
+        fcntl.flock(writer_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        next(
+            button for button in app.button if button.label == "Ruhepulsanalyse ausführen"
+        ).click().run()
+
+    assert not app.exception
+    assert any("Analysestatus: store_busy" in message.value for message in app.warning)
+
+
+def test_streamlit_maps_plan_changed_analysis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = generate_export("null-v1", 42, tmp_path / "first")
+    second = generate_export("null-v1", 43, tmp_path / "second")
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "synthetic", tmp_path / "real")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(first.export_path)
+        plan = health_lab.preview_write(request)
+        health_lab.execute_write(request, expected_plan=plan.fingerprint)
+    monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
+    monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(config.synthetic_store))
+    monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(config.real_store))
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
+    app = AppTest.from_file(str(app_path)).run()
+    next(button for button in app.button if button.label == "Ruhepulsanalyse prüfen").click().run()
+
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(second.export_path)
+        plan = health_lab.preview_write(request)
+        health_lab.execute_write(request, expected_plan=plan.fingerprint)
+    next(
+        button for button in app.button if button.label == "Ruhepulsanalyse ausführen"
+    ).click().run()
+
+    assert not app.exception
+    assert any("Analysestatus: plan_changed" in message.value for message in app.warning)
 
 
 def test_streamlit_renders_the_shared_real_import_confirmation_plan(

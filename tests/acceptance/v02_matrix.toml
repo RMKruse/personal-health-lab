@@ -1192,6 +1192,66 @@ expected_effect = "shared application analysis execution"
 forbidden_side_effects = ["persistent UI plan", "adapter statistical logic"]
 
 [[case]]
+id = "V02-A-RHR-009"
+contracts = ["V02-C-ADP-001", "V02-C-ADP-003"]
+fixtures = []
+runner = "test_streamlit_shows_the_same_empty_overview"
+initial_state = "empty temporary store"
+operation = "preview and execute analysis in Streamlit"
+level = "adapter"
+expected_result = "insufficient_data warning"
+expected_effect = "none"
+forbidden_side_effects = ["adapter exception", "analysis result"]
+
+[[case]]
+id = "V02-A-RHR-010"
+contracts = ["V02-C-ADP-001", "V02-C-ADP-003"]
+fixtures = []
+runner = "test_streamlit_maps_unstable_analysis"
+initial_state = "constant synthetic analysis outcome"
+operation = "preview and execute analysis in Streamlit"
+level = "adapter"
+expected_result = "unstable warning"
+expected_effect = "none"
+forbidden_side_effects = ["adapter exception", "analysis result"]
+
+[[case]]
+id = "V02-A-RHR-011"
+contracts = ["V02-C-ADP-001", "V02-C-ADP-003"]
+fixtures = []
+runner = "test_streamlit_maps_store_busy_analysis"
+initial_state = "previewed analysis with unavailable writer"
+operation = "execute analysis in Streamlit"
+level = "adapter"
+expected_result = "store_busy warning"
+expected_effect = "none"
+forbidden_side_effects = ["adapter exception", "AnalysisReceipt store_busy"]
+
+[[case]]
+id = "V02-A-RHR-012"
+contracts = ["V02-C-ADP-001", "V02-C-ADP-003"]
+fixtures = []
+runner = "test_streamlit_maps_plan_changed_analysis"
+initial_state = "previewed analysis followed by a newer active snapshot"
+operation = "execute stale analysis preview in Streamlit"
+level = "adapter"
+expected_result = "plan_changed warning"
+expected_effect = "none"
+forbidden_side_effects = ["adapter exception", "analysis of unauthorized snapshot"]
+
+[[case]]
+id = "V02-A-RHR-013"
+contracts = ["V02-C-ADP-001", "V02-C-ADP-002"]
+fixtures = []
+runner = "test_json_cli_analysis_reports_plan_changed"
+initial_state = "JSON analysis plan followed by a newer active snapshot"
+operation = "execute stale --expect-plan"
+level = "adapter"
+expected_result = "typed plan_changed JSON with exit code 3"
+expected_effect = "none"
+forbidden_side_effects = ["adapter exception", "analysis of unauthorized snapshot"]
+
+[[case]]
 id = "V02-A-PRE-001"
 contracts = ["V02-C-PRE-001"]
 fixtures = []

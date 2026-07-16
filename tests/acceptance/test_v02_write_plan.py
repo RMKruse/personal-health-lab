@@ -70,6 +70,11 @@ REGISTERED_CASES.update(
         "V02-A-RHR-006": "test_cli_runs_and_exposes_the_built_in_lag_analysis",
         "V02-A-RHR-007": "test_cli_runs_and_exposes_the_built_in_lag_analysis",
         "V02-A-RHR-008": "test_streamlit_shows_imported_daily_series",
+        "V02-A-RHR-009": "test_streamlit_shows_the_same_empty_overview",
+        "V02-A-RHR-010": "test_streamlit_maps_unstable_analysis",
+        "V02-A-RHR-011": "test_streamlit_maps_store_busy_analysis",
+        "V02-A-RHR-012": "test_streamlit_maps_plan_changed_analysis",
+        "V02-A-RHR-013": "test_json_cli_analysis_reports_plan_changed",
         "V02-A-PRE-001": "test_new_store_has_stable_identity_and_immutable_mode",
         "V02-A-PRE-002": "test_complete_store_copy_retains_the_same_identity",
         "V02-A-PRE-003": (

@@ -575,6 +575,44 @@ def test_cli_returns_expected_incomplete_for_unstable_analysis(
     assert receipt["result"]["status"] == "unstable"
 
 
+def test_json_cli_analysis_reports_plan_changed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    first = generate_export("null-v1", 42, tmp_path / "first")
+    second = generate_export("null-v1", 43, tmp_path / "second")
+    common_args = [
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(tmp_path / "synthetic"),
+        "--real-store",
+        str(tmp_path / "real"),
+    ]
+    assert _execute_json_import(common_args, first.export_path, capsys)[0] == 0
+    assert main([*common_args, "analyze", "--json"]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert _execute_json_import(common_args, second.export_path, capsys)[0] == 0
+
+    assert (
+        main(
+            [
+                *common_args,
+                "analyze",
+                "--json",
+                "--execute",
+                "--expect-plan",
+                plan["fingerprint"],
+            ]
+        )
+        == 3
+    )
+    receipt = json.loads(capsys.readouterr().out)
+
+    _assert_json_contract(receipt)
+    assert receipt["result"]["type"] == "write_not_started"
+    assert receipt["result"]["status"] == "plan_changed"
+
+
 def test_installed_cli_contracts_streams_and_redacts_technical_errors(tmp_path: Path) -> None:
     executable = Path(sys.executable).with_name("healthlab")
     common_args = [
