@@ -13,12 +13,17 @@ from personal_health_lab.adapters._config import load_runtime_config
 from personal_health_lab.application import (
     AnalysisDefinitionId,
     AnalysisStatus,
+    BatchDecisionTarget,
     CanonicalHealthType,
     CanonicalUnit,
     ConfigurationError,
+    ConfirmDataReviewBatch,
     CreatePlausibilityRuleVersion,
     DataConfirmation,
     DataCorrection,
+    DataReviewBatchActionId,
+    DataReviewBatchPlan,
+    DataReviewCaseKind,
     DataReviewDecisionId,
     DataReviewSelection,
     HealthLab,
@@ -242,6 +247,21 @@ st.caption(
 if data_review.cases:
     st.subheader("Datenprüfung")
     st.caption(f"Datenstatus: {data_review.status.value}")
+    batch_kind = st.selectbox(
+        "Filter für Sammelbestätigung",
+        tuple(DataReviewCaseKind),
+        format_func=lambda item: item.value,
+    )
+    batch_note = st.text_input("Optionale Sammelnotiz")
+    if st.button("Sammelbestätigung prüfen"):
+        assert batch_kind is not None
+        batch_request = ConfirmDataReviewBatch(
+            DataReviewSelection(batch_kind), batch_note or None
+        )
+        with HealthLab.open(config) as health_lab:
+            st.session_state["review_plan"] = health_lab.preview_write(batch_request)
+        st.session_state["review_request"] = batch_request
+        st.rerun()
     for detail in data_review_details:
         case = detail.case
         reasons = (
@@ -403,11 +423,17 @@ if data_review.cases:
                     st.error("Ausschlussgrund fehlt.")
 with st.expander("Datenprüfentscheidung widerrufen"):
     decision_id = st.text_input("Entscheidungs-ID")
+    batch_action_id = st.text_input("Sammelaktions-ID")
     revoke_reason = st.text_input("Widerrufsgrund")
     if st.button("Widerruf prüfen"):
         try:
             revoke_request = RevokeDataReviewDecision(
-                SingleDecisionTarget(DataReviewDecisionId(decision_id)), revoke_reason
+                (
+                    BatchDecisionTarget(DataReviewBatchActionId(batch_action_id))
+                    if batch_action_id
+                    else SingleDecisionTarget(DataReviewDecisionId(decision_id))
+                ),
+                revoke_reason,
             )
             with HealthLab.open(config) as health_lab:
                 st.session_state["review_plan"] = health_lab.preview_write(revoke_request)
@@ -447,6 +473,18 @@ with st.expander("Quellmessung direkt korrigieren"):
 review_plan = st.session_state.get("review_plan")
 if review_plan is not None:
     st.code(str(review_plan.fingerprint))
+    if isinstance(review_plan.details, DataReviewBatchPlan):
+        st.dataframe(
+            [
+                {
+                    "case_id": str(item.case_id),
+                    "value": item.effective_value,
+                    "unit": None if item.canonical_unit is None else item.canonical_unit.value,
+                }
+                for item in review_plan.details.matches
+            ],
+            use_container_width=True,
+        )
     if st.button("Datenprüfentscheidung ausführen"):
         with HealthLab.open(config) as health_lab:
             decision_result = health_lab.execute_write(

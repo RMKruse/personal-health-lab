@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import pydoc
 import sys
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime
@@ -14,17 +15,23 @@ from personal_health_lab.application import (
     AnalysisProvenance,
     AnalysisStatus,
     AssociationInterval,
+    BatchDecisionTarget,
     CanonicalHealthType,
     CanonicalUnit,
     CapacityCheck,
     ConfigurationError,
+    ConfirmDataReviewBatch,
     CreatePlausibilityRuleVersion,
     DataConfirmation,
     DataCorrection,
     DataMode,
     DataReview,
+    DataReviewBatchActionId,
+    DataReviewBatchPlan,
+    DataReviewBatchRevokePlan,
     DataReviewCaseDetail,
     DataReviewCaseId,
+    DataReviewCaseKind,
     DataReviewDecisionId,
     DataReviewDecisionPlan,
     DataReviewSelection,
@@ -57,6 +64,7 @@ from personal_health_lab.application import (
     SourceValueAcceptance,
     WorkspaceStatus,
     WriteApprovalStatus,
+    WriteBatchDecisionReceipt,
     WriteDecisionReceipt,
     WriteNotStarted,
     WritePlan,
@@ -142,8 +150,15 @@ def _parser() -> argparse.ArgumentParser:
     resolve.add_argument("--json", action="store_true", dest="as_json")
     resolve.add_argument("--execute", action="store_true")
     resolve.add_argument("--expect-plan", type=PlanFingerprint)
+    batch = commands.add_parser("review-confirm-batch", help="Datenprüffälle gesammelt bestätigen")
+    batch.add_argument("--kind", type=DataReviewCaseKind, choices=tuple(DataReviewCaseKind))
+    batch.add_argument("--note")
+    batch.add_argument("--json", action="store_true", dest="as_json")
+    batch.add_argument("--execute", action="store_true")
+    batch.add_argument("--expect-plan", type=PlanFingerprint)
     revoke = commands.add_parser("review-revoke", help="Datenprüfentscheidung widerrufen")
-    revoke.add_argument("decision_id", type=DataReviewDecisionId)
+    revoke.add_argument("decision_id", nargs="?", type=DataReviewDecisionId)
+    revoke.add_argument("--batch-action", type=DataReviewBatchActionId)
     revoke.add_argument("--reason", required=True)
     revoke.add_argument("--json", action="store_true", dest="as_json")
     revoke.add_argument("--execute", action="store_true")
@@ -412,6 +427,47 @@ def _write_plan_json(
             "type": "data_review_decision",
         }
         request_json = {"type": "data_review_decision"}
+    elif isinstance(details, DataReviewBatchPlan):
+        detail_json = {
+            "active_snapshot_ref": (
+                None if details.active_snapshot_ref is None else str(details.active_snapshot_ref)
+            ),
+            "selection": {
+                "kind": None if details.selection.kind is None else details.selection.kind.value
+            },
+            "matches": [
+                {
+                    "case_id": str(item.case_id),
+                    "kind": item.kind.value,
+                    "measurement_version_id": (
+                        None
+                        if item.measurement_version_id is None
+                        else str(item.measurement_version_id)
+                    ),
+                    "rule_version_id": item.rule_version_id,
+                    "evidence_fingerprint": item.evidence_fingerprint,
+                    "effective_value": item.effective_value,
+                    "canonical_unit": (
+                        None if item.canonical_unit is None else item.canonical_unit.value
+                    ),
+                }
+                for item in details.matches
+            ],
+            "count": details.count,
+            "type": "confirm_data_review_batch",
+        }
+        request_json = {"type": "confirm_data_review_batch"}
+    elif isinstance(details, DataReviewBatchRevokePlan):
+        detail_json = {
+            "active_snapshot_ref": (
+                None if details.active_snapshot_ref is None else str(details.active_snapshot_ref)
+            ),
+            "batch_action_id": str(details.batch_action_id),
+            "decision_ids": tuple(str(item) for item in details.decision_ids),
+            "count": details.count,
+            "type": "revoke_data_review_batch",
+        }
+        request_json = {"type": "revoke_data_review_batch"}
     elif isinstance(details, HistoricalReviewPlan):
         detail_json = {
             "base_snapshot_ref": (
@@ -477,6 +533,15 @@ def _write_receipt_json(
             "snapshot_ref": str(result.snapshot_ref),
             "status": result.status.value,
             "type": "data_review_decision",
+        }
+    elif isinstance(result, WriteBatchDecisionReceipt):
+        result_json = {
+            "batch_action_id": str(result.batch_action_id),
+            "decision_ids": tuple(str(item) for item in result.decision_ids),
+            "diagnostics": result.diagnostics,
+            "snapshot_ref": str(result.snapshot_ref),
+            "status": result.status.value,
+            "type": "data_review_batch",
         }
     elif isinstance(result, HistoricalReviewReceipt):
         result_json = {
@@ -551,6 +616,7 @@ def main(args: Sequence[str] | None = None) -> int:
         "historical-review",
         "import",
         "rule",
+        "review-confirm-batch",
         "review-resolve",
         "review-revoke",
     }
@@ -582,6 +648,10 @@ def main(args: Sequence[str] | None = None) -> int:
         or (parsed.case_id is None and parsed.correct is None)
     ):
         parser.error("Messung, Einheit, Prüffall oder Pflichtgrund fehlt.")
+    if parsed.command == "review-revoke" and (
+        (parsed.decision_id is None) == (parsed.batch_action is None)
+    ):
+        parser.error("Genau eine Entscheidungs- oder Sammelaktions-ID muss angegeben werden.")
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
     decision_request: WriteRequest
     try:
@@ -726,9 +796,45 @@ def main(args: Sequence[str] | None = None) -> int:
                     decision_write_receipt = health_lab.execute_write(
                         decision_request, expected_plan=decision_plan.fingerprint
                     )
+            elif parsed.command == "review-confirm-batch":
+                decision_request = ConfirmDataReviewBatch(
+                    DataReviewSelection(parsed.kind), parsed.note
+                )
+                decision_plan = health_lab.preview_write(decision_request)
+                assert isinstance(decision_plan.details, DataReviewBatchPlan)
+                decision_write_receipt = None
+                if parsed.execute:
+                    assert parsed.expect_plan is not None
+                    decision_write_receipt = health_lab.execute_write(
+                        decision_request, expected_plan=parsed.expect_plan
+                    )
+                elif not parsed.as_json:
+                    _print_write_plan(decision_plan, workspace_status)
+                    pydoc.pager(
+                        "\n".join(
+                            f"{item.case_id}: {item.effective_value} "
+                            f"{item.canonical_unit.value if item.canonical_unit else '-'}"
+                            for item in decision_plan.details.matches
+                        )
+                    )
+                    if (
+                        decision_plan.approval.status is not WriteApprovalStatus.BLOCKED
+                        and input(
+                            f"{decision_plan.details.count} Datenprüffälle bestätigen? [j/N] "
+                        ).strip().lower()
+                        in {"j", "ja"}
+                    ):
+                        decision_write_receipt = health_lab.execute_write(
+                            decision_request, expected_plan=decision_plan.fingerprint
+                        )
             elif parsed.command == "review-revoke":
                 decision_request = RevokeDataReviewDecision(
-                    SingleDecisionTarget(parsed.decision_id), parsed.reason
+                    (
+                        SingleDecisionTarget(parsed.decision_id)
+                        if parsed.decision_id is not None
+                        else BatchDecisionTarget(parsed.batch_action)
+                    ),
+                    parsed.reason,
                 )
                 decision_plan = health_lab.preview_write(decision_request)
                 decision_write_receipt = None
@@ -883,16 +989,31 @@ def main(args: Sequence[str] | None = None) -> int:
             _print_write_plan(historical_plan, workspace_status)
         else:
             print(f"Historische Datenprüfung: {historical_write_receipt.result.status.value}")
-    elif parsed.command in {"review-resolve", "review-revoke"} and parsed.as_json:
+    elif parsed.command in {
+        "review-confirm-batch",
+        "review-resolve",
+        "review-revoke",
+    } and parsed.as_json:
         output = (
             _write_plan_json(decision_plan, runtime_config, workspace_status)
             if decision_write_receipt is None
             else _write_receipt_json(decision_write_receipt, runtime_config)
         )
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
-    elif parsed.command in {"review-resolve", "review-revoke"}:
+    elif parsed.command in {"review-confirm-batch", "review-resolve", "review-revoke"}:
         if decision_write_receipt is None:
-            _print_write_plan(decision_plan, workspace_status)
+            if parsed.command != "review-confirm-batch":
+                if isinstance(decision_plan.details, DataReviewBatchPlan):
+                    _print_write_plan(decision_plan, workspace_status)
+                    pydoc.pager(
+                        "\n".join(
+                            f"{item.case_id}: {item.effective_value} "
+                            f"{item.canonical_unit.value if item.canonical_unit else '-'}"
+                            for item in decision_plan.details.matches
+                        )
+                    )
+                else:
+                    _print_write_plan(decision_plan, workspace_status)
         else:
             print(f"Datenprüfentscheidung: {decision_write_receipt.result.status.value}")
     elif parsed.command == "rules" and parsed.as_json:
@@ -1021,7 +1142,7 @@ def main(args: Sequence[str] | None = None) -> int:
             if historical_write_receipt is None:
                 return 3 if historical_plan.approval.status is WriteApprovalStatus.BLOCKED else 0
             return 3 if isinstance(historical_write_receipt.result, WriteNotStarted) else 0
-        if parsed.command in {"review-resolve", "review-revoke"}:
+        if parsed.command in {"review-confirm-batch", "review-resolve", "review-revoke"}:
             if decision_write_receipt is None:
                 return 3 if decision_plan.approval.status is WriteApprovalStatus.BLOCKED else 0
             return 3 if isinstance(decision_write_receipt.result, WriteNotStarted) else 0

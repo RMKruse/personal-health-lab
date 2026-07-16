@@ -9,8 +9,10 @@ import pytest
 
 from personal_health_lab.application import (
     AnalysisDefinitionId,
+    BatchDecisionTarget,
     CanonicalUnit,
     ConfigurationError,
+    ConfirmDataReviewBatch,
     DataConfirmation,
     DataCorrection,
     DataMode,
@@ -27,7 +29,10 @@ from personal_health_lab.application import (
     RuntimeConfig,
     SingleDecisionTarget,
     SourceValueAcceptance,
+    WriteBatchDecisionReceipt,
     WriteDecisionReceipt,
+    WriteNotStarted,
+    WriteNotStartedStatus,
 )
 from personal_health_lab.synthetic_export import generate_export
 
@@ -98,6 +103,170 @@ def test_review_decision_requests_enforce_mandatory_reasons() -> None:
         LocalMeasurementExclusion("a" * 64, " ")
     with pytest.raises(ConfigurationError):
         RevokeDataReviewDecision(SingleDecisionTarget("a" * 32), " ")
+
+
+def test_batch_confirmation_materializes_every_value_and_revokes_only_effective_members(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    package = _package(
+        tmp_path / "batch.zip",
+        [
+            ("HKQuantityTypeIdentifierRestingHeartRate", "count/min", value, f"hr-{index}")
+            for index, value in enumerate((251, 252, 253))
+        ],
+        export_date=datetime(2024, 2, 1, tzinfo=UTC),
+    )
+    with HealthLab.open(config) as health_lab:
+        _execute_import(health_lab, package)
+        request = ConfirmDataReviewBatch(
+            DataReviewSelection(DataReviewCaseKind.PLAUSIBILITY), "gemeinsam geprüft"
+        )
+        plan = health_lab.preview_write(request)
+        assert plan.details.count == 3
+        assert sorted(item.effective_value for item in plan.details.matches) == [251, 252, 253]
+        assert tuple(sorted(str(item.case_id) for item in plan.details.matches)) == tuple(
+            str(item.case_id) for item in plan.details.matches
+        )
+
+        result = health_lab.execute_write(request, expected_plan=plan.fingerprint).result
+        assert isinstance(result, WriteBatchDecisionReceipt)
+        assert len(result.decision_ids) == 3
+        assert health_lab.load_data_review(request.selection).cases == ()
+
+        _execute(
+            health_lab,
+            RevokeDataReviewDecision(
+                SingleDecisionTarget(result.decision_ids[0]), "einzeln erneut prüfen"
+            ),
+        )
+        reopened = health_lab.load_data_review(request.selection).cases
+        assert len(reopened) == 1
+        _execute(
+            health_lab,
+            ResolveDataReviewCase(reopened[0].case_id, DataConfirmation("später einzeln")),
+        )
+        revoked = health_lab.execute_write(
+            RevokeDataReviewDecision(
+                BatchDecisionTarget(result.batch_action_id), "Sammelaktion zurücknehmen"
+            ),
+            expected_plan=health_lab.preview_write(
+                RevokeDataReviewDecision(
+                    BatchDecisionTarget(result.batch_action_id), "Sammelaktion zurücknehmen"
+                )
+            ).fingerprint,
+        ).result
+        assert isinstance(revoked, WriteBatchDecisionReceipt)
+        assert len(revoked.decision_ids) == 2
+        assert len(health_lab.load_data_review(request.selection).cases) == 2
+
+
+def test_batch_revoke_preserves_a_later_individual_correction(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    package = _package(
+        tmp_path / "batch-correction.zip",
+        [
+            ("HKQuantityTypeIdentifierRestingHeartRate", "count/min", value, f"hr-{index}")
+            for index, value in enumerate((251, 252))
+        ],
+        export_date=datetime(2024, 2, 1, tzinfo=UTC),
+    )
+    with HealthLab.open(config) as health_lab:
+        _execute_import(health_lab, package)
+        request = ConfirmDataReviewBatch(
+            DataReviewSelection(DataReviewCaseKind.PLAUSIBILITY), "gemeinsam geprüft"
+        )
+        plan = health_lab.preview_write(request)
+        result = health_lab.execute_write(request, expected_plan=plan.fingerprint).result
+        assert isinstance(result, WriteBatchDecisionReceipt)
+
+        corrected_match = plan.details.matches[0]
+        _execute(
+            health_lab,
+            ResolveDataReviewCase(
+                None,
+                DataCorrection(
+                    corrected_match.measurement_version_id,
+                    61,
+                    CanonicalUnit.BEATS_PER_MINUTE,
+                    "spätere Einzelkorrektur",
+                ),
+            ),
+        )
+        revoke_request = RevokeDataReviewDecision(
+            BatchDecisionTarget(result.batch_action_id), "Sammelaktion zurücknehmen"
+        )
+        revoke_plan = health_lab.preview_write(revoke_request)
+        assert revoke_plan.details.count == 1
+        revoked = health_lab.execute_write(
+            revoke_request, expected_plan=revoke_plan.fingerprint
+        ).result
+
+        assert isinstance(revoked, WriteBatchDecisionReceipt)
+        assert len(revoked.decision_ids) == 1
+        reopened = health_lab.load_data_review(request.selection).cases
+        assert len(reopened) == 1
+        assert reopened[0].measurement_version_id != corrected_match.measurement_version_id
+
+
+def test_batch_confirmation_fails_atomically_when_the_match_set_changes(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    with HealthLab.open(config) as health_lab:
+        _execute_import(
+            health_lab,
+            _package(
+                tmp_path / "batch-change.zip",
+                [
+                    (
+                        "HKQuantityTypeIdentifierRestingHeartRate",
+                        "count/min",
+                        value,
+                        f"hr-{index}",
+                    )
+                    for index, value in enumerate((251, 252, 253))
+                ],
+                export_date=datetime(2024, 2, 1, tzinfo=UTC),
+            ),
+        )
+        batch = ConfirmDataReviewBatch(DataReviewSelection(DataReviewCaseKind.PLAUSIBILITY))
+        plan = health_lab.preview_write(batch)
+        first = health_lab.load_data_review(batch.selection).cases[0]
+        _execute(
+            health_lab,
+            ResolveDataReviewCase(first.case_id, DataConfirmation("einzeln geprüft")),
+        )
+
+        result = health_lab.execute_write(batch, expected_plan=plan.fingerprint).result
+        assert isinstance(result, WriteNotStarted)
+        assert result.status is WriteNotStartedStatus.PLAN_CHANGED
+        assert len(health_lab.load_data_review(batch.selection).cases) == 2
+
+
+def test_large_batch_plan_remains_complete(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    with HealthLab.open(config) as health_lab:
+        _execute_import(
+            health_lab,
+            _package(
+                tmp_path / "large-batch.zip",
+                [
+                    (
+                        "HKQuantityTypeIdentifierRestingHeartRate",
+                        "count/min",
+                        251 + index,
+                        f"batch-{index}",
+                    )
+                    for index in range(100)
+                ],
+                export_date=datetime(2024, 2, 1, tzinfo=UTC),
+            ),
+        )
+        plan = health_lab.preview_write(
+            ConfirmDataReviewBatch(DataReviewSelection(DataReviewCaseKind.PLAUSIBILITY))
+        )
+
+    assert plan.details.count == 100
+    assert len(plan.details.matches) == 100
 
 
 def test_corrections_supersede_forward_and_revocation_uses_source(

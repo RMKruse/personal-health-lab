@@ -27,6 +27,7 @@ from personal_health_lab.storage import (
     SourceOccurrenceFact,
     SourceResolution,
     SourceTypeRuleRequest,
+    StoredReviewCycleId,
 )
 
 
@@ -671,6 +672,25 @@ def close_review_cycle_updates(
     )
 
 
+def close_review_batch_cycle_updates(
+    store: LocalStore, review_case_ids: tuple[str, ...]
+) -> tuple[ReviewCycleUpdate, ...]:
+    affected: dict[StoredReviewCycleId, tuple[ReviewCycleRecord, int]] = {}
+    for review_case_id in review_case_ids:
+        for cycle in store.load_review_cycles_for_case(review_case_id):
+            current, count = affected.get(cycle.cycle_id, (cycle, 0))
+            affected[cycle.cycle_id] = (current, count + 1)
+    return tuple(
+        ReviewCycleUpdate(
+            cycle.cycle_id,
+            cycle.open_case_count - count,
+            "closed" if cycle.open_case_count == count else "open",
+        )
+        for cycle, count in affected.values()
+        if cycle.status == "open"
+    )
+
+
 def reopen_review_cycle_updates(
     store: LocalStore, review_case_id: str
 ) -> tuple[ReviewCycleUpdate, ...]:
@@ -687,6 +707,25 @@ def reopen_decision_cycle_updates(
     if review_case_id is None:
         return ()
     return reopen_review_cycle_updates(store, review_case_id)
+
+
+def reopen_batch_decision_cycle_updates(
+    store: LocalStore, decision_ids: tuple[str, ...]
+) -> tuple[ReviewCycleUpdate, ...]:
+    case_ids = tuple(
+        case_id
+        for decision_id in decision_ids
+        if (case_id := store.load_effective_decision_case_id(decision_id)) is not None
+    )
+    affected: dict[StoredReviewCycleId, tuple[ReviewCycleRecord, int]] = {}
+    for case_id in case_ids:
+        for cycle in store.load_review_cycles_for_case(case_id):
+            current, count = affected.get(cycle.cycle_id, (cycle, 0))
+            affected[cycle.cycle_id] = (current, count + 1)
+    return tuple(
+        ReviewCycleUpdate(cycle.cycle_id, cycle.open_case_count + count, "open")
+        for cycle, count in affected.values()
+    )
 
 
 def _unknown_rule_case(source_type: str) -> OpenDataReviewCase:

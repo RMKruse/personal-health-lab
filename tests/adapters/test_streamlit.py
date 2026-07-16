@@ -255,6 +255,32 @@ def test_streamlit_projects_the_personal_range_finding(
     assert any("above_personal_upper_bound" in item.value for item in app.caption)
 
 
+def test_streamlit_previews_the_application_materialized_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    personal_range_package: Callable[[Path], Path],
+) -> None:
+    synthetic_store = tmp_path / "synthetic"
+    config = RuntimeConfig(DataMode.SYNTHETIC, synthetic_store, tmp_path / "real")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(personal_range_package(tmp_path / "personal.zip"))
+        plan = health_lab.preview_write(request)
+        health_lab.execute_write(request, expected_plan=plan.fingerprint)
+
+    monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
+    monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(synthetic_store))
+    monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(tmp_path / "real"))
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
+    app = AppTest.from_file(str(app_path)).run()
+
+    next(button for button in app.button if button.label == "Sammelbestätigung prüfen").click()
+    app.run()
+
+    assert not app.exception
+    assert app.dataframe
+    assert any(button.label == "Datenprüfentscheidung ausführen" for button in app.button)
+
+
 def test_streamlit_can_plan_a_data_correction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

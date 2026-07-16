@@ -80,6 +80,12 @@ statement = "A new source version after correction or exclusion opens a continue
 evidence = ["positive", "negative", "transition"]
 
 [[contract]]
+id = "V02-C-REV-006"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Batch confirmation fully materializes and atomically applies one stable match set."
+evidence = ["positive", "negative", "boundary", "transition"]
+
+[[contract]]
 id = "V02-C-REV-007"
 source = "https://github.com/RMKruse/personal-health-lab/issues/33"
 statement = "Decision reasons and notes follow their closed mandatory logic."
@@ -89,6 +95,18 @@ evidence = ["positive", "negative", "transition"]
 id = "V02-C-REV-008"
 source = "https://github.com/RMKruse/personal-health-lab/issues/33"
 statement = "Review decisions affect only new snapshots and analyses."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V02-C-ADP-002"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Human and JSON CLI preserve their separate complete interaction contracts."
+evidence = ["positive", "negative", "boundary"]
+
+[[contract]]
+id = "V02-C-ADP-004"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Fixed adapter tracers exercise the real shared application seam."
 evidence = ["positive", "negative", "transition"]
 
 [[fixture]]
@@ -655,6 +673,90 @@ level = "application"
 expected_result = "typed forward-only decision result"
 expected_effect = "one new immutable snapshot and explicit current review state"
 forbidden_side_effects = ["raw-value mutation", "old snapshot mutation", "older decision reactivation"]
+
+[[case]]
+id = "V02-A-REV-017"
+contracts = ["V02-C-REV-006"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_batch_confirmation_materializes_every_value_and_revokes_only_effective_members"
+initial_state = "multiple open plausibility cases"
+operation = "preview a filtered batch confirmation"
+level = "application"
+expected_result = "stable complete IDs, values, count, and fingerprint"
+expected_effect = "materialized audit batch"
+forbidden_side_effects = ["adapter-side matching", "truncation"]
+
+[[case]]
+id = "V02-A-REV-018"
+contracts = ["V02-C-REV-006"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_large_batch_plan_remains_complete"
+initial_state = "large open match set"
+operation = "preview and serialize the batch"
+level = "application"
+expected_result = "complete untruncated set"
+expected_effect = "all matches bound"
+forbidden_side_effects = ["paging cursor", "artificial limit"]
+
+[[case]]
+id = "V02-A-REV-019"
+contracts = ["V02-C-REV-006"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_batch_confirmation_fails_atomically_when_the_match_set_changes"
+initial_state = "previewed batch whose open set later changes"
+operation = "execute the stale fingerprint"
+level = "application"
+expected_result = "plan_changed"
+expected_effect = "zero batch decisions"
+forbidden_side_effects = ["partial confirmation"]
+
+[[case]]
+id = "V02-A-REV-020"
+contracts = ["V02-C-REV-006"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_batch_confirmation_materializes_every_value_and_revokes_only_effective_members"
+initial_state = "effective decisions from one batch"
+operation = "revoke one member"
+level = "application"
+expected_result = "single case reopened"
+expected_effect = "other members remain effective"
+forbidden_side_effects = ["whole-batch revocation"]
+
+[[case]]
+id = "V02-A-REV-021"
+contracts = ["V02-C-REV-006"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_batch_confirmation_materializes_every_value_and_revokes_only_effective_members"
+initial_state = "batch with one superseded or revoked member"
+operation = "revoke the batch action"
+level = "application"
+expected_result = "only effective batch members revoked"
+expected_effect = "later single decision remains effective"
+forbidden_side_effects = ["later decision revocation", "older decision reactivation"]
+
+[[case]]
+id = "V02-A-ADP-004"
+contracts = ["V02-C-ADP-002"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_json_cli_keeps_the_complete_batch_and_reports_plan_changed"
+initial_state = "large application-materialized batch"
+operation = "render human or JSON CLI preview"
+level = "adapter"
+expected_result = "complete JSON and native human pager"
+expected_effect = "no adapter-side matching"
+forbidden_side_effects = ["truncation"]
+
+[[case]]
+id = "V02-A-ADP-011"
+contracts = ["V02-C-ADP-004"]
+fixtures = ["V02-F-DOM-REVIEW-DECISIONS-V1"]
+runner = "test_json_cli_keeps_the_complete_batch_and_reports_plan_changed"
+initial_state = "previewed JSON batch"
+operation = "change set then execute stale plan"
+level = "adapter"
+expected_result = "plan_changed with exit code 3"
+expected_effect = "complete prior batch remains observable"
+forbidden_side_effects = ["partial confirmation", "adapter decision logic"]
 
 [[case]]
 id = "V02-A-REV-022"

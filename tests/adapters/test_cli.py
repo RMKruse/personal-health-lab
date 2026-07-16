@@ -159,6 +159,108 @@ def test_cli_maps_data_review_plan_receipt_and_revocation(
     _assert_json_contract(json.loads(capsys.readouterr().out))
 
 
+def test_json_cli_keeps_the_complete_batch_and_reports_plan_changed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    common = [
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(tmp_path / "synthetic"),
+        "--real-store",
+        str(tmp_path / "real"),
+    ]
+    records = "".join(
+        '<Record type="HKQuantityTypeIdentifierRestingHeartRate" '
+        'sourceName="Test Watch" device="Test Device" unit="count/min" '
+        'sourceVersion="1" creationDate="2024-01-01 07:00:00 +0000" '
+        'startDate="2024-01-01 07:00:00 +0000" '
+        f'endDate="2024-01-01 07:00:00 +0000" value="{251 + index}">'
+        f'<MetadataEntry key="HKMetadataKeySyncIdentifier" value="batch-{index}"/>'
+        "</Record>"
+        for index in range(100)
+    )
+    package = tmp_path / "large-batch.zip"
+    with ZipFile(package, "w") as archive:
+        archive.writestr(
+            "apple_health_export/export.xml",
+            '<?xml version="1.0"?><HealthData>'
+            '<ExportDate value="2024-02-01 12:00:00 +0000"/>'
+            f"{records}</HealthData>",
+        )
+    assert _execute_json_import(common, package, capsys)[0] == 0
+
+    batch = [
+        *common,
+        "review-confirm-batch",
+        "--kind",
+        "plausibility",
+        "--json",
+    ]
+    assert main(batch) == 0
+    batch_plan = json.loads(capsys.readouterr().out)
+    _assert_json_contract(batch_plan)
+    assert batch_plan["details"]["count"] == 100
+    assert len(batch_plan["details"]["matches"]) == 100
+
+    single = [
+        *common,
+        "review-resolve",
+        batch_plan["details"]["matches"][0]["case_id"],
+        "--confirm",
+        "--json",
+    ]
+    assert main(single) == 0
+    single_plan = json.loads(capsys.readouterr().out)
+    assert main([*single, "--execute", "--expect-plan", single_plan["fingerprint"]]) == 0
+    capsys.readouterr()
+
+    assert main([*batch, "--execute", "--expect-plan", batch_plan["fingerprint"]]) == 3
+    changed = json.loads(capsys.readouterr().out)
+    _assert_json_contract(changed)
+    assert changed["result"]["status"] == "plan_changed"
+
+
+def test_human_batch_cli_displays_every_match_before_confirmation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    common = [
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(tmp_path / "synthetic"),
+        "--real-store",
+        str(tmp_path / "real"),
+    ]
+    package = tmp_path / "plausibility.zip"
+    with ZipFile(package, "w") as archive:
+        archive.writestr(
+            "apple_health_export/export.xml",
+            '<?xml version="1.0"?><HealthData>'
+            '<ExportDate value="2024-02-01 12:00:00 +0000"/>'
+            '<Record type="HKQuantityTypeIdentifierRestingHeartRate" '
+            'sourceName="Test Watch" device="Test Device" unit="count/min" '
+            'sourceVersion="1" creationDate="2024-01-01 07:00:00 +0000" '
+            'startDate="2024-01-01 07:00:00 +0000" '
+            'endDate="2024-01-01 07:00:00 +0000" value="251">'
+            '<MetadataEntry key="HKMetadataKeySyncIdentifier" value="batch-human"/>'
+            "</Record></HealthData>",
+        )
+    assert _execute_json_import(common, package, capsys)[0] == 0
+    displayed: list[str] = []
+    monkeypatch.setattr("personal_health_lab.adapters.cli._cli.pydoc.pager", displayed.append)
+
+    def decline(_prompt: str) -> str:
+        assert displayed
+        return "n"
+
+    monkeypatch.setattr("builtins.input", decline)
+    assert main([*common, "review-confirm-batch", "--kind", "plausibility"]) == 0
+    assert displayed[0]
+
+
 def test_cli_maps_correction_inputs(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -315,6 +417,9 @@ def test_real_json_import_renders_shared_confirmation_plan(
     assert len(plan["workspace"]["store_id"]) == 32
     assert plan["workspace"]["allowed_writes"] == [
         "import_health_export",
+        "resolve_data_review_case",
+        "confirm_data_review_batch",
+        "revoke_data_review_decision",
         "create_plausibility_rule_version",
         "run_historical_review",
     ]

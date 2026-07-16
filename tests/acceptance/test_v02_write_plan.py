@@ -157,6 +157,23 @@ REGISTERED_CASES.update(
         "V02-A-REV-016": (
             "test_new_flagged_source_version_requires_confirmation_after_local_exclusion"
         ),
+        "V02-A-REV-017": (
+            "test_batch_confirmation_materializes_every_value_and_revokes_only_effective_members"
+        ),
+        "V02-A-REV-018": (
+            "test_large_batch_plan_remains_complete"
+        ),
+        "V02-A-REV-019": (
+            "test_batch_confirmation_fails_atomically_when_the_match_set_changes"
+        ),
+        "V02-A-REV-020": (
+            "test_batch_confirmation_materializes_every_value_and_revokes_only_effective_members"
+        ),
+        "V02-A-REV-021": (
+            "test_batch_confirmation_materializes_every_value_and_revokes_only_effective_members"
+        ),
+        "V02-A-ADP-004": "test_json_cli_keeps_the_complete_batch_and_reports_plan_changed",
+        "V02-A-ADP-011": "test_json_cli_keeps_the_complete_batch_and_reports_plan_changed",
         "V02-A-REV-022": "test_review_decision_requests_enforce_mandatory_reasons",
         "V02-A-REV-023": (
             "test_new_clean_source_version_can_replace_a_continued_correction"

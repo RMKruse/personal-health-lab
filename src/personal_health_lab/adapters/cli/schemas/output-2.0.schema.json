@@ -427,6 +427,22 @@
         "type": {"const": "data_review_decision"}
       }
     },
+    "dataReviewBatchResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["batch_action_id", "decision_ids", "diagnostics", "snapshot_ref", "status", "type"],
+      "properties": {
+        "batch_action_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "decision_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[0-9a-f]{32}$"}
+        },
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "snapshot_ref": {"type": "string"},
+        "status": {"const": "committed"},
+        "type": {"const": "data_review_batch"}
+      }
+    },
     "historicalReviewResult": {
       "type": "object",
       "additionalProperties": false,
@@ -504,6 +520,47 @@
             },
             {
               "type": "object", "additionalProperties": false,
+              "required": ["active_snapshot_ref", "count", "matches", "selection", "type"],
+              "properties": {
+                "active_snapshot_ref": {"$ref": "#/$defs/nullableString"},
+                "count": {"type": "integer", "minimum": 0},
+                "matches": {
+                  "type": "array",
+                  "items": {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["canonical_unit", "case_id", "effective_value", "evidence_fingerprint", "kind", "measurement_version_id", "rule_version_id"],
+                    "properties": {
+                      "canonical_unit": {"type": ["string", "null"]},
+                      "case_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                      "effective_value": {"type": ["number", "null"]},
+                      "evidence_fingerprint": {"type": "string"},
+                      "kind": {"type": "string"},
+                      "measurement_version_id": {"$ref": "#/$defs/nullableString"},
+                      "rule_version_id": {"$ref": "#/$defs/nullableString"}
+                    }
+                  }
+                },
+                "selection": {
+                  "type": "object", "additionalProperties": false,
+                  "required": ["kind"],
+                  "properties": {"kind": {"type": ["string", "null"]}}
+                },
+                "type": {"const": "confirm_data_review_batch"}
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["active_snapshot_ref", "batch_action_id", "count", "decision_ids", "type"],
+              "properties": {
+                "active_snapshot_ref": {"$ref": "#/$defs/nullableString"},
+                "batch_action_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                "count": {"type": "integer", "minimum": 0},
+                "decision_ids": {"type": "array", "items": {"type": "string", "pattern": "^[0-9a-f]{32}$"}},
+                "type": {"const": "revoke_data_review_batch"}
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
               "required": ["base_snapshot_ref", "end_date", "rule_version_id", "start_date", "type"],
               "properties": {
                 "base_snapshot_ref": {"$ref": "#/$defs/nullableString"},
@@ -551,7 +608,7 @@
               "type": "object", "additionalProperties": false,
               "required": ["type"],
               "properties": {
-                "type": {"enum": ["create_plausibility_rule_version", "data_review_decision", "run_historical_review"]}
+                "type": {"enum": ["confirm_data_review_batch", "create_plausibility_rule_version", "data_review_decision", "revoke_data_review_batch", "run_historical_review"]}
               }
             }
           ]
@@ -650,6 +707,9 @@
             },
             {
               "$ref": "#/$defs/dataReviewDecisionResult"
+            },
+            {
+              "$ref": "#/$defs/dataReviewBatchResult"
             },
             {
               "$ref": "#/$defs/historicalReviewResult"

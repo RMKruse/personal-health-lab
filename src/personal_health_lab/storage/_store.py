@@ -674,6 +674,14 @@ class PublishDecisionResult:
 
 
 @dataclass(frozen=True, slots=True)
+class PublishBatchDecisionResult:
+    operation_id: OperationId
+    batch_action_id: str
+    decision_ids: tuple[str, ...]
+    snapshot_id: SnapshotId
+
+
+@dataclass(frozen=True, slots=True)
 class OpenDataReviewCase:
     review_case_id: str
     kind: Literal[
@@ -1066,6 +1074,21 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             note TEXT,
             mandatory_reason TEXT
         ) STRICT;
+        CREATE TABLE IF NOT EXISTS data_review_batch_actions (
+            batch_action_id TEXT PRIMARY KEY CHECK (
+                length(batch_action_id) = 32 AND batch_action_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            operation_id TEXT NOT NULL UNIQUE REFERENCES write_operations(operation_id),
+            selection_kind TEXT,
+            materialized_matches TEXT NOT NULL,
+            match_count INTEGER NOT NULL CHECK (match_count >= 0),
+            note TEXT
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS data_review_batch_members (
+            batch_action_id TEXT NOT NULL REFERENCES data_review_batch_actions(batch_action_id),
+            decision_id TEXT NOT NULL UNIQUE REFERENCES decision_refs(decision_id),
+            PRIMARY KEY (batch_action_id, decision_id)
+        ) STRICT;
         CREATE TABLE IF NOT EXISTS source_absence_suppressions (
             logical_measurement_id TEXT PRIMARY KEY,
             decision_id TEXT NOT NULL REFERENCES decision_refs(decision_id),
@@ -1109,6 +1132,18 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
         WHEN (SELECT event_kind FROM audit_events WHERE audit_event_id = NEW.audit_event_id)
              != 'data_review_decision'
         BEGIN SELECT RAISE(ABORT, 'wrong audit payload type'); END;
+        CREATE TRIGGER IF NOT EXISTS data_review_batch_actions_no_update
+        BEFORE UPDATE ON data_review_batch_actions
+        BEGIN SELECT RAISE(ABORT, 'batch audit is append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS data_review_batch_actions_no_delete
+        BEFORE DELETE ON data_review_batch_actions
+        BEGIN SELECT RAISE(ABORT, 'batch audit is append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS data_review_batch_members_no_update
+        BEFORE UPDATE ON data_review_batch_members
+        BEGIN SELECT RAISE(ABORT, 'batch audit is append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS data_review_batch_members_no_delete
+        BEFORE DELETE ON data_review_batch_members
+        BEGIN SELECT RAISE(ABORT, 'batch audit is append-only'); END;
         CREATE TRIGGER IF NOT EXISTS metadata_tombstones_kind
         BEFORE INSERT ON metadata_tombstones
         WHEN (SELECT event_kind FROM audit_events WHERE audit_event_id = NEW.audit_event_id)
@@ -3062,6 +3097,119 @@ class LocalStore:
             )
         return PublishDecisionResult(operation_id, decision_id, snapshot_id)
 
+    def publish_data_review_batch(
+        self,
+        *,
+        operation_id: OperationId,
+        snapshot_id: SnapshotId,
+        selection_kind: str | None,
+        materialized_matches: str,
+        case_ids: tuple[str, ...],
+        note: str | None,
+        cycle_updates: tuple[ReviewCycleUpdate, ...],
+    ) -> PublishBatchDecisionResult:
+        self._require_open()
+        self._require_writer()
+        active = self.load_active_snapshot_id()
+        if active is None:
+            raise StoreError("Aktiver Snapshot fehlt.")
+        selected_cases = {
+            case.review_case_id: case
+            for case in self.load_open_data_review_cases()
+            if (selection_kind is None or case.kind == selection_kind)
+        }
+        if not set(case_ids) <= selected_cases.keys():
+            raise StoreError("Sammelmenge hat sich geändert.")
+        open_cases = {case_id: selected_cases[case_id] for case_id in case_ids}
+        batch_action_id = uuid4().hex
+        decisions = tuple((open_cases[case_id], uuid4().hex) for case_id in case_ids)
+        audit_position = int(
+            self._metadata.execute(
+                "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+            ).fetchone()[0]
+        )
+        completed_at = datetime.now(UTC).isoformat()
+        with self._metadata:
+            self._metadata.execute(
+                "INSERT INTO write_operations VALUES (?, 'resolve_data_review_case', ?, ?, "
+                "'committed', 1)",
+                (str(operation_id), completed_at, completed_at),
+            )
+            self._metadata.execute(
+                "INSERT INTO data_review_batch_actions VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    batch_action_id,
+                    str(operation_id),
+                    selection_kind,
+                    materialized_matches,
+                    len(decisions),
+                    note,
+                ),
+            )
+            for offset, (case, decision_id) in enumerate(decisions):
+                audit_event_id = uuid4().hex
+                self._metadata.execute(
+                    "INSERT INTO decision_refs VALUES (?, 'confirmation')", (decision_id,)
+                )
+                self._metadata.execute(
+                    "INSERT INTO audit_events VALUES (?, ?, ?, 'data_review_decision', ?)",
+                    (audit_position + offset, audit_event_id, str(operation_id), completed_at),
+                )
+                assert case.logical_measurement_id is not None
+                logical_id = str(case.logical_measurement_id)
+                selected = (
+                    None
+                    if case.measurement_version_id is None
+                    else str(case.measurement_version_id)
+                )
+                self._metadata.execute(
+                    "INSERT INTO data_review_decisions VALUES "
+                    "(?, ?, ?, ?, ?, ?, 'confirm', ?, ?, '[]', ?, NULL)",
+                    (
+                        audit_event_id,
+                        decision_id,
+                        case.review_case_id,
+                        case.kind,
+                        logical_id,
+                        case.evidence_fingerprint,
+                        selected,
+                        self._resolved_version(active, logical_id),
+                        note,
+                    ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO data_review_batch_members VALUES (?, ?)",
+                    (batch_action_id, decision_id),
+                )
+            self._metadata.executemany(
+                "UPDATE review_cycles SET open_case_count = ?, status = ? WHERE cycle_id = ?",
+                (
+                    (update.open_case_count, update.status, str(update.cycle_id))
+                    for update in cycle_updates
+                ),
+            )
+            manifest_sha256 = self._stage_review_snapshot(
+                parent_snapshot_id=active,
+                snapshot_id=snapshot_id,
+                operation_id=operation_id,
+                audit_position=audit_position + len(decisions) - 1,
+                review_case_id=None,
+                decision_id=batch_action_id,
+                action="confirm_batch",
+                selected_measurement_version_id=None,
+                candidate_version_ids=(),
+                batch_confirmations=decisions,
+            )
+            self._activate_review_snapshot(
+                operation_id, snapshot_id, active, manifest_sha256, completed_at
+            )
+        return PublishBatchDecisionResult(
+            operation_id,
+            batch_action_id,
+            tuple(decision_id for _, decision_id in decisions),
+            snapshot_id,
+        )
+
     def revoke_data_review_decision(
         self,
         *,
@@ -3213,6 +3361,173 @@ class LocalStore:
             )
         return PublishDecisionResult(operation_id, decision_id, snapshot_id)
 
+    def load_effective_batch_decision_ids(self, batch_action_id: str) -> tuple[str, ...]:
+        self._require_open()
+        rows = self._metadata.execute(
+            "SELECT m.decision_id, d.logical_measurement_id, d.case_kind, "
+            "d.selected_measurement_version_id, d.previous_measurement_version_id "
+            "FROM data_review_batch_members m "
+            "JOIN data_review_decisions d USING (decision_id) "
+            "JOIN audit_events original_event USING (audit_event_id) "
+            "WHERE m.batch_action_id = ? AND NOT EXISTS ("
+            "SELECT 1 FROM metadata_tombstones t "
+            "WHERE t.target_audit_event_id = d.audit_event_id) AND NOT EXISTS ("
+            "SELECT 1 FROM data_review_decisions later "
+            "JOIN audit_events later_event USING (audit_event_id) "
+            "WHERE later.logical_measurement_id = d.logical_measurement_id "
+            "AND later_event.audit_position > original_event.audit_position "
+            "AND later_event.operation_id != original_event.operation_id) "
+            "ORDER BY m.decision_id",
+            (batch_action_id,),
+        ).fetchall()
+        effective: list[str] = []
+        for row in rows:
+            resolved = self.load_resolved_measurement(str(row[1]))
+            expected_version = str(row[3] if str(row[2]) == "continued_override" else row[4])
+            if (
+                resolved is not None
+                and resolved.selected_measurement_version_id == expected_version
+                and resolved.effective_decision_id in {None, str(row[0])}
+            ):
+                effective.append(str(row[0]))
+        return tuple(effective)
+
+    def revoke_data_review_batch(
+        self,
+        *,
+        operation_id: OperationId,
+        snapshot_id: SnapshotId,
+        batch_action_id: str,
+        expected_decision_ids: tuple[str, ...],
+        reason: str,
+        cycle_updates: tuple[ReviewCycleUpdate, ...],
+    ) -> PublishBatchDecisionResult:
+        self._require_open()
+        self._require_writer()
+        active = self.load_active_snapshot_id()
+        if active is None:
+            raise StoreError("Aktiver Snapshot fehlt.")
+        if self.load_effective_batch_decision_ids(batch_action_id) != expected_decision_ids:
+            raise StoreError("Wirksame Sammelentscheidungen haben sich geändert.")
+        placeholders = ", ".join("?" for _ in expected_decision_ids)
+        rows = self._metadata.execute(
+            "SELECT d.audit_event_id, d.decision_id, d.review_case_id, "
+            "d.selected_measurement_version_id, d.previous_measurement_version_id, "
+            "d.candidate_version_ids FROM data_review_decisions d "
+            "WHERE d.decision_id IN (SELECT decision_id FROM data_review_batch_members "
+            "WHERE batch_action_id = ?) "
+            f"AND d.decision_id IN ({placeholders}) AND NOT EXISTS ("
+            "SELECT 1 FROM metadata_tombstones t "
+            "WHERE t.target_audit_event_id = d.audit_event_id) ORDER BY d.decision_id",
+            (batch_action_id, *expected_decision_ids),
+        ).fetchall()
+        if not rows:
+            raise StoreError("Sammelaktion hat keine wirksame Entscheidung.")
+        basis = self._metadata.execute(
+            "SELECT a.previous_snapshot_id FROM snapshot_activations a "
+            "JOIN audit_events e ON e.operation_id = a.operation_id "
+            "WHERE e.audit_event_id = ?",
+            (str(rows[0][0]),),
+        ).fetchone()
+        if basis is None or basis[0] is None:
+            raise StoreError("Entscheidungsbasis fehlt.")
+        case_path = (
+            self._root
+            / _PARQUET_DIRECTORY
+            / "snapshots"
+            / str(basis[0])
+            / "open_review_cases.parquet"
+        )
+        escaped_case_path = str(case_path).replace("'", "''")
+        revocations: list[tuple[OpenDataReviewCase, str, str, tuple[str, ...]]] = []
+        for row in rows:
+            case_row = self._query.execute(
+                "SELECT review_case_id, case_kind, logical_measurement_id, "
+                "measurement_version_id, rule_version_id, evidence_fingerprint "
+                f"FROM read_parquet('{escaped_case_path}') WHERE review_case_id = ?",
+                (str(row[2]),),
+            ).fetchone()
+            if case_row is None:
+                raise StoreError("Ursprünglicher Datenprüffall fehlt.")
+            revocations.append(
+                (
+                    OpenDataReviewCase(
+                        review_case_id=str(case_row[0]),
+                        kind=cast(
+                            Literal[
+                                "plausibility",
+                                "continued_override",
+                                "suspected_source_deletion",
+                                "source_conflict",
+                                "rule_definition",
+                            ],
+                            str(case_row[1]),
+                        ),
+                        logical_measurement_id=LogicalMeasurementId(str(case_row[2])),
+                        measurement_version_id=(
+                            None
+                            if case_row[3] is None
+                            else MeasurementVersionId(str(case_row[3]))
+                        ),
+                        rule_version_id=None if case_row[4] is None else str(case_row[4]),
+                        evidence_fingerprint=str(case_row[5]),
+                    ),
+                    str(row[1]),
+                    str(row[4]),
+                    tuple(json.loads(str(row[5]))),
+                )
+            )
+        completed_at = datetime.now(UTC).isoformat()
+        audit_position = int(
+            self._metadata.execute(
+                "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+            ).fetchone()[0]
+        )
+        with self._metadata:
+            self._metadata.execute(
+                "INSERT INTO write_operations VALUES (?, 'revoke_data_review_decision', ?, ?, "
+                "'committed', 1)",
+                (str(operation_id), completed_at, completed_at),
+            )
+            for offset, row in enumerate(rows):
+                audit_event_id = uuid4().hex
+                self._metadata.execute(
+                    "INSERT INTO audit_events VALUES (?, ?, ?, 'metadata_tombstone', ?)",
+                    (audit_position + offset, audit_event_id, str(operation_id), completed_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO metadata_tombstones VALUES (?, ?, ?, 'revoked', NULL, ?)",
+                    (uuid4().hex, audit_event_id, str(row[0]), reason),
+                )
+            self._metadata.executemany(
+                "UPDATE review_cycles SET open_case_count = ?, status = ? WHERE cycle_id = ?",
+                (
+                    (update.open_case_count, update.status, str(update.cycle_id))
+                    for update in cycle_updates
+                ),
+            )
+            manifest_sha256 = self._stage_review_snapshot(
+                parent_snapshot_id=active,
+                snapshot_id=snapshot_id,
+                operation_id=operation_id,
+                audit_position=audit_position + len(rows) - 1,
+                review_case_id=None,
+                decision_id=batch_action_id,
+                action="revoke_batch",
+                selected_measurement_version_id=None,
+                candidate_version_ids=(),
+                batch_revocations=tuple(revocations),
+            )
+            self._activate_review_snapshot(
+                operation_id, snapshot_id, active, manifest_sha256, completed_at
+            )
+        return PublishBatchDecisionResult(
+            operation_id,
+            batch_action_id,
+            tuple(str(row[1]) for row in rows),
+            snapshot_id,
+        )
+
     def _resolved_version(self, snapshot_id: SnapshotId, logical_id: str) -> str:
         path = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
         escaped = str(path / "resolved_measurements.parquet").replace("'", "''")
@@ -3344,6 +3659,10 @@ class LocalStore:
         reopened_case: OpenDataReviewCase | None = None,
         replacement_plausibility_cases: tuple[OpenDataReviewCase, ...] | None = None,
         replaced_measurement_version_ids: tuple[str, ...] = (),
+        batch_confirmations: tuple[tuple[OpenDataReviewCase, str], ...] = (),
+        batch_revocations: tuple[
+            tuple[OpenDataReviewCase, str, str, tuple[str, ...]], ...
+        ] = (),
     ) -> str:
         parent = self._root / _PARQUET_DIRECTORY / "snapshots" / str(parent_snapshot_id)
         staging = self._root / "staging" / str(operation_id)
@@ -3354,7 +3673,33 @@ class LocalStore:
             self._query.execute(
                 f"CREATE OR REPLACE TEMP TABLE {table} AS SELECT * FROM read_parquet('{escaped}')"
             )
-        if replacement_plausibility_cases is not None:
+        if batch_revocations:
+            for batch_case, decision, selected_version, candidates in batch_revocations:
+                self._query.execute(
+                    "DELETE FROM resolved_measurements WHERE effective_decision_id = ? "
+                    "OR conflict_resolution_decision_id = ?",
+                    (decision, decision),
+                )
+                self._reopen_review_case(
+                    batch_case,
+                    selected_version,
+                    candidates,
+                    batch_case.review_case_id,
+                )
+        elif batch_confirmations:
+            self._query.executemany(
+                "DELETE FROM open_review_cases WHERE review_case_id = ?",
+                ((batch_case.review_case_id,) for batch_case, _ in batch_confirmations),
+            )
+            for batch_case, _decision_id in batch_confirmations:
+                if batch_case.kind == "continued_override":
+                    assert batch_case.logical_measurement_id is not None
+                    assert batch_case.measurement_version_id is not None
+                    self._include_source(
+                        str(batch_case.logical_measurement_id),
+                        str(batch_case.measurement_version_id),
+                    )
+        elif replacement_plausibility_cases is not None:
             if replaced_measurement_version_ids:
                 placeholders = ",".join("?" for _ in replaced_measurement_version_ids)
                 self._query.execute(

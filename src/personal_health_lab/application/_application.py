@@ -16,12 +16,14 @@ from personal_health_lab import DataMode
 from personal_health_lab.data_quality import (
     DataQualityError,
     HistoricalReviewRequest,
+    close_review_batch_cycle_updates,
     close_review_cycle_updates,
     create_plausibility_rule_version,
     load_plausibility_rule_state,
     load_review_case_detail,
     load_review_state,
     plausibility_rule_recommendations,
+    reopen_batch_decision_cycle_updates,
     reopen_decision_cycle_updates,
     run_historical_review,
 )
@@ -58,6 +60,8 @@ from personal_health_lab.storage import (
     LocalStore,
     OpenDataReviewCase,
     PersonBindingStatus,
+    PublishBatchDecisionResult,
+    PublishDecisionResult,
     StoreBusyError,
     StoreError,
     StoreId,
@@ -103,6 +107,9 @@ class WorkspaceStatus:
     )
     allowed_writes: tuple[str, ...] = (
         "import_health_export",
+        "resolve_data_review_case",
+        "confirm_data_review_batch",
+        "revoke_data_review_decision",
         "create_plausibility_rule_version",
         "run_historical_review",
     )
@@ -390,8 +397,31 @@ class SingleDecisionTarget:
 
 
 @dataclass(frozen=True, slots=True)
+class DataReviewBatchActionId:
+    _value: str
+
+    def __post_init__(self) -> None:
+        if len(self._value) != 32 or not set(self._value) <= set("0123456789abcdef"):
+            raise ValueError("Sammelaktions-ID muss ein 32-stelliger Hex-Wert sein.")
+
+    def __str__(self) -> str:
+        return self._value
+
+
+@dataclass(frozen=True, slots=True)
+class BatchDecisionTarget:
+    batch_action_id: DataReviewBatchActionId
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmDataReviewBatch:
+    selection: DataReviewSelection
+    note: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class RevokeDataReviewDecision:
-    target: SingleDecisionTarget
+    target: SingleDecisionTarget | BatchDecisionTarget
     reason: str
 
     def __post_init__(self) -> None:
@@ -402,6 +432,7 @@ class RevokeDataReviewDecision:
 WriteRequest = (
     ImportHealthExport
     | ResolveDataReviewCase
+    | ConfirmDataReviewBatch
     | RevokeDataReviewDecision
     | CreatePlausibilityRuleVersion
     | RunHistoricalReview
@@ -442,6 +473,49 @@ class DataReviewDecisionPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class DataReviewBatchMatch:
+    case_id: DataReviewCaseId
+    kind: DataReviewCaseKind
+    measurement_version_id: MeasurementVersionId | None
+    rule_version_id: str | None
+    evidence_fingerprint: str
+    effective_value: float | None
+    canonical_unit: CanonicalUnit | None
+
+
+@dataclass(frozen=True, slots=True)
+class DataReviewBatchPlan:
+    selection: DataReviewSelection
+    matches: tuple[DataReviewBatchMatch, ...]
+    count: int
+    active_snapshot_ref: SnapshotRef | None
+
+
+@dataclass(frozen=True, slots=True)
+class DataReviewBatchRevokePlan:
+    batch_action_id: DataReviewBatchActionId
+    decision_ids: tuple[DataReviewDecisionId, ...]
+    count: int
+    active_snapshot_ref: SnapshotRef | None
+
+
+def _data_review_batch_match_payload(match: DataReviewBatchMatch) -> dict[str, object]:
+    return {
+        "case_id": str(match.case_id),
+        "kind": match.kind.value,
+        "measurement_version_id": (
+            None
+            if match.measurement_version_id is None
+            else str(match.measurement_version_id)
+        ),
+        "rule_version_id": match.rule_version_id,
+        "evidence_fingerprint": match.evidence_fingerprint,
+        "effective_value": match.effective_value,
+        "canonical_unit": None if match.canonical_unit is None else match.canonical_unit.value,
+    }
+
+
+@dataclass(frozen=True, slots=True)
 class PlausibilityRuleVersionPlan:
     previous_version_id: str | None
     proposed_version_id: str
@@ -459,6 +533,8 @@ class HistoricalReviewPlan:
 WritePlanDetails = (
     ImportHealthExportPlan
     | DataReviewDecisionPlan
+    | DataReviewBatchPlan
+    | DataReviewBatchRevokePlan
     | PlausibilityRuleVersionPlan
     | HistoricalReviewPlan
 )
@@ -662,6 +738,16 @@ class WriteDecisionReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class WriteBatchDecisionReceipt:
+    operation_id: OperationId
+    batch_action_id: DataReviewBatchActionId
+    decision_ids: tuple[DataReviewDecisionId, ...]
+    snapshot_ref: SnapshotRef
+    status: ImportStatus = ImportStatus.COMMITTED
+    diagnostics: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class PlausibilityRuleVersionReceipt:
     operation_id: OperationId
     rule_version_id: str
@@ -683,6 +769,7 @@ class HistoricalReviewReceipt:
 WriteResult = (
     ImportReceipt
     | WriteDecisionReceipt
+    | WriteBatchDecisionReceipt
     | PlausibilityRuleVersionReceipt
     | HistoricalReviewReceipt
     | WriteNotStarted
@@ -932,15 +1019,24 @@ class HealthLab:
         )
 
     def _build_data_review_plan(
-        self, request: ResolveDataReviewCase | RevokeDataReviewDecision
+        self,
+        request: ResolveDataReviewCase | ConfirmDataReviewBatch | RevokeDataReviewDecision,
     ) -> WritePlan:
         if self._store is None:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
         snapshot = self._store.load_active_snapshot_id()
         if snapshot is None:
+            if isinstance(request, ConfirmDataReviewBatch):
+                details: WritePlanDetails = DataReviewBatchPlan(request.selection, (), 0, None)
+            elif isinstance(request, RevokeDataReviewDecision) and isinstance(
+                request.target, BatchDecisionTarget
+            ):
+                details = DataReviewBatchRevokePlan(request.target.batch_action_id, (), 0, None)
+            else:
+                details = DataReviewDecisionPlan(None, None)
             return WritePlan(
                 PlanFingerprint(hashlib.sha256(b"data_review:no_snapshot").hexdigest()),
-                DataReviewDecisionPlan(None, None),
+                details,
                 WritePreflight(
                     WriteApproval(WriteApprovalStatus.BLOCKED), diagnostics=("no_active_snapshot",)
                 ),
@@ -997,11 +1093,52 @@ class HealthLab:
                 "case_id": None if case_id is None else str(case_id),
                 "resolution": resolution_payload,
             }
+        elif isinstance(request, ConfirmDataReviewBatch):
+            case_id = None
+            review = self.load_data_review(request.selection)
+            matches = tuple(
+                DataReviewBatchMatch(
+                    case.case_id,
+                    case.kind,
+                    case.measurement_version_id,
+                    case.rule_version_id,
+                    case.evidence_fingerprint,
+                    detail.effective_value,
+                    detail.canonical_unit,
+                )
+                for case in sorted(review.cases, key=lambda item: str(item.case_id))
+                if DataReviewAction.CONFIRM in case.allowed_actions
+                for detail in (self.load_data_review_case(case.case_id),)
+            )
+            request_payload = {
+                "type": "confirm_data_review_batch",
+                "selection": {
+                    "kind": None if request.selection.kind is None else request.selection.kind.value
+                },
+                "note": request.note,
+                "matches": [_data_review_batch_match_payload(item) for item in matches],
+                "count": len(matches),
+            }
         else:
             case_id = None
+            revoke_decisions = (
+                tuple(
+                    DataReviewDecisionId(item)
+                    for item in self._store.load_effective_batch_decision_ids(
+                        str(request.target.batch_action_id)
+                    )
+                )
+                if isinstance(request.target, BatchDecisionTarget)
+                else ()
+            )
             request_payload = {
                 "type": "revoke_data_review_decision",
-                "decision_id": str(request.target.decision_id),
+                "target": (
+                    {"type": "single", "decision_id": str(request.target.decision_id)}
+                    if isinstance(request.target, SingleDecisionTarget)
+                    else {"type": "batch", "batch_action_id": str(request.target.batch_action_id)}
+                ),
+                "effective_decision_ids": tuple(str(item) for item in revoke_decisions),
                 "reason": request.reason,
             }
         fingerprint = PlanFingerprint(
@@ -1013,10 +1150,31 @@ class HealthLab:
                 ).encode()
             ).hexdigest()
         )
+        if isinstance(request, ConfirmDataReviewBatch):
+            details = DataReviewBatchPlan(request.selection, matches, len(matches), snapshot)
+        elif isinstance(request, RevokeDataReviewDecision) and isinstance(
+            request.target, BatchDecisionTarget
+        ):
+            details = DataReviewBatchRevokePlan(
+                request.target.batch_action_id,
+                revoke_decisions,
+                len(revoke_decisions),
+                snapshot,
+            )
+        else:
+            details = DataReviewDecisionPlan(case_id, snapshot)
+        empty_batch = isinstance(details, (DataReviewBatchPlan, DataReviewBatchRevokePlan)) and (
+            details.count == 0
+        )
         return WritePlan(
             fingerprint,
-            DataReviewDecisionPlan(case_id, snapshot),
-            WritePreflight(WriteApproval(WriteApprovalStatus.READY)),
+            details,
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED if empty_batch else WriteApprovalStatus.READY
+                ),
+                diagnostics=("empty_batch",) if empty_batch else (),
+            ),
         )
 
     def _build_import_plan(
@@ -1509,7 +1667,7 @@ class HealthLab:
 
     def _execute_data_review_write(
         self,
-        request: ResolveDataReviewCase | RevokeDataReviewDecision,
+        request: ResolveDataReviewCase | ConfirmDataReviewBatch | RevokeDataReviewDecision,
         plan: WritePlan,
         expected_plan: PlanFingerprint,
     ) -> WriteReceipt:
@@ -1520,6 +1678,7 @@ class HealthLab:
                 plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
             )
         operation_id = OperationId(uuid4().hex)
+        result: PublishDecisionResult | PublishBatchDecisionResult
         try:
             if isinstance(request, ResolveDataReviewCase):
                 review = self.load_data_review(DataReviewSelection())
@@ -1688,15 +1847,92 @@ class HealthLab:
                         else close_review_cycle_updates(writer, str(case.case_id))
                     ),
                 )
-            else:
-                decision_id = str(request.target.decision_id)
-                result = writer.revoke_data_review_decision(
+            elif isinstance(request, ConfirmDataReviewBatch):
+                if not isinstance(plan.details, DataReviewBatchPlan):
+                    return self._not_started(
+                        plan,
+                        WriteNotStartedStatus.PLAN_CHANGED,
+                        ("plan_changed",),
+                        expected_plan,
+                    )
+                current_matches = tuple(
+                    DataReviewBatchMatch(
+                        DataReviewCaseId(case.review_case_id),
+                        DataReviewCaseKind(case.kind),
+                        case.measurement_version_id,
+                        case.rule_version_id,
+                        case.evidence_fingerprint,
+                        detail.effective_value,
+                        None
+                        if detail.canonical_unit is None
+                        else CanonicalUnit(detail.canonical_unit),
+                    )
+                    for case in sorted(
+                        writer.load_open_data_review_cases(),
+                        key=lambda item: item.review_case_id,
+                    )
+                    if (
+                        request.selection.kind is None
+                        or case.kind == request.selection.kind.value
+                    )
+                    and case.kind in {"plausibility", "continued_override"}
+                    for detail in (load_review_case_detail(writer, case.review_case_id),)
+                    if case.kind == "plausibility" or detail.reasons
+                )
+                if current_matches != plan.details.matches:
+                    return self._not_started(
+                        plan,
+                        WriteNotStartedStatus.PLAN_CHANGED,
+                        ("plan_changed",),
+                        expected_plan,
+                    )
+                result = writer.publish_data_review_batch(
                     operation_id=operation_id,
                     snapshot_id=SnapshotId(uuid4().hex),
-                    decision_id=decision_id,
-                    reason=request.reason,
-                    cycle_updates=reopen_decision_cycle_updates(writer, decision_id),
+                    selection_kind=(
+                        None if request.selection.kind is None else request.selection.kind.value
+                    ),
+                    materialized_matches=json.dumps(
+                        [
+                            _data_review_batch_match_payload(item)
+                            for item in plan.details.matches
+                        ],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    case_ids=tuple(str(item.case_id) for item in plan.details.matches),
+                    note=request.note,
+                    cycle_updates=close_review_batch_cycle_updates(
+                        writer,
+                        tuple(str(item.case_id) for item in plan.details.matches),
+                    ),
                 )
+            else:
+                if isinstance(request.target, BatchDecisionTarget):
+                    if not isinstance(plan.details, DataReviewBatchRevokePlan):
+                        raise StoreError("Sammelwiderrufsplan fehlt.")
+                    result = writer.revoke_data_review_batch(
+                        operation_id=operation_id,
+                        snapshot_id=SnapshotId(uuid4().hex),
+                        batch_action_id=str(request.target.batch_action_id),
+                        expected_decision_ids=tuple(
+                            str(item) for item in plan.details.decision_ids
+                        ),
+                        reason=request.reason,
+                        cycle_updates=reopen_batch_decision_cycle_updates(
+                            writer,
+                            tuple(str(item) for item in plan.details.decision_ids),
+                        ),
+                    )
+                else:
+                    decision_id = str(request.target.decision_id)
+                    result = writer.revoke_data_review_decision(
+                        operation_id=operation_id,
+                        snapshot_id=SnapshotId(uuid4().hex),
+                        decision_id=decision_id,
+                        reason=request.reason,
+                        cycle_updates=reopen_decision_cycle_updates(writer, decision_id),
+                    )
         except StoreError:
             return self._not_started(
                 plan,
@@ -1706,10 +1942,19 @@ class HealthLab:
             )
         finally:
             writer.close()
-        receipt = WriteDecisionReceipt(
-            operation_id=result.operation_id,
-            decision_id=DataReviewDecisionId(result.decision_id),
-            snapshot_ref=result.snapshot_id,
+        receipt: WriteResult = (
+            WriteBatchDecisionReceipt(
+                result.operation_id,
+                DataReviewBatchActionId(result.batch_action_id),
+                tuple(DataReviewDecisionId(item) for item in result.decision_ids),
+                result.snapshot_id,
+            )
+            if isinstance(result, PublishBatchDecisionResult)
+            else WriteDecisionReceipt(
+                operation_id=result.operation_id,
+                decision_id=DataReviewDecisionId(result.decision_id),
+                snapshot_ref=result.snapshot_id,
+            )
         )
         return WriteReceipt(
             operation_id=result.operation_id,
