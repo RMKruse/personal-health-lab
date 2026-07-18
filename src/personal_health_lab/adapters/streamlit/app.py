@@ -18,6 +18,7 @@ from personal_health_lab.application import (
     CanonicalUnit,
     ConfigurationError,
     ConfirmDataReviewBatch,
+    CreateMetadataBackup,
     CreatePlausibilityRuleVersion,
     DataConfirmation,
     DataCorrection,
@@ -33,6 +34,7 @@ from personal_health_lab.application import (
     ImportStatus,
     LocalMeasurementExclusion,
     MeasurementVersionId,
+    MetadataBackupReceipt,
     OverviewSelection,
     OverviewStatus,
     PlausibilityRuleSpecification,
@@ -47,6 +49,7 @@ from personal_health_lab.application import (
     SourceDeletionVerdict,
     SourceValueAcceptance,
     WriteApprovalStatus,
+    WriteNotStarted,
 )
 
 
@@ -173,6 +176,73 @@ if import_plan is not None:
         st.session_state.pop("import_request", None)
         st.session_state.pop("import_plan", None)
         st.rerun()
+
+with st.expander("Sicherung & Wiederherstellung"):
+    backup_plan = st.session_state.get("backup_plan")
+    backup_target = st.text_input(
+        "Zieldatei für Metadatensicherung",
+        disabled=backup_plan is not None,
+    )
+    if st.button(
+        "Metadatensicherung prüfen",
+        disabled=not backup_target or backup_plan is not None,
+    ):
+        try:
+            backup_request = CreateMetadataBackup(Path(backup_target))
+            with HealthLab.open(config) as health_lab:
+                st.session_state["backup_plan"] = health_lab.preview_write(backup_request)
+            st.session_state["backup_request"] = backup_request
+            st.rerun()
+        except (OSError, ConfigurationError, HealthLabError):
+            st.error("Metadatensicherung konnte nicht geplant werden.")
+    backup_plan = st.session_state.get("backup_plan")
+    if backup_plan is not None:
+        st.code(str(backup_plan.fingerprint))
+        st.caption(
+            f"Audit-Höchststand: {backup_plan.details.audit_max_position} · "
+            f"Sicherungs-ID: {backup_plan.details.backup_id} · "
+            f"Zieldatei: {backup_plan.details.target_file}"
+        )
+        st.caption(
+            "Bestätigungen: "
+            + (", ".join(item.value for item in backup_plan.confirmations) or "-")
+        )
+        if st.button(
+            "Metadatensicherung ausführen",
+            disabled=backup_plan.approval.status is WriteApprovalStatus.BLOCKED,
+        ):
+            try:
+                with HealthLab.open(config) as health_lab:
+                    backup_result = health_lab.execute_write(
+                        st.session_state["backup_request"],
+                        expected_plan=backup_plan.fingerprint,
+                    ).result
+                if isinstance(backup_result, MetadataBackupReceipt):
+                    st.session_state["last_backup"] = (
+                        backup_result.status.value,
+                        backup_result.target_file,
+                    )
+                elif isinstance(backup_result, WriteNotStarted):
+                    st.session_state["last_backup"] = (
+                        backup_result.status.value,
+                        "-",
+                    )
+                st.session_state.pop("backup_plan", None)
+                st.session_state.pop("backup_request", None)
+                st.rerun()
+            except (OSError, HealthLabError):
+                st.error("Metadatensicherung konnte nicht geschrieben werden.")
+        if st.button("Sicherungsvorschau verwerfen und bearbeiten"):
+            st.session_state.pop("backup_plan", None)
+            st.session_state.pop("backup_request", None)
+            st.rerun()
+    last_backup = st.session_state.pop("last_backup", None)
+    if last_backup is not None:
+        message = f"Metadatensicherung: {last_backup[0]} · Datei {last_backup[1]}"
+        if last_backup[0] in {"completed", "no_op"}:
+            st.success(message)
+        else:
+            st.warning(message)
 
 analysis_plan = st.session_state.get("analysis_plan")
 start_date = st.date_input("Von", value=None, disabled=analysis_plan is not None)

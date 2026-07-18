@@ -193,6 +193,23 @@ class ReviewCaseDetail:
     canonical_unit: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class ReviewBackupFact:
+    snapshot_id: SnapshotId
+    review_case_id: str
+    case_kind: str
+    logical_measurement_id: LogicalMeasurementId | None
+    measurement_version_id: MeasurementVersionId | None
+    rule_version_id: str | None
+    evidence_fingerprint: str
+    source_type: str | None
+    measured_at_utc: datetime | None
+    effective_value: float | None
+    effective_value_source: str | None
+    canonical_unit: str | None
+    reasons: tuple[ReviewReason, ...]
+
+
 def select_governing_export(exports: tuple[ExportFact, ...]) -> str:
     """Choose one export reproducibly; unordered exports never outrank dated ones."""
     if not exports:
@@ -1036,9 +1053,133 @@ def load_review_case_detail(store: LocalStore, review_case_id: str) -> ReviewCas
     )
 
 
+def _snapshot_review_detail(
+    store: LocalStore,
+    case: OpenDataReviewCase,
+    versions: tuple[MeasurementVersionFact, ...],
+    measurements: tuple[ResolvedMeasurement, ...],
+    rules: tuple[PlausibilityRuleRecord, ...],
+) -> ReviewCaseDetail:
+    if case.kind == "rule_definition":
+        return ReviewCaseDetail(
+            store.load_source_type_for_review_case(case.review_case_id),
+            None,
+            None,
+            None,
+            (),
+            None,
+        )
+    if case.measurement_version_id is None or case.kind not in {
+        "plausibility",
+        "continued_override",
+    }:
+        return ReviewCaseDetail(None, None, None, None, (), None)
+    version_by_id = {item.measurement_version_id: item for item in versions}
+    version = version_by_id.get(str(case.measurement_version_id))
+    if version is None:
+        raise ValueError("Quellmessungsversion des Datenprüffalls fehlt.")
+    resolved = next(
+        (
+            item
+            for item in measurements
+            if item.logical_measurement_id == version.logical_measurement_id
+        ),
+        None,
+    )
+    rule = (
+        _rule_at(version.canonical_type, datetime.fromisoformat(version.source_start_utc), rules)
+        if case.kind == "continued_override"
+        else next(
+            (
+                item
+                for item in rules
+                if item.data_type == version.canonical_type
+                and item.version_id == case.rule_version_id
+            ),
+            None,
+        )
+    )
+    if rule is None:
+        raise ValueError("Plausibilitätsregel des Datenprüffalls fehlt.")
+    effective_value = (
+        version.canonical_value
+        if resolved is None or resolved.effective_value is None
+        else resolved.effective_value
+    )
+    reason_value = version.canonical_value if case.kind == "continued_override" else effective_value
+    reasons = list(_plausibility_reasons(rule, reason_value, version.canonical_unit))
+    if version.canonical_type == "apple_resting_heart_rate":
+        daily = _effective_daily_resting_hr(version_by_id, measurements)
+        daily_values = tuple(
+            (day, measurement.effective_value)
+            for day, (_, measurement) in sorted(daily.items())
+            if measurement.effective_value is not None
+        )
+        selected_on_day = daily.get(version.measurement_local_date)
+        eligible = case.kind == "continued_override" or (
+            selected_on_day is not None
+            and selected_on_day[1].selected_measurement_version_id
+            == version.measurement_version_id
+        )
+        if eligible:
+            personal_bounds = _personal_bounds(
+                rule,
+                version.measurement_local_date,
+                daily_values,
+                version.canonical_unit,
+            )
+            reasons.extend(
+                reason
+                for reason in _plausibility_reasons(
+                    rule, reason_value, version.canonical_unit, personal_bounds
+                )
+                if reason.code
+                in {"below_personal_lower_bound", "above_personal_upper_bound"}
+            )
+    return ReviewCaseDetail(
+        version.canonical_type,
+        datetime.fromisoformat(version.source_start_utc),
+        None if resolved is None else resolved.effective_value,
+        None if resolved is None else resolved.effective_value_source,
+        tuple(reasons),
+        version.canonical_unit,
+    )
+
+
+def load_review_backup_facts(store: LocalStore) -> tuple[ReviewBackupFact, ...]:
+    """Freeze all historical and active review facts through data-quality policy."""
+    rules = store.load_plausibility_rule_versions()
+    return tuple(
+        ReviewBackupFact(
+            snapshot_id=snapshot.snapshot_id,
+            review_case_id=case.review_case_id,
+            case_kind=case.kind,
+            logical_measurement_id=case.logical_measurement_id,
+            measurement_version_id=case.measurement_version_id,
+            rule_version_id=case.rule_version_id,
+            evidence_fingerprint=case.evidence_fingerprint,
+            source_type=detail.source_type,
+            measured_at_utc=detail.measured_at,
+            effective_value=detail.effective_value,
+            effective_value_source=detail.effective_value_source,
+            canonical_unit=detail.canonical_unit,
+            reasons=detail.reasons,
+        )
+        for snapshot in store.load_review_snapshot_facts()
+        for case in sorted(snapshot.cases, key=lambda item: item.review_case_id)
+        for detail in (
+            _snapshot_review_detail(
+                store, case, snapshot.versions, snapshot.measurements, rules
+            ),
+        )
+    )
+
+
 __all__ = [
+    "ReviewBackupFact",
     "ReviewCaseDetail",
     "ReviewReason",
+    "load_review_backup_facts",
     "load_review_case_detail",
     "load_review_state",
     "resolve_sources",

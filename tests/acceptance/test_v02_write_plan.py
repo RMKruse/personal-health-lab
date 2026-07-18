@@ -96,6 +96,25 @@ REGISTERED_CASES.update(
 )
 REGISTERED_CASES.update(
     {
+        "V02-A-BAK-001": "test_metadata_backup_is_one_redacted_portable_sqlite_file",
+        "V02-A-BAK-002": "test_metadata_backup_is_one_redacted_portable_sqlite_file",
+        "V02-A-BAK-003": "test_metadata_backup_is_one_redacted_portable_sqlite_file",
+        "V02-A-BAK-004": (
+            "test_metadata_backup_hash_survives_vacuum_and_same_target_is_no_op"
+        ),
+        "V02-A-BAK-005": "test_metadata_backup_is_one_redacted_portable_sqlite_file",
+        "V02-A-BAK-006": (
+            "test_metadata_backup_hash_survives_vacuum_and_same_target_is_no_op"
+        ),
+        "V02-A-BAK-007": "test_metadata_backup_conflict_blocks_without_overwriting",
+        "V02-A-BAK-008": "test_metadata_backup_is_real_only",
+        "V02-A-BAK-009": "test_metadata_backup_capacity_is_rechecked_under_the_writer_lock",
+        "V02-A-BAK-010": "test_cli_maps_metadata_backup_without_exposing_its_path",
+        "V02-A-PRE-021": "test_metadata_backup_v1_measures_populated_writer_phases",
+    }
+)
+REGISTERED_CASES.update(
+    {
         "V02-A-RES-001": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
         "V02-A-RES-002": "test_incomplete_analysis_creates_no_result_or_maturity",
         "V02-A-RES-003": "test_incomplete_analysis_creates_no_result_or_maturity",

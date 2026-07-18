@@ -2491,3 +2491,168 @@ level = "adapter"
 expected_result = "both adapters separate current and historical status axes"
 expected_effect = "shared application values"
 forbidden_side_effects = ["adapter domain logic", "historical current fallback"]
+
+[[contract]]
+id = "V02-C-BAK-001"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Metadata backup is a complete point-in-time audit overlay and not a data backup."
+evidence = ["positive", "negative"]
+
+[[contract]]
+id = "V02-C-BAK-002"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "One portable SQLite file is atomically published with a layout-independent hash."
+evidence = ["positive", "transition"]
+
+[[contract]]
+id = "V02-C-BAK-003"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Backup identity, canonical content, audit order, and references are hard integrity gates."
+evidence = ["positive", "negative"]
+
+[[contract]]
+id = "V02-C-BAK-004"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Manual metadata backup is real-only and protects the actual target without path disclosure."
+evidence = ["positive", "negative", "transition"]
+
+[[fixture]]
+id = "V02-F-DOM-METADATA-BACKUP-V1"
+kind = "domain"
+generator = "metadata-backup-v1"
+seed = 49
+parameters = "empty and populated real stores; SQLite page layouts; target volume and capacity transitions"
+platform = "all"
+sha256 = "db913dfdb284ff2c6d36336fb504dae4c891377ec96a2021d4bc18468fd04dfe"
+
+[[case]]
+id = "V02-A-BAK-001"
+contracts = ["V02-C-BAK-001"]
+fixtures = ["V02-F-DOM-METADATA-BACKUP-V1"]
+runner = "test_metadata_backup_is_one_redacted_portable_sqlite_file"
+initial_state = "real store with metadata overlay"
+operation = "create metadata backup"
+level = "application"
+expected_result = "closed positive-list audit overlay"
+expected_effect = "portable metadata file"
+forbidden_side_effects = ["measurement payload", "snapshot", "analysis"]
+
+[[case]]
+id = "V02-A-BAK-002"
+contracts = ["V02-C-BAK-001"]
+fixtures = ["V02-F-DOM-METADATA-BACKUP-V1"]
+runner = "test_metadata_backup_is_one_redacted_portable_sqlite_file"
+initial_state = "real store with operational artifacts"
+operation = "inspect backup tables"
+level = "storage"
+expected_result = "no exports, payloads, active pointers, caches, paths, or secrets"
+expected_effect = "none"
+forbidden_side_effects = ["data backup"]
+
+[[case]]
+id = "V02-A-BAK-003"
+contracts = ["V02-C-BAK-002"]
+fixtures = ["V02-F-DOM-METADATA-BACKUP-V1"]
+runner = "test_metadata_backup_is_one_redacted_portable_sqlite_file"
+initial_state = "valid real store"
+operation = "create metadata backup"
+level = "application"
+expected_result = "manifest with backup, schema, store, audit, mapping, and hash identity"
+expected_effect = "one portable SQLite file"
+forbidden_side_effects = ["directory archive"]
+
+[[case]]
+id = "V02-A-BAK-004"
+contracts = ["V02-C-BAK-002"]
+fixtures = ["V02-F-DOM-METADATA-BACKUP-V1"]
+runner = "test_metadata_backup_hash_survives_vacuum_and_same_target_is_no_op"
+initial_state = "valid backup"
+operation = "VACUUM and reopen"
+level = "storage"
+expected_result = "unchanged canonical content hash"
+expected_effect = "none"
+forbidden_side_effects = ["page-layout identity"]
+
+[[case]]
+id = "V02-A-BAK-005"
+contracts = ["V02-C-BAK-002"]
+fixtures = ["V02-F-DOM-METADATA-BACKUP-V1"]
+runner = "test_metadata_backup_is_one_redacted_portable_sqlite_file"
+initial_state = "empty target directory"
+operation = "publish backup"
+level = "storage"
+expected_result = "temporary file renamed on target volume"
+expected_effect = "exactly one final file"
+forbidden_side_effects = ["second full spool", "partial final file"]
+
+[[case]]
+id = "V02-A-BAK-006"
+contracts = ["V02-C-BAK-003"]
+fixtures = ["V02-F-DOM-METADATA-BACKUP-V1"]
+runner = "test_metadata_backup_hash_survives_vacuum_and_same_target_is_no_op"
+initial_state = "same backup ID and canonical hash at target"
+operation = "repeat backup"
+level = "application"
+expected_result = "no_op"
+expected_effect = "none"
+forbidden_side_effects = ["overwrite"]
+
+[[case]]
+id = "V02-A-BAK-007"
+contracts = ["V02-C-BAK-003"]
+fixtures = ["V02-F-DOM-METADATA-BACKUP-V1"]
+runner = "test_metadata_backup_conflict_blocks_without_overwriting"
+initial_state = "same target with conflicting manifest content"
+operation = "repeat backup"
+level = "application"
+expected_result = "blocked integrity conflict"
+expected_effect = "none"
+forbidden_side_effects = ["overwrite", "partial output"]
+
+[[case]]
+id = "V02-A-BAK-008"
+contracts = ["V02-C-BAK-004"]
+fixtures = ["V02-F-DOM-METADATA-BACKUP-V1"]
+runner = "test_metadata_backup_is_real_only"
+initial_state = "synthetic store"
+operation = "preview metadata backup"
+level = "application"
+expected_result = "blocked real_store_required"
+expected_effect = "none"
+forbidden_side_effects = ["backup file", "FileVault probe"]
+
+[[case]]
+id = "V02-A-BAK-009"
+contracts = ["V02-C-BAK-004", "V02-C-PRE-004", "V02-C-PRE-005"]
+fixtures = ["V02-F-DOM-METADATA-BACKUP-V1"]
+runner = "test_metadata_backup_capacity_is_rechecked_under_the_writer_lock"
+initial_state = "ready target becomes insufficient"
+operation = "execute confirmed backup"
+level = "application"
+expected_result = "blocked final target preflight"
+expected_effect = "none"
+forbidden_side_effects = ["backup file"]
+
+[[case]]
+id = "V02-A-BAK-010"
+contracts = ["V02-C-BAK-004"]
+fixtures = ["V02-F-DOM-METADATA-BACKUP-V1"]
+runner = "test_cli_maps_metadata_backup_without_exposing_its_path"
+initial_state = "real backup plan and receipt"
+operation = "render through CLI and Streamlit"
+level = "adapter"
+expected_result = "redacted target and no health values"
+expected_effect = "shared application values"
+forbidden_side_effects = ["unredacted path", "health value"]
+
+[[case]]
+id = "V02-A-PRE-021"
+contracts = ["V02-C-PRE-006"]
+fixtures = ["V02-F-DOM-METADATA-BACKUP-V1"]
+runner = "test_metadata_backup_v1_measures_populated_writer_phases"
+initial_state = "metadata overlay and target filesystem"
+operation = "estimate peak live allocation"
+level = "storage"
+expected_result = "metadata-backup/v1 conservative target-volume bound"
+expected_effect = "none"
+forbidden_side_effects = ["second full spool", "base allocation counted as new"]

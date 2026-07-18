@@ -42,6 +42,13 @@ from personal_health_lab.health_import import (
     import_health_export,
 )
 from personal_health_lab.overview import Overview, OverviewReader, OverviewSelection
+from personal_health_lab.recovery import (
+    BackupId,
+    MetadataBackupStatus,
+    create_metadata_backup,
+    describe_metadata_backup,
+    preflight_metadata_backup,
+)
 from personal_health_lab.resting_hr_analysis import (
     AnalysisDefinitionId,
     AnalysisError,
@@ -94,6 +101,18 @@ class WorkspaceState(StrEnum):
     MIGRATION_REQUIRED = "migration_required"
 
 
+_READY_WRITES = (
+    "import_health_export",
+    "resolve_data_review_case",
+    "confirm_data_review_batch",
+    "revoke_data_review_decision",
+    "create_plausibility_rule_version",
+    "run_historical_review",
+    "run_resting_heart_rate_analysis",
+    "create_metadata_backup",
+)
+
+
 @dataclass(frozen=True, slots=True)
 class WorkspaceStatus:
     mode: DataMode
@@ -107,15 +126,7 @@ class WorkspaceStatus:
         "data_review_case",
         "plausibility_rules",
     )
-    allowed_writes: tuple[str, ...] = (
-        "import_health_export",
-        "resolve_data_review_case",
-        "confirm_data_review_batch",
-        "revoke_data_review_decision",
-        "create_plausibility_rule_version",
-        "run_historical_review",
-        "run_resting_heart_rate_analysis",
-    )
+    allowed_writes: tuple[str, ...] = _READY_WRITES
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +204,16 @@ class ImportHealthExport:
         if not isinstance(self.package_path, Path):
             raise ConfigurationError("Health-Exportpfad muss ein pathlib.Path-Wert sein.")
         object.__setattr__(self, "package_path", self.package_path.expanduser().resolve())
+
+
+@dataclass(frozen=True, slots=True)
+class CreateMetadataBackup:
+    target_path: Path
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.target_path, Path):
+            raise ConfigurationError("Sicherungsziel muss ein pathlib.Path-Wert sein.")
+        object.__setattr__(self, "target_path", self.target_path.expanduser().resolve())
 
 
 @dataclass(frozen=True, slots=True)
@@ -454,6 +475,7 @@ class RevokeDataReviewDecision:
 
 WriteRequest = (
     ImportHealthExport
+    | CreateMetadataBackup
     | ResolveDataReviewCase
     | ConfirmDataReviewBatch
     | RevokeDataReviewDecision
@@ -475,6 +497,7 @@ class WriteConfirmation(StrEnum):
     FILEVAULT_TRANSITIONING = "filevault_transitioning"
     FILEVAULT_UNKNOWN = "filevault_unknown"
     LEGACY_STORE_MIGRATION = "legacy_store_migration"
+    METADATA_BACKUP_POINT_IN_TIME = "metadata_backup_point_in_time"
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,6 +511,14 @@ class ImportHealthExportPlan:
     package_size: int
     input_bytes: int = 0
     record_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class MetadataBackupPlan:
+    backup_id: BackupId
+    canonical_content_sha256: str
+    audit_max_position: int
+    target_file: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -565,6 +596,7 @@ class RestingHeartRateAnalysisPlan:
 
 WritePlanDetails = (
     ImportHealthExportPlan
+    | MetadataBackupPlan
     | DataReviewDecisionPlan
     | DataReviewBatchPlan
     | DataReviewBatchRevokePlan
@@ -615,6 +647,18 @@ class ImportReceipt:
     logical_measurement_count: int = 0
     measurement_version_count: int = 0
     source_occurrence_count: int = 0
+    diagnostics: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MetadataBackupReceipt:
+    operation_id: OperationId
+    backup_id: BackupId
+    canonical_content_sha256: str
+    audit_max_position: int
+    created_at_utc: datetime
+    target_file: str
+    status: MetadataBackupStatus
     diagnostics: tuple[str, ...] = ()
 
 
@@ -817,6 +861,7 @@ class AnalysisReceipt:
 
 WriteResult = (
     ImportReceipt
+    | MetadataBackupReceipt
     | WriteDecisionReceipt
     | WriteBatchDecisionReceipt
     | PlausibilityRuleVersionReceipt
@@ -877,6 +922,8 @@ class HealthLab:
 
     def preview_write(self, request: WriteRequest) -> WritePlan:
         self._require_open()
+        if isinstance(request, CreateMetadataBackup):
+            return self._build_metadata_backup_plan(request)
         if isinstance(request, RunRestingHeartRateAnalysis):
             return self._build_resting_heart_rate_analysis_plan(request)
         if isinstance(request, RunHistoricalReview):
@@ -891,6 +938,95 @@ class HealthLab:
             else None
         )
         return self._build_import_plan(request, filevault)
+
+    def _build_metadata_backup_plan(
+        self,
+        request: CreateMetadataBackup,
+        *,
+        filevault_override: FileVaultCheck | None = None,
+        capacity_override: CapacityCheck | None = None,
+    ) -> WritePlan:
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        if self._config.mode is not DataMode.REAL:
+            details = MetadataBackupPlan(BackupId("0" * 32), "0" * 64, 0, request.target_path.name)
+            payload = {"operation": "create_metadata_backup", "mode": "synthetic", "version": 1}
+            return WritePlan(
+                PlanFingerprint(
+                    hashlib.sha256(
+                        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest()
+                ),
+                details,
+                WritePreflight(
+                    WriteApproval(WriteApprovalStatus.BLOCKED),
+                    diagnostics=("real_store_required",),
+                ),
+            )
+        try:
+            description = describe_metadata_backup(self._store, request.target_path)
+            filevault = filevault_override or probe_filevault(request.target_path.parent)
+            capacity = capacity_override or preflight_metadata_backup(
+                self._store,
+                request.target_path
+            )
+        except StoreError as error:
+            raise HealthLabError("Metadatensicherung konnte nicht geplant werden.") from error
+        confirmations = [WriteConfirmation.METADATA_BACKUP_POINT_IN_TIME]
+        if filevault.status is not FileVaultStatus.PROTECTED:
+            confirmations.append(WriteConfirmation("filevault_" + filevault.status.value))
+        diagnostics = (
+            ()
+            if capacity.status is CapacityStatus.READY
+            else (
+                "capacity_"
+                + (capacity.reason.value if capacity.reason else capacity.status.value),
+            )
+        )
+        blocked = capacity.status is not CapacityStatus.READY
+        payload = {
+            "audit_max_position": description.audit_max_position,
+            "backup_id": str(description.backup_id),
+            "canonical_content_sha256": description.canonical_content_sha256,
+            "capacity": {
+                "estimate": capacity.estimate_bytes,
+                "fragment": capacity.fragment_size,
+                "status": capacity.status.value,
+                "target_volume": capacity.target_volume,
+            },
+            "filevault": {
+                "reason": None if filevault.reason is None else filevault.reason.value,
+                "status": filevault.status.value,
+                "target_volume": filevault.target_volume,
+            },
+            "operation": "create_metadata_backup",
+            "target_file": request.target_path.name,
+            "version": 1,
+        }
+        return WritePlan(
+            PlanFingerprint(
+                hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+            ),
+            MetadataBackupPlan(
+                description.backup_id,
+                description.canonical_content_sha256,
+                description.audit_max_position,
+                description.target_file,
+            ),
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED
+                    if blocked
+                    else WriteApprovalStatus.CONFIRMATION_REQUIRED
+                ),
+                tuple(confirmations),
+                filevault,
+                diagnostics,
+                capacity,
+            ),
+        )
 
     def _build_resting_heart_rate_analysis_plan(
         self, request: RunRestingHeartRateAnalysis
@@ -1381,6 +1517,37 @@ class HealthLab:
     ) -> WritePlan | None:
         if current_plan.fingerprint == expected_plan:
             return current_plan
+        if isinstance(request, CreateMetadataBackup):
+            filevault = current_plan.preflight.filevault
+            capacity = current_plan.preflight.capacity
+            if (
+                filevault is None
+                or filevault.status is not FileVaultStatus.PROTECTED
+                or capacity is None
+            ):
+                return None
+            candidates = [
+                self._build_metadata_backup_plan(
+                    request,
+                    filevault_override=FileVaultCheck(status, filevault.target_volume),
+                    capacity_override=capacity,
+                )
+                for status in (FileVaultStatus.UNPROTECTED, FileVaultStatus.TRANSITIONING)
+            ]
+            candidates.extend(
+                self._build_metadata_backup_plan(
+                    request,
+                    filevault_override=FileVaultCheck(
+                        FileVaultStatus.UNKNOWN, filevault.target_volume, reason
+                    ),
+                    capacity_override=capacity,
+                )
+                for reason in FileVaultReason
+            )
+            return next(
+                (candidate for candidate in candidates if candidate.fingerprint == expected_plan),
+                None,
+            )
         if not isinstance(request, ImportHealthExport):
             return None
         if not isinstance(current_plan.details, ImportHealthExportPlan):
@@ -1458,6 +1625,8 @@ class HealthLab:
                 current_plan.diagnostics,
                 expected_plan,
             )
+        if isinstance(request, CreateMetadataBackup):
+            return self._execute_metadata_backup(request, authorization_plan, expected_plan)
         if isinstance(request, CreatePlausibilityRuleVersion):
             return self._execute_plausibility_rule_write(request, authorization_plan, expected_plan)
         if isinstance(request, RunHistoricalReview):
@@ -1611,6 +1780,103 @@ class HealthLab:
             result=import_result,
             final_preflight=final_preflight,
             diagnostics=result.diagnostics,
+        )
+
+    def _execute_metadata_backup(
+        self,
+        request: CreateMetadataBackup,
+        plan: WritePlan,
+        expected_plan: PlanFingerprint,
+    ) -> WriteReceipt:
+        if not isinstance(plan.details, MetadataBackupPlan):
+            return self._not_started(
+                plan,
+                WriteNotStartedStatus.PLAN_CHANGED,
+                ("plan_changed",),
+                expected_plan,
+            )
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        try:
+            final_filevault = probe_filevault(request.target_path.parent)
+            expected_filevault = plan.preflight.filevault
+            if expected_filevault is None or not self._filevault_allows_execution(
+                expected_filevault, final_filevault
+            ):
+                return self._not_started_with_preflight(
+                    plan,
+                    WriteNotStartedStatus.PLAN_CHANGED,
+                    ("plan_changed",),
+                    expected_plan,
+                    filevault=final_filevault,
+                )
+            final_capacity = preflight_metadata_backup(writer, request.target_path)
+            if final_capacity.status is not CapacityStatus.READY:
+                diagnostic = "capacity_" + (
+                    final_capacity.reason.value
+                    if final_capacity.reason is not None
+                    else final_capacity.status.value
+                )
+                return self._not_started_with_preflight(
+                    plan,
+                    WriteNotStartedStatus.BLOCKED,
+                    (diagnostic,),
+                    expected_plan,
+                    filevault=final_filevault,
+                    capacity=final_capacity,
+                )
+            current = describe_metadata_backup(writer, request.target_path)
+            if (
+                current.backup_id != plan.details.backup_id
+                or current.canonical_content_sha256
+                != plan.details.canonical_content_sha256
+                or current.audit_max_position != plan.details.audit_max_position
+            ):
+                return self._not_started_with_preflight(
+                    plan,
+                    WriteNotStartedStatus.PLAN_CHANGED,
+                    ("plan_changed",),
+                    expected_plan,
+                    filevault=final_filevault,
+                    capacity=final_capacity,
+                )
+            result = create_metadata_backup(writer, request.target_path)
+        except StoreError:
+            return self._not_started(
+                plan,
+                WriteNotStartedStatus.BLOCKED,
+                ("backup_integrity_conflict",),
+                expected_plan,
+            )
+        except OSError as error:
+            raise HealthLabError("Metadatensicherung konnte nicht geschrieben werden.") from error
+        finally:
+            writer.close()
+        operation_id = OperationId(uuid4().hex)
+        backup_receipt = MetadataBackupReceipt(
+            operation_id,
+            result.backup_id,
+            result.canonical_content_sha256,
+            result.audit_max_position,
+            result.created_at_utc,
+            result.target_file,
+            result.status,
+        )
+        return WriteReceipt(
+            operation_id,
+            expected_plan,
+            backup_receipt,
+            WritePreflight(
+                plan.approval,
+                plan.confirmations,
+                final_filevault,
+                (),
+                final_capacity,
+            ),
         )
 
     def _execute_plausibility_rule_write(
@@ -2242,6 +2508,11 @@ class HealthLab:
                 WorkspaceState.READY
                 if identity.store_id is not None and identity.is_current
                 else WorkspaceState.MIGRATION_REQUIRED
+            ),
+            allowed_writes=(
+                _READY_WRITES
+                if identity.mode is DataMode.REAL
+                else tuple(item for item in _READY_WRITES if item != "create_metadata_backup")
             ),
         )
 

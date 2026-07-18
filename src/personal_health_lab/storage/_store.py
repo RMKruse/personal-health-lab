@@ -257,8 +257,12 @@ def _publication_fault_point(root: Path, fault_point_id: str) -> None:
     """Private test seam for durable import-publication transitions."""
 
 
-def probe_capacity(path: Path, estimate_bytes: int | None) -> CapacityCheck:
-    method_id = _FULL_SNAPSHOT_IMPORT_METHOD
+def probe_capacity(
+    path: Path,
+    estimate_bytes: int | None,
+    *,
+    method_id: str = _FULL_SNAPSHOT_IMPORT_METHOD,
+) -> CapacityCheck:
     minimum_remaining = _GIB
     try:
         stats = os.statvfs(path)
@@ -870,6 +874,33 @@ class ProvenanceCounts:
     quarantined_import_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class BackupImportFact:
+    import_id: ImportId
+    operation_id: OperationId
+    status: str
+    snapshot_id: SnapshotId
+    record_count: int
+    committed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class BackupSnapshotFact:
+    snapshot_id: SnapshotId
+    schema_version: int
+    created_by_operation_id: OperationId
+    parent_snapshot_id: SnapshotId | None
+    created_at_utc: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewSnapshotFacts:
+    snapshot_id: SnapshotId
+    cases: tuple[OpenDataReviewCase, ...]
+    versions: tuple[MeasurementVersionFact, ...]
+    measurements: tuple[ResolvedMeasurement, ...]
+
+
 def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
     metadata.executescript(
         """
@@ -1323,6 +1354,147 @@ class LocalStore:
     _writer_lock: IO[bytes] | None = None
     _scratch_bound: bool = True
     _closed: bool = False
+
+    def copy_metadata_tables(
+        self, destination: sqlite3.Connection, table_names: tuple[str, ...]
+    ) -> None:
+        """Copy an explicit recovery-owned positive list into a portable database."""
+        self._require_open()
+        for table in table_names:
+            if not table.isidentifier():
+                raise ValueError("Metadatentabellenname ist ungültig.")
+            columns = tuple(self._metadata.execute(f'PRAGMA table_info("{table}")'))
+            declaration = ", ".join(
+                f'"{column[1]!s}" {str(column[2]) or "BLOB"}' for column in columns
+            )
+            destination.execute(f'CREATE TABLE "{table}" ({declaration}) STRICT')
+            rows = self._metadata.execute(f'SELECT * FROM "{table}"').fetchall()
+            if rows:
+                placeholders = ", ".join("?" for _ in columns)
+                destination.executemany(
+                    f'INSERT INTO "{table}" VALUES ({placeholders})', rows
+                )
+
+    def validate_recovery_writer(self) -> StoreIdentity:
+        self._require_open()
+        self._require_writer()
+        self._validate_store()
+        return self.load_identity()
+
+    def load_backup_audit_position(self) -> int:
+        self._require_open()
+        return int(
+            self._metadata.execute(
+                "SELECT COALESCE(MAX(audit_position), 0) FROM audit_events"
+            ).fetchone()[0]
+        )
+
+    def load_backup_import_facts(self) -> tuple[BackupImportFact, ...]:
+        self._require_open()
+        return tuple(
+            BackupImportFact(
+                ImportId(str(row[0])),
+                OperationId(str(row[1])),
+                str(row[2]),
+                SnapshotId(str(row[3])),
+                int(row[4]),
+                datetime.fromisoformat(str(row[5])),
+            )
+            for row in self._metadata.execute(
+                "SELECT import_id, operation_id, status, snapshot_id, record_count, "
+                "committed_at FROM imports "
+                "WHERE status IN ('committed', 'duplicate', 'quarantined') "
+                "ORDER BY import_id"
+            )
+        )
+
+    def load_backup_snapshot_facts(self) -> tuple[BackupSnapshotFact, ...]:
+        self._require_open()
+        return tuple(
+            BackupSnapshotFact(
+                SnapshotId(str(row[0])),
+                int(row[1]),
+                OperationId(str(row[2])),
+                None if row[3] is None else SnapshotId(str(row[3])),
+                datetime.fromisoformat(str(row[4])),
+            )
+            for row in self._metadata.execute(
+                "SELECT snapshot_id, snapshot_schema_version, created_by_operation_id, "
+                "parent_snapshot_id, created_at_utc FROM dataset_snapshots "
+                "ORDER BY snapshot_id"
+            )
+        )
+
+    def load_review_snapshot_facts(self) -> tuple[ReviewSnapshotFacts, ...]:
+        self._require_open()
+        snapshots = []
+        for snapshot in self.load_backup_snapshot_facts():
+            directory = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot.snapshot_id)
+            paths = {
+                name: str(directory / name).replace("'", "''")
+                for name in (
+                    "open_review_cases.parquet",
+                    "measurement_versions.parquet",
+                    "resolved_measurements.parquet",
+                )
+            }
+            cases = tuple(
+                OpenDataReviewCase(
+                    str(row[0]),
+                    cast(
+                        Literal[
+                            "plausibility",
+                            "continued_override",
+                            "suspected_source_deletion",
+                            "source_conflict",
+                            "rule_definition",
+                        ],
+                        str(row[1]),
+                    ),
+                    None if row[2] is None else LogicalMeasurementId(str(row[2])),
+                    None if row[3] is None else MeasurementVersionId(str(row[3])),
+                    None if row[4] is None else str(row[4]),
+                    str(row[5]),
+                )
+                for row in self._query.execute(
+                    "SELECT * FROM read_parquet"
+                    f"('{paths['open_review_cases.parquet']}')"
+                ).fetchall()
+            )
+            versions = tuple(
+                MeasurementVersionFact(
+                    measurement_version_id=str(row[0]),
+                    logical_measurement_id=str(row[1]),
+                    canonical_type=str(row[2]),
+                    canonical_unit=str(row[3]),
+                    canonical_value=float(row[4]),
+                    source_start_utc=str(row[5]),
+                    source_end_utc=str(row[6]),
+                    source_updated_at_utc=str(row[7]),
+                    source_version=str(row[8]),
+                    source_name=str(row[9]),
+                    device=str(row[10]),
+                    strong_source_id_hash=None if row[11] is None else str(row[11]),
+                    measurement_local_date=row[12],
+                )
+                for row in self._query.execute(
+                    "SELECT measurement_version_id, identity_candidate_id, canonical_type, "
+                    "canonical_unit, canonical_value, source_start_utc, source_end_utc, "
+                    "source_updated_at_utc, source_version, source_name, device, "
+                    "strong_source_id_hash, measurement_local_date FROM read_parquet"
+                    f"('{paths['measurement_versions.parquet']}')"
+                ).fetchall()
+            )
+            measurements = tuple(
+                ResolvedMeasurement(*row)
+                for row in self._query.execute(
+                    f"SELECT * FROM read_parquet('{paths['resolved_measurements.parquet']}')"
+                ).fetchall()
+            )
+            snapshots.append(
+                ReviewSnapshotFacts(snapshot.snapshot_id, cases, versions, measurements)
+            )
+        return tuple(snapshots)
 
     def preflight_full_snapshot_import(
         self,

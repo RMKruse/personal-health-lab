@@ -61,6 +61,33 @@ def test_streamlit_translates_invalid_configuration(
     )
 
 
+def test_streamlit_plans_and_executes_metadata_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "private" / "metadata.sqlite3"
+    target.parent.mkdir()
+    monkeypatch.setenv("HEALTHLAB_MODE", "real")
+    monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(tmp_path / "synthetic"))
+    monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(tmp_path / "real"))
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
+    app = AppTest.from_file(str(app_path)).run()
+
+    next(
+        item for item in app.text_input if item.label == "Zieldatei für Metadatensicherung"
+    ).set_value(str(target))
+    next(button for button in app.button if button.label == "Metadatensicherung prüfen").click()
+    app.run()
+
+    assert not app.exception
+    assert any("Audit-Höchststand: 0" in item.value for item in app.caption)
+    assert all(str(tmp_path) not in item.value for item in app.caption)
+    next(button for button in app.button if button.label == "Metadatensicherung ausführen").click()
+    app.run()
+
+    assert target.is_file()
+    assert any("Metadatensicherung: completed" in item.value for item in app.success)
+
+
 def test_streamlit_projects_plausibility_rules(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

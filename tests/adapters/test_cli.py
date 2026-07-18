@@ -91,6 +91,39 @@ def _execute_json_analysis(
     return exit_code, receipt
 
 
+def test_cli_maps_metadata_backup_without_exposing_its_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    common = [
+        "--mode",
+        "real",
+        "--synthetic-store",
+        str(tmp_path / "synthetic"),
+        "--real-store",
+        str(tmp_path / "real"),
+    ]
+    target = tmp_path / "private" / "metadata.sqlite3"
+    target.parent.mkdir()
+    with HealthLab.open(
+        RuntimeConfig(DataMode.REAL, tmp_path / "synthetic", tmp_path / "real")
+    ):
+        pass
+    args = [*common, "backup", str(target), "--json"]
+    assert main(args) == 0
+    plan_text = capsys.readouterr().out
+    plan = json.loads(plan_text)
+    assert plan["details"]["type"] == "create_metadata_backup"
+    assert plan["request"]["target"] == "<redacted>"
+    assert str(tmp_path) not in plan_text
+
+    assert main([*args, "--execute", "--expect-plan", plan["fingerprint"]]) == 0
+    receipt_text = capsys.readouterr().out
+    receipt = json.loads(receipt_text)
+    assert receipt["result"]["status"] == "completed"
+    assert receipt["result"]["target_file"] == "metadata.sqlite3"
+    assert str(tmp_path) not in receipt_text
+
+
 def test_cli_projects_source_conflicts_from_the_shared_data_review(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -449,6 +482,7 @@ def test_real_json_import_renders_shared_confirmation_plan(
             "create_plausibility_rule_version",
             "run_historical_review",
             "run_resting_heart_rate_analysis",
+            "create_metadata_backup",
         ]
 
 

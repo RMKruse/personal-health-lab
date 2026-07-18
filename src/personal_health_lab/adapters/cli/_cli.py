@@ -22,6 +22,7 @@ from personal_health_lab.application import (
     CapacityCheck,
     ConfigurationError,
     ConfirmDataReviewBatch,
+    CreateMetadataBackup,
     CreatePlausibilityRuleVersion,
     DataConfirmation,
     DataCorrection,
@@ -46,6 +47,8 @@ from personal_health_lab.application import (
     ImportStatus,
     LocalMeasurementExclusion,
     MeasurementVersionId,
+    MetadataBackupPlan,
+    MetadataBackupReceipt,
     OverviewSelection,
     PlanFingerprint,
     PlausibilityRules,
@@ -167,6 +170,11 @@ def _parser() -> argparse.ArgumentParser:
     revoke.add_argument("--json", action="store_true", dest="as_json")
     revoke.add_argument("--execute", action="store_true")
     revoke.add_argument("--expect-plan", type=PlanFingerprint)
+    backup = commands.add_parser("backup", help="Metadaten punktgenau sichern")
+    backup.add_argument("target", type=Path)
+    backup.add_argument("--json", action="store_true", dest="as_json")
+    backup.add_argument("--execute", action="store_true")
+    backup.add_argument("--expect-plan", type=PlanFingerprint)
     return parser
 
 
@@ -450,6 +458,15 @@ def _write_plan_json(
             "package": "<redacted>",
             "type": "import_health_export",
         }
+    elif isinstance(details, MetadataBackupPlan):
+        detail_json = {
+            "audit_max_position": details.audit_max_position,
+            "backup_id": str(details.backup_id),
+            "canonical_content_sha256": details.canonical_content_sha256,
+            "target_file": details.target_file,
+            "type": "create_metadata_backup",
+        }
+        request_json = {"target": "<redacted>", "type": "create_metadata_backup"}
     elif isinstance(details, PlausibilityRuleVersionPlan):
         detail_json = {
             "active_snapshot_ref": (
@@ -574,6 +591,17 @@ def _write_receipt_json(
             "status": result.status.value,
             "type": "import_health_export",
         }
+    elif isinstance(result, MetadataBackupReceipt):
+        result_json = {
+            "audit_max_position": result.audit_max_position,
+            "backup_id": str(result.backup_id),
+            "canonical_content_sha256": result.canonical_content_sha256,
+            "created_at_utc": result.created_at_utc.isoformat(),
+            "diagnostics": result.diagnostics,
+            "status": result.status.value,
+            "target_file": result.target_file,
+            "type": "create_metadata_backup",
+        }
     elif isinstance(result, PlausibilityRuleVersionReceipt):
         result_json = {
             "diagnostics": result.diagnostics,
@@ -685,6 +713,7 @@ def main(args: Sequence[str] | None = None) -> int:
     parsed = parser.parse_args(args)
     write_commands = {
         "analyze",
+        "backup",
         "historical-review",
         "import",
         "rule",
@@ -757,6 +786,25 @@ def main(args: Sequence[str] | None = None) -> int:
                         import_write_receipt = health_lab.execute_write(
                             import_request,
                             expected_plan=import_plan.fingerprint,
+                        )
+            elif parsed.command == "backup":
+                backup_request = CreateMetadataBackup(parsed.target)
+                backup_plan = health_lab.preview_write(backup_request)
+                backup_write_receipt = None
+                if parsed.execute:
+                    assert parsed.expect_plan is not None
+                    backup_write_receipt = health_lab.execute_write(
+                        backup_request, expected_plan=parsed.expect_plan
+                    )
+                elif not parsed.as_json:
+                    _print_write_plan(backup_plan, workspace_status)
+                    if (
+                        backup_plan.approval.status is not WriteApprovalStatus.BLOCKED
+                        and input("Metadatensicherung schreiben? [j/N] ").strip().lower()
+                        in {"j", "ja"}
+                    ):
+                        backup_write_receipt = health_lab.execute_write(
+                            backup_request, expected_plan=backup_plan.fingerprint
                         )
             elif parsed.command == "rule":
                 rule_request = CreatePlausibilityRuleVersion(
@@ -979,7 +1027,20 @@ def main(args: Sequence[str] | None = None) -> int:
     }
     if not parsed.as_json:
         print("Konfiguration: " + json.dumps(runtime_config, ensure_ascii=False, sort_keys=True))
-    if parsed.command == "analyze" and parsed.as_json:
+    if parsed.command == "backup" and parsed.as_json:
+        output = (
+            _write_plan_json(backup_plan, runtime_config, workspace_status)
+            if backup_write_receipt is None
+            else _write_receipt_json(backup_write_receipt, runtime_config)
+        )
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+    elif parsed.command == "backup":
+        if backup_write_receipt is None:
+            _print_write_plan(backup_plan, workspace_status)
+            print("Metadatensicherung nicht ausgeführt.")
+        else:
+            print(f"Metadatensicherung: {backup_write_receipt.result.status.value}")
+    elif parsed.command == "analyze" and parsed.as_json:
         output = (
             _write_plan_json(analysis_plan, runtime_config, workspace_status)
             if analysis_write_receipt is None
@@ -1237,6 +1298,10 @@ def main(args: Sequence[str] | None = None) -> int:
                 f"{historical.completed_at.isoformat() if historical.completed_at else '-'}"
             )
     if parsed.command in write_commands:
+        if parsed.command == "backup":
+            if backup_write_receipt is None:
+                return 3 if backup_plan.approval.status is WriteApprovalStatus.BLOCKED else 0
+            return 3 if isinstance(backup_write_receipt.result, WriteNotStarted) else 0
         if parsed.command == "analyze":
             if analysis_write_receipt is None:
                 return 3 if analysis_plan.approval.status is WriteApprovalStatus.BLOCKED else 0
