@@ -997,11 +997,17 @@ class HealthLab:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
         diagnostics = self.load_migration_diagnostics()
         source = diagnostics.source_version
-        backup_file = (
-            None
-            if source is None or not diagnostics.steps
-            else f"metadata-v{source}-to-v{diagnostics.target_version}.sqlite3"
-        )
+        backup_file = None
+        if source is not None and diagnostics.steps:
+            stem = f"metadata-v{source}-to-v{diagnostics.target_version}"
+            backup_directory = self._config.active_store / "migration-backups"
+            sequence = 1
+            backup_file = f"{stem}.sqlite3"
+            while (backup_directory / backup_file).exists() or (
+                backup_directory / f"{backup_file}.tmp"
+            ).exists():
+                sequence += 1
+                backup_file = f"{stem}-{sequence}.sqlite3"
         filevault = (
             filevault_override
             if filevault_override is not None
@@ -1031,8 +1037,10 @@ class HealthLab:
                     capacity.reason.value if capacity.reason is not None else capacity.status.value
                 ),
             )
+        active_snapshot = self._store.load_active_snapshot_id()
+        affected_snapshot_refs = () if active_snapshot is None else (active_snapshot,)
         payload = {
-            "affected_snapshot_refs": (),
+            "affected_snapshot_refs": tuple(map(str, affected_snapshot_refs)),
             "backup_file": backup_file,
             "capacity": None
             if capacity is None
@@ -1053,7 +1061,7 @@ class HealthLab:
             "source_version": source,
             "steps": diagnostics.steps,
             "target_version": diagnostics.target_version,
-            "existing_analyses_become_stale": False,
+            "existing_analyses_become_stale": active_snapshot is not None,
             "version": 1,
         }
         return WritePlan(
@@ -1067,8 +1075,8 @@ class HealthLab:
                 diagnostics.target_version,
                 diagnostics.steps,
                 backup_file,
-                (),
-                False,
+                affected_snapshot_refs,
+                active_snapshot is not None,
             ),
             WritePreflight(
                 WriteApproval(
@@ -2006,12 +2014,17 @@ class HealthLab:
                     capacity=final_capacity,
                 )
             assert plan.details.backup_file is not None
-            writer.migrate_store_schema(plan.details.steps, plan.details.backup_file)
-        except StoreError:
+            writer.migrate_store_schema(
+                plan.details.steps, plan.details.backup_file, operation_id
+            )
+        except StoreError as error:
+            diagnostic = str(error)
+            if diagnostic not in {"migration_backup_failed", "migration_validation_failed"}:
+                diagnostic = "migration_failed"
             return self._not_started(
                 plan,
                 WriteNotStartedStatus.BLOCKED,
-                ("migration_backup_failed",),
+                (diagnostic,),
                 expected_plan,
             )
         finally:
@@ -2789,8 +2802,6 @@ class HealthLab:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
         raw_source = self._store.load_identity().schema_version
         target, steps, diagnostics = plan_store_migration(raw_source)
-        if steps and self._store.contains_health_data():
-            diagnostics += ("populated_store_requires_cow",)
         try:
             source = int(raw_source)
         except ValueError:

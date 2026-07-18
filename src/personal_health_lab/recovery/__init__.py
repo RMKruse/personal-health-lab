@@ -33,6 +33,7 @@ _METADATA_TABLES = (
     "historical_review_cycles",
     "audit_events",
     "import_publications",
+    "migration_publications",
     "data_review_decisions",
     "data_review_batch_actions",
     "data_review_batch_members",
@@ -104,10 +105,12 @@ def _audit_is_valid(connection: sqlite3.Connection, audit_max: int) -> bool:
         "count(import_publications.audit_event_id) "
         "+ count(data_review_decisions.audit_event_id) "
         "+ count(metadata_tombstones.audit_event_id) "
+        "+ count(migration_publications.audit_event_id) "
         "FROM audit_events "
         "LEFT JOIN import_publications USING (audit_event_id) "
         "LEFT JOIN data_review_decisions USING (audit_event_id) "
-        "LEFT JOIN metadata_tombstones USING (audit_event_id)"
+        "LEFT JOIN metadata_tombstones USING (audit_event_id) "
+        "LEFT JOIN migration_publications USING (audit_event_id)"
     ).fetchone()
     if audit is None or tuple(map(int, audit)) != (audit_max, 1, audit_max, audit_max):
         return False
@@ -126,6 +129,11 @@ def _audit_is_valid(connection: sqlite3.Connection, audit_max: int) -> bool:
         "LEFT JOIN snapshot_refs snapshot_ref "
         "ON snapshot_ref.snapshot_id = publication.snapshot_id "
         "WHERE import_ref.import_id IS NULL OR snapshot_ref.snapshot_id IS NULL "
+        "UNION ALL "
+        "SELECT 1 FROM migration_publications publication "
+        "LEFT JOIN snapshot_refs snapshot_ref "
+        "ON snapshot_ref.snapshot_id = publication.snapshot_id "
+        "WHERE publication.snapshot_id IS NOT NULL AND snapshot_ref.snapshot_id IS NULL "
         "UNION ALL "
         "SELECT 1 FROM review_cycle_cases cycle_case "
         "JOIN review_cycles cycle USING (cycle_id) "

@@ -105,6 +105,15 @@ REGISTERED_CASES.update(
         "V02-A-MIG-007": "test_registered_store_migration_chain_executes_as_one_operation",
         "V02-A-MIG-008": "test_migration_uses_one_backup_and_one_writer_lock",
         "V02-A-MIG-009": "test_failed_backup_or_capacity_preflight_prevents_migration_start",
+        "V02-A-MIG-010": "test_populated_store_is_migrated_copy_on_write",
+        "V02-A-MIG-011": "test_migration_makes_existing_analysis_stale",
+        "V02-A-MIG-012": "test_populated_store_is_migrated_copy_on_write",
+        "V02-A-MIG-013": "test_migration_validation_failure_prevents_activation",
+        "V02-A-MIG-014": "test_missing_cow_migration_bound_blocks_plan",
+        "V02-A-MIG-015": "test_migration_fault_keeps_old_snapshot_and_retry_starts_fresh",
+        "V02-A-MIG-016": "test_migration_fault_keeps_old_snapshot_and_retry_starts_fresh",
+        "V02-A-MIG-017": "test_migration_fault_keeps_old_snapshot_and_retry_starts_fresh",
+        "V02-A-PRE-025": "test_cow_migration_v1_bounds_normal_and_stress_fixtures",
     }
 )
 REGISTERED_CASES.update(

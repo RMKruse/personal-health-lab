@@ -53,8 +53,13 @@ def test_streamlit_focuses_migration_in_restricted_session(
 ) -> None:
     store = tmp_path / "migration-store"
     config = RuntimeConfig(DataMode.SYNTHETIC, store, tmp_path / "real")
-    with HealthLab.open(config):
-        pass
+    fixture = generate_export("null-v1", 42, tmp_path / "migration-fixture")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(fixture.export_path)
+        imported = health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+    snapshot_ref = str(imported.result.snapshot_ref)
     with sqlite3.connect(store / "metadata.sqlite3") as metadata:
         metadata.execute("UPDATE store_identity SET schema_version = 2 WHERE singleton = 1")
     monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
@@ -68,13 +73,15 @@ def test_streamlit_focuses_migration_in_restricted_session(
     assert any(item.value == "Datenspeichermigration" for item in app.subheader)
     assert any("Schema: 2 → 4" in item.value for item in app.caption)
     assert any("2 → 3, 3 → 4" in item.value for item in app.caption)
+    assert any(f"Betroffene Snapshots: {snapshot_ref}" in item.value for item in app.caption)
+    assert any("Bestehende Analysen werden stale: true" in item.value for item in app.caption)
     assert not app.file_uploader
     next(
         button for button in app.button if button.label == "Datenspeichermigration ausführen"
     ).click().run()
 
     assert not app.exception
-    assert any(item.value == "Status: empty" for item in app.markdown)
+    assert any(item.value == "Status: ready" for item in app.markdown)
 
 
 def test_streamlit_translates_invalid_configuration(

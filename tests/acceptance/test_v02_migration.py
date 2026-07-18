@@ -1,9 +1,14 @@
+import json
+import shutil
 import sqlite3
 from pathlib import Path
 
 import pytest
 
 from personal_health_lab.application import (
+    AnalysisDefinitionId,
+    AnalysisFreshness,
+    AnalysisReceipt,
     CapacityCheck,
     CapacityStatus,
     CreateMetadataBackup,
@@ -14,6 +19,7 @@ from personal_health_lab.application import (
     MigrateStore,
     MigrationStatus,
     OverviewSelection,
+    RunRestingHeartRateAnalysis,
     RuntimeConfig,
     StoreMigrationPlan,
     StoreMigrationReceipt,
@@ -22,7 +28,7 @@ from personal_health_lab.application import (
     WriteNotStarted,
     WriteNotStartedStatus,
 )
-from personal_health_lab.storage import LocalStore
+from personal_health_lab.storage import LocalStore, StoreError, cow_migration_estimate
 from personal_health_lab.synthetic_export import generate_export
 
 
@@ -36,6 +42,39 @@ def _set_version(config: RuntimeConfig, version: int) -> None:
             "UPDATE store_identity SET schema_version = ? WHERE singleton = 1",
             (version,),
         )
+
+
+def _set_legacy_migration_constraints(config: RuntimeConfig) -> None:
+    database = config.active_store / "metadata.sqlite3"
+    with sqlite3.connect(database) as metadata:
+        schema_version = int(metadata.execute("PRAGMA schema_version").fetchone()[0])
+        metadata.execute("PRAGMA writable_schema = ON")
+        metadata.execute(
+            "UPDATE sqlite_schema SET sql = replace(sql, ?, ?) WHERE name = ?",
+            (
+                "'run_historical_review', 'migrate_store')",
+                "'run_historical_review')",
+                "write_operations",
+            ),
+        )
+        metadata.execute(
+            "UPDATE sqlite_schema SET sql = replace(sql, ?, ?) WHERE name = ?",
+            (
+                "'historical',\n                    'migration'",
+                "'historical'",
+                "snapshot_activations",
+            ),
+        )
+        metadata.execute(
+            "UPDATE sqlite_schema SET sql = replace(sql, ?, ?) WHERE name = ?",
+            (
+                "'metadata_tombstone',\n                    'store_migrated'",
+                "'metadata_tombstone'",
+                "audit_events",
+            ),
+        )
+        metadata.execute("PRAGMA writable_schema = OFF")
+        metadata.execute(f"PRAGMA schema_version = {schema_version + 1}")
 
 
 def test_current_store_migration_is_a_no_op_without_backup(tmp_path: Path) -> None:
@@ -132,27 +171,384 @@ def test_migration_required_blocks_metadata_backup_bypass(tmp_path: Path) -> Non
     assert not (tmp_path / "backup.zip").exists()
 
 
-def test_populated_store_waits_for_copy_on_write_migration_slice(tmp_path: Path) -> None:
+def test_populated_store_is_migrated_copy_on_write(tmp_path: Path) -> None:
     fixture = generate_export("null-v1", 42, tmp_path / "fixture-populated")
     config = _config(tmp_path / "populated")
     with HealthLab.open(config) as health_lab:
         request = ImportHealthExport(fixture.export_path)
         plan = health_lab.preview_write(request)
-        health_lab.execute_write(request, expected_plan=plan.fingerprint)
+        imported = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+    old_snapshot = imported.result.snapshot_ref
+    assert old_snapshot is not None
+    old_directory = config.active_store / "parquet" / "snapshots" / str(old_snapshot)
+    old_files = {
+        path.name: path.read_bytes() for path in old_directory.iterdir() if path.is_file()
+    }
     _set_version(config, 3)
+    _set_legacy_migration_constraints(config)
 
     with HealthLab.open(config) as health_lab:
         request = MigrateStore()
         plan = health_lab.preview_write(request)
         receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
 
-    assert plan.approval.status is WriteApprovalStatus.BLOCKED
-    assert plan.diagnostics == ("populated_store_requires_cow",)
+    assert plan.approval.status is WriteApprovalStatus.CONFIRMATION_REQUIRED
+    assert plan.diagnostics == ()
     assert isinstance(plan.details, StoreMigrationPlan)
-    assert plan.details.affected_snapshot_refs == ()
-    assert plan.details.existing_analyses_become_stale is False
+    assert plan.details.affected_snapshot_refs == (old_snapshot,)
+    assert plan.details.existing_analyses_become_stale is True
+    assert plan.preflight.capacity is not None
+    assert plan.preflight.capacity.method_id == "cow-migration/v1"
+    assert isinstance(receipt.result, StoreMigrationReceipt)
+    assert receipt.result.status is MigrationStatus.COMPLETED
+    snapshot_ids = {
+        path.name for path in (config.active_store / "parquet" / "snapshots").iterdir()
+    }
+    snapshot_ids.remove(str(old_snapshot))
+    new_snapshot = snapshot_ids.pop()
+    with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
+        assert metadata.execute(
+            "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
+        ).fetchone() == (new_snapshot,)
+        assert metadata.execute(
+            "SELECT request_kind FROM write_operations WHERE operation_id = ?",
+            (str(receipt.result.operation_id),),
+        ).fetchone() == ("migrate_store",)
+        assert metadata.execute(
+            "SELECT activation_kind FROM snapshot_activations WHERE operation_id = ?",
+            (str(receipt.result.operation_id),),
+        ).fetchone() == ("migration",)
+        assert metadata.execute(
+            "SELECT event_kind FROM audit_events WHERE operation_id = ?",
+            (str(receipt.result.operation_id),),
+        ).fetchone() == ("store_migrated",)
+        assert metadata.execute(
+            "SELECT snapshot_id FROM migration_publications "
+            "JOIN audit_events USING (audit_event_id) WHERE operation_id = ?",
+            (str(receipt.result.operation_id),),
+        ).fetchone() == (new_snapshot,)
+    assert {path.name: path.read_bytes() for path in old_directory.iterdir() if path.is_file()} == (
+        old_files
+    )
+    new_manifest = (
+        config.active_store
+        / "parquet"
+        / "snapshots"
+        / new_snapshot
+        / "manifest.json"
+    ).read_bytes()
+    assert new_manifest != old_files["manifest.json"]
+    assert json.loads(new_manifest)["created_by_operation_id"] == str(
+        receipt.result.operation_id
+    )
+
+
+@pytest.mark.parametrize(
+    "fault_point",
+    (
+        "migration.after_backup/v1",
+        "migration.before_snapshot_move/v1",
+        "migration.after_snapshot_move/v1",
+        "migration.before_sqlite_commit/v1",
+    ),
+)
+def test_migration_fault_keeps_old_snapshot_and_retry_starts_fresh(
+    fault_point: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = generate_export("null-v1", 42, tmp_path / "fixture-fault")
+    config = _config(tmp_path / "fault")
+    with HealthLab.open(config) as health_lab:
+        imported = health_lab.execute_write(
+            ImportHealthExport(fixture.export_path),
+            expected_plan=health_lab.preview_write(
+                ImportHealthExport(fixture.export_path)
+            ).fingerprint,
+        )
+    old_snapshot = imported.result.snapshot_ref
+    assert old_snapshot is not None
+    _set_version(config, 3)
+    _set_legacy_migration_constraints(config)
+
+    def fail_at(_root: Path, current: str) -> None:
+        if current == fault_point:
+            raise RuntimeError(f"fault at {current}")
+
+    monkeypatch.setattr("personal_health_lab.storage._store._migration_fault_point", fail_at)
+    with HealthLab.open(config) as health_lab:
+        request = MigrateStore()
+        plan = health_lab.preview_write(request)
+        with pytest.raises(RuntimeError, match="fault at"):
+            health_lab.execute_write(request, expected_plan=plan.fingerprint)
+
+    with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
+        assert "'migrate_store'" not in metadata.execute(
+            "SELECT sql FROM sqlite_schema WHERE name = 'write_operations'"
+        ).fetchone()[0]
+
+    monkeypatch.undo()
+    with HealthLab.open(config) as health_lab:
+        retry_request = MigrateStore()
+        retry_plan = health_lab.preview_write(retry_request)
+        retry = health_lab.execute_write(
+            retry_request, expected_plan=retry_plan.fingerprint
+        )
+
+    assert isinstance(retry.result, StoreMigrationReceipt)
+    assert retry.result.status is MigrationStatus.COMPLETED
+    assert retry_plan.details.backup_file == "metadata-v3-to-v4-2.sqlite3"
+    with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
+        active = metadata.execute(
+            "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
+        ).fetchone()
+        assert active is not None and active != (str(old_snapshot),)
+        assert metadata.execute(
+            "SELECT schema_version FROM store_identity WHERE singleton = 1"
+        ).fetchone() == (4,)
+
+
+@pytest.mark.parametrize(
+    "validation_layer",
+    ("snapshot", "store"),
+)
+def test_migration_validation_failure_prevents_activation(
+    validation_layer: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = generate_export("null-v1", 42, tmp_path / f"fixture-{validation_layer}")
+    config = _config(tmp_path / validation_layer)
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(fixture.export_path)
+        imported = health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+    old_snapshot = imported.result.snapshot_ref
+    assert old_snapshot is not None
+    _set_version(config, 3)
+
+    if validation_layer == "store":
+        original_validate_store = LocalStore._validate_store
+
+        def fail_store_validation(store: LocalStore) -> None:
+            if store.load_identity().is_current:
+                raise StoreError("injected store validation failure")
+            original_validate_store(store)
+
+        monkeypatch.setattr(LocalStore, "_validate_store", fail_store_validation)
+    else:
+        original_validate_snapshot = LocalStore._validate_snapshot
+
+        def fail_snapshot_validation(
+            store: LocalStore,
+            directory: Path,
+            snapshot_id: str,
+            manifest_sha256: str,
+            **kwargs: str | None,
+        ) -> None:
+            if directory.parent.name == "migration-staging":
+                raise StoreError("injected snapshot validation failure")
+            original_validate_snapshot(
+                store, directory, snapshot_id, manifest_sha256, **kwargs
+            )
+
+        monkeypatch.setattr(LocalStore, "_validate_snapshot", fail_snapshot_validation)
+    with HealthLab.open(config) as health_lab:
+        request = MigrateStore()
+        plan = health_lab.preview_write(request)
+        receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+
     assert isinstance(receipt.result, WriteNotStarted)
+    with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
+        assert metadata.execute(
+            "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
+        ).fetchone() == (str(old_snapshot),)
+        assert metadata.execute(
+            "SELECT schema_version FROM store_identity WHERE singleton = 1"
+        ).fetchone() == (3,)
+
+
+def test_cow_migration_v1_bounds_normal_and_stress_fixtures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    normal = cow_migration_estimate(425_984, 294_403, 4096)
+    stress = cow_migration_estimate(8 * 425_984, 8 * 294_403, 4096)
+
+    assert normal is not None and normal >= 8.62 * 1024**2
+    assert stress is not None and stress >= 68.56 * 1024**2
+    assert cow_migration_estimate(1, 1, 4096) == 73_728
+    assert cow_migration_estimate(425_984, 294_403, 4096, writer_bound=False) is None
+    assert cow_migration_estimate(425_984, 294_403, 4096, scratch_bound=False) is None
+
+    for export_count in (1, 8):
+        config = _config(tmp_path / f"allocation-{export_count}")
+        with HealthLab.open(config) as health_lab:
+            for seed in range(export_count):
+                fixture = generate_export(
+                    "null-v1", seed, tmp_path / f"allocation-fixture-{export_count}-{seed}"
+                )
+                request = ImportHealthExport(fixture.export_path)
+                health_lab.execute_write(
+                    request, expected_plan=health_lab.preview_write(request).fingerprint
+                )
+        _set_version(config, 3)
+        baseline = sum(
+            path.stat().st_blocks * 512
+            for path in config.active_store.rglob("*")
+            if path.is_file()
+        )
+        measured: list[int] = []
+        measured_phases: list[str] = []
+
+        def checkpoint(
+            root: Path,
+            _phase: str,
+            baseline_bytes: int = baseline,
+            samples: list[int] = measured,
+            phases: list[str] = measured_phases,
+        ) -> None:
+            allocated = sum(
+                path.stat().st_blocks * 512 for path in root.rglob("*") if path.is_file()
+            )
+            samples.append(max(0, allocated - baseline_bytes))
+            phases.append(_phase)
+
+        monkeypatch.setattr(
+            "personal_health_lab.storage._store._allocation_checkpoint", checkpoint
+        )
+        with HealthLab.open(config) as health_lab:
+            request = MigrateStore()
+            plan = health_lab.preview_write(request)
+            health_lab.execute_write(request, expected_plan=plan.fingerprint)
+        assert plan.preflight.capacity is not None
+        assert plan.preflight.capacity.estimate_bytes is not None
+        assert max(measured) <= plan.preflight.capacity.estimate_bytes
+        assert measured_phases == [
+            "migration_backup",
+            "migration_staged",
+            "migration_moved",
+            "migration_activated",
+        ]
+        assert plan.preflight.capacity.target_volume.startswith("volume-")
+        assert (
+            plan.preflight.capacity.estimate_bytes % plan.preflight.capacity.fragment_size == 0
+        )
+
+
+def test_missing_cow_migration_bound_blocks_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path / "unknown-bound")
+    with HealthLab.open(config):
+        pass
+    _set_version(config, 3)
+    monkeypatch.setattr(
+        "personal_health_lab.storage._store.cow_migration_estimate",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with HealthLab.open(config) as health_lab:
+        plan = health_lab.preview_write(MigrateStore())
+
+    assert plan.approval.status is WriteApprovalStatus.BLOCKED
+    assert plan.diagnostics == ("capacity_estimate_unknown",)
     assert not (config.active_store / "migration-backups").exists()
+
+
+def test_migration_makes_existing_analysis_stale(tmp_path: Path) -> None:
+    fixture = generate_export("lag-signal-v1", 42, tmp_path / "fixture-analysis")
+    config = _config(tmp_path / "analysis")
+    analysis = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v2"))
+    with HealthLab.open(config) as health_lab:
+        imported = ImportHealthExport(fixture.export_path)
+        health_lab.execute_write(
+            imported, expected_plan=health_lab.preview_write(imported).fingerprint
+        )
+        completed = health_lab.execute_write(
+            analysis, expected_plan=health_lab.preview_write(analysis).fingerprint
+        )
+    assert isinstance(completed.result, AnalysisReceipt)
+    old_result = completed.result.result_ref
+    assert old_result is not None
+    _set_version(config, 3)
+
+    with HealthLab.open(config) as health_lab:
+        migration = MigrateStore()
+        health_lab.execute_write(
+            migration, expected_plan=health_lab.preview_write(migration).fingerprint
+        )
+    with HealthLab.open(config) as health_lab:
+        overview = health_lab.load_overview(OverviewSelection())
+
+    stale = next(
+        item
+        for item in overview.analysis_history
+        if item.provenance is not None and item.provenance.result_id == old_result
+    )
+    assert stale.freshness is AnalysisFreshness.STALE
+
+
+def test_restart_keeps_cataloged_snapshot_and_quarantines_incomplete_backup(
+    tmp_path: Path,
+) -> None:
+    fixture = generate_export("null-v1", 42, tmp_path / "fixture-recovery")
+    config = _config(tmp_path / "recovery")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(fixture.export_path)
+        imported = health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+    snapshot = imported.result.snapshot_ref
+    assert snapshot is not None
+    operation_id = "a" * 32
+    marker_root = config.active_store / "migration-staging"
+    marker_root.mkdir()
+    marker = marker_root / f"{operation_id}.json"
+    marker.write_text(
+        json.dumps({"operation_id": operation_id, "snapshot_id": str(snapshot)}),
+        encoding="utf-8",
+    )
+    backup_root = config.active_store / "migration-backups"
+    backup_root.mkdir()
+    temporary_backup = backup_root / "metadata-v3-to-v4.sqlite3.tmp"
+    temporary_backup.write_bytes(b"partial")
+
+    with HealthLab.open(config):
+        pass
+
+    assert not marker.exists()
+    assert not temporary_backup.exists()
+    assert (
+        config.active_store / "parquet" / "snapshots" / str(snapshot) / "manifest.json"
+    ).exists()
+    quarantined_backups = tuple(
+        (config.active_store / "quarantine" / "migrations").glob("*/backup")
+    )
+    assert len(quarantined_backups) == 1
+
+
+def test_restart_quarantines_markerless_migration_snapshot(tmp_path: Path) -> None:
+    fixture = generate_export("null-v1", 42, tmp_path / "fixture-orphan")
+    config = _config(tmp_path / "orphan")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(fixture.export_path)
+        imported = health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+    active = imported.result.snapshot_ref
+    assert active is not None
+    orphan_id = "b" * 32
+    shutil.copytree(
+        config.active_store / "parquet" / "snapshots" / str(active),
+        config.active_store / "parquet" / "snapshots" / orphan_id,
+    )
+    _set_version(config, 3)
+
+    with HealthLab.open(config):
+        pass
+
+    assert not (config.active_store / "parquet" / "snapshots" / orphan_id).exists()
+    quarantined = tuple(
+        (config.active_store / "quarantine" / "migrations").glob("*/snapshot")
+    )
+    assert len(quarantined) == 1
 
 
 def test_opening_legacy_store_does_not_recover_or_create_query_state(

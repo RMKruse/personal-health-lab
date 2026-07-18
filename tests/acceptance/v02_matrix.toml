@@ -2675,6 +2675,24 @@ source = "https://github.com/RMKruse/personal-health-lab/issues/33"
 statement = "A complete migration chain is one confirmed operation with one backup and one writer lock."
 evidence = ["positive", "negative", "transition"]
 
+[[contract]]
+id = "V02-C-MIG-004"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Parquet migration is copy-on-write with one atomic activation."
+evidence = ["positive", "transition"]
+
+[[contract]]
+id = "V02-C-MIG-005"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Migration target validation is hard and complete."
+evidence = ["negative", "transition"]
+
+[[contract]]
+id = "V02-C-MIG-006"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Failed migrations are quarantined, never resumed, and retried from scratch."
+evidence = ["negative", "transition"]
+
 [[fixture]]
 id = "V02-F-DOM-STORE-MIGRATION-V1"
 kind = "domain"
@@ -2683,6 +2701,53 @@ seed = 0
 parameters = "empty and metadata-only store schemas 1 through 5"
 platform = "all"
 sha256 = "888ecb7f8d5d6d51c6ad0adb3692786da5cf072d49e42cb501a190ac881857b6"
+
+[[fixture]]
+id = "V02-F-DOM-COW-MIGRATION-V1"
+kind = "domain"
+generator = "populated-store-cow-migration-v1"
+seed = 42
+parameters = "populated store with active immutable snapshot and analysis result"
+platform = "all"
+sha256 = "7ed2172f50a0b2e4d7492ef43b25d6f5cd20d4bbf138377776fdbeff52b83b81"
+
+[[fixture]]
+id = "V02-F-SYS-ALLOC-COW-NORMAL-V1"
+kind = "system"
+generator = "cow-migration-allocation-v1"
+seed = 42
+parameters = "425984 metadata bytes and 294403 active snapshot bytes"
+platform = "all"
+sha256 = "14264886aea54506532f48d8d25fe8f2189f600584195d2faf40dc12b3b6b42a"
+
+[[fixture]]
+id = "V02-F-SYS-ALLOC-COW-STRESS-V1"
+kind = "system"
+generator = "cow-migration-allocation-v1"
+seed = 42
+parameters = "normal cow migration allocation fixture multiplied by eight"
+platform = "all"
+sha256 = "0d1e21c090fc488381f49b0fcaacf8784f2cee5a5c60354bc1e4f45a3f90a781"
+
+[[fault_point]]
+id = "migration.after_backup/v1"
+operation = "migrate_store"
+transition = "after durable migration backup"
+
+[[fault_point]]
+id = "migration.before_snapshot_move/v1"
+operation = "migrate_store"
+transition = "before immutable snapshot move"
+
+[[fault_point]]
+id = "migration.after_snapshot_move/v1"
+operation = "migrate_store"
+transition = "after immutable snapshot move"
+
+[[fault_point]]
+id = "migration.before_sqlite_commit/v1"
+operation = "migrate_store"
+transition = "before atomic schema and active-snapshot commit"
 
 [[case]]
 id = "V02-A-MIG-001"
@@ -2791,3 +2856,113 @@ level = "application"
 expected_result = "blocked before migration starts"
 expected_effect = "none"
 forbidden_side_effects = ["schema write", "partial backup"]
+
+[[case]]
+id = "V02-A-MIG-010"
+contracts = ["V02-C-MIG-004"]
+fixtures = ["V02-F-DOM-COW-MIGRATION-V1"]
+runner = "test_populated_store_is_migrated_copy_on_write"
+initial_state = "populated older store with active immutable snapshot"
+operation = "execute confirmed MigrateStore"
+level = "application"
+expected_result = "new snapshot ID and manifest"
+expected_effect = "new active snapshot, old snapshot unchanged"
+forbidden_side_effects = ["in-place Parquet write", "old manifest mutation"]
+
+[[case]]
+id = "V02-A-MIG-011"
+contracts = ["V02-C-MIG-004"]
+fixtures = ["V02-F-DOM-COW-MIGRATION-V1"]
+runner = "test_migration_makes_existing_analysis_stale"
+initial_state = "active snapshot with completed analysis"
+operation = "execute confirmed MigrateStore"
+level = "application"
+expected_result = "analysis freshness stale"
+expected_effect = "analysis remains bound to old snapshot"
+forbidden_side_effects = ["analysis rewrite", "analysis deletion"]
+
+[[case]]
+id = "V02-A-MIG-012"
+contracts = ["V02-C-MIG-004"]
+fixtures = ["V02-F-DOM-COW-MIGRATION-V1"]
+runner = "test_populated_store_is_migrated_copy_on_write"
+initial_state = "validated staged snapshot and older store schema"
+operation = "activate migration"
+level = "storage"
+expected_result = "one atomic schema and active-snapshot switch"
+expected_effect = "current schema references new snapshot"
+forbidden_side_effects = ["manifest activation pointer", "partial activation"]
+
+[[case]]
+id = "V02-A-MIG-013"
+contracts = ["V02-C-MIG-005"]
+fixtures = ["V02-F-DOM-COW-MIGRATION-V1"]
+runner = "test_migration_validation_failure_prevents_activation"
+initial_state = "invalid migration target at each hard validation layer"
+operation = "execute confirmed MigrateStore"
+level = "storage"
+expected_result = "blocked migration"
+expected_effect = "old schema and snapshot remain active"
+forbidden_side_effects = ["warning-only activation", "partial catalog write"]
+
+[[case]]
+id = "V02-A-MIG-014"
+contracts = ["V02-C-MIG-005"]
+fixtures = ["V02-F-DOM-COW-MIGRATION-V1"]
+runner = "test_missing_cow_migration_bound_blocks_plan"
+initial_state = "migration step without writer or scratch bound"
+operation = "preview MigrateStore"
+level = "application"
+expected_result = "blocked unknown capacity"
+expected_effect = "none"
+forbidden_side_effects = ["migration backup", "best-effort estimate"]
+
+[[case]]
+id = "V02-A-MIG-015"
+contracts = ["V02-C-MIG-006"]
+fixtures = ["V02-F-DOM-COW-MIGRATION-V1"]
+fault_points = ["migration.after_backup/v1", "migration.before_snapshot_move/v1", "migration.after_snapshot_move/v1", "migration.before_sqlite_commit/v1"]
+runner = "test_migration_fault_keeps_old_snapshot_and_retry_starts_fresh"
+initial_state = "populated older store"
+operation = "fault each durable migration transition"
+level = "storage"
+expected_result = "old state remains active"
+expected_effect = "migration output is unreferenced"
+forbidden_side_effects = ["partial activation", "old snapshot mutation"]
+
+[[case]]
+id = "V02-A-MIG-016"
+contracts = ["V02-C-MIG-006"]
+fixtures = ["V02-F-DOM-COW-MIGRATION-V1"]
+fault_points = ["migration.after_snapshot_move/v1", "migration.before_sqlite_commit/v1"]
+runner = "test_migration_fault_keeps_old_snapshot_and_retry_starts_fresh"
+initial_state = "crash with unreferenced final snapshot"
+operation = "reopen store"
+level = "storage"
+expected_result = "migration remainder quarantined"
+expected_effect = "none"
+forbidden_side_effects = ["automatic continuation", "artifact activation"]
+
+[[case]]
+id = "V02-A-MIG-017"
+contracts = ["V02-C-MIG-006"]
+fixtures = ["V02-F-DOM-COW-MIGRATION-V1"]
+runner = "test_migration_fault_keeps_old_snapshot_and_retry_starts_fresh"
+initial_state = "failed migration with quarantined remainder"
+operation = "retry confirmed MigrateStore"
+level = "application"
+expected_result = "fresh completed migration"
+expected_effect = "new independently staged snapshot is active"
+forbidden_side_effects = ["reuse quarantined artifact", "resume old operation"]
+
+[[case]]
+id = "V02-A-PRE-025"
+contracts = ["V02-C-PRE-006"]
+fixtures = ["V02-F-SYS-ALLOC-COW-NORMAL-V1", "V02-F-SYS-ALLOC-COW-STRESS-V1"]
+runner = "test_cow_migration_v1_bounds_normal_and_stress_fixtures"
+initial_state = "normal and stress copy-on-write migration fixtures"
+operation = "estimate peak live allocation"
+level = "storage"
+expected_result = "cow-migration/v1 conservative bound"
+expected_effect = "none"
+forbidden_side_effects = ["base allocation counted as new", "copy-on-write credit"]

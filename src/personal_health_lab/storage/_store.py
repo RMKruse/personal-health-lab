@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import subprocess
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta, timezone
 from enum import StrEnum
@@ -45,7 +46,7 @@ _QUERY_FILE = "query.duckdb"
 _STORE_SCHEMA_VERSION = 4
 _WRITER_LOCK_FILE = ".writer.lock"
 _FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
-_STORE_MIGRATION_METHOD = "store-migration/v1"
+_STORE_MIGRATION_METHOD = "cow-migration/v1"
 _SNAPSHOT_SCHEMA_VERSION = 1
 _IDENTITY_RULE_VERSION = "healthkit-natural/v2"
 _MAPPING_RULE_VERSION = "healthkit-canonical/v1"
@@ -251,6 +252,24 @@ def full_snapshot_import_estimate(
     return _DIRECTORY_OVERHEAD + max(phases)
 
 
+def cow_migration_estimate(
+    metadata_bytes: int,
+    snapshot_bytes: int,
+    fragment_size: int,
+    *,
+    writer_bound: bool = True,
+    scratch_bound: bool = True,
+) -> int | None:
+    """Bound peak live allocation for ``cow-migration/v1``."""
+    if not writer_bound or not scratch_bound:
+        return None
+    if metadata_bytes < 0 or snapshot_bytes < 0 or fragment_size <= 0:
+        raise ValueError("Kapazitätseingaben müssen nichtnegativ und Fragmente positiv sein.")
+    backup_catalog_and_journal = _round_up(16 * metadata_bytes, fragment_size)
+    snapshot_and_scratch = _round_up(8 * snapshot_bytes, fragment_size)
+    return _DIRECTORY_OVERHEAD + backup_catalog_and_journal + snapshot_and_scratch
+
+
 def _allocation_checkpoint(root: Path, phase: str) -> None:
     """Private test seam for measuring the real writer's live allocation."""
 
@@ -261,6 +280,10 @@ def _publication_fault_point(root: Path, fault_point_id: str) -> None:
 
 def _migration_backup_fault_point(root: Path) -> None:
     """Private test seam immediately before the migration backup starts."""
+
+
+def _migration_fault_point(root: Path, fault_point_id: str) -> None:
+    """Private test seam for durable copy-on-write migration transitions."""
 
 
 def probe_capacity(
@@ -911,8 +934,20 @@ class ReviewSnapshotFacts:
     measurements: tuple[ResolvedMeasurement, ...]
 
 
+def _execute_script(metadata: sqlite3.Connection, script: str) -> None:
+    statement = ""
+    for line in script.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            metadata.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise sqlite3.DatabaseError("incomplete schema statement")
+
+
 def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
-    metadata.executescript(
+    _execute_script(
+        metadata,
         """
         CREATE TABLE IF NOT EXISTS imports (
             import_id TEXT PRIMARY KEY CHECK (
@@ -947,7 +982,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                 request_kind IN ('import_health_export', 'resolve_data_review_case',
                                  'revoke_data_review_decision',
                                  'create_plausibility_rule_version',
-                                 'run_historical_review')
+                                 'run_historical_review', 'migrate_store')
             ),
             started_at_utc TEXT NOT NULL CHECK (
                 length(started_at_utc) >= 20 AND substr(started_at_utc, 11, 1) = 'T'
@@ -982,7 +1017,8 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             previous_snapshot_id TEXT REFERENCES dataset_snapshots(snapshot_id),
             activation_kind TEXT NOT NULL CHECK (
                 activation_kind IN (
-                    'import', 'data_review_decision', 'rule_version', 'historical'
+                    'import', 'data_review_decision', 'rule_version', 'historical',
+                    'migration'
                 )
             ),
             activated_at_utc TEXT NOT NULL CHECK (
@@ -1106,7 +1142,10 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             ),
             operation_id TEXT NOT NULL REFERENCES write_operations(operation_id),
             event_kind TEXT NOT NULL CHECK (
-                event_kind IN ('import_published', 'data_review_decision', 'metadata_tombstone')
+                event_kind IN (
+                    'import_published', 'data_review_decision', 'metadata_tombstone',
+                    'store_migrated'
+                )
             ),
             occurred_at_utc TEXT NOT NULL CHECK (
                 length(occurred_at_utc) >= 20 AND substr(occurred_at_utc, 11, 1) = 'T'
@@ -1116,6 +1155,14 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
             import_id TEXT NOT NULL UNIQUE REFERENCES imports(import_id),
             snapshot_id TEXT NOT NULL UNIQUE REFERENCES dataset_snapshots(snapshot_id)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS migration_publications (
+            audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
+            snapshot_id TEXT REFERENCES dataset_snapshots(snapshot_id),
+            source_schema_version INTEGER NOT NULL CHECK (source_schema_version > 0),
+            target_schema_version INTEGER NOT NULL CHECK (
+                target_schema_version > source_schema_version
+            )
         ) STRICT;
         CREATE TABLE IF NOT EXISTS data_review_decisions (
             audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
@@ -1193,6 +1240,17 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
         BEFORE INSERT ON import_publications
         WHEN (SELECT event_kind FROM audit_events WHERE audit_event_id = NEW.audit_event_id)
              != 'import_published'
+        BEGIN SELECT RAISE(ABORT, 'wrong audit payload type'); END;
+        CREATE TRIGGER IF NOT EXISTS migration_publications_no_update
+        BEFORE UPDATE ON migration_publications
+        BEGIN SELECT RAISE(ABORT, 'audit payload is append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS migration_publications_no_delete
+        BEFORE DELETE ON migration_publications
+        BEGIN SELECT RAISE(ABORT, 'audit payload is append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS migration_publications_kind
+        BEFORE INSERT ON migration_publications
+        WHEN (SELECT event_kind FROM audit_events WHERE audit_event_id = NEW.audit_event_id)
+             != 'store_migrated'
         BEGIN SELECT RAISE(ABORT, 'wrong audit payload type'); END;
         CREATE TRIGGER IF NOT EXISTS data_review_decisions_kind
         BEFORE INSERT ON data_review_decisions
@@ -1353,6 +1411,67 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
     for column, declaration in migrations.items():
         if column not in analysis_columns:
             metadata.execute(f"ALTER TABLE analysis_runs ADD COLUMN {column} {declaration}")
+
+
+def _upgrade_migration_event_constraints(metadata: sqlite3.Connection) -> None:
+    upgrades = (
+        (
+            "write_operations",
+            "'migrate_store'",
+            "'run_historical_review'",
+            "'run_historical_review', 'migrate_store'",
+        ),
+        (
+            "snapshot_activations",
+            "'migration'",
+            "'historical'",
+            "'historical', 'migration'",
+        ),
+        (
+            "audit_events",
+            "'store_migrated'",
+            "'metadata_tombstone'",
+            "'metadata_tombstone', 'store_migrated'",
+        ),
+    )
+    rebuilt: list[tuple[str, str, str]] = []
+    for table, new_value, old_constraint, new_constraint in upgrades:
+        row = metadata.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+        if row is None or not isinstance(row[0], str):
+            continue
+        definition = row[0]
+        if new_value in definition:
+            continue
+        if old_constraint not in definition:
+            raise sqlite3.DatabaseError(f"unsupported {table} constraint")
+        temporary = f"{table}__migration_upgrade"
+        upgraded = definition.replace(old_constraint, new_constraint, 1).replace(
+            f"CREATE TABLE {table}", f"CREATE TABLE {temporary}", 1
+        )
+        rebuilt.append((table, temporary, upgraded))
+    if not rebuilt:
+        return
+
+    if any(table == "audit_events" for table, _, _ in rebuilt):
+        for trigger in (
+            "import_publications_kind",
+            "migration_publications_kind",
+            "data_review_decisions_kind",
+            "metadata_tombstones_kind",
+            "metadata_tombstones_backward",
+        ):
+            metadata.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    for table, temporary, definition in rebuilt:
+        metadata.execute(f"DROP TABLE IF EXISTS {temporary}")
+        metadata.execute(definition)
+        metadata.execute(f"INSERT INTO {temporary} SELECT * FROM {table}")
+        metadata.execute(f"DROP TABLE {table}")
+        metadata.execute(f"ALTER TABLE {temporary} RENAME TO {table}")
+    violations = metadata.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise sqlite3.IntegrityError("foreign key violation after constraint upgrade")
 
 
 @dataclass(slots=True)
@@ -1592,15 +1711,33 @@ class LocalStore:
         try:
             metadata_bytes = (self._root / _METADATA_FILE).stat().st_blocks * 512
             fragment_size = os.statvfs(self._root).f_frsize
+            active = self.load_active_snapshot_id()
+            snapshot_bytes = (
+                0
+                if active is None
+                else sum(
+                    path.stat().st_blocks * 512
+                    for path in (
+                        self._root / _PARQUET_DIRECTORY / "snapshots" / str(active)
+                    ).iterdir()
+                    if path.is_file()
+                )
+            )
         except OSError:
             return probe_capacity(self._root, None, method_id=_STORE_MIGRATION_METHOD)
-        estimate = _round_up(max(2 * _MIB, 3 * metadata_bytes), fragment_size)
+        estimate = cow_migration_estimate(
+            metadata_bytes,
+            snapshot_bytes,
+            fragment_size,
+            scratch_bound=self._scratch_bound,
+        )
         return probe_capacity(self._root, estimate, method_id=_STORE_MIGRATION_METHOD)
 
     def migrate_store_schema(
         self,
         steps: tuple[tuple[int, int], ...],
         backup_file: str,
+        operation_id: OperationId,
     ) -> StoreIdentity:
         self._require_writer()
         identity = self.load_identity()
@@ -1624,30 +1761,252 @@ class LocalStore:
         backup_path = backup_directory / backup_file
         temporary = backup_path.with_suffix(backup_path.suffix + ".tmp")
         if backup_path.exists() or temporary.exists():
-            raise StoreError("Migrationssicherung existiert bereits.")
+            raise StoreError("migration_backup_failed")
         try:
             _migration_backup_fault_point(self._root)
             with sqlite3.connect(temporary) as backup:
                 self._metadata.backup(backup)
             os.replace(temporary, backup_path)
+            _allocation_checkpoint(self._root, "migration_backup")
+            _migration_fault_point(self._root, "migration.after_backup/v1")
         except (OSError, sqlite3.Error) as error:
             temporary.unlink(missing_ok=True)
-            raise StoreError("Migrationssicherung ist fehlgeschlagen.") from error
+            raise StoreError("migration_backup_failed") from error
 
+        active = self.load_active_snapshot_id()
         existing_store_id = identity.store_id
-        store_id = str(existing_store_id) if existing_store_id is not None else uuid4().hex
+        store_id = str(existing_store_id) if existing_store_id is not None else None
+        if store_id is None and active is not None:
+            try:
+                existing_manifest = json.loads(
+                    (
+                        self._root
+                        / _PARQUET_DIRECTORY
+                        / "snapshots"
+                        / str(active)
+                        / "manifest.json"
+                    ).read_bytes()
+                )
+                manifest_store_id = existing_manifest.get("store_id")
+                if _is_lower_hex(manifest_store_id, 32):
+                    store_id = str(manifest_store_id)
+            except (OSError, AttributeError, json.JSONDecodeError):
+                pass
+        if store_id is None:
+            store_id = uuid4().hex
         binding = identity.person_binding
-        with self._metadata:
-            _ensure_current_tables(self._metadata)
-            self._metadata.execute("ALTER TABLE store_identity RENAME TO legacy_store_identity")
-            self._metadata.execute(_STORE_IDENTITY_DDL)
-            self._metadata.execute(
-                "INSERT INTO store_identity VALUES (1, ?, ?, ?, ?)",
-                (self._mode.value, _STORE_SCHEMA_VERSION, store_id, binding.value),
+        new_snapshot: SnapshotId | None = None
+        manifest_sha256: str | None = None
+        created_at = datetime.now(UTC).isoformat()
+        marker = self._root / "migration-staging" / f"{operation_id}.json"
+        staging: Path | None = None
+        snapshot: Path | None = None
+        if active is not None:
+            new_snapshot = SnapshotId(uuid4().hex)
+            staging_root = self._root / "migration-staging"
+            staging_root.mkdir(exist_ok=True)
+            staging = staging_root / str(operation_id)
+            snapshot = (
+                self._root / _PARQUET_DIRECTORY / "snapshots" / str(new_snapshot)
             )
-            self._metadata.execute("DROP TABLE legacy_store_identity")
-            self._validate_store()
+            marker.write_text(
+                json.dumps(
+                    {"operation_id": str(operation_id), "snapshot_id": str(new_snapshot)},
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            try:
+                shutil.copytree(
+                    self._root / _PARQUET_DIRECTORY / "snapshots" / str(active), staging
+                )
+                manifest = json.loads((staging / "manifest.json").read_bytes())
+                manifest.update(
+                    {
+                        "created_at_utc": created_at,
+                        "created_by_operation_id": str(operation_id),
+                        "parent_snapshot_id": str(active),
+                        "snapshot_id": str(new_snapshot),
+                    }
+                )
+                manifest_bytes = json.dumps(
+                    manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+                ).encode()
+                (staging / "manifest.json").write_bytes(manifest_bytes)
+                manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+                self._validate_snapshot(
+                    staging,
+                    str(new_snapshot),
+                    manifest_sha256,
+                    expected_store_id=store_id,
+                )
+                _allocation_checkpoint(self._root, "migration_staged")
+                _migration_fault_point(self._root, "migration.before_snapshot_move/v1")
+                snapshot.parent.mkdir(parents=True, exist_ok=True)
+                staging.replace(snapshot)
+                _allocation_checkpoint(self._root, "migration_moved")
+                _migration_fault_point(self._root, "migration.after_snapshot_move/v1")
+            except (OSError, sqlite3.Error, duckdb.Error, StoreError) as error:
+                self._quarantine_migration_artifacts(operation_id, staging, snapshot)
+                raise StoreError("migration_validation_failed") from error
+
+        self._metadata.commit()
+        self._metadata.execute("PRAGMA foreign_keys = OFF")
+        try:
+            with self._metadata:
+                _upgrade_migration_event_constraints(self._metadata)
+                _ensure_current_tables(self._metadata)
+                self._metadata.execute("ALTER TABLE store_identity RENAME TO legacy_store_identity")
+                self._metadata.execute(_STORE_IDENTITY_DDL)
+                self._metadata.execute(
+                    "INSERT INTO store_identity VALUES (1, ?, ?, ?, ?)",
+                    (self._mode.value, _STORE_SCHEMA_VERSION, store_id, binding.value),
+                )
+                self._metadata.execute("DROP TABLE legacy_store_identity")
+                self._metadata.execute(
+                    "INSERT INTO write_operations VALUES (?, 'migrate_store', ?, ?, "
+                    "'committed', 1)",
+                    (str(operation_id), created_at, created_at),
+                )
+                if new_snapshot is not None:
+                    assert active is not None
+                    assert manifest_sha256 is not None
+                    self._metadata.execute(
+                        "INSERT INTO dataset_snapshots VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            str(new_snapshot),
+                            _SNAPSHOT_SCHEMA_VERSION,
+                            manifest_sha256,
+                            str(operation_id),
+                            str(active),
+                            created_at,
+                        ),
+                    )
+                    self._metadata.execute(
+                        "INSERT INTO snapshot_activations VALUES (?, ?, ?, ?, 'migration', ?)",
+                        (
+                            uuid4().hex,
+                            str(operation_id),
+                            str(new_snapshot),
+                            str(active),
+                            created_at,
+                        ),
+                    )
+                    self._metadata.execute(
+                        "UPDATE active_snapshot SET snapshot_id = ? WHERE singleton = 1",
+                        (str(new_snapshot),),
+                    )
+                audit_position = int(
+                    self._metadata.execute(
+                        "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+                    ).fetchone()[0]
+                )
+                audit_event_id = uuid4().hex
+                self._metadata.execute(
+                    "INSERT INTO audit_events VALUES (?, ?, ?, 'store_migrated', ?)",
+                    (audit_position, audit_event_id, str(operation_id), created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO migration_publications VALUES (?, ?, ?, ?)",
+                    (
+                        audit_event_id,
+                        None if new_snapshot is None else str(new_snapshot),
+                        source_version,
+                        _STORE_SCHEMA_VERSION,
+                    ),
+                )
+                self._validate_store()
+                _allocation_checkpoint(self._root, "migration_activated")
+                _migration_fault_point(self._root, "migration.before_sqlite_commit/v1")
+        except (OSError, sqlite3.Error, duckdb.Error, StoreError) as error:
+            self._quarantine_migration_artifacts(operation_id, staging, snapshot)
+            raise StoreError("migration_validation_failed") from error
+        finally:
+            self._metadata.execute("PRAGMA foreign_keys = ON")
+        with suppress(OSError):
+            marker.unlink(missing_ok=True)
         return self.load_identity()
+
+    def _quarantine_migration_artifacts(
+        self,
+        operation_id: OperationId,
+        staging: Path | None,
+        snapshot: Path | None,
+    ) -> None:
+        quarantine = self._root / "quarantine" / "migrations" / str(operation_id)
+        quarantine.mkdir(parents=True, exist_ok=True)
+        for source, label in ((staging, "staging"), (snapshot, "snapshot")):
+            if source is not None and source.exists():
+                os.replace(source, quarantine / label)
+        (quarantine / "diagnostic.json").write_text(
+            json.dumps({"diagnostic": "migration_not_activated"}), encoding="utf-8"
+        )
+        (self._root / "migration-staging" / f"{operation_id}.json").unlink(missing_ok=True)
+
+    def _recover_migrations(self) -> None:
+        backup_root = self._root / "migration-backups"
+        if backup_root.exists():
+            for temporary in backup_root.glob("*.tmp"):
+                quarantine = self._root / "quarantine" / "migrations" / uuid4().hex
+                quarantine.mkdir(parents=True)
+                os.replace(temporary, quarantine / "backup")
+                (quarantine / "diagnostic.json").write_text(
+                    json.dumps({"diagnostic": "interrupted_migration_backup"}),
+                    encoding="utf-8",
+                )
+        marker_root = self._root / "migration-staging"
+        for marker in (() if not marker_root.exists() else marker_root.glob("*.json")):
+            try:
+                values = json.loads(marker.read_bytes())
+                raw_operation_id = values["operation_id"]
+                raw_snapshot_id = values["snapshot_id"]
+                if not _is_lower_hex(raw_operation_id, 32) or not _is_lower_hex(
+                    raw_snapshot_id, 32
+                ):
+                    raise ValueError
+                operation_id = OperationId(str(raw_operation_id))
+                snapshot_id = SnapshotId(str(raw_snapshot_id))
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                quarantine = self._root / "quarantine" / "migrations" / uuid4().hex
+                quarantine.mkdir(parents=True)
+                os.replace(marker, quarantine / "marker.json")
+                (quarantine / "diagnostic.json").write_text(
+                    json.dumps({"diagnostic": "invalid_migration_marker"}), encoding="utf-8"
+                )
+                continue
+            cataloged = self._metadata.execute(
+                "SELECT 1 FROM dataset_snapshots WHERE snapshot_id = ?", (str(snapshot_id),)
+            ).fetchone()
+            if cataloged is not None:
+                marker.unlink(missing_ok=True)
+                continue
+            self._quarantine_migration_artifacts(
+                operation_id,
+                marker_root / str(operation_id),
+                self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id),
+            )
+        if marker_root.exists():
+            for staging in tuple(path for path in marker_root.iterdir() if path.is_dir()):
+                self._quarantine_migration_artifacts(
+                    OperationId(uuid4().hex), staging, None
+                )
+        has_snapshot_catalog = self._metadata.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'dataset_snapshots'"
+        ).fetchone()
+        if has_snapshot_catalog is None:
+            return
+        cataloged = {
+            str(row[0])
+            for row in self._metadata.execute("SELECT snapshot_id FROM dataset_snapshots")
+        }
+        snapshot_root = self._root / _PARQUET_DIRECTORY / "snapshots"
+        if snapshot_root.exists():
+            for snapshot in tuple(path for path in snapshot_root.iterdir() if path.is_dir()):
+                if snapshot.name not in cataloged:
+                    self._quarantine_migration_artifacts(
+                        OperationId(uuid4().hex), None, snapshot
+                    )
 
     @classmethod
     def open(cls, root: Path, mode: DataMode) -> Self:
@@ -1664,6 +2023,7 @@ class LocalStore:
             store = cls._open(root, mode, initialize=True)
             if store.load_identity().is_current:
                 store._recover_imports()
+            store._recover_migrations()
             store._validate_store()
             return store
         except Exception:
@@ -1683,6 +2043,7 @@ class LocalStore:
             store = cls._open(root, mode, initialize=True, writer_lock=writer_lock)
             if store.load_identity().is_current:
                 store._recover_imports()
+            store._recover_migrations()
             store._validate_store()
             return store
         except Exception:
@@ -2612,17 +2973,29 @@ class LocalStore:
             for row in self._metadata.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
         if "audit_events" in tables:
+            migration_count = (
+                "+ count(migration_publications.audit_event_id)"
+                if "migration_publications" in tables
+                else ""
+            )
+            migration_join = (
+                "LEFT JOIN migration_publications USING (audit_event_id)"
+                if "migration_publications" in tables
+                else ""
+            )
             audit = self._metadata.execute(
-                """
+                f"""
                 SELECT count(*), COALESCE(MIN(audit_position), 1),
                        COALESCE(MAX(audit_position), 0),
                        count(import_publications.audit_event_id)
                        + count(data_review_decisions.audit_event_id)
                        + count(metadata_tombstones.audit_event_id)
+                       {migration_count}
                 FROM audit_events
                 LEFT JOIN import_publications USING (audit_event_id)
                 LEFT JOIN data_review_decisions USING (audit_event_id)
                 LEFT JOIN metadata_tombstones USING (audit_event_id)
+                {migration_join}
                 """
             ).fetchone()
             assert audit is not None
@@ -2657,7 +3030,14 @@ class LocalStore:
             ):
                 raise StoreError("Snapshot-Katalog und Manifest widersprechen sich.")
 
-    def _validate_snapshot(self, directory: Path, snapshot_id: str, manifest_sha256: str) -> None:
+    def _validate_snapshot(
+        self,
+        directory: Path,
+        snapshot_id: str,
+        manifest_sha256: str,
+        *,
+        expected_store_id: str | None = None,
+    ) -> None:
         try:
             manifest_bytes = (directory / "manifest.json").read_bytes()
             manifest = json.loads(manifest_bytes)
@@ -2673,7 +3053,8 @@ class LocalStore:
         if (
             not isinstance(manifest, dict)
             or store_row is None
-            or manifest.get("store_id") != store_row[0]
+            or manifest.get("store_id")
+            != (store_row[0] if expected_store_id is None else expected_store_id)
             or manifest_bytes
             != json.dumps(
                 manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True

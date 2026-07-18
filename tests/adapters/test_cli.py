@@ -922,8 +922,13 @@ def test_cli_maps_store_migration_plan_and_receipt(
 ) -> None:
     store = tmp_path / "migration-store"
     config = RuntimeConfig(DataMode.SYNTHETIC, store, tmp_path / "real")
-    with HealthLab.open(config):
-        pass
+    fixture = generate_export("null-v1", 42, tmp_path / "migration-fixture")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(fixture.export_path)
+        imported = health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+    snapshot_ref = str(imported.result.snapshot_ref)
     with sqlite3.connect(store / "metadata.sqlite3") as metadata:
         metadata.execute("UPDATE store_identity SET schema_version = 2 WHERE singleton = 1")
     common = [
@@ -941,6 +946,8 @@ def test_cli_maps_store_migration_plan_and_receipt(
     assert plan["workspace"]["allowed_writes"] == ["migrate_store"]
     assert plan["details"]["steps"] == [[2, 3], [3, 4]]
     assert plan["details"]["backup_file"] == "metadata-v2-to-v4.sqlite3"
+    assert plan["details"]["affected_snapshot_refs"] == [snapshot_ref]
+    assert plan["details"]["existing_analyses_become_stale"] is True
 
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr("builtins.input", lambda _prompt: "n")
@@ -948,8 +955,8 @@ def test_cli_maps_store_migration_plan_and_receipt(
     human_plan = capsys.readouterr().out
     assert "Migrationskette: 2 -> 3 -> 4" in human_plan
     assert "Migrationssicherung: metadata-v2-to-v4.sqlite3" in human_plan
-    assert "Betroffene Snapshots: -" in human_plan
-    assert "Bestehende Analysen werden veraltet: nein" in human_plan
+    assert f"Betroffene Snapshots: {snapshot_ref}" in human_plan
+    assert "Bestehende Analysen werden veraltet: ja" in human_plan
 
     assert main(
         [
