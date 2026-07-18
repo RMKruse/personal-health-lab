@@ -2656,3 +2656,138 @@ level = "storage"
 expected_result = "metadata-backup/v1 conservative target-volume bound"
 expected_effect = "none"
 forbidden_side_effects = ["second full spool", "base allocation counted as new"]
+
+[[contract]]
+id = "V02-C-MIG-001"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Store schema versions are positive integers migrated only through registered adjacent steps."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V02-C-MIG-002"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Opening is read-only and migration-required sessions expose only diagnosis and migration."
+evidence = ["negative", "transition"]
+
+[[contract]]
+id = "V02-C-MIG-003"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "A complete migration chain is one confirmed operation with one backup and one writer lock."
+evidence = ["positive", "negative", "transition"]
+
+[[fixture]]
+id = "V02-F-DOM-STORE-MIGRATION-V1"
+kind = "domain"
+generator = "sqlite-store-schema-v1"
+seed = 0
+parameters = "empty and metadata-only store schemas 1 through 5"
+platform = "all"
+sha256 = "888ecb7f8d5d6d51c6ad0adb3692786da5cf072d49e42cb501a190ac881857b6"
+
+[[case]]
+id = "V02-A-MIG-001"
+contracts = ["V02-C-MIG-001"]
+fixtures = ["V02-F-DOM-STORE-MIGRATION-V1"]
+runner = "test_current_store_migration_is_a_no_op_without_backup"
+initial_state = "current store schema"
+operation = "preview and execute MigrateStore"
+level = "application"
+expected_result = "no_op with empty chain"
+expected_effect = "none"
+forbidden_side_effects = ["migration backup", "schema write"]
+
+[[case]]
+id = "V02-A-MIG-002"
+contracts = ["V02-C-MIG-001"]
+fixtures = ["V02-F-DOM-STORE-MIGRATION-V1"]
+runner = "test_registered_store_migration_chain_executes_as_one_operation"
+initial_state = "one-version-old store schema"
+operation = "execute MigrateStore"
+level = "application"
+expected_result = "registered adjacent step"
+expected_effect = "current schema"
+forbidden_side_effects = ["unregistered step"]
+
+[[case]]
+id = "V02-A-MIG-003"
+contracts = ["V02-C-MIG-001", "V02-C-MIG-003"]
+fixtures = ["V02-F-DOM-STORE-MIGRATION-V1"]
+runner = "test_registered_store_migration_chain_executes_as_one_operation"
+initial_state = "multi-version-old store schema"
+operation = "execute MigrateStore"
+level = "application"
+expected_result = "complete adjacent chain"
+expected_effect = "one current-schema activation"
+forbidden_side_effects = ["partial activation"]
+
+[[case]]
+id = "V02-A-MIG-004"
+contracts = ["V02-C-MIG-001"]
+fixtures = ["V02-F-DOM-STORE-MIGRATION-V1"]
+runner = "test_unregistered_jump_or_downgrade_is_blocked"
+initial_state = "unregistered jump, downgrade, missing edge, or newer schema"
+operation = "preview MigrateStore"
+level = "application"
+expected_result = "blocked migration diagnosis"
+expected_effect = "none"
+forbidden_side_effects = ["best-effort open", "schema write"]
+
+[[case]]
+id = "V02-A-MIG-005"
+contracts = ["V02-C-MIG-002"]
+fixtures = ["V02-F-DOM-STORE-MIGRATION-V1"]
+runner = "test_migration_required_session_only_allows_diagnosis_and_migration"
+initial_state = "supported older schema"
+operation = "open restricted session"
+level = "application"
+expected_result = "migration_required with diagnosis and MigrateStore only"
+expected_effect = "none"
+forbidden_side_effects = ["domain read", "domain write", "implicit migration"]
+
+[[case]]
+id = "V02-A-MIG-006"
+contracts = ["V02-C-MIG-002"]
+fixtures = ["V02-F-DOM-STORE-MIGRATION-V1"]
+runner = "test_abandoning_migration_plan_changes_nothing"
+initial_state = "supported older schema"
+operation = "preview then abandon MigrateStore"
+level = "application"
+expected_result = "side-effect-free plan"
+expected_effect = "none"
+forbidden_side_effects = ["backup", "schema write"]
+
+[[case]]
+id = "V02-A-MIG-007"
+contracts = ["V02-C-MIG-003"]
+fixtures = ["V02-F-DOM-STORE-MIGRATION-V1"]
+runner = "test_registered_store_migration_chain_executes_as_one_operation"
+initial_state = "supported older metadata-only schema"
+operation = "preview MigrateStore"
+level = "application"
+expected_result = "full chain, snapshots, backup, capacity, and stale effects"
+expected_effect = "none before execution"
+forbidden_side_effects = ["hidden chain step", "unreported target"]
+
+[[case]]
+id = "V02-A-MIG-008"
+contracts = ["V02-C-MIG-003"]
+fixtures = ["V02-F-DOM-STORE-MIGRATION-V1"]
+runner = "test_migration_uses_one_backup_and_one_writer_lock"
+initial_state = "supported older schema"
+operation = "execute confirmed chain"
+level = "storage"
+expected_result = "one SQLite online backup and one writer lock"
+expected_effect = "current schema"
+forbidden_side_effects = ["second backup", "concurrent writer"]
+
+[[case]]
+id = "V02-A-MIG-009"
+contracts = ["V02-C-MIG-003"]
+fixtures = ["V02-F-DOM-STORE-MIGRATION-V1"]
+runner = "test_failed_backup_or_capacity_preflight_prevents_migration_start"
+initial_state = "failed backup or blocked capacity preflight"
+operation = "execute confirmed MigrateStore"
+level = "application"
+expected_result = "blocked before migration starts"
+expected_effect = "none"
+forbidden_side_effects = ["schema write", "partial backup"]

@@ -10,6 +10,7 @@ MODULES = {
     "data_quality",
     "health_data",
     "health_import",
+    "migration",
     "overview",
     "package_root",
     "recovery",
@@ -22,6 +23,7 @@ ALLOWED_DEPENDENCIES = {
     "adapters": {"application", "package_root", "synthetic_export"},
     "application": {
         "health_import",
+        "migration",
         "health_data",
         "data_quality",
         "overview",
@@ -33,6 +35,7 @@ ALLOWED_DEPENDENCIES = {
     "health_data": set(),
     "data_quality": {"health_data", "storage"},
     "health_import": {"data_quality", "health_data", "storage"},
+    "migration": {"storage"},
     "overview": {"health_data", "package_root", "storage"},
     "recovery": {"data_quality", "storage"},
     "package_root": {"runtime"},

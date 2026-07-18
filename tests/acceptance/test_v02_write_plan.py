@@ -96,6 +96,19 @@ REGISTERED_CASES.update(
 )
 REGISTERED_CASES.update(
     {
+        "V02-A-MIG-001": "test_current_store_migration_is_a_no_op_without_backup",
+        "V02-A-MIG-002": "test_registered_store_migration_chain_executes_as_one_operation",
+        "V02-A-MIG-003": "test_registered_store_migration_chain_executes_as_one_operation",
+        "V02-A-MIG-004": "test_unregistered_jump_or_downgrade_is_blocked",
+        "V02-A-MIG-005": "test_migration_required_session_only_allows_diagnosis_and_migration",
+        "V02-A-MIG-006": "test_abandoning_migration_plan_changes_nothing",
+        "V02-A-MIG-007": "test_registered_store_migration_chain_executes_as_one_operation",
+        "V02-A-MIG-008": "test_migration_uses_one_backup_and_one_writer_lock",
+        "V02-A-MIG-009": "test_failed_backup_or_capacity_preflight_prevents_migration_start",
+    }
+)
+REGISTERED_CASES.update(
+    {
         "V02-A-BAK-001": "test_metadata_backup_is_one_redacted_portable_sqlite_file",
         "V02-A-BAK-002": "test_metadata_backup_is_one_redacted_portable_sqlite_file",
         "V02-A-BAK-003": "test_metadata_backup_is_one_redacted_portable_sqlite_file",

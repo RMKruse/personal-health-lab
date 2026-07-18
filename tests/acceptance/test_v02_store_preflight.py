@@ -20,6 +20,7 @@ from personal_health_lab.application import (
     ImportHealthExport,
     ImportReceipt,
     ImportStatus,
+    MigrateStore,
     PersonBindingStatus,
     RuntimeConfig,
     WorkspaceState,
@@ -535,7 +536,7 @@ def test_complete_store_copy_retains_the_same_identity(tmp_path: Path) -> None:
     assert copied.store_id == original.store_id
 
 
-def test_legacy_real_store_gets_identity_only_after_confirmed_execution(
+def test_populated_legacy_real_store_waits_for_copy_on_write_migration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _filevault_fixture(monkeypatch, status=FileVaultStatus.PROTECTED)
@@ -558,10 +559,16 @@ def test_legacy_real_store_gets_identity_only_after_confirmed_execution(
     request = ImportHealthExport(_package(tmp_path / "next.zip"))
     with HealthLab.open(config) as health_lab:
         before = health_lab.load_workspace_status()
-        plan = health_lab.preview_write(request)
+        blocked_import = health_lab.preview_write(request)
+        migration_request = MigrateStore()
+        migration_plan = health_lab.preview_write(migration_request)
     assert before.store_id is None
     assert before.state is WorkspaceState.MIGRATION_REQUIRED
-    assert WriteConfirmation.LEGACY_STORE_MIGRATION in plan.confirmations
+    assert blocked_import.approval.status is WriteApprovalStatus.BLOCKED
+    assert blocked_import.diagnostics == ("migration_required",)
+    assert WriteConfirmation.STORE_MIGRATION in migration_plan.confirmations
+    assert migration_plan.approval.status is WriteApprovalStatus.BLOCKED
+    assert migration_plan.diagnostics == ("populated_store_requires_cow",)
 
     with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
         assert metadata.execute(
@@ -569,20 +576,22 @@ def test_legacy_real_store_gets_identity_only_after_confirmed_execution(
         ).fetchone() == (None,)
 
     with HealthLab.open(config) as health_lab:
-        receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+        migration_receipt = health_lab.execute_write(
+            migration_request, expected_plan=migration_plan.fingerprint
+        )
         migrated = health_lab.load_workspace_status()
-    assert isinstance(receipt.result, ImportReceipt)
-    assert migrated.store_id is not None
-    assert migrated.person_binding is PersonBindingStatus.BOUND
-    assert migrated.state is WorkspaceState.READY
+        plan = health_lab.preview_write(request)
+        receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+    assert migration_receipt.result.status.value == "blocked"
+    assert receipt.result.status.value == "blocked"
+    assert migrated.store_id is None
+    assert migrated.person_binding is PersonBindingStatus.UNBOUND
+    assert migrated.state is WorkspaceState.MIGRATION_REQUIRED
     with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
-        assert "diagnostics" in {
+        assert "diagnostics" not in {
             str(row[1]) for row in metadata.execute("PRAGMA table_info(imports)")
         }
-    assert len(tuple((config.active_store / "migration-backups").glob("*.sqlite3"))) == 1
-
-    with HealthLab.open(config) as health_lab:
-        assert health_lab.load_workspace_status().store_id == migrated.store_id
+    assert not (config.active_store / "migration-backups").exists()
 
 
 def test_legacy_identity_schema_is_not_changed_on_open(tmp_path: Path) -> None:

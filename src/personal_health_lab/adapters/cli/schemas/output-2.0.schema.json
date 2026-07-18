@@ -253,7 +253,7 @@
             "available_bytes": {"type": ["integer", "null"], "minimum": 0},
             "estimate_bytes": {"type": ["integer", "null"], "minimum": 0},
             "fragment_size": {"type": ["integer", "null"], "minimum": 1},
-            "method_id": {"const": "full-snapshot-import/v1"},
+            "method_id": {"enum": ["full-snapshot-import/v1", "metadata-backup/v1", "store-migration/v1"]},
             "minimum_remaining_bytes": {"type": "integer", "minimum": 0},
             "reason": {
               "enum": [
@@ -473,6 +473,27 @@
         "type": {"const": "run_resting_heart_rate_analysis"}
       }
     },
+    "storeMigrationResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backup_file", "diagnostics", "source_version", "status", "steps", "target_version", "type"],
+      "properties": {
+        "backup_file": {"$ref": "#/$defs/nullableString"},
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "source_version": {"type": "integer", "minimum": 1},
+        "status": {"enum": ["completed", "no_op"]},
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [{"type": "integer"}, {"type": "integer"}],
+            "items": false
+          }
+        },
+        "target_version": {"type": "integer", "minimum": 1},
+        "type": {"const": "migrate_store"}
+      }
+    },
     "writePlanOutput": {
       "type": "object",
       "additionalProperties": false,
@@ -501,7 +522,8 @@
               "filevault_unprotected",
               "filevault_transitioning",
               "filevault_unknown",
-              "legacy_store_migration"
+              "metadata_backup_point_in_time",
+              "store_migration"
             ]
           }
         },
@@ -598,6 +620,26 @@
                 "start_date": {"$ref": "#/$defs/nullableString"},
                 "type": {"const": "run_resting_heart_rate_analysis"}
               }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["affected_snapshot_refs", "backup_file", "existing_analyses_become_stale", "source_version", "steps", "target_version", "type"],
+              "properties": {
+                "affected_snapshot_refs": {"type": "array", "items": {"type": "string"}},
+                "backup_file": {"$ref": "#/$defs/nullableString"},
+                "existing_analyses_become_stale": {"type": "boolean"},
+                "source_version": {"type": ["integer", "null"]},
+                "steps": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "prefixItems": [{"type": "integer"}, {"type": "integer"}],
+                    "items": false
+                  }
+                },
+                "target_version": {"type": "integer", "minimum": 1},
+                "type": {"const": "migrate_store"}
+              }
             }
           ]
         },
@@ -637,7 +679,7 @@
               "type": "object", "additionalProperties": false,
               "required": ["type"],
               "properties": {
-                "type": {"enum": ["confirm_data_review_batch", "create_plausibility_rule_version", "data_review_decision", "revoke_data_review_batch", "run_historical_review", "run_resting_heart_rate_analysis"]}
+                "type": {"enum": ["confirm_data_review_batch", "create_plausibility_rule_version", "data_review_decision", "migrate_store", "revoke_data_review_batch", "run_historical_review", "run_resting_heart_rate_analysis"]}
               }
             }
           ]
@@ -695,7 +737,8 @@
                   "filevault_unprotected",
                   "filevault_transitioning",
                   "filevault_unknown",
-                  "legacy_store_migration"
+                  "metadata_backup_point_in_time",
+                  "store_migration"
                 ]
               }
             },
@@ -745,6 +788,9 @@
             },
             {
               "$ref": "#/$defs/restingHeartRateAnalysisResult"
+            },
+            {
+              "$ref": "#/$defs/storeMigrationResult"
             }
           ]
         },

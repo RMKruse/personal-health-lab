@@ -35,6 +35,7 @@ from personal_health_lab.application import (
     LocalMeasurementExclusion,
     MeasurementVersionId,
     MetadataBackupReceipt,
+    MigrateStore,
     OverviewSelection,
     OverviewStatus,
     PlausibilityRuleSpecification,
@@ -48,6 +49,8 @@ from personal_health_lab.application import (
     SourceDeletionResolution,
     SourceDeletionVerdict,
     SourceValueAcceptance,
+    StoreMigrationPlan,
+    WorkspaceState,
     WriteApprovalStatus,
     WriteNotStarted,
 )
@@ -75,6 +78,71 @@ st.caption(
     f"{workspace_status.store_id or '-'} · Bindung: {workspace_status.person_binding.value}"
 )
 st.caption("Zulässige Schreibaktionen: " + ", ".join(workspace_status.allowed_writes))
+
+if workspace_status.state is WorkspaceState.MIGRATION_REQUIRED:
+    try:
+        with HealthLab.open(config) as health_lab:
+            migration_diagnostics = health_lab.load_migration_diagnostics()
+            migration_request = MigrateStore()
+            migration_plan = health_lab.preview_write(migration_request)
+            assert isinstance(migration_plan.details, StoreMigrationPlan)
+    except HealthLabError:
+        st.error("Migrationsdiagnose konnte nicht geladen werden.")
+        st.stop()
+    st.subheader("Datenspeichermigration")
+    st.caption(
+        f"Schema: {migration_diagnostics.source_version} → "
+        f"{migration_diagnostics.target_version}"
+    )
+    st.caption(
+        "Schritte: "
+        + (
+            ", ".join(f"{source} → {target}" for source, target in migration_plan.details.steps)
+            or "-"
+        )
+    )
+    st.caption(f"Migrationssicherung: {migration_plan.details.backup_file or '-'}")
+    st.caption(
+        "Betroffene Snapshots: "
+        + (", ".join(map(str, migration_plan.details.affected_snapshot_refs)) or "-")
+    )
+    st.caption(
+        "Bestehende Analysen werden stale: "
+        + str(migration_plan.details.existing_analyses_become_stale).lower()
+    )
+    migration_capacity = migration_plan.preflight.capacity
+    st.caption(
+        "Kapazität: "
+        + (
+            f"{migration_capacity.status.value} · Methode {migration_capacity.method_id} · "
+            f"Schätzung {migration_capacity.estimate_bytes} · "
+            f"Marge {migration_capacity.safety_margin_bytes} · "
+            f"Mindestrest {migration_capacity.minimum_remaining_bytes}"
+            if migration_capacity is not None
+            else "-"
+        )
+    )
+    st.caption("Diagnosen: " + (", ".join(migration_plan.diagnostics) or "-"))
+    st.code(str(migration_plan.fingerprint))
+    if st.button(
+        "Datenspeichermigration ausführen",
+        disabled=migration_plan.approval.status is WriteApprovalStatus.BLOCKED,
+    ):
+        try:
+            with HealthLab.open(config) as health_lab:
+                migration_result = health_lab.execute_write(
+                    migration_request, expected_plan=migration_plan.fingerprint
+                ).result
+            if isinstance(migration_result, WriteNotStarted):
+                st.warning(f"Datenspeichermigration: {migration_result.status.value}")
+            else:
+                st.success(f"Datenspeichermigration: {migration_result.status.value}")
+                st.rerun()
+        except HealthLabError:
+            st.error("Datenspeichermigration konnte nicht ausgeführt werden.")
+    if st.button("Migration abbrechen"):
+        st.info("Datenspeichermigration nicht ausgeführt.")
+    st.stop()
 
 import_plan = st.session_state.get("import_plan")
 uploaded = st.file_uploader(

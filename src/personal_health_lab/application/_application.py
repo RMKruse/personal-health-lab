@@ -41,6 +41,7 @@ from personal_health_lab.health_import import (
     estimate_health_export,
     import_health_export,
 )
+from personal_health_lab.migration import plan_store_migration
 from personal_health_lab.overview import Overview, OverviewReader, OverviewSelection
 from personal_health_lab.recovery import (
     BackupId,
@@ -110,6 +111,15 @@ _READY_WRITES = (
     "run_historical_review",
     "run_resting_heart_rate_analysis",
     "create_metadata_backup",
+    "migrate_store",
+)
+_READY_READS = (
+    "workspace_status",
+    "overview",
+    "data_review",
+    "data_review_case",
+    "plausibility_rules",
+    "migration_diagnostics",
 )
 
 
@@ -119,13 +129,7 @@ class WorkspaceStatus:
     store_id: StoreId | None
     person_binding: PersonBindingStatus
     state: WorkspaceState = WorkspaceState.READY
-    allowed_reads: tuple[str, ...] = (
-        "workspace_status",
-        "overview",
-        "data_review",
-        "data_review_case",
-        "plausibility_rules",
-    )
+    allowed_reads: tuple[str, ...] = _READY_READS
     allowed_writes: tuple[str, ...] = _READY_WRITES
 
 
@@ -214,6 +218,19 @@ class CreateMetadataBackup:
         if not isinstance(self.target_path, Path):
             raise ConfigurationError("Sicherungsziel muss ein pathlib.Path-Wert sein.")
         object.__setattr__(self, "target_path", self.target_path.expanduser().resolve())
+
+
+@dataclass(frozen=True, slots=True)
+class MigrateStore:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class MigrationDiagnostics:
+    source_version: int | None
+    target_version: int
+    steps: tuple[tuple[int, int], ...]
+    diagnostics: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -476,6 +493,7 @@ class RevokeDataReviewDecision:
 WriteRequest = (
     ImportHealthExport
     | CreateMetadataBackup
+    | MigrateStore
     | ResolveDataReviewCase
     | ConfirmDataReviewBatch
     | RevokeDataReviewDecision
@@ -496,8 +514,8 @@ class WriteConfirmation(StrEnum):
     FILEVAULT_UNPROTECTED = "filevault_unprotected"
     FILEVAULT_TRANSITIONING = "filevault_transitioning"
     FILEVAULT_UNKNOWN = "filevault_unknown"
-    LEGACY_STORE_MIGRATION = "legacy_store_migration"
     METADATA_BACKUP_POINT_IN_TIME = "metadata_backup_point_in_time"
+    STORE_MIGRATION = "store_migration"
 
 
 @dataclass(frozen=True, slots=True)
@@ -519,6 +537,16 @@ class MetadataBackupPlan:
     canonical_content_sha256: str
     audit_max_position: int
     target_file: str
+
+
+@dataclass(frozen=True, slots=True)
+class StoreMigrationPlan:
+    source_version: int | None
+    target_version: int
+    steps: tuple[tuple[int, int], ...]
+    backup_file: str | None
+    affected_snapshot_refs: tuple[SnapshotRef, ...]
+    existing_analyses_become_stale: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -597,6 +625,7 @@ class RestingHeartRateAnalysisPlan:
 WritePlanDetails = (
     ImportHealthExportPlan
     | MetadataBackupPlan
+    | StoreMigrationPlan
     | DataReviewDecisionPlan
     | DataReviewBatchPlan
     | DataReviewBatchRevokePlan
@@ -659,6 +688,22 @@ class MetadataBackupReceipt:
     created_at_utc: datetime
     target_file: str
     status: MetadataBackupStatus
+    diagnostics: tuple[str, ...] = ()
+
+
+class MigrationStatus(StrEnum):
+    COMPLETED = "completed"
+    NO_OP = "no_op"
+
+
+@dataclass(frozen=True, slots=True)
+class StoreMigrationReceipt:
+    operation_id: OperationId
+    status: MigrationStatus
+    source_version: int
+    target_version: int
+    steps: tuple[tuple[int, int], ...]
+    backup_file: str | None
     diagnostics: tuple[str, ...] = ()
 
 
@@ -862,6 +907,7 @@ class AnalysisReceipt:
 WriteResult = (
     ImportReceipt
     | MetadataBackupReceipt
+    | StoreMigrationReceipt
     | WriteDecisionReceipt
     | WriteBatchDecisionReceipt
     | PlausibilityRuleVersionReceipt
@@ -922,6 +968,8 @@ class HealthLab:
 
     def preview_write(self, request: WriteRequest) -> WritePlan:
         self._require_open()
+        if isinstance(request, MigrateStore):
+            return self._build_store_migration_plan()
         if isinstance(request, CreateMetadataBackup):
             return self._build_metadata_backup_plan(request)
         if isinstance(request, RunRestingHeartRateAnalysis):
@@ -939,6 +987,106 @@ class HealthLab:
         )
         return self._build_import_plan(request, filevault)
 
+    def _build_store_migration_plan(
+        self,
+        *,
+        filevault_override: FileVaultCheck | None = None,
+        capacity_override: CapacityCheck | None = None,
+    ) -> WritePlan:
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        diagnostics = self.load_migration_diagnostics()
+        source = diagnostics.source_version
+        backup_file = (
+            None
+            if source is None or not diagnostics.steps
+            else f"metadata-v{source}-to-v{diagnostics.target_version}.sqlite3"
+        )
+        filevault = (
+            filevault_override
+            if filevault_override is not None
+            else (
+                probe_filevault(self._config.active_store)
+                if self._config.mode is DataMode.REAL and diagnostics.steps
+                else None
+            )
+        )
+        capacity = (
+            capacity_override
+            if capacity_override is not None
+            else (self._store.preflight_store_migration() if diagnostics.steps else None)
+        )
+        blocked = bool(diagnostics.diagnostics) or (
+            capacity is not None and capacity.status is not CapacityStatus.READY
+        )
+        confirmations: tuple[WriteConfirmation, ...] = (
+            () if not diagnostics.steps else (WriteConfirmation.STORE_MIGRATION,)
+        )
+        if filevault is not None and filevault.status is not FileVaultStatus.PROTECTED:
+            confirmations += (WriteConfirmation("filevault_" + filevault.status.value),)
+        plan_diagnostics = diagnostics.diagnostics
+        if capacity is not None and capacity.status is not CapacityStatus.READY:
+            plan_diagnostics += (
+                "capacity_" + (
+                    capacity.reason.value if capacity.reason is not None else capacity.status.value
+                ),
+            )
+        payload = {
+            "affected_snapshot_refs": (),
+            "backup_file": backup_file,
+            "capacity": None
+            if capacity is None
+            else {
+                "estimate": capacity.estimate_bytes,
+                "fragment": capacity.fragment_size,
+                "status": capacity.status.value,
+                "target_volume": capacity.target_volume,
+            },
+            "filevault": None
+            if filevault is None
+            else {
+                "reason": None if filevault.reason is None else filevault.reason.value,
+                "status": filevault.status.value,
+                "target_volume": filevault.target_volume,
+            },
+            "operation": "migrate_store",
+            "source_version": source,
+            "steps": diagnostics.steps,
+            "target_version": diagnostics.target_version,
+            "existing_analyses_become_stale": False,
+            "version": 1,
+        }
+        return WritePlan(
+            PlanFingerprint(
+                hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+            ),
+            StoreMigrationPlan(
+                source,
+                diagnostics.target_version,
+                diagnostics.steps,
+                backup_file,
+                (),
+                False,
+            ),
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED
+                    if blocked
+                    else (
+                        WriteApprovalStatus.CONFIRMATION_REQUIRED
+                        if diagnostics.steps
+                        else WriteApprovalStatus.READY
+                    )
+                ),
+                confirmations,
+                filevault,
+                plan_diagnostics,
+                capacity,
+            ),
+        )
+
     def _build_metadata_backup_plan(
         self,
         request: CreateMetadataBackup,
@@ -948,6 +1096,26 @@ class HealthLab:
     ) -> WritePlan:
         if self._store is None:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        if self.load_workspace_status().state is WorkspaceState.MIGRATION_REQUIRED:
+            details = MetadataBackupPlan(BackupId("0" * 32), "0" * 64, 0, request.target_path.name)
+            payload = {
+                "operation": "create_metadata_backup",
+                "status": "migration_required",
+                "target": request.target_path.name,
+                "version": 1,
+            }
+            return WritePlan(
+                PlanFingerprint(
+                    hashlib.sha256(
+                        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest()
+                ),
+                details,
+                WritePreflight(
+                    WriteApproval(WriteApprovalStatus.BLOCKED),
+                    diagnostics=("migration_required",),
+                ),
+            )
         if self._config.mode is not DataMode.REAL:
             details = MetadataBackupPlan(BackupId("0" * 32), "0" * 64, 0, request.target_path.name)
             payload = {"operation": "create_metadata_backup", "mode": "synthetic", "version": 1}
@@ -1418,7 +1586,7 @@ class HealthLab:
             approval = WriteApproval(WriteApprovalStatus.READY)
             confirmations = ()
             diagnostics = ()
-        if workspace.state is WorkspaceState.MIGRATION_REQUIRED and workspace.store_id is not None:
+        if workspace.state is WorkspaceState.MIGRATION_REQUIRED:
             approval = WriteApproval(WriteApprovalStatus.BLOCKED)
             confirmations = ()
             diagnostics = ("migration_required",)
@@ -1439,8 +1607,6 @@ class HealthLab:
             diagnostics = ("target_locked",)
         elif approval.status is not WriteApprovalStatus.BLOCKED and filevault is not None:
             confirmation_list = [WriteConfirmation.REAL_IMPORT_SAME_PERSON]
-            if workspace.store_id is None:
-                confirmation_list.append(WriteConfirmation.LEGACY_STORE_MIGRATION)
             if filevault.status is not FileVaultStatus.PROTECTED:
                 confirmation_list.append(WriteConfirmation(f"filevault_{filevault.status.value}"))
             confirmations = tuple(confirmation_list)
@@ -1625,6 +1791,8 @@ class HealthLab:
                 current_plan.diagnostics,
                 expected_plan,
             )
+        if isinstance(request, MigrateStore):
+            return self._execute_store_migration(authorization_plan, expected_plan)
         if isinstance(request, CreateMetadataBackup):
             return self._execute_metadata_backup(request, authorization_plan, expected_plan)
         if isinstance(request, CreatePlausibilityRuleVersion):
@@ -1645,7 +1813,6 @@ class HealthLab:
                 expected_plan,
             )
         try:
-            workspace = self.load_workspace_status()
             writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
         except StoreBusyError:
             return self._not_started(
@@ -1736,10 +1903,6 @@ class HealthLab:
                     filevault=final_filevault,
                     capacity=final_capacity,
                 )
-            if workspace.state is WorkspaceState.MIGRATION_REQUIRED:
-                writer.initialize_identity(
-                    confirm_existing_person=self._config.mode is DataMode.REAL
-                )
             result = import_health_export(
                 request.package_path,
                 store=writer,
@@ -1780,6 +1943,98 @@ class HealthLab:
             result=import_result,
             final_preflight=final_preflight,
             diagnostics=result.diagnostics,
+        )
+
+    def _execute_store_migration(
+        self,
+        plan: WritePlan,
+        expected_plan: PlanFingerprint,
+    ) -> WriteReceipt:
+        if not isinstance(plan.details, StoreMigrationPlan) or plan.details.source_version is None:
+            return self._not_started(
+                plan, WriteNotStartedStatus.BLOCKED, plan.diagnostics, expected_plan
+            )
+        operation_id = OperationId(uuid4().hex)
+        if not plan.details.steps:
+            result = StoreMigrationReceipt(
+                operation_id,
+                MigrationStatus.NO_OP,
+                plan.details.source_version,
+                plan.details.target_version,
+                (),
+                None,
+            )
+            return WriteReceipt(operation_id, expected_plan, result, plan.preflight)
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        try:
+            final_filevault = (
+                probe_filevault(self._config.active_store)
+                if plan.preflight.filevault is not None
+                else None
+            )
+            expected_filevault = plan.preflight.filevault
+            if (
+                expected_filevault is not None
+                and final_filevault is not None
+                and not self._filevault_allows_execution(expected_filevault, final_filevault)
+            ):
+                return self._not_started_with_preflight(
+                    plan,
+                    WriteNotStartedStatus.PLAN_CHANGED,
+                    ("plan_changed",),
+                    expected_plan,
+                    filevault=final_filevault,
+                )
+            final_capacity = writer.preflight_store_migration()
+            if final_capacity.status is not CapacityStatus.READY:
+                diagnostic = "capacity_" + (
+                    final_capacity.reason.value
+                    if final_capacity.reason is not None
+                    else final_capacity.status.value
+                )
+                return self._not_started_with_preflight(
+                    plan,
+                    WriteNotStartedStatus.BLOCKED,
+                    (diagnostic,),
+                    expected_plan,
+                    filevault=final_filevault,
+                    capacity=final_capacity,
+                )
+            assert plan.details.backup_file is not None
+            writer.migrate_store_schema(plan.details.steps, plan.details.backup_file)
+        except StoreError:
+            return self._not_started(
+                plan,
+                WriteNotStartedStatus.BLOCKED,
+                ("migration_backup_failed",),
+                expected_plan,
+            )
+        finally:
+            writer.close()
+        result = StoreMigrationReceipt(
+            operation_id,
+            MigrationStatus.COMPLETED,
+            plan.details.source_version,
+            plan.details.target_version,
+            plan.details.steps,
+            plan.details.backup_file,
+        )
+        return WriteReceipt(
+            operation_id,
+            expected_plan,
+            result,
+            WritePreflight(
+                plan.approval,
+                plan.confirmations,
+                final_filevault,
+                (),
+                final_capacity,
+            ),
         )
 
     def _execute_metadata_backup(
@@ -2388,10 +2643,12 @@ class HealthLab:
         )
 
     def load_overview(self, selection: OverviewSelection) -> Overview:
+        self._require_ready()
         reader = self._require_open()
         return reader.load(selection)
 
     def load_data_review(self, selection: DataReviewSelection) -> DataReview:
+        self._require_ready()
         self._require_open()
         if self._store is None:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
@@ -2500,23 +2757,48 @@ class HealthLab:
         if self._store is None:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
         identity = self._store.load_identity()
+        state = (
+            WorkspaceState.READY
+            if identity.store_id is not None and identity.is_current
+            else WorkspaceState.MIGRATION_REQUIRED
+        )
         return WorkspaceStatus(
             mode=identity.mode,
             store_id=identity.store_id,
             person_binding=identity.person_binding,
-            state=(
-                WorkspaceState.READY
-                if identity.store_id is not None and identity.is_current
-                else WorkspaceState.MIGRATION_REQUIRED
+            state=state,
+            allowed_reads=(
+                ("workspace_status", "migration_diagnostics")
+                if state is WorkspaceState.MIGRATION_REQUIRED
+                else _READY_READS
             ),
             allowed_writes=(
-                _READY_WRITES
-                if identity.mode is DataMode.REAL
-                else tuple(item for item in _READY_WRITES if item != "create_metadata_backup")
+                ("migrate_store",)
+                if state is WorkspaceState.MIGRATION_REQUIRED
+                else (
+                    _READY_WRITES
+                    if identity.mode is DataMode.REAL
+                    else tuple(item for item in _READY_WRITES if item != "create_metadata_backup")
+                )
             ),
         )
 
+    def load_migration_diagnostics(self) -> MigrationDiagnostics:
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        raw_source = self._store.load_identity().schema_version
+        target, steps, diagnostics = plan_store_migration(raw_source)
+        if steps and self._store.contains_health_data():
+            diagnostics += ("populated_store_requires_cow",)
+        try:
+            source = int(raw_source)
+        except ValueError:
+            source = None
+        return MigrationDiagnostics(source, target, steps, diagnostics)
+
     def load_plausibility_rules(self) -> PlausibilityRules:
+        self._require_ready()
         self._require_open()
         if self._store is None:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
@@ -2567,3 +2849,7 @@ class HealthLab:
         if self._overview_reader is None:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
         return self._overview_reader
+
+    def _require_ready(self) -> None:
+        if self.load_workspace_status().state is WorkspaceState.MIGRATION_REQUIRED:
+            raise HealthLabError("Datenspeicher benötigt zuerst eine Migration.")

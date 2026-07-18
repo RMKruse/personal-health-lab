@@ -49,6 +49,7 @@ from personal_health_lab.application import (
     MeasurementVersionId,
     MetadataBackupPlan,
     MetadataBackupReceipt,
+    MigrateStore,
     OverviewSelection,
     PlanFingerprint,
     PlausibilityRules,
@@ -67,6 +68,8 @@ from personal_health_lab.application import (
     SourceDeletionResolution,
     SourceDeletionVerdict,
     SourceValueAcceptance,
+    StoreMigrationPlan,
+    StoreMigrationReceipt,
     WorkspaceStatus,
     WriteApprovalStatus,
     WriteBatchDecisionReceipt,
@@ -175,6 +178,10 @@ def _parser() -> argparse.ArgumentParser:
     backup.add_argument("--json", action="store_true", dest="as_json")
     backup.add_argument("--execute", action="store_true")
     backup.add_argument("--expect-plan", type=PlanFingerprint)
+    migration = commands.add_parser("migrate", help="Datenspeicherschema migrieren")
+    migration.add_argument("--json", action="store_true", dest="as_json")
+    migration.add_argument("--execute", action="store_true")
+    migration.add_argument("--expect-plan", type=PlanFingerprint)
     return parser
 
 
@@ -467,6 +474,19 @@ def _write_plan_json(
             "type": "create_metadata_backup",
         }
         request_json = {"target": "<redacted>", "type": "create_metadata_backup"}
+    elif isinstance(details, StoreMigrationPlan):
+        detail_json = {
+            "affected_snapshot_refs": tuple(
+                str(item) for item in details.affected_snapshot_refs
+            ),
+            "backup_file": details.backup_file,
+            "existing_analyses_become_stale": details.existing_analyses_become_stale,
+            "source_version": details.source_version,
+            "steps": details.steps,
+            "target_version": details.target_version,
+            "type": "migrate_store",
+        }
+        request_json = {"type": "migrate_store"}
     elif isinstance(details, PlausibilityRuleVersionPlan):
         detail_json = {
             "active_snapshot_ref": (
@@ -602,6 +622,16 @@ def _write_receipt_json(
             "target_file": result.target_file,
             "type": "create_metadata_backup",
         }
+    elif isinstance(result, StoreMigrationReceipt):
+        result_json = {
+            "backup_file": result.backup_file,
+            "diagnostics": result.diagnostics,
+            "source_version": result.source_version,
+            "status": result.status.value,
+            "steps": result.steps,
+            "target_version": result.target_version,
+            "type": "migrate_store",
+        }
     elif isinstance(result, PlausibilityRuleVersionReceipt):
         result_json = {
             "diagnostics": result.diagnostics,
@@ -682,6 +712,21 @@ def _print_write_plan(plan: WritePlan, workspace: WorkspaceStatus) -> None:
         f"Datenspeicher-ID: {workspace.store_id or '-'} · Bindung: {workspace.person_binding.value}"
     )
     print("Bestätigungen: " + (", ".join(plan.confirmations) or "-"))
+    if isinstance(plan.details, StoreMigrationPlan):
+        migration = plan.details
+        chain = " -> ".join(
+            [str(migration.steps[0][0]), *(str(target) for _, target in migration.steps)]
+        ) if migration.steps else "-"
+        print(f"Migrationskette: {chain}")
+        print(f"Migrationssicherung: {migration.backup_file or '-'}")
+        print(
+            "Betroffene Snapshots: "
+            + (", ".join(str(item) for item in migration.affected_snapshot_refs) or "-")
+        )
+        print(
+            "Bestehende Analysen werden veraltet: "
+            + ("ja" if migration.existing_analyses_become_stale else "nein")
+        )
     filevault = plan.preflight.filevault
     print(
         "FileVault: "
@@ -716,6 +761,7 @@ def main(args: Sequence[str] | None = None) -> int:
         "backup",
         "historical-review",
         "import",
+        "migrate",
         "rule",
         "review-confirm-batch",
         "review-resolve",
@@ -786,6 +832,25 @@ def main(args: Sequence[str] | None = None) -> int:
                         import_write_receipt = health_lab.execute_write(
                             import_request,
                             expected_plan=import_plan.fingerprint,
+                        )
+            elif parsed.command == "migrate":
+                migration_request = MigrateStore()
+                migration_plan = health_lab.preview_write(migration_request)
+                migration_write_receipt = None
+                if parsed.execute:
+                    assert parsed.expect_plan is not None
+                    migration_write_receipt = health_lab.execute_write(
+                        migration_request, expected_plan=parsed.expect_plan
+                    )
+                elif not parsed.as_json:
+                    _print_write_plan(migration_plan, workspace_status)
+                    if (
+                        migration_plan.approval.status is not WriteApprovalStatus.BLOCKED
+                        and input("Datenspeichermigration ausführen? [j/N] ").strip().lower()
+                        in {"j", "ja"}
+                    ):
+                        migration_write_receipt = health_lab.execute_write(
+                            migration_request, expected_plan=migration_plan.fingerprint
                         )
             elif parsed.command == "backup":
                 backup_request = CreateMetadataBackup(parsed.target)
@@ -1034,6 +1099,19 @@ def main(args: Sequence[str] | None = None) -> int:
             else _write_receipt_json(backup_write_receipt, runtime_config)
         )
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+    elif parsed.command == "migrate" and parsed.as_json:
+        output = (
+            _write_plan_json(migration_plan, runtime_config, workspace_status)
+            if migration_write_receipt is None
+            else _write_receipt_json(migration_write_receipt, runtime_config)
+        )
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+    elif parsed.command == "migrate":
+        if migration_write_receipt is None:
+            _print_write_plan(migration_plan, workspace_status)
+            print("Datenspeichermigration nicht ausgeführt.")
+        else:
+            print(f"Datenspeichermigration: {migration_write_receipt.result.status.value}")
     elif parsed.command == "backup":
         if backup_write_receipt is None:
             _print_write_plan(backup_plan, workspace_status)
@@ -1298,6 +1376,14 @@ def main(args: Sequence[str] | None = None) -> int:
                 f"{historical.completed_at.isoformat() if historical.completed_at else '-'}"
             )
     if parsed.command in write_commands:
+        if parsed.command == "migrate":
+            if migration_write_receipt is None:
+                return (
+                    3
+                    if migration_plan.approval.status is WriteApprovalStatus.BLOCKED
+                    else 0
+                )
+            return 3 if isinstance(migration_write_receipt.result, WriteNotStarted) else 0
         if parsed.command == "backup":
             if backup_write_receipt is None:
                 return 3 if backup_plan.approval.status is WriteApprovalStatus.BLOCKED else 0

@@ -1,6 +1,7 @@
 import fcntl
 import json
 import platform
+import sqlite3
 import subprocess
 import sys
 from collections.abc import Callable
@@ -483,6 +484,7 @@ def test_real_json_import_renders_shared_confirmation_plan(
             "run_historical_review",
             "run_resting_heart_rate_analysis",
             "create_metadata_backup",
+            "migrate_store",
         ]
 
 
@@ -862,7 +864,6 @@ def test_cli_runs_and_exposes_the_built_in_lag_analysis(
         item["pointwise_interval"] and item["simultaneous_band"]
         for item in analysis_result["lag_associations"]
     )
-
     structured_result = json.dumps(analysis_result, ensure_ascii=False).lower()
     assert all(
         forbidden not in structured_result
@@ -914,3 +915,53 @@ def test_cli_runs_and_exposes_the_built_in_lag_analysis(
     assert insufficient["result"]["analysis"] is None
     assert insufficient["result"]["provenance"]["snapshot_ref"] == provenance["snapshot_ref"]
     assert insufficient["result"]["provenance"]["result_ref"] is None
+
+
+def test_cli_maps_store_migration_plan_and_receipt(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = tmp_path / "migration-store"
+    config = RuntimeConfig(DataMode.SYNTHETIC, store, tmp_path / "real")
+    with HealthLab.open(config):
+        pass
+    with sqlite3.connect(store / "metadata.sqlite3") as metadata:
+        metadata.execute("UPDATE store_identity SET schema_version = 2 WHERE singleton = 1")
+    common = [
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(store),
+        "--real-store",
+        str(tmp_path / "real"),
+    ]
+
+    assert main([*common, "migrate", "--json"]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    _assert_json_contract(plan)
+    assert plan["workspace"]["allowed_writes"] == ["migrate_store"]
+    assert plan["details"]["steps"] == [[2, 3], [3, 4]]
+    assert plan["details"]["backup_file"] == "metadata-v2-to-v4.sqlite3"
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+        assert main([*common, "migrate"]) == 0
+    human_plan = capsys.readouterr().out
+    assert "Migrationskette: 2 -> 3 -> 4" in human_plan
+    assert "Migrationssicherung: metadata-v2-to-v4.sqlite3" in human_plan
+    assert "Betroffene Snapshots: -" in human_plan
+    assert "Bestehende Analysen werden veraltet: nein" in human_plan
+
+    assert main(
+        [
+            *common,
+            "migrate",
+            "--json",
+            "--execute",
+            "--expect-plan",
+            plan["fingerprint"],
+        ]
+    ) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    _assert_json_contract(receipt)
+    assert receipt["result"]["status"] == "completed"
+    assert receipt["result"]["steps"] == [[2, 3], [3, 4]]

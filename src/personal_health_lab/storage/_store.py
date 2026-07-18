@@ -13,6 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta, timezone
 from enum import StrEnum
+from itertools import pairwise
 from pathlib import Path
 from typing import IO, Literal, Self, cast
 from uuid import uuid4
@@ -44,6 +45,7 @@ _QUERY_FILE = "query.duckdb"
 _STORE_SCHEMA_VERSION = 4
 _WRITER_LOCK_FILE = ".writer.lock"
 _FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
+_STORE_MIGRATION_METHOD = "store-migration/v1"
 _SNAPSHOT_SCHEMA_VERSION = 1
 _IDENTITY_RULE_VERSION = "healthkit-natural/v2"
 _MAPPING_RULE_VERSION = "healthkit-canonical/v1"
@@ -255,6 +257,10 @@ def _allocation_checkpoint(root: Path, phase: str) -> None:
 
 def _publication_fault_point(root: Path, fault_point_id: str) -> None:
     """Private test seam for durable import-publication transitions."""
+
+
+def _migration_backup_fault_point(root: Path) -> None:
+    """Private test seam immediately before the migration backup starts."""
 
 
 def probe_capacity(
@@ -534,6 +540,10 @@ class StoreIdentity:
     @property
     def is_current(self) -> bool:
         return self.schema_version == str(_STORE_SCHEMA_VERSION)
+
+
+def current_store_schema_version() -> int:
+    return _STORE_SCHEMA_VERSION
 
 
 @dataclass(frozen=True, slots=True)
@@ -1562,57 +1572,71 @@ class LocalStore:
             schema_version=str(row[3]),
         )
 
-    def initialize_identity(self, *, confirm_existing_person: bool) -> StoreIdentity:
+    def contains_health_data(self) -> bool:
+        imports_table = self._metadata.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'imports'"
+        ).fetchone()
+        if imports_table is not None and self._metadata.execute(
+            "SELECT 1 FROM imports "
+            "WHERE status IN ('committed', 'duplicate', 'quarantined') LIMIT 1"
+        ).fetchone() is not None:
+            return True
+        snapshots_table = self._metadata.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'snapshots'"
+        ).fetchone()
+        return snapshots_table is not None and self._metadata.execute(
+            "SELECT 1 FROM snapshots LIMIT 1"
+        ).fetchone() is not None
+
+    def preflight_store_migration(self) -> CapacityCheck:
+        try:
+            metadata_bytes = (self._root / _METADATA_FILE).stat().st_blocks * 512
+            fragment_size = os.statvfs(self._root).f_frsize
+        except OSError:
+            return probe_capacity(self._root, None, method_id=_STORE_MIGRATION_METHOD)
+        estimate = _round_up(max(2 * _MIB, 3 * metadata_bytes), fragment_size)
+        return probe_capacity(self._root, estimate, method_id=_STORE_MIGRATION_METHOD)
+
+    def migrate_store_schema(
+        self,
+        steps: tuple[tuple[int, int], ...],
+        backup_file: str,
+    ) -> StoreIdentity:
         self._require_writer()
         identity = self.load_identity()
-        if identity.store_id is not None:
-            return identity
-        has_personal_data = bool(
-            self._metadata.execute(
-                "SELECT 1 FROM imports "
-                "WHERE status IN ('committed', 'duplicate', 'quarantined') LIMIT 1"
-            ).fetchone()
-        )
-        if self._mode is DataMode.REAL and has_personal_data and not confirm_existing_person:
+        try:
+            source_version = int(identity.schema_version)
+        except ValueError as error:
             raise StoreConfigurationError(
-                "Bestehende reale Daten benötigen die Einpersonenbestätigung."
-            )
-        binding = (
-            PersonBindingStatus.BOUND
-            if self._mode is DataMode.REAL and has_personal_data
-            else PersonBindingStatus.UNBOUND
-        )
-        store_id = uuid4().hex
-        active = self._metadata.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'active_snapshot'"
-        ).fetchone()
-        if active is not None:
-            snapshot = self._metadata.execute(
-                "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
-            ).fetchone()
-            if snapshot is not None:
-                try:
-                    candidate = json.loads(
-                        (
-                            self._root
-                            / _PARQUET_DIRECTORY
-                            / "snapshots"
-                            / str(snapshot[0])
-                            / "manifest.json"
-                        ).read_bytes()
-                    )["store_id"]
-                    store_id = str(StoreId(str(candidate)))
-                except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-                    pass
-        if identity.schema_version != str(_STORE_SCHEMA_VERSION):
-            backup_directory = self._root / "migration-backups"
-            backup_directory.mkdir(exist_ok=True)
-            backup_path = backup_directory / (
-                f"metadata-v{identity.schema_version}-"
-                f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}.sqlite3"
-            )
-            with sqlite3.connect(backup_path) as backup:
+                "Datenspeicherschema ist keine positive Ganzzahl."
+            ) from error
+        if (
+            not steps
+            or steps[0][0] != source_version
+            or steps[-1][1] != _STORE_SCHEMA_VERSION
+            or any(target != source + 1 for source, target in steps)
+            or any(left[1] != right[0] for left, right in pairwise(steps))
+        ):
+            raise StoreConfigurationError("Migrationskette ist nicht lückenlos registriert.")
+
+        backup_directory = self._root / "migration-backups"
+        backup_directory.mkdir(exist_ok=True)
+        backup_path = backup_directory / backup_file
+        temporary = backup_path.with_suffix(backup_path.suffix + ".tmp")
+        if backup_path.exists() or temporary.exists():
+            raise StoreError("Migrationssicherung existiert bereits.")
+        try:
+            _migration_backup_fault_point(self._root)
+            with sqlite3.connect(temporary) as backup:
                 self._metadata.backup(backup)
+            os.replace(temporary, backup_path)
+        except (OSError, sqlite3.Error) as error:
+            temporary.unlink(missing_ok=True)
+            raise StoreError("Migrationssicherung ist fehlgeschlagen.") from error
+
+        existing_store_id = identity.store_id
+        store_id = str(existing_store_id) if existing_store_id is not None else uuid4().hex
+        binding = identity.person_binding
         with self._metadata:
             _ensure_current_tables(self._metadata)
             self._metadata.execute("ALTER TABLE store_identity RENAME TO legacy_store_identity")
@@ -1622,6 +1646,7 @@ class LocalStore:
                 (self._mode.value, _STORE_SCHEMA_VERSION, store_id, binding.value),
             )
             self._metadata.execute("DROP TABLE legacy_store_identity")
+            self._validate_store()
         return self.load_identity()
 
     @classmethod
@@ -1637,7 +1662,8 @@ class LocalStore:
         store: Self | None = None
         try:
             store = cls._open(root, mode, initialize=True)
-            store._recover_imports()
+            if store.load_identity().is_current:
+                store._recover_imports()
             store._validate_store()
             return store
         except Exception:
@@ -1655,7 +1681,8 @@ class LocalStore:
         store: Self | None = None
         try:
             store = cls._open(root, mode, initialize=True, writer_lock=writer_lock)
-            store._recover_imports()
+            if store.load_identity().is_current:
+                store._recover_imports()
             store._validate_store()
             return store
         except Exception:
@@ -1697,15 +1724,9 @@ class LocalStore:
             )
             if existing_identity is not None:
                 existing_mode, existing_schema = map(str, existing_identity)
-                if existing_mode != mode.value or existing_schema not in {
-                    "1",
-                    "1.0",
-                    "1.1",
-                    "1.2",
-                    "2",
-                    "3",
-                    str(_STORE_SCHEMA_VERSION),
-                }:
+                supported_legacy = existing_schema in {"1.0", "1.1", "1.2"}
+                integer_schema = existing_schema.isdecimal() and int(existing_schema) > 0
+                if existing_mode != mode.value or not (supported_legacy or integer_schema):
                     raise StoreConfigurationError(
                         "Datenspeicher gehört zu einem anderen Modus oder Schema."
                     )
@@ -1740,8 +1761,10 @@ class LocalStore:
                 metadata.commit()
             elif (
                 str(identity[0]) != mode.value
-                or str(identity[1])
-                not in {"1", "1.0", "1.1", "1.2", "2", "3", str(_STORE_SCHEMA_VERSION)}
+                or not (
+                    str(identity[1]) in {"1.0", "1.1", "1.2"}
+                    or (str(identity[1]).isdecimal() and int(str(identity[1])) > 0)
+                )
                 or (
                     str(identity[1]) == str(_STORE_SCHEMA_VERSION)
                     and (identity[2] is None or not str(identity[2]))
@@ -1751,9 +1774,13 @@ class LocalStore:
                     "Datenspeicher gehört zu einem anderen Modus oder Schema."
                 )
             query_path = root / _QUERY_FILE
-            if initialize and not query_path.exists():
+            if initialize and not legacy_identity and not query_path.exists():
                 duckdb.connect(str(query_path)).close()
-            query = duckdb.connect(str(query_path), config={"access_mode": "READ_ONLY"})
+            query = (
+                duckdb.connect(":memory:")
+                if legacy_identity and not query_path.exists()
+                else duckdb.connect(str(query_path), config={"access_mode": "READ_ONLY"})
+            )
             scratch_bound = True
             if writer_lock is not None:
                 temporary = str(root / ".duckdb-temp").replace("'", "''")

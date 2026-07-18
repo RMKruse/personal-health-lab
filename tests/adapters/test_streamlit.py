@@ -1,6 +1,7 @@
 import fcntl
 import json
 import platform
+import sqlite3
 from collections.abc import Callable
 from datetime import date
 from pathlib import Path
@@ -45,6 +46,35 @@ def test_streamlit_shows_the_same_empty_overview(
 
     assert any("Analysestatus: insufficient_data" in item.value for item in app.warning)
     assert not app.get("vega_lite_chart")
+
+
+def test_streamlit_focuses_migration_in_restricted_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = tmp_path / "migration-store"
+    config = RuntimeConfig(DataMode.SYNTHETIC, store, tmp_path / "real")
+    with HealthLab.open(config):
+        pass
+    with sqlite3.connect(store / "metadata.sqlite3") as metadata:
+        metadata.execute("UPDATE store_identity SET schema_version = 2 WHERE singleton = 1")
+    monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
+    monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(store))
+    monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(tmp_path / "real"))
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
+
+    app = AppTest.from_file(str(app_path)).run()
+
+    assert not app.exception
+    assert any(item.value == "Datenspeichermigration" for item in app.subheader)
+    assert any("Schema: 2 → 4" in item.value for item in app.caption)
+    assert any("2 → 3, 3 → 4" in item.value for item in app.caption)
+    assert not app.file_uploader
+    next(
+        button for button in app.button if button.label == "Datenspeichermigration ausführen"
+    ).click().run()
+
+    assert not app.exception
+    assert any(item.value == "Status: empty" for item in app.markdown)
 
 
 def test_streamlit_translates_invalid_configuration(
