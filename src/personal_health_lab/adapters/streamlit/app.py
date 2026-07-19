@@ -41,6 +41,8 @@ from personal_health_lab.application import (
     PlausibilityRuleSpecification,
     ResolveDataReviewCase,
     RevokeDataReviewDecision,
+    RollbackMigration,
+    RollbackMigrationPlan,
     RunHistoricalReview,
     RunRestingHeartRateAnalysis,
     SingleDecisionTarget,
@@ -143,6 +145,42 @@ if workspace_status.state is WorkspaceState.MIGRATION_REQUIRED:
     if st.button("Migration abbrechen"):
         st.info("Datenspeichermigration nicht ausgeführt.")
     st.stop()
+
+try:
+    with HealthLab.open(config) as health_lab:
+        rollback_request = RollbackMigration()
+        rollback_plan = health_lab.preview_write(rollback_request)
+        assert isinstance(rollback_plan.details, RollbackMigrationPlan)
+except HealthLabError:
+    st.error("Migrationsrollback konnte nicht geplant werden.")
+    st.stop()
+
+if rollback_plan.details.migration_operation_id is not None:
+    rollback = rollback_plan.details
+    st.subheader("Migrationsrollback")
+    st.caption(f"Migration: {rollback.migration_operation_id}")
+    st.caption(f"Schema: {rollback.source_version} → {rollback.target_version}")
+    st.caption(f"Migrationssicherung: {rollback.backup_file or '-'}")
+    st.caption(f"Wiederhergestellter Snapshot: {rollback.restored_snapshot_ref or '-'}")
+    st.caption(f"Unreferenzierter Snapshot: {rollback.current_snapshot_ref or '-'}")
+    st.caption("Diagnosen: " + (", ".join(rollback_plan.diagnostics) or "-"))
+    st.code(str(rollback_plan.fingerprint))
+    if st.button(
+        "Letzte Migration zurückrollen",
+        disabled=rollback_plan.approval.status is WriteApprovalStatus.BLOCKED,
+    ):
+        try:
+            with HealthLab.open(config) as health_lab:
+                rollback_result = health_lab.execute_write(
+                    rollback_request, expected_plan=rollback_plan.fingerprint
+                ).result
+            if isinstance(rollback_result, WriteNotStarted):
+                st.warning(f"Migrationsrollback: {rollback_result.status.value}")
+            else:
+                st.success(f"Migrationsrollback: {rollback_result.status.value}")
+                st.rerun()
+        except HealthLabError:
+            st.error("Migrationsrollback konnte nicht ausgeführt werden.")
 
 import_plan = st.session_state.get("import_plan")
 uploaded = st.file_uploader(

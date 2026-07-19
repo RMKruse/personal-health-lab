@@ -9,6 +9,7 @@ from personal_health_lab.application import (
     AnalysisDefinitionId,
     AnalysisFreshness,
     AnalysisReceipt,
+    AnalysisStatus,
     CapacityCheck,
     CapacityStatus,
     CreateMetadataBackup,
@@ -19,6 +20,9 @@ from personal_health_lab.application import (
     MigrateStore,
     MigrationStatus,
     OverviewSelection,
+    RollbackMigration,
+    RollbackMigrationPlan,
+    RollbackMigrationReceipt,
     RunRestingHeartRateAnalysis,
     RuntimeConfig,
     StoreMigrationPlan,
@@ -52,7 +56,8 @@ def _set_legacy_migration_constraints(config: RuntimeConfig) -> None:
         metadata.execute(
             "UPDATE sqlite_schema SET sql = replace(sql, ?, ?) WHERE name = ?",
             (
-                "'run_historical_review', 'migrate_store')",
+                "'run_historical_review', 'migrate_store',\n"
+                "                                 'rollback_migration')",
                 "'run_historical_review')",
                 "write_operations",
             ),
@@ -720,3 +725,140 @@ def test_abandoning_migration_plan_changes_nothing(tmp_path: Path) -> None:
     assert plan.details.steps == ((2, 3), (3, 4))
     assert (config.active_store / "metadata.sqlite3").read_bytes() == before
     assert not (config.active_store / "migration-backups").exists()
+
+
+def test_direct_migration_rollback_restores_backup_and_old_snapshot(tmp_path: Path) -> None:
+    fixture = generate_export("null-v1", 42, tmp_path / "fixture-rollback")
+    config = _config(tmp_path / "rollback")
+    with HealthLab.open(config) as health_lab:
+        imported = ImportHealthExport(fixture.export_path)
+        import_receipt = health_lab.execute_write(
+            imported, expected_plan=health_lab.preview_write(imported).fingerprint
+        )
+    old_snapshot = import_receipt.result.snapshot_ref
+    assert old_snapshot is not None
+    _set_version(config, 2)
+    _set_legacy_migration_constraints(config)
+
+    with HealthLab.open(config) as health_lab:
+        migration = MigrateStore()
+        migration_receipt = health_lab.execute_write(
+            migration, expected_plan=health_lab.preview_write(migration).fingerprint
+        )
+    assert isinstance(migration_receipt.result, StoreMigrationReceipt)
+    migration_operation_id = migration_receipt.result.operation_id
+    snapshot_root = config.active_store / "parquet" / "snapshots"
+    generated_snapshot = next(
+        path.name for path in snapshot_root.iterdir() if path.name != str(old_snapshot)
+    )
+
+    with HealthLab.open(config) as health_lab:
+        rollback = RollbackMigration()
+        plan = health_lab.preview_write(rollback)
+        receipt = health_lab.execute_write(rollback, expected_plan=plan.fingerprint)
+
+    assert plan.approval.status is WriteApprovalStatus.CONFIRMATION_REQUIRED
+    assert isinstance(plan.details, RollbackMigrationPlan)
+    assert plan.details.migration_operation_id == migration_operation_id
+    assert plan.details.current_snapshot_ref is not None
+    assert str(plan.details.current_snapshot_ref) == generated_snapshot
+    assert plan.details.restored_snapshot_ref == old_snapshot
+    assert isinstance(receipt.result, RollbackMigrationReceipt)
+    assert receipt.result.status is MigrationStatus.COMPLETED
+    assert receipt.result.restored_snapshot_ref == old_snapshot
+    assert receipt.result.unreferenced_snapshot_ref == plan.details.current_snapshot_ref
+
+    assert (snapshot_root / generated_snapshot).is_dir()
+    with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
+        assert metadata.execute(
+            "SELECT schema_version FROM store_identity WHERE singleton = 1"
+        ).fetchone() == (2,)
+        assert metadata.execute(
+            "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
+        ).fetchone() == (str(old_snapshot),)
+        assert metadata.execute(
+            "SELECT 1 FROM dataset_snapshots WHERE snapshot_id = ?", (generated_snapshot,)
+        ).fetchone() is None
+        assert metadata.execute(
+            "SELECT request_kind FROM write_operations ORDER BY rowid DESC LIMIT 1"
+        ).fetchone() == ("rollback_migration",)
+
+
+def test_later_successful_state_change_blocks_migration_rollback(tmp_path: Path) -> None:
+    first = generate_export("null-v1", 42, tmp_path / "fixture-before-migration")
+    later = generate_export("null-v1", 43, tmp_path / "fixture-after-migration")
+    config = _config(tmp_path / "rollback-blocked")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(first.export_path)
+        health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+    _set_version(config, 3)
+    _set_legacy_migration_constraints(config)
+    with HealthLab.open(config) as health_lab:
+        migration = MigrateStore()
+        health_lab.execute_write(
+            migration, expected_plan=health_lab.preview_write(migration).fingerprint
+        )
+        request = ImportHealthExport(later.export_path)
+        health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+        rollback = RollbackMigration()
+        plan = health_lab.preview_write(rollback)
+        receipt = health_lab.execute_write(rollback, expected_plan=plan.fingerprint)
+
+    assert plan.approval.status is WriteApprovalStatus.BLOCKED
+    assert plan.diagnostics == ("migration_rollback_superseded",)
+    assert isinstance(receipt.result, WriteNotStarted)
+    assert receipt.result.status is WriteNotStartedStatus.BLOCKED
+
+
+def test_later_successful_analysis_blocks_migration_rollback(tmp_path: Path) -> None:
+    fixture = generate_export("lag-signal-v1", 42, tmp_path / "fixture-analysis-after")
+    config = _config(tmp_path / "rollback-blocked-by-analysis")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(fixture.export_path)
+        health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+    _set_version(config, 3)
+    _set_legacy_migration_constraints(config)
+
+    with HealthLab.open(config) as health_lab:
+        migration = MigrateStore()
+        migration_receipt = health_lab.execute_write(
+            migration, expected_plan=health_lab.preview_write(migration).fingerprint
+        )
+        analysis = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v2"))
+        analysis_receipt = health_lab.execute_write(
+            analysis, expected_plan=health_lab.preview_write(analysis).fingerprint
+        )
+
+    assert isinstance(migration_receipt.result, StoreMigrationReceipt)
+    assert isinstance(analysis_receipt.result, AnalysisReceipt)
+    assert analysis_receipt.result.status is AnalysisStatus.COMPLETED
+    with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
+        metadata.execute(
+            "UPDATE write_operations SET started_at_utc = ?, completed_at_utc = ? "
+            "WHERE operation_id = ?",
+            (
+                "2099-01-01T00:00:00.123456+00:00",
+                "2099-01-01T00:00:00.123456+00:00",
+                str(migration_receipt.result.operation_id),
+            ),
+        )
+        metadata.execute(
+            "UPDATE analysis_receipts SET created_at = ? WHERE operation_id = ?",
+            (
+                "2099-01-01T00:00:00.123457+00:00",
+                str(analysis_receipt.result.operation_id),
+            ),
+        )
+
+    with HealthLab.open(config) as health_lab:
+        rollback = RollbackMigration()
+        plan = health_lab.preview_write(rollback)
+
+    assert plan.approval.status is WriteApprovalStatus.BLOCKED
+    assert plan.diagnostics == ("migration_rollback_superseded",)

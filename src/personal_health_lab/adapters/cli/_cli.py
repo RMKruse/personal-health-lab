@@ -60,6 +60,9 @@ from personal_health_lab.application import (
     RestingHeartRateAnalysisPlan,
     RestingHeartRateAnalysisResult,
     RevokeDataReviewDecision,
+    RollbackMigration,
+    RollbackMigrationPlan,
+    RollbackMigrationReceipt,
     RunHistoricalReview,
     RunRestingHeartRateAnalysis,
     SingleDecisionTarget,
@@ -182,6 +185,10 @@ def _parser() -> argparse.ArgumentParser:
     migration.add_argument("--json", action="store_true", dest="as_json")
     migration.add_argument("--execute", action="store_true")
     migration.add_argument("--expect-plan", type=PlanFingerprint)
+    rollback = commands.add_parser("rollback-migration", help="Letzte Migration zurückrollen")
+    rollback.add_argument("--json", action="store_true", dest="as_json")
+    rollback.add_argument("--execute", action="store_true")
+    rollback.add_argument("--expect-plan", type=PlanFingerprint)
     return parser
 
 
@@ -487,6 +494,30 @@ def _write_plan_json(
             "type": "migrate_store",
         }
         request_json = {"type": "migrate_store"}
+    elif isinstance(details, RollbackMigrationPlan):
+        detail_json = {
+            "backup_file": details.backup_file,
+            "backup_sha256": details.backup_sha256,
+            "current_snapshot_ref": (
+                None
+                if details.current_snapshot_ref is None
+                else str(details.current_snapshot_ref)
+            ),
+            "migration_operation_id": (
+                None
+                if details.migration_operation_id is None
+                else str(details.migration_operation_id)
+            ),
+            "restored_snapshot_ref": (
+                None
+                if details.restored_snapshot_ref is None
+                else str(details.restored_snapshot_ref)
+            ),
+            "source_version": details.source_version,
+            "target_version": details.target_version,
+            "type": "rollback_migration",
+        }
+        request_json = {"type": "rollback_migration"}
     elif isinstance(details, PlausibilityRuleVersionPlan):
         detail_json = {
             "active_snapshot_ref": (
@@ -632,6 +663,26 @@ def _write_receipt_json(
             "target_version": result.target_version,
             "type": "migrate_store",
         }
+    elif isinstance(result, RollbackMigrationReceipt):
+        result_json = {
+            "backup_file": result.backup_file,
+            "diagnostics": result.diagnostics,
+            "migration_operation_id": str(result.migration_operation_id),
+            "restored_snapshot_ref": (
+                None
+                if result.restored_snapshot_ref is None
+                else str(result.restored_snapshot_ref)
+            ),
+            "source_version": result.source_version,
+            "status": result.status.value,
+            "target_version": result.target_version,
+            "type": "rollback_migration",
+            "unreferenced_snapshot_ref": (
+                None
+                if result.unreferenced_snapshot_ref is None
+                else str(result.unreferenced_snapshot_ref)
+            ),
+        }
     elif isinstance(result, PlausibilityRuleVersionReceipt):
         result_json = {
             "diagnostics": result.diagnostics,
@@ -727,6 +778,15 @@ def _print_write_plan(plan: WritePlan, workspace: WorkspaceStatus) -> None:
             "Bestehende Analysen werden veraltet: "
             + ("ja" if migration.existing_analyses_become_stale else "nein")
         )
+    elif isinstance(plan.details, RollbackMigrationPlan):
+        rollback = plan.details
+        print(f"Zurückzurollende Migration: {rollback.migration_operation_id or '-'}")
+        print(f"Migrationssicherung: {rollback.backup_file or '-'}")
+        print(
+            f"Schema: {rollback.source_version or '-'} -> {rollback.target_version or '-'}"
+        )
+        print(f"Wiederhergestellter Snapshot: {rollback.restored_snapshot_ref or '-'}")
+        print(f"Unreferenzierter Snapshot: {rollback.current_snapshot_ref or '-'}")
     filevault = plan.preflight.filevault
     print(
         "FileVault: "
@@ -762,6 +822,7 @@ def main(args: Sequence[str] | None = None) -> int:
         "historical-review",
         "import",
         "migrate",
+        "rollback-migration",
         "rule",
         "review-confirm-batch",
         "review-resolve",
@@ -851,6 +912,25 @@ def main(args: Sequence[str] | None = None) -> int:
                     ):
                         migration_write_receipt = health_lab.execute_write(
                             migration_request, expected_plan=migration_plan.fingerprint
+                        )
+            elif parsed.command == "rollback-migration":
+                rollback_request = RollbackMigration()
+                rollback_plan = health_lab.preview_write(rollback_request)
+                rollback_write_receipt = None
+                if parsed.execute:
+                    assert parsed.expect_plan is not None
+                    rollback_write_receipt = health_lab.execute_write(
+                        rollback_request, expected_plan=parsed.expect_plan
+                    )
+                elif not parsed.as_json:
+                    _print_write_plan(rollback_plan, workspace_status)
+                    if (
+                        rollback_plan.approval.status is not WriteApprovalStatus.BLOCKED
+                        and input("Letzte Migration zurückrollen? [j/N] ").strip().lower()
+                        in {"j", "ja"}
+                    ):
+                        rollback_write_receipt = health_lab.execute_write(
+                            rollback_request, expected_plan=rollback_plan.fingerprint
                         )
             elif parsed.command == "backup":
                 backup_request = CreateMetadataBackup(parsed.target)
@@ -1112,6 +1192,19 @@ def main(args: Sequence[str] | None = None) -> int:
             print("Datenspeichermigration nicht ausgeführt.")
         else:
             print(f"Datenspeichermigration: {migration_write_receipt.result.status.value}")
+    elif parsed.command == "rollback-migration" and parsed.as_json:
+        output = (
+            _write_plan_json(rollback_plan, runtime_config, workspace_status)
+            if rollback_write_receipt is None
+            else _write_receipt_json(rollback_write_receipt, runtime_config)
+        )
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+    elif parsed.command == "rollback-migration":
+        if rollback_write_receipt is None:
+            _print_write_plan(rollback_plan, workspace_status)
+            print("Migrationsrollback nicht ausgeführt.")
+        else:
+            print(f"Migrationsrollback: {rollback_write_receipt.result.status.value}")
     elif parsed.command == "backup":
         if backup_write_receipt is None:
             _print_write_plan(backup_plan, workspace_status)
@@ -1384,6 +1477,10 @@ def main(args: Sequence[str] | None = None) -> int:
                     else 0
                 )
             return 3 if isinstance(migration_write_receipt.result, WriteNotStarted) else 0
+        if parsed.command == "rollback-migration":
+            if rollback_write_receipt is None:
+                return 3 if rollback_plan.approval.status is WriteApprovalStatus.BLOCKED else 0
+            return 3 if isinstance(rollback_write_receipt.result, WriteNotStarted) else 0
         if parsed.command == "backup":
             if backup_write_receipt is None:
                 return 3 if backup_plan.approval.status is WriteApprovalStatus.BLOCKED else 0

@@ -2693,6 +2693,12 @@ source = "https://github.com/RMKruse/personal-health-lab/issues/33"
 statement = "Failed migrations are quarantined, never resumed, and retried from scratch."
 evidence = ["negative", "transition"]
 
+[[contract]]
+id = "V02-C-MIG-007"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Migration rollback is limited to the latest state change and restores its backup without reverse-migrating artifacts."
+evidence = ["positive", "negative", "transition"]
+
 [[fixture]]
 id = "V02-F-DOM-STORE-MIGRATION-V1"
 kind = "domain"
@@ -2954,6 +2960,54 @@ level = "application"
 expected_result = "fresh completed migration"
 expected_effect = "new independently staged snapshot is active"
 forbidden_side_effects = ["reuse quarantined artifact", "resume old operation"]
+
+[[case]]
+id = "V02-A-MIG-018"
+contracts = ["V02-C-MIG-007"]
+fixtures = ["V02-F-DOM-COW-MIGRATION-V1"]
+runner = "test_direct_migration_rollback_restores_backup_and_old_snapshot"
+initial_state = "completed migration is the latest successful state change"
+operation = "execute confirmed RollbackMigration"
+level = "application"
+expected_result = "completed rollback"
+expected_effect = "saved catalog and old active snapshot restored atomically"
+forbidden_side_effects = ["partial restore", "new snapshot activation"]
+
+[[case]]
+id = "V02-A-MIG-019"
+contracts = ["V02-C-MIG-007"]
+fixtures = ["V02-F-DOM-COW-MIGRATION-V1"]
+runner = "test_later_successful_state_change_blocks_migration_rollback"
+initial_state = "successful state-changing write followed migration"
+operation = "preview and execute RollbackMigration"
+level = "application"
+expected_result = "blocked migration_rollback_superseded"
+expected_effect = "none"
+forbidden_side_effects = ["later write loss", "catalog restore"]
+
+[[case]]
+id = "V02-A-MIG-020"
+contracts = ["V02-C-MIG-007"]
+fixtures = ["V02-F-DOM-COW-MIGRATION-V1"]
+runner = "test_direct_migration_rollback_restores_backup_and_old_snapshot"
+initial_state = "copy-on-write migration with old and generated snapshots"
+operation = "execute confirmed RollbackMigration"
+level = "storage"
+expected_result = "old snapshot active and generated snapshot unreferenced"
+expected_effect = "generated immutable artifact remains on disk"
+forbidden_side_effects = ["reverse migration", "snapshot deletion"]
+
+[[case]]
+id = "V02-A-ADP-010"
+contracts = ["V02-C-ADP-004", "V02-C-MIG-007"]
+fixtures = ["V02-F-DOM-COW-MIGRATION-V1"]
+runner = "test_streamlit_focuses_migration_in_restricted_session"
+initial_state = "multi-step migration with an analysis bound to the old snapshot"
+operation = "migrate, observe stale, and rollback through CLI and Streamlit"
+level = "adapter"
+expected_result = "both adapters complete the shared typed tracer"
+expected_effect = "old catalog and snapshot restored"
+forbidden_side_effects = ["adapter rollback logic", "historical snapshot deletion"]
 
 [[case]]
 id = "V02-A-PRE-025"

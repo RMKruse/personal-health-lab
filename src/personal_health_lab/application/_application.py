@@ -41,7 +41,7 @@ from personal_health_lab.health_import import (
     estimate_health_export,
     import_health_export,
 )
-from personal_health_lab.migration import plan_store_migration
+from personal_health_lab.migration import plan_migration_rollback, plan_store_migration
 from personal_health_lab.overview import Overview, OverviewReader, OverviewSelection
 from personal_health_lab.recovery import (
     BackupId,
@@ -112,6 +112,7 @@ _READY_WRITES = (
     "run_resting_heart_rate_analysis",
     "create_metadata_backup",
     "migrate_store",
+    "rollback_migration",
 )
 _READY_READS = (
     "workspace_status",
@@ -222,6 +223,11 @@ class CreateMetadataBackup:
 
 @dataclass(frozen=True, slots=True)
 class MigrateStore:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class RollbackMigration:
     pass
 
 
@@ -494,6 +500,7 @@ WriteRequest = (
     ImportHealthExport
     | CreateMetadataBackup
     | MigrateStore
+    | RollbackMigration
     | ResolveDataReviewCase
     | ConfirmDataReviewBatch
     | RevokeDataReviewDecision
@@ -516,6 +523,7 @@ class WriteConfirmation(StrEnum):
     FILEVAULT_UNKNOWN = "filevault_unknown"
     METADATA_BACKUP_POINT_IN_TIME = "metadata_backup_point_in_time"
     STORE_MIGRATION = "store_migration"
+    MIGRATION_ROLLBACK = "migration_rollback"
 
 
 @dataclass(frozen=True, slots=True)
@@ -547,6 +555,17 @@ class StoreMigrationPlan:
     backup_file: str | None
     affected_snapshot_refs: tuple[SnapshotRef, ...]
     existing_analyses_become_stale: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RollbackMigrationPlan:
+    migration_operation_id: OperationId | None
+    source_version: int | None
+    target_version: int | None
+    backup_file: str | None
+    backup_sha256: str | None
+    current_snapshot_ref: SnapshotRef | None
+    restored_snapshot_ref: SnapshotRef | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -626,6 +645,7 @@ WritePlanDetails = (
     ImportHealthExportPlan
     | MetadataBackupPlan
     | StoreMigrationPlan
+    | RollbackMigrationPlan
     | DataReviewDecisionPlan
     | DataReviewBatchPlan
     | DataReviewBatchRevokePlan
@@ -704,6 +724,19 @@ class StoreMigrationReceipt:
     target_version: int
     steps: tuple[tuple[int, int], ...]
     backup_file: str | None
+    diagnostics: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class RollbackMigrationReceipt:
+    operation_id: OperationId
+    migration_operation_id: OperationId
+    status: MigrationStatus
+    source_version: int
+    target_version: int
+    backup_file: str
+    restored_snapshot_ref: SnapshotRef | None
+    unreferenced_snapshot_ref: SnapshotRef | None
     diagnostics: tuple[str, ...] = ()
 
 
@@ -908,6 +941,7 @@ WriteResult = (
     ImportReceipt
     | MetadataBackupReceipt
     | StoreMigrationReceipt
+    | RollbackMigrationReceipt
     | WriteDecisionReceipt
     | WriteBatchDecisionReceipt
     | PlausibilityRuleVersionReceipt
@@ -970,6 +1004,8 @@ class HealthLab:
         self._require_open()
         if isinstance(request, MigrateStore):
             return self._build_store_migration_plan()
+        if isinstance(request, RollbackMigration):
+            return self._build_migration_rollback_plan()
         if isinstance(request, CreateMetadataBackup):
             return self._build_metadata_backup_plan(request)
         if isinstance(request, RunRestingHeartRateAnalysis):
@@ -1092,6 +1128,64 @@ class HealthLab:
                 filevault,
                 plan_diagnostics,
                 capacity,
+            ),
+        )
+
+    def _build_migration_rollback_plan(self) -> WritePlan:
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        facts = self._store.load_migration_rollback_facts()
+        diagnostics = plan_migration_rollback(facts)
+        details = RollbackMigrationPlan(
+            migration_operation_id=(
+                None if facts is None else facts.migration_operation_id
+            ),
+            source_version=None if facts is None else facts.post_migration_version,
+            target_version=None if facts is None else facts.pre_migration_version,
+            backup_file=None if facts is None else facts.backup_file,
+            backup_sha256=None if facts is None else facts.backup_sha256,
+            current_snapshot_ref=None if facts is None else facts.migrated_snapshot_id,
+            restored_snapshot_ref=None if facts is None else facts.previous_snapshot_id,
+        )
+        payload = {
+            "backup_file": details.backup_file,
+            "backup_sha256": details.backup_sha256,
+            "current_snapshot_ref": (
+                None
+                if details.current_snapshot_ref is None
+                else str(details.current_snapshot_ref)
+            ),
+            "diagnostics": diagnostics,
+            "migration_operation_id": (
+                None
+                if details.migration_operation_id is None
+                else str(details.migration_operation_id)
+            ),
+            "operation": "rollback_migration",
+            "restored_snapshot_ref": (
+                None
+                if details.restored_snapshot_ref is None
+                else str(details.restored_snapshot_ref)
+            ),
+            "source_version": details.source_version,
+            "target_version": details.target_version,
+            "version": 1,
+        }
+        return WritePlan(
+            PlanFingerprint(
+                hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+            ),
+            details,
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED
+                    if diagnostics
+                    else WriteApprovalStatus.CONFIRMATION_REQUIRED
+                ),
+                () if diagnostics else (WriteConfirmation.MIGRATION_ROLLBACK,),
+                diagnostics=diagnostics,
             ),
         )
 
@@ -1801,6 +1895,8 @@ class HealthLab:
             )
         if isinstance(request, MigrateStore):
             return self._execute_store_migration(authorization_plan, expected_plan)
+        if isinstance(request, RollbackMigration):
+            return self._execute_migration_rollback(authorization_plan, expected_plan)
         if isinstance(request, CreateMetadataBackup):
             return self._execute_metadata_backup(request, authorization_plan, expected_plan)
         if isinstance(request, CreatePlausibilityRuleVersion):
@@ -2049,6 +2145,75 @@ class HealthLab:
                 final_capacity,
             ),
         )
+
+    def _execute_migration_rollback(
+        self,
+        plan: WritePlan,
+        expected_plan: PlanFingerprint,
+    ) -> WriteReceipt:
+        details = plan.details
+        if (
+            not isinstance(details, RollbackMigrationPlan)
+            or details.migration_operation_id is None
+            or details.source_version is None
+            or details.target_version is None
+            or details.backup_file is None
+        ):
+            return self._not_started(
+                plan, WriteNotStartedStatus.BLOCKED, plan.diagnostics, expected_plan
+            )
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        operation_id = OperationId(uuid4().hex)
+        try:
+            facts = writer.load_migration_rollback_facts()
+            if (
+                facts is None
+                or plan_migration_rollback(facts)
+                or facts.migration_operation_id != details.migration_operation_id
+                or facts.backup_file != details.backup_file
+                or facts.backup_sha256 != details.backup_sha256
+                or facts.post_migration_version != details.source_version
+                or facts.pre_migration_version != details.target_version
+                or facts.migrated_snapshot_id != details.current_snapshot_ref
+                or facts.previous_snapshot_id != details.restored_snapshot_ref
+            ):
+                return self._not_started(
+                    plan,
+                    WriteNotStartedStatus.PLAN_CHANGED,
+                    ("plan_changed",),
+                    expected_plan,
+                )
+            writer.rollback_store_migration(facts, operation_id)
+        except StoreError as error:
+            status = (
+                WriteNotStartedStatus.PLAN_CHANGED
+                if str(error) == "migration_rollback_changed"
+                else WriteNotStartedStatus.BLOCKED
+            )
+            diagnostic = (
+                "plan_changed"
+                if status is WriteNotStartedStatus.PLAN_CHANGED
+                else str(error)
+            )
+            return self._not_started(plan, status, (diagnostic,), expected_plan)
+        finally:
+            writer.close()
+        result = RollbackMigrationReceipt(
+            operation_id,
+            details.migration_operation_id,
+            MigrationStatus.COMPLETED,
+            details.source_version,
+            details.target_version,
+            details.backup_file,
+            details.restored_snapshot_ref,
+            details.current_snapshot_ref,
+        )
+        return WriteReceipt(operation_id, expected_plan, result, plan.preflight)
 
     def _execute_metadata_backup(
         self,

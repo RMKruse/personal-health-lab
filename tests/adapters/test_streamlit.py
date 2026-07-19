@@ -11,9 +11,11 @@ from streamlit.testing.v1 import AppTest
 
 from personal_health_lab.adapters.cli import main as cli_main
 from personal_health_lab.application import (
+    AnalysisDefinitionId,
     DataMode,
     HealthLab,
     ImportHealthExport,
+    RunRestingHeartRateAnalysis,
     RuntimeConfig,
 )
 from personal_health_lab.synthetic_export import GenerationOptions, generate_export
@@ -49,19 +51,62 @@ def test_streamlit_shows_the_same_empty_overview(
 
 
 def test_streamlit_focuses_migration_in_restricted_session(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     store = tmp_path / "migration-store"
     config = RuntimeConfig(DataMode.SYNTHETIC, store, tmp_path / "real")
-    fixture = generate_export("null-v1", 42, tmp_path / "migration-fixture")
+    fixture = generate_export("lag-signal-v1", 42, tmp_path / "migration-fixture")
     with HealthLab.open(config) as health_lab:
         request = ImportHealthExport(fixture.export_path)
         imported = health_lab.execute_write(
             request, expected_plan=health_lab.preview_write(request).fingerprint
         )
+        analysis = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v2"))
+        health_lab.execute_write(
+            analysis, expected_plan=health_lab.preview_write(analysis).fingerprint
+        )
     snapshot_ref = str(imported.result.snapshot_ref)
     with sqlite3.connect(store / "metadata.sqlite3") as metadata:
         metadata.execute("UPDATE store_identity SET schema_version = 2 WHERE singleton = 1")
+    common = [
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(store),
+        "--real-store",
+        str(tmp_path / "real"),
+    ]
+    assert cli_main([*common, "migrate", "--json"]) == 0
+    cli_migration_plan = json.loads(capsys.readouterr().out)
+    assert cli_main(
+        [
+            *common,
+            "migrate",
+            "--json",
+            "--execute",
+            "--expect-plan",
+            cli_migration_plan["fingerprint"],
+        ]
+    ) == 0
+    capsys.readouterr()
+    assert cli_main([*common, "overview", "--json"]) == 0
+    cli_overview = json.loads(capsys.readouterr().out)
+    assert any(item["freshness"] == "stale" for item in cli_overview["analysis_history"])
+    assert cli_main([*common, "rollback-migration", "--json"]) == 0
+    cli_rollback_plan = json.loads(capsys.readouterr().out)
+    assert cli_main(
+        [
+            *common,
+            "rollback-migration",
+            "--json",
+            "--execute",
+            "--expect-plan",
+            cli_rollback_plan["fingerprint"],
+        ]
+    ) == 0
+    capsys.readouterr()
     monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
     monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(store))
     monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(tmp_path / "real"))
@@ -82,6 +127,17 @@ def test_streamlit_focuses_migration_in_restricted_session(
 
     assert not app.exception
     assert any(item.value == "Status: ready" for item in app.markdown)
+    assert any("stale" in item.value for item in app.caption)
+    assert any(item.value == "Migrationsrollback" for item in app.subheader)
+    assert any(
+        f"Wiederhergestellter Snapshot: {snapshot_ref}" in item.value
+        for item in app.caption
+    )
+    next(button for button in app.button if button.label == "Letzte Migration zurückrollen").click()
+    app.run()
+
+    assert not app.exception
+    assert any(item.value == "Datenspeichermigration" for item in app.subheader)
 
 
 def test_streamlit_translates_invalid_configuration(

@@ -485,6 +485,7 @@ def test_real_json_import_renders_shared_confirmation_plan(
             "run_resting_heart_rate_analysis",
             "create_metadata_backup",
             "migrate_store",
+            "rollback_migration",
         ]
 
 
@@ -972,3 +973,26 @@ def test_cli_maps_store_migration_plan_and_receipt(
     _assert_json_contract(receipt)
     assert receipt["result"]["status"] == "completed"
     assert receipt["result"]["steps"] == [[2, 3], [3, 4]]
+
+    assert main([*common, "rollback-migration", "--json"]) == 0
+    rollback_plan = json.loads(capsys.readouterr().out)
+    _assert_json_contract(rollback_plan)
+    assert rollback_plan["details"]["type"] == "rollback_migration"
+    assert rollback_plan["details"]["source_version"] == 4
+    assert rollback_plan["details"]["target_version"] == 2
+    assert rollback_plan["details"]["restored_snapshot_ref"] == snapshot_ref
+
+    assert main(
+        [
+            *common,
+            "rollback-migration",
+            "--json",
+            "--execute",
+            "--expect-plan",
+            rollback_plan["fingerprint"],
+        ]
+    ) == 0
+    rollback_receipt = json.loads(capsys.readouterr().out)
+    _assert_json_contract(rollback_receipt)
+    assert rollback_receipt["result"]["status"] == "completed"
+    assert rollback_receipt["result"]["restored_snapshot_ref"] == snapshot_ref

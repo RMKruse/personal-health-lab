@@ -565,6 +565,21 @@ class StoreIdentity:
         return self.schema_version == str(_STORE_SCHEMA_VERSION)
 
 
+@dataclass(frozen=True, slots=True)
+class MigrationRollbackFacts:
+    migration_operation_id: OperationId
+    latest_state_change_operation_id: OperationId | None
+    backup_file: str
+    backup_sha256: str | None
+    backup_exists: bool
+    backup_matches_migration: bool
+    pre_migration_version: int
+    post_migration_version: int
+    migrated_snapshot_id: SnapshotId | None
+    previous_snapshot_id: SnapshotId | None
+    active_snapshot_id: SnapshotId | None
+
+
 def current_store_schema_version() -> int:
     return _STORE_SCHEMA_VERSION
 
@@ -982,7 +997,8 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                 request_kind IN ('import_health_export', 'resolve_data_review_case',
                                  'revoke_data_review_decision',
                                  'create_plausibility_rule_version',
-                                 'run_historical_review', 'migrate_store')
+                                 'run_historical_review', 'migrate_store',
+                                 'rollback_migration')
             ),
             started_at_utc TEXT NOT NULL CHECK (
                 length(started_at_utc) >= 20 AND substr(started_at_utc, 11, 1) = 'T'
@@ -1162,7 +1178,8 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             source_schema_version INTEGER NOT NULL CHECK (source_schema_version > 0),
             target_schema_version INTEGER NOT NULL CHECK (
                 target_schema_version > source_schema_version
-            )
+            ),
+            backup_file TEXT NOT NULL
         ) STRICT;
         CREATE TABLE IF NOT EXISTS data_review_decisions (
             audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
@@ -1411,31 +1428,36 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
     for column, declaration in migrations.items():
         if column not in analysis_columns:
             metadata.execute(f"ALTER TABLE analysis_runs ADD COLUMN {column} {declaration}")
+    migration_columns = {
+        str(row[1]) for row in metadata.execute("PRAGMA table_info(migration_publications)")
+    }
+    if migration_columns and "backup_file" not in migration_columns:
+        metadata.execute("ALTER TABLE migration_publications ADD COLUMN backup_file TEXT")
 
 
 def _upgrade_migration_event_constraints(metadata: sqlite3.Connection) -> None:
     upgrades = (
         (
             "write_operations",
-            "'migrate_store'",
-            "'run_historical_review'",
-            "'run_historical_review', 'migrate_store'",
+            "'rollback_migration'",
+            ("'run_historical_review', 'migrate_store'", "'run_historical_review'"),
+            "'run_historical_review', 'migrate_store', 'rollback_migration'",
         ),
         (
             "snapshot_activations",
             "'migration'",
-            "'historical'",
+            ("'historical'",),
             "'historical', 'migration'",
         ),
         (
             "audit_events",
             "'store_migrated'",
-            "'metadata_tombstone'",
+            ("'metadata_tombstone'",),
             "'metadata_tombstone', 'store_migrated'",
         ),
     )
     rebuilt: list[tuple[str, str, str]] = []
-    for table, new_value, old_constraint, new_constraint in upgrades:
+    for table, new_value, old_constraints, new_constraint in upgrades:
         row = metadata.execute(
             "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?", (table,)
         ).fetchone()
@@ -1444,7 +1466,10 @@ def _upgrade_migration_event_constraints(metadata: sqlite3.Connection) -> None:
         definition = row[0]
         if new_value in definition:
             continue
-        if old_constraint not in definition:
+        old_constraint = next(
+            (candidate for candidate in old_constraints if candidate in definition), None
+        )
+        if old_constraint is None:
             raise sqlite3.DatabaseError(f"unsupported {table} constraint")
         temporary = f"{table}__migration_upgrade"
         upgraded = definition.replace(old_constraint, new_constraint, 1).replace(
@@ -1553,6 +1578,120 @@ class LocalStore:
                 "ORDER BY snapshot_id"
             )
         )
+
+    def load_migration_rollback_facts(self) -> MigrationRollbackFacts | None:
+        self._require_open()
+        columns = {
+            str(row[1])
+            for row in self._metadata.execute("PRAGMA table_info(migration_publications)")
+        }
+        if "backup_file" not in columns:
+            return None
+        row = self._metadata.execute(
+            "SELECT operation.operation_id, publication.backup_file, "
+            "publication.source_schema_version, publication.target_schema_version, "
+            "publication.snapshot_id, activation.previous_snapshot_id, "
+            "(SELECT operation_id FROM ("
+            "SELECT operation_id, julianday(completed_at_utc) AS completed_at, "
+            "0 AS analysis_change, rowid AS local_sequence "
+            "FROM write_operations WHERE state_changed = 1 "
+            "UNION ALL "
+            "SELECT operation_id, julianday(created_at) AS completed_at, "
+            "1 AS analysis_change, rowid AS local_sequence "
+            "FROM analysis_receipts"
+            ") ORDER BY completed_at DESC, analysis_change DESC, "
+            "local_sequence DESC LIMIT 1) "
+            "FROM migration_publications publication "
+            "JOIN audit_events event USING (audit_event_id) "
+            "JOIN write_operations operation USING (operation_id) "
+            "LEFT JOIN snapshot_activations activation USING (operation_id) "
+            "ORDER BY operation.rowid DESC LIMIT 1"
+        ).fetchone()
+        if row is None or row[1] is None:
+            return None
+        backup_file = str(row[1])
+        current_snapshot = None if row[4] is None else SnapshotId(str(row[4]))
+        restored_snapshot = None if row[5] is None else SnapshotId(str(row[5]))
+        backup_path = self._root / "migration-backups" / backup_file
+        backup_sha256: str | None = None
+        backup_exists = Path(backup_file).name == backup_file and backup_path.is_file()
+        backup_matches_migration = False
+        if backup_exists:
+            try:
+                with backup_path.open("rb") as source:
+                    backup_sha256 = hashlib.file_digest(source, "sha256").hexdigest()
+                with sqlite3.connect(
+                    f"{backup_path.resolve().as_uri()}?mode=ro", uri=True
+                ) as backup:
+                    backup_active = backup.execute(
+                        "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
+                    ).fetchone()
+                    backup_identity = backup.execute(
+                        "SELECT mode, schema_version FROM store_identity WHERE singleton = 1"
+                    ).fetchone()
+                backup_matches_migration = backup_identity == (
+                    self._mode.value,
+                    row[2],
+                ) and (None if backup_active is None else str(backup_active[0])) == (
+                    None if restored_snapshot is None else str(restored_snapshot)
+                )
+            except (OSError, sqlite3.Error):
+                pass
+        return MigrationRollbackFacts(
+            migration_operation_id=OperationId(str(row[0])),
+            latest_state_change_operation_id=(
+                None if row[6] is None else OperationId(str(row[6]))
+            ),
+            backup_file=backup_file,
+            backup_sha256=backup_sha256,
+            backup_exists=backup_exists,
+            backup_matches_migration=backup_matches_migration,
+            pre_migration_version=int(row[2]),
+            post_migration_version=int(row[3]),
+            migrated_snapshot_id=current_snapshot,
+            previous_snapshot_id=restored_snapshot,
+            active_snapshot_id=self.load_active_snapshot_id(),
+        )
+
+    def rollback_store_migration(
+        self, facts: MigrationRollbackFacts, operation_id: OperationId
+    ) -> StoreIdentity:
+        self._require_writer()
+        if facts != self.load_migration_rollback_facts():
+            raise StoreError("migration_rollback_changed")
+        backup_path = self._root / "migration-backups" / facts.backup_file
+        restored = sqlite3.connect(":memory:")
+        try:
+            with sqlite3.connect(
+                f"{backup_path.resolve().as_uri()}?mode=ro", uri=True
+            ) as backup:
+                backup.backup(restored)
+            restored.execute("PRAGMA foreign_keys = OFF")
+            _upgrade_migration_event_constraints(restored)
+            created_at = datetime.now(UTC).isoformat()
+            restored.execute(
+                "INSERT INTO write_operations VALUES (?, 'rollback_migration', ?, ?, "
+                "'committed', 1)",
+                (str(operation_id), created_at, created_at),
+            )
+            restored.commit()
+            restored.execute("PRAGMA foreign_keys = ON")
+            if restored.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+                raise sqlite3.IntegrityError("rollback integrity check failed")
+            if restored.execute("PRAGMA foreign_key_check").fetchall():
+                raise sqlite3.IntegrityError("rollback foreign key check failed")
+            restored.backup(self._metadata)
+        except (OSError, sqlite3.Error) as error:
+            raise StoreError("migration_rollback_failed") from error
+        finally:
+            restored.close()
+        identity = self.load_identity()
+        if (
+            identity.schema_version != str(facts.pre_migration_version)
+            or self.load_active_snapshot_id() != facts.previous_snapshot_id
+        ):
+            raise StoreError("migration_rollback_failed")
+        return identity
 
     def load_review_snapshot_facts(self) -> tuple[ReviewSnapshotFacts, ...]:
         self._require_open()
@@ -1908,12 +2047,15 @@ class LocalStore:
                     (audit_position, audit_event_id, str(operation_id), created_at),
                 )
                 self._metadata.execute(
-                    "INSERT INTO migration_publications VALUES (?, ?, ?, ?)",
+                    "INSERT INTO migration_publications "
+                    "(audit_event_id, snapshot_id, source_schema_version, "
+                    "target_schema_version, backup_file) VALUES (?, ?, ?, ?, ?)",
                     (
                         audit_event_id,
                         None if new_snapshot is None else str(new_snapshot),
                         source_version,
                         _STORE_SCHEMA_VERSION,
+                        backup_file,
                     ),
                 )
                 self._validate_store()

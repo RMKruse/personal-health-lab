@@ -1,6 +1,6 @@
 """Registered adjacent store-schema migration policy."""
 
-from personal_health_lab.storage import current_store_schema_version
+from personal_health_lab.storage import MigrationRollbackFacts, current_store_schema_version
 
 _REGISTERED_STEPS = ((1, 2), (2, 3), (3, 4))
 
@@ -30,4 +30,19 @@ def plan_store_migration(
     return target, tuple(steps), ()
 
 
-__all__ = ["plan_store_migration"]
+def plan_migration_rollback(facts: MigrationRollbackFacts | None) -> tuple[str, ...]:
+    if facts is None:
+        return ("migration_rollback_unavailable",)
+    if (
+        facts.latest_state_change_operation_id != facts.migration_operation_id
+        or facts.active_snapshot_id != facts.migrated_snapshot_id
+    ):
+        return ("migration_rollback_superseded",)
+    if not facts.backup_exists:
+        return ("migration_rollback_backup_missing",)
+    if not facts.backup_matches_migration:
+        return ("migration_rollback_backup_invalid",)
+    return ()
+
+
+__all__ = ["plan_migration_rollback", "plan_store_migration"]

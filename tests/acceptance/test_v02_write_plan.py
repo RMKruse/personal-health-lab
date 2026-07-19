@@ -113,6 +113,10 @@ REGISTERED_CASES.update(
         "V02-A-MIG-015": "test_migration_fault_keeps_old_snapshot_and_retry_starts_fresh",
         "V02-A-MIG-016": "test_migration_fault_keeps_old_snapshot_and_retry_starts_fresh",
         "V02-A-MIG-017": "test_migration_fault_keeps_old_snapshot_and_retry_starts_fresh",
+        "V02-A-MIG-018": "test_direct_migration_rollback_restores_backup_and_old_snapshot",
+        "V02-A-MIG-019": "test_later_successful_state_change_blocks_migration_rollback",
+        "V02-A-MIG-020": "test_direct_migration_rollback_restores_backup_and_old_snapshot",
+        "V02-A-ADP-010": "test_streamlit_focuses_migration_in_restricted_session",
         "V02-A-PRE-025": "test_cow_migration_v1_bounds_normal_and_stress_fixtures",
     }
 )

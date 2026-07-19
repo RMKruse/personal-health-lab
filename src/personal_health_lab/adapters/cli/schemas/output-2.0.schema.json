@@ -494,6 +494,22 @@
         "type": {"const": "migrate_store"}
       }
     },
+    "migrationRollbackResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backup_file", "diagnostics", "migration_operation_id", "restored_snapshot_ref", "source_version", "status", "target_version", "type", "unreferenced_snapshot_ref"],
+      "properties": {
+        "backup_file": {"type": "string"},
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "migration_operation_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "restored_snapshot_ref": {"$ref": "#/$defs/nullableString"},
+        "source_version": {"type": "integer", "minimum": 1},
+        "status": {"const": "completed"},
+        "target_version": {"type": "integer", "minimum": 1},
+        "type": {"const": "rollback_migration"},
+        "unreferenced_snapshot_ref": {"$ref": "#/$defs/nullableString"}
+      }
+    },
     "writePlanOutput": {
       "type": "object",
       "additionalProperties": false,
@@ -523,7 +539,8 @@
               "filevault_transitioning",
               "filevault_unknown",
               "metadata_backup_point_in_time",
-              "store_migration"
+              "store_migration",
+              "migration_rollback"
             ]
           }
         },
@@ -640,6 +657,20 @@
                 "target_version": {"type": "integer", "minimum": 1},
                 "type": {"const": "migrate_store"}
               }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["backup_file", "backup_sha256", "current_snapshot_ref", "migration_operation_id", "restored_snapshot_ref", "source_version", "target_version", "type"],
+              "properties": {
+                "backup_file": {"$ref": "#/$defs/nullableString"},
+                "backup_sha256": {"$ref": "#/$defs/nullableString"},
+                "current_snapshot_ref": {"$ref": "#/$defs/nullableString"},
+                "migration_operation_id": {"$ref": "#/$defs/nullableString"},
+                "restored_snapshot_ref": {"$ref": "#/$defs/nullableString"},
+                "source_version": {"type": ["integer", "null"]},
+                "target_version": {"type": ["integer", "null"]},
+                "type": {"const": "rollback_migration"}
+              }
             }
           ]
         },
@@ -679,7 +710,7 @@
               "type": "object", "additionalProperties": false,
               "required": ["type"],
               "properties": {
-                "type": {"enum": ["confirm_data_review_batch", "create_plausibility_rule_version", "data_review_decision", "migrate_store", "revoke_data_review_batch", "run_historical_review", "run_resting_heart_rate_analysis"]}
+                "type": {"enum": ["confirm_data_review_batch", "create_plausibility_rule_version", "data_review_decision", "migrate_store", "rollback_migration", "revoke_data_review_batch", "run_historical_review", "run_resting_heart_rate_analysis"]}
               }
             }
           ]
@@ -738,7 +769,8 @@
                   "filevault_transitioning",
                   "filevault_unknown",
                   "metadata_backup_point_in_time",
-                  "store_migration"
+                  "store_migration",
+                  "migration_rollback"
                 ]
               }
             },
@@ -791,6 +823,9 @@
             },
             {
               "$ref": "#/$defs/storeMigrationResult"
+            },
+            {
+              "$ref": "#/$defs/migrationRollbackResult"
             }
           ]
         },
