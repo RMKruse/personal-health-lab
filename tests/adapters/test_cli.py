@@ -13,7 +13,13 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from personal_health_lab.adapters.cli import main
-from personal_health_lab.application import DataMode, HealthLab, ImportHealthExport, RuntimeConfig
+from personal_health_lab.application import (
+    CreateMetadataBackup,
+    DataMode,
+    HealthLab,
+    ImportHealthExport,
+    RuntimeConfig,
+)
 from personal_health_lab.synthetic_export import GenerationOptions, generate_export
 
 _EXPECTED_RUNTIME_CONFIG = {
@@ -123,6 +129,89 @@ def test_cli_maps_metadata_backup_without_exposing_its_path(
     assert receipt["result"]["status"] == "completed"
     assert receipt["result"]["target_file"] == "metadata.sqlite3"
     assert str(tmp_path) not in receipt_text
+
+
+def test_cli_maps_metadata_restore_status_and_abort_without_exposing_paths(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    backup = tmp_path / "private" / "metadata.sqlite3"
+    backup.parent.mkdir()
+    source_config = RuntimeConfig(
+        DataMode.REAL, tmp_path / "source-synthetic", tmp_path / "source-real"
+    )
+    with HealthLab.open(source_config) as health_lab:
+        request = CreateMetadataBackup(backup)
+        health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+    common = [
+        "--mode",
+        "real",
+        "--synthetic-store",
+        str(tmp_path / "target-synthetic"),
+        "--real-store",
+        str(tmp_path / "target-real"),
+    ]
+
+    assert main([*common, "restore", str(backup), "--json"]) == 0
+    plan_text = capsys.readouterr().out
+    plan = json.loads(plan_text)
+    _assert_json_contract(plan)
+    assert plan["details"]["type"] == "begin_metadata_restore"
+    assert plan["request"] == {"backup": "<redacted>", "type": "begin_metadata_restore"}
+    assert str(tmp_path) not in plan_text
+
+    assert (
+        main(
+            [
+                *common,
+                "restore",
+                str(backup),
+                "--json",
+                "--execute",
+                "--expect-plan",
+                plan["fingerprint"],
+            ]
+        )
+        == 0
+    )
+    receipt_text = capsys.readouterr().out
+    receipt = json.loads(receipt_text)
+    _assert_json_contract(receipt)
+    assert receipt["result"]["type"] == "metadata_restore"
+    assert receipt["result"]["status"] == "pending"
+    assert str(tmp_path) not in receipt_text
+
+    assert main([*common, "recovery-status", "--json"]) == 0
+    status_text = capsys.readouterr().out
+    status = json.loads(status_text)
+    _assert_json_contract(status)
+    assert status["kind"] == "recovery_status"
+    assert status["recovery"]["status"] == "pending"
+    assert status["workspace"]["state"] == "restore_pending"
+    assert str(tmp_path) not in status_text
+
+    assert main([*common, "abort-restore", "--json"]) == 0
+    abort_plan = json.loads(capsys.readouterr().out)
+    _assert_json_contract(abort_plan)
+    assert abort_plan["details"]["type"] == "abort_metadata_restore"
+    assert (
+        main(
+            [
+                *common,
+                "abort-restore",
+                "--json",
+                "--execute",
+                "--expect-plan",
+                abort_plan["fingerprint"],
+            ]
+        )
+        == 0
+    )
+    aborted = json.loads(capsys.readouterr().out)
+    _assert_json_contract(aborted)
+    assert aborted["result"]["status"] == "aborted"
+    assert not (tmp_path / "target-real").exists()
 
 
 def test_cli_projects_source_conflicts_from_the_shared_data_review(
@@ -480,13 +569,14 @@ def test_real_json_import_renders_shared_confirmation_plan(
         "resolve_data_review_case",
         "confirm_data_review_batch",
         "revoke_data_review_decision",
-            "create_plausibility_rule_version",
-            "run_historical_review",
-            "run_resting_heart_rate_analysis",
-            "create_metadata_backup",
-            "migrate_store",
-            "rollback_migration",
-        ]
+        "create_plausibility_rule_version",
+        "run_historical_review",
+        "run_resting_heart_rate_analysis",
+        "create_metadata_backup",
+        "begin_metadata_restore",
+        "migrate_store",
+        "rollback_migration",
+    ]
 
 
 def test_cli_projects_and_creates_plausibility_rule_versions(
@@ -945,8 +1035,8 @@ def test_cli_maps_store_migration_plan_and_receipt(
     plan = json.loads(capsys.readouterr().out)
     _assert_json_contract(plan)
     assert plan["workspace"]["allowed_writes"] == ["migrate_store"]
-    assert plan["details"]["steps"] == [[2, 3], [3, 4]]
-    assert plan["details"]["backup_file"] == "metadata-v2-to-v4.sqlite3"
+    assert plan["details"]["steps"] == [[2, 3], [3, 4], [4, 5]]
+    assert plan["details"]["backup_file"] == "metadata-v2-to-v5.sqlite3"
     assert plan["details"]["affected_snapshot_refs"] == [snapshot_ref]
     assert plan["details"]["existing_analyses_become_stale"] is True
 
@@ -954,8 +1044,8 @@ def test_cli_maps_store_migration_plan_and_receipt(
         monkeypatch.setattr("builtins.input", lambda _prompt: "n")
         assert main([*common, "migrate"]) == 0
     human_plan = capsys.readouterr().out
-    assert "Migrationskette: 2 -> 3 -> 4" in human_plan
-    assert "Migrationssicherung: metadata-v2-to-v4.sqlite3" in human_plan
+    assert "Migrationskette: 2 -> 3 -> 4 -> 5" in human_plan
+    assert "Migrationssicherung: metadata-v2-to-v5.sqlite3" in human_plan
     assert f"Betroffene Snapshots: {snapshot_ref}" in human_plan
     assert "Bestehende Analysen werden veraltet: ja" in human_plan
 
@@ -972,13 +1062,13 @@ def test_cli_maps_store_migration_plan_and_receipt(
     receipt = json.loads(capsys.readouterr().out)
     _assert_json_contract(receipt)
     assert receipt["result"]["status"] == "completed"
-    assert receipt["result"]["steps"] == [[2, 3], [3, 4]]
+    assert receipt["result"]["steps"] == [[2, 3], [3, 4], [4, 5]]
 
     assert main([*common, "rollback-migration", "--json"]) == 0
     rollback_plan = json.loads(capsys.readouterr().out)
     _assert_json_contract(rollback_plan)
     assert rollback_plan["details"]["type"] == "rollback_migration"
-    assert rollback_plan["details"]["source_version"] == 4
+    assert rollback_plan["details"]["source_version"] == 5
     assert rollback_plan["details"]["target_version"] == 2
     assert rollback_plan["details"]["restored_snapshot_ref"] == snapshot_ref
 

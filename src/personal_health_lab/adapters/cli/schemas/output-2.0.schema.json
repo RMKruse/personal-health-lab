@@ -14,6 +14,9 @@
     },
     {
       "$ref": "#/$defs/plausibilityRulesOutput"
+    },
+    {
+      "$ref": "#/$defs/recoveryStatusOutput"
     }
   ],
   "$defs": {
@@ -22,6 +25,40 @@
         "string",
         "null"
       ]
+    },
+    "recoveryStatusOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "recovery", "runtime_config", "schema_version", "workspace"],
+      "properties": {
+        "kind": {"const": "recovery_status"},
+        "recovery": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["audit_max_position", "backup_id", "migration_steps", "original_backup_sha256", "restore_id", "source_schema_version", "status", "target_schema_version", "working_copy_sha256"],
+          "properties": {
+            "audit_max_position": {"type": "integer", "minimum": 0},
+            "backup_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+            "migration_steps": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "prefixItems": [{"type": "integer"}, {"type": "integer"}],
+                "items": false
+              }
+            },
+            "original_backup_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "restore_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+            "source_schema_version": {"type": "integer", "minimum": 1},
+            "status": {"const": "pending"},
+            "target_schema_version": {"type": "integer", "minimum": 1},
+            "working_copy_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        "runtime_config": {"$ref": "#/$defs/runtimeConfig"},
+        "schema_version": {"const": "2.0"},
+        "workspace": {"$ref": "#/$defs/workspace"}
+      }
     },
     "plausibilityRulesOutput": {
       "type": "object",
@@ -253,7 +290,7 @@
             "available_bytes": {"type": ["integer", "null"], "minimum": 0},
             "estimate_bytes": {"type": ["integer", "null"], "minimum": 0},
             "fragment_size": {"type": ["integer", "null"], "minimum": 1},
-            "method_id": {"enum": ["cow-migration/v1", "full-snapshot-import/v1", "metadata-backup/v1"]},
+            "method_id": {"enum": ["cow-migration/v1", "full-snapshot-import/v1", "metadata-backup/v1", "restore-start/v1"]},
             "minimum_remaining_bytes": {"type": "integer", "minimum": 0},
             "reason": {
               "enum": [
@@ -299,7 +336,7 @@
           "enum": ["unbound", "bound", "pending"]
         },
         "state": {
-          "enum": ["ready", "migration_required"]
+          "enum": ["ready", "migration_required", "restore_pending"]
         },
         "store_id": {
           "$ref": "#/$defs/nullableString"
@@ -510,6 +547,20 @@
         "unreferenced_snapshot_ref": {"$ref": "#/$defs/nullableString"}
       }
     },
+    "metadataRestoreResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backup_id", "diagnostics", "original_backup_sha256", "restore_id", "status", "type", "working_copy_sha256"],
+      "properties": {
+        "backup_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "original_backup_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "restore_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "status": {"enum": ["pending", "aborted", "no_op"]},
+        "type": {"const": "metadata_restore"},
+        "working_copy_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
     "writePlanOutput": {
       "type": "object",
       "additionalProperties": false,
@@ -539,6 +590,7 @@
               "filevault_transitioning",
               "filevault_unknown",
               "metadata_backup_point_in_time",
+              "metadata_restore",
               "store_migration",
               "migration_rollback"
             ]
@@ -553,6 +605,38 @@
                 "package_hash": {"type": "string"},
                 "package_size": {"type": "integer", "minimum": 0},
                 "type": {"const": "import_health_export"}
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["audit_max_position", "backup_id", "migration_steps", "original_backup_sha256", "restore_id", "source_schema_version", "source_store_id", "target_schema_version", "type", "working_copy_sha256"],
+              "properties": {
+                "audit_max_position": {"type": ["integer", "null"], "minimum": 0},
+                "backup_id": {"$ref": "#/$defs/nullableString"},
+                "migration_steps": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "prefixItems": [{"type": "integer"}, {"type": "integer"}],
+                    "items": false
+                  }
+                },
+                "original_backup_sha256": {"$ref": "#/$defs/nullableString"},
+                "restore_id": {"$ref": "#/$defs/nullableString"},
+                "source_schema_version": {"type": ["integer", "null"], "minimum": 1},
+                "source_store_id": {"$ref": "#/$defs/nullableString"},
+                "target_schema_version": {"type": "integer", "minimum": 1},
+                "type": {"const": "begin_metadata_restore"},
+                "working_copy_sha256": {"$ref": "#/$defs/nullableString"}
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["backup_id", "restore_id", "type"],
+              "properties": {
+                "backup_id": {"$ref": "#/$defs/nullableString"},
+                "restore_id": {"$ref": "#/$defs/nullableString"},
+                "type": {"const": "abort_metadata_restore"}
               }
             },
             {
@@ -708,9 +792,17 @@
             },
             {
               "type": "object", "additionalProperties": false,
+              "required": ["backup", "type"],
+              "properties": {
+                "backup": {"const": "<redacted>"},
+                "type": {"const": "begin_metadata_restore"}
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
               "required": ["type"],
               "properties": {
-                "type": {"enum": ["confirm_data_review_batch", "create_plausibility_rule_version", "data_review_decision", "migrate_store", "rollback_migration", "revoke_data_review_batch", "run_historical_review", "run_resting_heart_rate_analysis"]}
+                "type": {"enum": ["abort_metadata_restore", "confirm_data_review_batch", "create_plausibility_rule_version", "data_review_decision", "migrate_store", "rollback_migration", "revoke_data_review_batch", "run_historical_review", "run_resting_heart_rate_analysis"]}
               }
             }
           ]
@@ -769,6 +861,7 @@
                   "filevault_transitioning",
                   "filevault_unknown",
                   "metadata_backup_point_in_time",
+                  "metadata_restore",
                   "store_migration",
                   "migration_rollback"
                 ]
@@ -826,6 +919,9 @@
             },
             {
               "$ref": "#/$defs/migrationRollbackResult"
+            },
+            {
+              "$ref": "#/$defs/metadataRestoreResult"
             }
           ]
         },

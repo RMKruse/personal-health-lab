@@ -43,7 +43,7 @@ from personal_health_lab.health_data import (
 _METADATA_FILE = "metadata.sqlite3"
 _PARQUET_DIRECTORY = "parquet"
 _QUERY_FILE = "query.duckdb"
-_STORE_SCHEMA_VERSION = 4
+_STORE_SCHEMA_VERSION = 5
 _WRITER_LOCK_FILE = ".writer.lock"
 _FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
 _STORE_MIGRATION_METHOD = "cow-migration/v1"
@@ -563,6 +563,21 @@ class StoreIdentity:
     @property
     def is_current(self) -> bool:
         return self.schema_version == str(_STORE_SCHEMA_VERSION)
+
+
+@dataclass(frozen=True, slots=True)
+class RestoreSessionFacts:
+    restore_id: str
+    operation_id: str
+    backup_id: str
+    source_store_id: str
+    original_backup_sha256: str
+    canonical_content_sha256: str
+    working_copy_sha256: str
+    audit_max_position: int
+    source_schema_version: int
+    target_schema_version: int
+    completion_status: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1181,6 +1196,47 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             ),
             backup_file TEXT NOT NULL
         ) STRICT;
+        CREATE TABLE IF NOT EXISTS metadata_restores (
+            restore_id TEXT PRIMARY KEY CHECK (
+                length(restore_id) = 32 AND restore_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            operation_id TEXT NOT NULL UNIQUE CHECK (
+                length(operation_id) = 32 AND operation_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            backup_id TEXT NOT NULL CHECK (
+                length(backup_id) = 32 AND backup_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            source_store_id TEXT NOT NULL CHECK (
+                length(source_store_id) = 32
+                AND source_store_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            original_backup_sha256 TEXT NOT NULL CHECK (
+                length(original_backup_sha256) = 64
+                AND original_backup_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            canonical_content_sha256 TEXT NOT NULL CHECK (
+                length(canonical_content_sha256) = 64
+                AND canonical_content_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            working_copy_sha256 TEXT NOT NULL CHECK (
+                length(working_copy_sha256) = 64
+                AND working_copy_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            audit_max_position INTEGER NOT NULL CHECK (audit_max_position >= 0),
+            source_schema_version INTEGER NOT NULL CHECK (source_schema_version > 0),
+            target_schema_version INTEGER NOT NULL CHECK (
+                target_schema_version >= source_schema_version
+            ),
+            started_at_utc TEXT NOT NULL CHECK (
+                length(started_at_utc) >= 20 AND substr(started_at_utc, 11, 1) = 'T'
+            ),
+            activated_at_utc TEXT CHECK (
+                activated_at_utc IS NULL OR (
+                    length(activated_at_utc) >= 20
+                    AND substr(activated_at_utc, 11, 1) = 'T'
+                )
+            )
+        ) STRICT;
         CREATE TABLE IF NOT EXISTS data_review_decisions (
             audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
             decision_id TEXT NOT NULL UNIQUE REFERENCES decision_refs(decision_id),
@@ -1534,6 +1590,99 @@ class LocalStore:
         self._require_writer()
         self._validate_store()
         return self.load_identity()
+
+    def _restore_tables_exist(self) -> bool:
+        return bool(
+            self._metadata.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'metadata_restores'"
+            ).fetchone()[0]
+            == 1
+        )
+
+    @staticmethod
+    def _restore_session_facts(row: tuple[object, ...]) -> RestoreSessionFacts:
+        return RestoreSessionFacts(
+            restore_id=str(row[0]),
+            operation_id=str(row[1]),
+            backup_id=str(row[2]),
+            source_store_id=str(row[3]),
+            original_backup_sha256=str(row[4]),
+            canonical_content_sha256=str(row[5]),
+            working_copy_sha256=str(row[6]),
+            audit_max_position=int(str(row[7])),
+            source_schema_version=int(str(row[8])),
+            target_schema_version=int(str(row[9])),
+            completion_status=None if row[10] is None else "activated",
+        )
+
+    def load_restore_session(self) -> RestoreSessionFacts | None:
+        self._require_open()
+        if not self._restore_tables_exist():
+            return None
+        row = self._metadata.execute(
+            "SELECT restore_id, operation_id, backup_id, source_store_id, "
+            "original_backup_sha256, canonical_content_sha256, working_copy_sha256, "
+            "audit_max_position, source_schema_version, target_schema_version, "
+            "activated_at_utc FROM metadata_restores WHERE activated_at_utc IS NULL "
+            "ORDER BY started_at_utc DESC LIMIT 1"
+        ).fetchone()
+        return None if row is None else self._restore_session_facts(row)
+
+    def load_completed_restore(
+        self, backup_id: str, canonical_content_sha256: str
+    ) -> RestoreSessionFacts | None:
+        self._require_open()
+        if not self._restore_tables_exist():
+            return None
+        row = self._metadata.execute(
+            "SELECT restore_id, operation_id, backup_id, source_store_id, "
+            "original_backup_sha256, canonical_content_sha256, working_copy_sha256, "
+            "audit_max_position, source_schema_version, target_schema_version, "
+            "activated_at_utc FROM metadata_restores WHERE backup_id = ? "
+            "AND canonical_content_sha256 = ? AND activated_at_utc IS NOT NULL LIMIT 1",
+            (backup_id, canonical_content_sha256),
+        ).fetchone()
+        return None if row is None else self._restore_session_facts(row)
+
+    def is_empty_for_restore(self) -> bool:
+        self._require_open()
+        identity = self.load_identity()
+        if identity.person_binding is not PersonBindingStatus.UNBOUND:
+            return False
+        return all(
+            int(self._metadata.execute(f"SELECT count(*) FROM {table}").fetchone()[0]) == 0
+            for table in ("write_operations", "imports", "audit_events", "active_snapshot")
+        )
+
+    def start_restore_session(self, facts: RestoreSessionFacts) -> None:
+        self._require_open()
+        self._require_writer()
+        if self.load_restore_session() is not None or not self.is_empty_for_restore():
+            raise StoreError("restore_store_not_empty")
+        now = datetime.now(UTC).isoformat()
+        with self._metadata:
+            self._metadata.execute(
+                "INSERT INTO metadata_restores VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                (
+                    facts.restore_id,
+                    facts.operation_id,
+                    facts.backup_id,
+                    facts.source_store_id,
+                    facts.original_backup_sha256,
+                    facts.canonical_content_sha256,
+                    facts.working_copy_sha256,
+                    facts.audit_max_position,
+                    facts.source_schema_version,
+                    facts.target_schema_version,
+                    now,
+                ),
+            )
+            self._metadata.execute(
+                "UPDATE store_identity SET store_id = ?, person_binding = 'pending' "
+                "WHERE singleton = 1",
+                (facts.source_store_id,),
+            )
 
     def load_backup_audit_position(self) -> int:
         self._require_open()

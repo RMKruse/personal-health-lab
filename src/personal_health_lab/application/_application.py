@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import math
+import shutil
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
@@ -46,9 +47,18 @@ from personal_health_lab.overview import Overview, OverviewReader, OverviewSelec
 from personal_health_lab.recovery import (
     BackupId,
     MetadataBackupStatus,
+    MetadataRestoreInspection,
+    MetadataRestoreStatus,
+    RestoreId,
+    begin_metadata_restore,
     create_metadata_backup,
     describe_metadata_backup,
+    inspect_metadata_restore,
+    load_metadata_restore,
     preflight_metadata_backup,
+    preflight_metadata_restore_start,
+    stage_metadata_restore_abort,
+    validate_metadata_restore_abort,
 )
 from personal_health_lab.resting_hr_analysis import (
     AnalysisDefinitionId,
@@ -100,6 +110,7 @@ AnalysisResultRef = AnalysisResultId
 class WorkspaceState(StrEnum):
     READY = "ready"
     MIGRATION_REQUIRED = "migration_required"
+    RESTORE_PENDING = "restore_pending"
 
 
 _READY_WRITES = (
@@ -111,6 +122,7 @@ _READY_WRITES = (
     "run_historical_review",
     "run_resting_heart_rate_analysis",
     "create_metadata_backup",
+    "begin_metadata_restore",
     "migrate_store",
     "rollback_migration",
 )
@@ -219,6 +231,34 @@ class CreateMetadataBackup:
         if not isinstance(self.target_path, Path):
             raise ConfigurationError("Sicherungsziel muss ein pathlib.Path-Wert sein.")
         object.__setattr__(self, "target_path", self.target_path.expanduser().resolve())
+
+
+@dataclass(frozen=True, slots=True)
+class BeginMetadataRestore:
+    backup_path: Path
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.backup_path, Path):
+            raise ConfigurationError("Wiederherstellungssicherung muss ein pathlib.Path-Wert sein.")
+        object.__setattr__(self, "backup_path", self.backup_path.expanduser().resolve())
+
+
+@dataclass(frozen=True, slots=True)
+class AbortMetadataRestore:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryStatus:
+    restore_id: RestoreId
+    backup_id: BackupId
+    original_backup_sha256: str
+    working_copy_sha256: str
+    audit_max_position: int
+    source_schema_version: int
+    target_schema_version: int
+    migration_steps: tuple[tuple[int, int], ...]
+    status: MetadataRestoreStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -499,6 +539,8 @@ class RevokeDataReviewDecision:
 WriteRequest = (
     ImportHealthExport
     | CreateMetadataBackup
+    | BeginMetadataRestore
+    | AbortMetadataRestore
     | MigrateStore
     | RollbackMigration
     | ResolveDataReviewCase
@@ -522,6 +564,7 @@ class WriteConfirmation(StrEnum):
     FILEVAULT_TRANSITIONING = "filevault_transitioning"
     FILEVAULT_UNKNOWN = "filevault_unknown"
     METADATA_BACKUP_POINT_IN_TIME = "metadata_backup_point_in_time"
+    METADATA_RESTORE = "metadata_restore"
     STORE_MIGRATION = "store_migration"
     MIGRATION_ROLLBACK = "migration_rollback"
 
@@ -545,6 +588,25 @@ class MetadataBackupPlan:
     canonical_content_sha256: str
     audit_max_position: int
     target_file: str
+
+
+@dataclass(frozen=True, slots=True)
+class MetadataRestorePlan:
+    restore_id: RestoreId | None
+    backup_id: BackupId | None
+    source_store_id: StoreId | None
+    original_backup_sha256: str | None
+    working_copy_sha256: str | None
+    audit_max_position: int | None
+    source_schema_version: int | None
+    target_schema_version: int
+    migration_steps: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AbortMetadataRestorePlan:
+    restore_id: RestoreId | None
+    backup_id: BackupId | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -644,6 +706,8 @@ class RestingHeartRateAnalysisPlan:
 WritePlanDetails = (
     ImportHealthExportPlan
     | MetadataBackupPlan
+    | MetadataRestorePlan
+    | AbortMetadataRestorePlan
     | StoreMigrationPlan
     | RollbackMigrationPlan
     | DataReviewDecisionPlan
@@ -708,6 +772,17 @@ class MetadataBackupReceipt:
     created_at_utc: datetime
     target_file: str
     status: MetadataBackupStatus
+    diagnostics: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MetadataRestoreReceipt:
+    operation_id: OperationId
+    restore_id: RestoreId
+    backup_id: BackupId
+    original_backup_sha256: str
+    working_copy_sha256: str
+    status: MetadataRestoreStatus
     diagnostics: tuple[str, ...] = ()
 
 
@@ -940,6 +1015,7 @@ class AnalysisReceipt:
 WriteResult = (
     ImportReceipt
     | MetadataBackupReceipt
+    | MetadataRestoreReceipt
     | StoreMigrationReceipt
     | RollbackMigrationReceipt
     | WriteDecisionReceipt
@@ -1002,6 +1078,14 @@ class HealthLab:
 
     def preview_write(self, request: WriteRequest) -> WritePlan:
         self._require_open()
+        if isinstance(request, BeginMetadataRestore):
+            return self._build_metadata_restore_plan(request)
+        if isinstance(request, AbortMetadataRestore):
+            return self._build_metadata_restore_abort_plan()
+        if self.load_workspace_status().state is WorkspaceState.RESTORE_PENDING and not isinstance(
+            request, ImportHealthExport
+        ):
+            raise HealthLabError("Während der Wiederherstellung ist diese Operation gesperrt.")
         if isinstance(request, MigrateStore):
             return self._build_store_migration_plan()
         if isinstance(request, RollbackMigration):
@@ -1022,6 +1106,143 @@ class HealthLab:
             else None
         )
         return self._build_import_plan(request, filevault)
+
+    @staticmethod
+    def _public_recovery_status(inspection: MetadataRestoreInspection) -> RecoveryStatus:
+        assert inspection.working_copy_sha256 is not None
+        return RecoveryStatus(
+            inspection.restore_id,
+            inspection.backup_id,
+            inspection.original_backup_sha256,
+            inspection.working_copy_sha256,
+            inspection.audit_max_position,
+            inspection.source_schema_version,
+            inspection.target_schema_version,
+            inspection.migration_steps,
+            inspection.status,
+        )
+
+    def _build_metadata_restore_plan(
+        self,
+        request: BeginMetadataRestore,
+        *,
+        filevault_override: FileVaultCheck | None = None,
+        capacity_override: CapacityCheck | None = None,
+    ) -> WritePlan:
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        inspection: MetadataRestoreInspection | None = None
+        diagnostics: tuple[str, ...] = ()
+        try:
+            inspection = inspect_metadata_restore(
+                self._store, request.backup_path, self._config.active_store
+            )
+        except StoreError as error:
+            diagnostics = (str(error),)
+        filevault = filevault_override or probe_filevault(self._config.active_store)
+        capacity = capacity_override or preflight_metadata_restore_start(
+            request.backup_path, self._config.active_store
+        )
+        blocked = inspection is None or capacity.status is not CapacityStatus.READY
+        if capacity.status is not CapacityStatus.READY and not diagnostics:
+            diagnostics = (
+                "capacity_" + (capacity.reason.value if capacity.reason else capacity.status.value),
+            )
+        confirmations: list[WriteConfirmation] = []
+        if inspection is not None and inspection.status is not MetadataRestoreStatus.NO_OP:
+            confirmations.append(WriteConfirmation.METADATA_RESTORE)
+            if filevault.status is not FileVaultStatus.PROTECTED:
+                confirmations.append(WriteConfirmation("filevault_" + filevault.status.value))
+        details = MetadataRestorePlan(
+            None if inspection is None else inspection.restore_id,
+            None if inspection is None else inspection.backup_id,
+            None if inspection is None else inspection.source_store_id,
+            None if inspection is None else inspection.original_backup_sha256,
+            None if inspection is None else inspection.working_copy_sha256,
+            None if inspection is None else inspection.audit_max_position,
+            None if inspection is None else inspection.source_schema_version,
+            2 if inspection is None else inspection.target_schema_version,
+            () if inspection is None else inspection.migration_steps,
+        )
+        payload = {
+            "backup_path": str(request.backup_path),
+            "capacity": {
+                "estimate_bytes": capacity.estimate_bytes,
+                "fragment_size": capacity.fragment_size,
+                "method_id": capacity.method_id,
+                "status": capacity.status.value,
+                "target_volume": capacity.target_volume,
+            },
+            "confirmations": [item.value for item in confirmations],
+            "details": {
+                "audit_max_position": details.audit_max_position,
+                "backup_id": None if details.backup_id is None else str(details.backup_id),
+                "migration_steps": details.migration_steps,
+                "original_backup_sha256": details.original_backup_sha256,
+                "restore_id": None if details.restore_id is None else str(details.restore_id),
+                "source_store_id": (
+                    None if details.source_store_id is None else str(details.source_store_id)
+                ),
+            },
+            "diagnostics": diagnostics,
+            "filevault": {
+                "reason": None if filevault.reason is None else filevault.reason.value,
+                "status": filevault.status.value,
+                "target_volume": filevault.target_volume,
+            },
+            "operation": "begin_metadata_restore",
+            "version": 1,
+        }
+        return WritePlan(
+            PlanFingerprint(
+                hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+            ),
+            details,
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED
+                    if blocked
+                    else (
+                        WriteApprovalStatus.READY
+                        if not confirmations
+                        else WriteApprovalStatus.CONFIRMATION_REQUIRED
+                    )
+                ),
+                tuple(confirmations),
+                filevault,
+                diagnostics,
+                capacity,
+            ),
+        )
+
+    def _build_metadata_restore_abort_plan(self) -> WritePlan:
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        try:
+            inspection = load_metadata_restore(self._store)
+            details = AbortMetadataRestorePlan(inspection.restore_id, inspection.backup_id)
+            diagnostics: tuple[str, ...] = ()
+            approval = WriteApprovalStatus.READY
+        except StoreError as error:
+            details = AbortMetadataRestorePlan(None, None)
+            diagnostics = (str(error),)
+            approval = WriteApprovalStatus.BLOCKED
+        payload = {
+            "backup_id": None if details.backup_id is None else str(details.backup_id),
+            "operation": "abort_metadata_restore",
+            "restore_id": None if details.restore_id is None else str(details.restore_id),
+        }
+        return WritePlan(
+            PlanFingerprint(
+                hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+            ),
+            details,
+            WritePreflight(WriteApproval(approval), diagnostics=diagnostics),
+        )
 
     def _build_store_migration_plan(
         self,
@@ -1816,6 +2037,37 @@ class HealthLab:
                 (candidate for candidate in candidates if candidate.fingerprint == expected_plan),
                 None,
             )
+        if isinstance(request, BeginMetadataRestore):
+            filevault = current_plan.preflight.filevault
+            capacity = current_plan.preflight.capacity
+            if (
+                filevault is None
+                or filevault.status is not FileVaultStatus.PROTECTED
+                or capacity is None
+            ):
+                return None
+            candidates = [
+                self._build_metadata_restore_plan(
+                    request,
+                    filevault_override=FileVaultCheck(status, filevault.target_volume),
+                    capacity_override=capacity,
+                )
+                for status in (FileVaultStatus.UNPROTECTED, FileVaultStatus.TRANSITIONING)
+            ]
+            candidates.extend(
+                self._build_metadata_restore_plan(
+                    request,
+                    filevault_override=FileVaultCheck(
+                        FileVaultStatus.UNKNOWN, filevault.target_volume, reason
+                    ),
+                    capacity_override=capacity,
+                )
+                for reason in FileVaultReason
+            )
+            return next(
+                (candidate for candidate in candidates if candidate.fingerprint == expected_plan),
+                None,
+            )
         if not isinstance(request, ImportHealthExport):
             return None
         if not isinstance(current_plan.details, ImportHealthExportPlan):
@@ -1893,6 +2145,10 @@ class HealthLab:
                 current_plan.diagnostics,
                 expected_plan,
             )
+        if isinstance(request, BeginMetadataRestore):
+            return self._execute_metadata_restore(request, authorization_plan, expected_plan)
+        if isinstance(request, AbortMetadataRestore):
+            return self._execute_metadata_restore_abort(authorization_plan, expected_plan)
         if isinstance(request, MigrateStore):
             return self._execute_store_migration(authorization_plan, expected_plan)
         if isinstance(request, RollbackMigration):
@@ -1909,6 +2165,13 @@ class HealthLab:
             )
         if not isinstance(request, ImportHealthExport):
             return self._execute_data_review_write(request, authorization_plan, expected_plan)
+        if self.load_workspace_status().state is WorkspaceState.RESTORE_PENDING:
+            return self._not_started(
+                authorization_plan,
+                WriteNotStartedStatus.BLOCKED,
+                ("restore_source_import_not_available",),
+                expected_plan,
+            )
         if not isinstance(authorization_plan.details, ImportHealthExportPlan):
             return self._not_started(
                 authorization_plan,
@@ -2311,6 +2574,173 @@ class HealthLab:
                 final_capacity,
             ),
         )
+
+    def _execute_metadata_restore(
+        self,
+        request: BeginMetadataRestore,
+        plan: WritePlan,
+        expected_plan: PlanFingerprint,
+    ) -> WriteReceipt:
+        details = plan.details
+        if (
+            not isinstance(details, MetadataRestorePlan)
+            or details.restore_id is None
+            or details.backup_id is None
+            or details.source_store_id is None
+            or details.original_backup_sha256 is None
+            or details.audit_max_position is None
+            or details.source_schema_version is None
+        ):
+            return self._not_started(
+                plan,
+                WriteNotStartedStatus.PLAN_CHANGED,
+                ("plan_changed",),
+                expected_plan,
+            )
+        operation_id = OperationId(uuid4().hex)
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        try:
+            final_filevault = probe_filevault(self._config.active_store)
+            expected_filevault = plan.preflight.filevault
+            if expected_filevault is None or not self._filevault_allows_execution(
+                expected_filevault, final_filevault
+            ):
+                return self._not_started_with_preflight(
+                    plan,
+                    WriteNotStartedStatus.PLAN_CHANGED,
+                    ("plan_changed",),
+                    expected_plan,
+                    filevault=final_filevault,
+                )
+            final_capacity = preflight_metadata_restore_start(
+                request.backup_path, self._config.active_store
+            )
+            if final_capacity.status is not CapacityStatus.READY:
+                diagnostic = "capacity_" + (
+                    final_capacity.reason.value
+                    if final_capacity.reason is not None
+                    else final_capacity.status.value
+                )
+                return self._not_started_with_preflight(
+                    plan,
+                    WriteNotStartedStatus.BLOCKED,
+                    (diagnostic,),
+                    expected_plan,
+                    filevault=final_filevault,
+                    capacity=final_capacity,
+                )
+            current = inspect_metadata_restore(
+                writer, request.backup_path, self._config.active_store
+            )
+            expected = MetadataRestoreInspection(
+                details.restore_id,
+                details.backup_id,
+                details.source_store_id,
+                details.original_backup_sha256,
+                current.canonical_content_sha256,
+                details.working_copy_sha256,
+                details.audit_max_position,
+                details.source_schema_version,
+                details.target_schema_version,
+                details.migration_steps,
+                current.status,
+            )
+            result = begin_metadata_restore(
+                writer,
+                request.backup_path,
+                self._config.active_store,
+                expected,
+                str(operation_id),
+            )
+        except StoreError as error:
+            return self._not_started(
+                plan, WriteNotStartedStatus.BLOCKED, (str(error),), expected_plan
+            )
+        finally:
+            writer.close()
+        assert result.working_copy_sha256 is not None
+        restore_receipt = MetadataRestoreReceipt(
+            operation_id,
+            result.restore_id,
+            result.backup_id,
+            result.original_backup_sha256,
+            result.working_copy_sha256,
+            result.status,
+        )
+        return WriteReceipt(
+            operation_id,
+            expected_plan,
+            restore_receipt,
+            WritePreflight(
+                plan.approval,
+                plan.confirmations,
+                final_filevault,
+                (),
+                final_capacity,
+            ),
+        )
+
+    def _execute_metadata_restore_abort(
+        self, plan: WritePlan, expected_plan: PlanFingerprint
+    ) -> WriteReceipt:
+        if not isinstance(plan.details, AbortMetadataRestorePlan):
+            return self._not_started(
+                plan,
+                WriteNotStartedStatus.PLAN_CHANGED,
+                ("plan_changed",),
+                expected_plan,
+            )
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        try:
+            inspection = validate_metadata_restore_abort(writer, self._config.active_store)
+            if (
+                plan.details.restore_id != inspection.restore_id
+                or plan.details.backup_id != inspection.backup_id
+            ):
+                return self._not_started(
+                    plan,
+                    WriteNotStartedStatus.PLAN_CHANGED,
+                    ("plan_changed",),
+                    expected_plan,
+                )
+            discarded = stage_metadata_restore_abort(
+                self._config.active_store, inspection.restore_id
+            )
+        except StoreError as error:
+            return self._not_started(
+                plan, WriteNotStartedStatus.BLOCKED, (str(error),), expected_plan
+            )
+        finally:
+            writer.close()
+        try:
+            shutil.rmtree(discarded)
+        except OSError as error:
+            raise HealthLabError("Wiederherstellung konnte nicht verworfen werden.") from error
+        if self._overview_reader is not None:
+            self._overview_reader.close()
+            self._overview_reader = None
+            self._store = None
+        operation_id = OperationId(uuid4().hex)
+        assert inspection.working_copy_sha256 is not None
+        result = MetadataRestoreReceipt(
+            operation_id,
+            inspection.restore_id,
+            inspection.backup_id,
+            inspection.original_backup_sha256,
+            inspection.working_copy_sha256,
+            MetadataRestoreStatus.ABORTED,
+        )
+        return WriteReceipt(operation_id, expected_plan, result, plan.preflight)
 
     def _execute_plausibility_rule_write(
         self,
@@ -2935,11 +3365,12 @@ class HealthLab:
         if self._store is None:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
         identity = self._store.load_identity()
-        state = (
-            WorkspaceState.READY
-            if identity.store_id is not None and identity.is_current
-            else WorkspaceState.MIGRATION_REQUIRED
-        )
+        if identity.store_id is None or not identity.is_current:
+            state = WorkspaceState.MIGRATION_REQUIRED
+        elif self._store.load_restore_session() is not None:
+            state = WorkspaceState.RESTORE_PENDING
+        else:
+            state = WorkspaceState.READY
         return WorkspaceStatus(
             mode=identity.mode,
             store_id=identity.store_id,
@@ -2948,21 +3379,44 @@ class HealthLab:
             allowed_reads=(
                 ("workspace_status", "migration_diagnostics")
                 if state is WorkspaceState.MIGRATION_REQUIRED
-                else _READY_READS
+                else (
+                    ("workspace_status", "recovery_status")
+                    if state is WorkspaceState.RESTORE_PENDING
+                    else _READY_READS
+                )
             ),
             allowed_writes=(
                 ("migrate_store",)
                 if state is WorkspaceState.MIGRATION_REQUIRED
                 else (
-                    _READY_WRITES
-                    if identity.mode is DataMode.REAL
-                    else tuple(item for item in _READY_WRITES if item != "create_metadata_backup")
+                    ("import_health_export", "abort_metadata_restore")
+                    if state is WorkspaceState.RESTORE_PENDING
+                    else (
+                        _READY_WRITES
+                        if identity.mode is DataMode.REAL
+                        else tuple(
+                            item
+                            for item in _READY_WRITES
+                            if item not in {"create_metadata_backup", "begin_metadata_restore"}
+                        )
+                    )
                 )
             ),
         )
 
+    def load_recovery_status(self) -> RecoveryStatus:
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        try:
+            return self._public_recovery_status(load_metadata_restore(self._store))
+        except StoreError as error:
+            raise HealthLabError("Wiederherstellungsstatus ist nicht verfügbar.") from error
+
     def load_migration_diagnostics(self) -> MigrationDiagnostics:
         self._require_open()
+        if self.load_workspace_status().state is WorkspaceState.RESTORE_PENDING:
+            raise HealthLabError("Während der Wiederherstellung ist Migration gesperrt.")
         if self._store is None:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
         raw_source = self._store.load_identity().schema_version
@@ -3027,5 +3481,8 @@ class HealthLab:
         return self._overview_reader
 
     def _require_ready(self) -> None:
-        if self.load_workspace_status().state is WorkspaceState.MIGRATION_REQUIRED:
+        state = self.load_workspace_status().state
+        if state is WorkspaceState.MIGRATION_REQUIRED:
             raise HealthLabError("Datenspeicher benötigt zuerst eine Migration.")
+        if state is WorkspaceState.RESTORE_PENDING:
+            raise HealthLabError("Datenspeicher befindet sich in Wiederherstellung.")

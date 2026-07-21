@@ -37,7 +37,7 @@ ALLOWED_DEPENDENCIES = {
     "health_import": {"data_quality", "health_data", "storage"},
     "migration": {"storage"},
     "overview": {"health_data", "package_root", "storage"},
-    "recovery": {"data_quality", "storage"},
+    "recovery": {"data_quality", "migration", "storage"},
     "package_root": {"runtime"},
     "resting_hr_analysis": {"health_data", "storage"},
     "runtime": set(),

@@ -12,6 +12,7 @@ from streamlit.testing.v1 import AppTest
 from personal_health_lab.adapters.cli import main as cli_main
 from personal_health_lab.application import (
     AnalysisDefinitionId,
+    CreateMetadataBackup,
     DataMode,
     HealthLab,
     ImportHealthExport,
@@ -116,8 +117,8 @@ def test_streamlit_focuses_migration_in_restricted_session(
 
     assert not app.exception
     assert any(item.value == "Datenspeichermigration" for item in app.subheader)
-    assert any("Schema: 2 → 4" in item.value for item in app.caption)
-    assert any("2 → 3, 3 → 4" in item.value for item in app.caption)
+    assert any("Schema: 2 → 5" in item.value for item in app.caption)
+    assert any("2 → 3, 3 → 4, 4 → 5" in item.value for item in app.caption)
     assert any(f"Betroffene Snapshots: {snapshot_ref}" in item.value for item in app.caption)
     assert any("Bestehende Analysen werden stale: true" in item.value for item in app.caption)
     assert not app.file_uploader
@@ -179,6 +180,50 @@ def test_streamlit_plans_and_executes_metadata_backup(
 
     assert target.is_file()
     assert any("Metadatensicherung: completed" in item.value for item in app.success)
+
+
+def test_streamlit_focuses_pending_metadata_restore_and_can_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backup = tmp_path / "private" / "metadata.sqlite3"
+    backup.parent.mkdir()
+    source_config = RuntimeConfig(
+        DataMode.REAL, tmp_path / "source-synthetic", tmp_path / "source-real"
+    )
+    with HealthLab.open(source_config) as health_lab:
+        request = CreateMetadataBackup(backup)
+        health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+    target = tmp_path / "target-real"
+    monkeypatch.setenv("HEALTHLAB_MODE", "real")
+    monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(tmp_path / "target-synthetic"))
+    monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(target))
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
+
+    app = AppTest.from_file(str(app_path)).run()
+    next(
+        item for item in app.text_input if item.label == "Metadatensicherung wiederherstellen"
+    ).set_value(str(backup))
+    next(button for button in app.button if button.label == "Wiederherstellung prüfen").click()
+    app.run()
+
+    assert not app.exception
+    assert any("Sicherungs-ID:" in item.value for item in app.caption)
+    next(button for button in app.button if button.label == "Wiederherstellung beginnen").click()
+    app.run()
+
+    assert not app.exception
+    assert any(item.value == "Metadatenwiederherstellung" for item in app.subheader)
+    assert any("Status: pending" in item.value for item in app.caption)
+    assert not app.file_uploader
+    assert all(button.label != "Ruhepulsanalyse prüfen" for button in app.button)
+    next(button for button in app.button if button.label == "Wiederherstellung abbrechen").click()
+    app.run()
+
+    assert not app.exception
+    assert not target.exists()
+    assert any("Wiederherstellung: aborted" in item.value for item in app.success)
 
 
 def test_streamlit_projects_plausibility_rules(

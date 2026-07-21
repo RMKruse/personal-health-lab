@@ -2,7 +2,24 @@
 
 from personal_health_lab.storage import MigrationRollbackFacts, current_store_schema_version
 
-_REGISTERED_STEPS = ((1, 2), (2, 3), (3, 4))
+_REGISTERED_STEPS = ((1, 2), (2, 3), (3, 4), (4, 5))
+_REGISTERED_BACKUP_STEPS = ((1, 2),)
+
+
+def _plan_adjacent_migration(
+    source: int,
+    target: int,
+    registered_steps: tuple[tuple[int, int], ...],
+) -> tuple[tuple[int, int], ...] | None:
+    steps: list[tuple[int, int]] = []
+    current = source
+    while current < target:
+        step = next((item for item in registered_steps if item[0] == current), None)
+        if step is None or step[1] != current + 1:
+            return None
+        steps.append(step)
+        current = step[1]
+    return tuple(steps)
 
 
 def plan_store_migration(
@@ -19,15 +36,21 @@ def plan_store_migration(
         return target, (), ()
     if source > target:
         return target, (), ("newer_schema",)
-    steps: list[tuple[int, int]] = []
-    current = source
-    while current < target:
-        step = next((item for item in _REGISTERED_STEPS if item[0] == current), None)
-        if step is None or step[1] != current + 1:
-            return target, (), ("missing_migration_step",)
-        steps.append(step)
-        current = step[1]
-    return target, tuple(steps), ()
+    steps = _plan_adjacent_migration(source, target, _REGISTERED_STEPS)
+    if steps is None:
+        return target, (), ("missing_migration_step",)
+    return target, steps, ()
+
+
+def plan_backup_migration(
+    source_version: int,
+    target_version: int,
+) -> tuple[tuple[int, int], ...] | None:
+    """Return the registered backup-schema path, or ``None`` when unavailable."""
+
+    if source_version <= 0 or source_version > target_version:
+        return None
+    return _plan_adjacent_migration(source_version, target_version, _REGISTERED_BACKUP_STEPS)
 
 
 def plan_migration_rollback(facts: MigrationRollbackFacts | None) -> tuple[str, ...]:
@@ -45,4 +68,8 @@ def plan_migration_rollback(facts: MigrationRollbackFacts | None) -> tuple[str, 
     return ()
 
 
-__all__ = ["plan_migration_rollback", "plan_store_migration"]
+__all__ = [
+    "plan_backup_migration",
+    "plan_migration_rollback",
+    "plan_store_migration",
+]

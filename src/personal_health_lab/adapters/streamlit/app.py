@@ -11,9 +11,11 @@ import streamlit as st
 
 from personal_health_lab.adapters._config import load_runtime_config
 from personal_health_lab.application import (
+    AbortMetadataRestore,
     AnalysisDefinitionId,
     AnalysisStatus,
     BatchDecisionTarget,
+    BeginMetadataRestore,
     CanonicalHealthType,
     CanonicalUnit,
     ConfigurationError,
@@ -35,6 +37,8 @@ from personal_health_lab.application import (
     LocalMeasurementExclusion,
     MeasurementVersionId,
     MetadataBackupReceipt,
+    MetadataRestorePlan,
+    MetadataRestoreReceipt,
     MigrateStore,
     OverviewSelection,
     OverviewStatus,
@@ -144,6 +148,48 @@ if workspace_status.state is WorkspaceState.MIGRATION_REQUIRED:
             st.error("Datenspeichermigration konnte nicht ausgeführt werden.")
     if st.button("Migration abbrechen"):
         st.info("Datenspeichermigration nicht ausgeführt.")
+    st.stop()
+
+if workspace_status.state is WorkspaceState.RESTORE_PENDING:
+    try:
+        with HealthLab.open(config) as health_lab:
+            recovery_status = health_lab.load_recovery_status()
+            abort_restore_request = AbortMetadataRestore()
+            abort_restore_plan = health_lab.preview_write(abort_restore_request)
+    except HealthLabError:
+        st.error("Wiederherstellungsstatus konnte nicht geladen werden.")
+        st.stop()
+    st.subheader("Metadatenwiederherstellung")
+    st.caption(f"Status: {recovery_status.status.value}")
+    st.caption(f"Wiederherstellungs-ID: {recovery_status.restore_id}")
+    st.caption(f"Sicherungs-ID: {recovery_status.backup_id}")
+    st.caption(
+        f"Sicherungsschema: {recovery_status.source_schema_version} → "
+        f"{recovery_status.target_schema_version}"
+    )
+    st.caption(
+        "Migrationsschritte: "
+        + (
+            ", ".join(
+                f"{source} → {target}"
+                for source, target in recovery_status.migration_steps
+            )
+            or "-"
+        )
+    )
+    if st.button(
+        "Wiederherstellung abbrechen",
+        disabled=abort_restore_plan.approval.status is WriteApprovalStatus.BLOCKED,
+    ):
+        try:
+            with HealthLab.open(config) as health_lab:
+                abort_result = health_lab.execute_write(
+                    abort_restore_request,
+                    expected_plan=abort_restore_plan.fingerprint,
+                ).result
+            st.success(f"Wiederherstellung: {abort_result.status.value}")
+        except HealthLabError:
+            st.error("Wiederherstellung konnte nicht abgebrochen werden.")
     st.stop()
 
 try:
@@ -349,6 +395,61 @@ with st.expander("Sicherung & Wiederherstellung"):
             st.success(message)
         else:
             st.warning(message)
+
+    restore_plan = st.session_state.get("restore_plan")
+    restore_backup = st.text_input(
+        "Metadatensicherung wiederherstellen",
+        disabled=restore_plan is not None,
+    )
+    if st.button(
+        "Wiederherstellung prüfen",
+        disabled=not restore_backup or restore_plan is not None,
+    ):
+        try:
+            restore_request = BeginMetadataRestore(Path(restore_backup))
+            with HealthLab.open(config) as health_lab:
+                st.session_state["restore_plan"] = health_lab.preview_write(restore_request)
+            st.session_state["restore_request"] = restore_request
+            st.rerun()
+        except (OSError, ConfigurationError, HealthLabError):
+            st.error("Wiederherstellung konnte nicht geplant werden.")
+    restore_plan = st.session_state.get("restore_plan")
+    if restore_plan is not None:
+        assert isinstance(restore_plan.details, MetadataRestorePlan)
+        st.code(str(restore_plan.fingerprint))
+        st.caption(
+            f"Sicherungs-ID: {restore_plan.details.backup_id or '-'} · "
+            f"Audit-Höchststand: {restore_plan.details.audit_max_position or 0}"
+        )
+        st.caption(
+            f"Sicherungsschema: {restore_plan.details.source_schema_version or '-'} → "
+            f"{restore_plan.details.target_schema_version}"
+        )
+        st.caption(
+            "Bestätigungen: "
+            + (", ".join(item.value for item in restore_plan.confirmations) or "-")
+        )
+        if st.button(
+            "Wiederherstellung beginnen",
+            disabled=restore_plan.approval.status is WriteApprovalStatus.BLOCKED,
+        ):
+            try:
+                with HealthLab.open(config) as health_lab:
+                    restore_result = health_lab.execute_write(
+                        st.session_state["restore_request"],
+                        expected_plan=restore_plan.fingerprint,
+                    ).result
+                if isinstance(restore_result, MetadataRestoreReceipt):
+                    st.session_state["last_restore"] = restore_result.status.value
+                st.session_state.pop("restore_plan", None)
+                st.session_state.pop("restore_request", None)
+                st.rerun()
+            except (OSError, HealthLabError):
+                st.error("Wiederherstellung konnte nicht begonnen werden.")
+        if st.button("Wiederherstellungsvorschau verwerfen und bearbeiten"):
+            st.session_state.pop("restore_plan", None)
+            st.session_state.pop("restore_request", None)
+            st.rerun()
 
 analysis_plan = st.session_state.get("analysis_plan")
 start_date = st.date_input("Von", value=None, disabled=analysis_plan is not None)

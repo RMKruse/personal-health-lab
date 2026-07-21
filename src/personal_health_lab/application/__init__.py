@@ -25,7 +25,12 @@ from personal_health_lab.overview import (
     OverviewSelection,
     OverviewStatus,
 )
-from personal_health_lab.recovery import BackupId, MetadataBackupStatus
+from personal_health_lab.recovery import (
+    BackupId,
+    MetadataBackupStatus,
+    MetadataRestoreStatus,
+    RestoreId,
+)
 from personal_health_lab.resting_hr_analysis import (
     AnalysisDefinitionId,
     AnalysisProvenance,
@@ -47,9 +52,12 @@ from personal_health_lab.storage import (
 )
 
 from ._application import (
+    AbortMetadataRestore,
+    AbortMetadataRestorePlan,
     AnalysisReceipt,
     AnalysisStatus,
     BatchDecisionTarget,
+    BeginMetadataRestore,
     ConfigurationError,
     ConfirmDataReviewBatch,
     CreateMetadataBackup,
@@ -86,6 +94,8 @@ from ._application import (
     LocalMeasurementExclusion,
     MetadataBackupPlan,
     MetadataBackupReceipt,
+    MetadataRestorePlan,
+    MetadataRestoreReceipt,
     MigrateStore,
     MigrationDiagnostics,
     MigrationStatus,
@@ -98,6 +108,7 @@ from ._application import (
     PlausibilityRuleVersion,
     PlausibilityRuleVersionPlan,
     PlausibilityRuleVersionReceipt,
+    RecoveryStatus,
     ResolveDataReviewCase,
     RestingHeartRateAnalysisPlan,
     ReviewReasonCode,
@@ -134,6 +145,8 @@ from ._application import (
 )
 
 __all__ = [
+    "AbortMetadataRestore",
+    "AbortMetadataRestorePlan",
     "AnalysisDataStatusReason",
     "AnalysisDefinitionId",
     "AnalysisFreshness",
@@ -145,6 +158,7 @@ __all__ = [
     "AssociationInterval",
     "BackupId",
     "BatchDecisionTarget",
+    "BeginMetadataRestore",
     "CanonicalHealthType",
     "CanonicalUnit",
     "CapacityCheck",
@@ -195,6 +209,9 @@ __all__ = [
     "MetadataBackupPlan",
     "MetadataBackupReceipt",
     "MetadataBackupStatus",
+    "MetadataRestorePlan",
+    "MetadataRestoreReceipt",
+    "MetadataRestoreStatus",
     "MigrateStore",
     "MigrationDiagnostics",
     "MigrationStatus",
@@ -215,10 +232,12 @@ __all__ = [
     "PlausibilityRuleVersionPlan",
     "PlausibilityRuleVersionReceipt",
     "PlausibilityRules",
+    "RecoveryStatus",
     "ReproducibilityStatus",
     "ResolveDataReviewCase",
     "RestingHeartRateAnalysisPlan",
     "RestingHeartRateAnalysisResult",
+    "RestoreId",
     "ReviewReasonCode",
     "RevokeDataReviewDecision",
     "RollbackMigration",

@@ -3020,3 +3020,198 @@ level = "storage"
 expected_result = "cow-migration/v1 conservative bound"
 expected_effect = "none"
 forbidden_side_effects = ["base allocation counted as new", "copy-on-write credit"]
+
+[[contract]]
+id = "V02-C-RST-001"
+statement = "Metadata restore starts only from a valid backup into a new empty real store and creates one durable restore-pending session."
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V02-C-RST-002"
+statement = "A restore-pending store exposes only recovery status, required source import, and abort while domain reads and unrelated writes remain blocked."
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V02-C-RST-004"
+statement = "Supported backup schemas migrate forward in an isolated working copy and never mutate the original backup."
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V02-C-RST-006"
+statement = "Aborting a pending restore discards the newly created store completely; an already represented backup is idempotent."
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+evidence = ["positive", "negative", "transition"]
+
+[[fixture]]
+id = "V02-F-DOM-METADATA-RESTORE-V1"
+kind = "domain"
+generator = "metadata-restore-domain-v1"
+seed = 0
+parameters = "current and legacy metadata backups; empty, non-empty, synthetic, pending, and activated real stores"
+platform = "all"
+sha256 = "16ec68578760e4109fe0d7d5da91c3148beda76805450a11dafd4c44bc95d068"
+
+[[fixture]]
+id = "V02-F-SYS-ALLOC-RESTORE-NORMAL-V1"
+kind = "system"
+generator = "restore-start-allocation-v1"
+seed = 0
+parameters = "current metadata backup, pending catalog, SQLite journal, and staging working copy"
+platform = "all"
+sha256 = "47f6f0f51fc91e9422ddef85ef784c8a9516bda10599084ba78e98b8253af14f"
+
+[[fixture]]
+id = "V02-F-SYS-ALLOC-RESTORE-STRESS-V1"
+kind = "system"
+generator = "restore-start-allocation-v1"
+seed = 0
+parameters = "normal restore-start allocation fixture with a 4 MiB SQLite free-page working copy"
+platform = "all"
+sha256 = "2fd13480e7d0ea4002ab7d23e2d5a40f474c2dfc05dff62f3e38e80bbbc352fa"
+
+[[case]]
+id = "V02-A-RST-001"
+contracts = ["V02-C-RST-001"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_valid_backup_begins_a_read_only_restore_pending_session"
+initial_state = "valid current metadata backup and new empty real store"
+operation = "execute confirmed BeginMetadataRestore"
+level = "application"
+expected_result = "pending restore receipt"
+expected_effect = "durable restore-pending session"
+forbidden_side_effects = ["backup mutation", "domain activation"]
+
+[[case]]
+id = "V02-A-RST-002"
+contracts = ["V02-C-RST-001"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_restore_rejects_synthetic_populated_and_conflicting_targets"
+initial_state = "synthetic or populated target"
+operation = "preview BeginMetadataRestore"
+level = "application"
+expected_result = "blocked"
+expected_effect = "none"
+forbidden_side_effects = ["target replacement", "backup mutation"]
+
+[[case]]
+id = "V02-A-RST-003"
+contracts = ["V02-C-RST-001"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_restore_rejects_synthetic_populated_and_conflicting_targets"
+initial_state = "pending target with a different backup"
+operation = "preview BeginMetadataRestore"
+level = "application"
+expected_result = "blocked conflict"
+expected_effect = "existing pending session unchanged"
+forbidden_side_effects = ["second session", "working-copy replacement"]
+
+[[case]]
+id = "V02-A-RST-004"
+contracts = ["V02-C-RST-001"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_valid_backup_begins_a_read_only_restore_pending_session"
+initial_state = "new empty real store"
+operation = "begin restore"
+level = "storage"
+expected_result = "backup store identity adopted as pending"
+expected_effect = "pending identity and binding"
+forbidden_side_effects = ["ready binding", "snapshot activation"]
+
+[[case]]
+id = "V02-A-RST-005"
+contracts = ["V02-C-RST-002"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_valid_backup_begins_a_read_only_restore_pending_session"
+initial_state = "restore-pending store"
+operation = "inspect workspace permissions"
+level = "application"
+expected_result = "recovery-only session"
+expected_effect = "none"
+forbidden_side_effects = ["domain read", "unrelated write"]
+
+[[case]]
+id = "V02-A-RST-006"
+contracts = ["V02-C-RST-002"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_valid_backup_begins_a_read_only_restore_pending_session"
+initial_state = "durable restore-pending store"
+operation = "reopen"
+level = "storage"
+expected_result = "same pending session and recovery facts"
+expected_effect = "none"
+forbidden_side_effects = ["implicit continuation", "catalog mutation"]
+
+[[case]]
+id = "V02-A-RST-010"
+contracts = ["V02-C-RST-004"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_supported_backup_schema_is_migrated_only_in_staging"
+initial_state = "supported legacy backup schema"
+operation = "begin restore"
+level = "storage"
+expected_result = "registered adjacent backup migration"
+expected_effect = "current-schema working copy"
+forbidden_side_effects = ["original backup write", "unregistered jump"]
+
+[[case]]
+id = "V02-A-RST-011"
+contracts = ["V02-C-RST-004"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_supported_backup_schema_is_migrated_only_in_staging"
+initial_state = "legacy backup and empty target"
+operation = "inspect pending recovery facts"
+level = "storage"
+expected_result = "original and working hashes with migration provenance"
+expected_effect = "none"
+forbidden_side_effects = ["backup ID rewrite", "original hash rewrite"]
+
+[[case]]
+id = "V02-A-RST-012"
+contracts = ["V02-C-RST-004"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_unknown_or_unregistered_backup_schema_is_blocked"
+initial_state = "newer or unregistered backup schema"
+operation = "preview BeginMetadataRestore"
+level = "application"
+expected_result = "blocked schema diagnosis"
+expected_effect = "none"
+forbidden_side_effects = ["best-effort migration", "working-copy creation"]
+
+[[case]]
+id = "V02-A-RST-016"
+contracts = ["V02-C-RST-006"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_abort_discards_pending_store_and_activated_backup_is_idempotent"
+initial_state = "restore-pending newly created real store"
+operation = "execute AbortMetadataRestore"
+level = "application"
+expected_result = "aborted receipt"
+expected_effect = "new store removed completely"
+forbidden_side_effects = ["backup deletion", "partial target retention"]
+
+[[case]]
+id = "V02-A-RST-017"
+contracts = ["V02-C-RST-006"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_abort_discards_pending_store_and_activated_backup_is_idempotent"
+initial_state = "store already represented by exact backup"
+operation = "execute BeginMetadataRestore"
+level = "application"
+expected_result = "no_op"
+expected_effect = "none"
+forbidden_side_effects = ["new session", "store replacement"]
+
+[[case]]
+id = "V02-A-PRE-022"
+contracts = ["V02-C-PRE-006"]
+fixtures = ["V02-F-SYS-ALLOC-RESTORE-NORMAL-V1", "V02-F-SYS-ALLOC-RESTORE-STRESS-V1"]
+runner = "test_restore_start_v1_bounds_normal_and_stress_fixtures"
+initial_state = "normal and stress metadata restore fixtures"
+operation = "measure restore-start peak live allocation"
+level = "storage"
+expected_result = "restore-start/v1 conservative bound"
+expected_effect = "pending restore"
+forbidden_side_effects = ["base allocation counted as new", "unbounded working copy"]

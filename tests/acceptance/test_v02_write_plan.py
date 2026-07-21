@@ -141,6 +141,26 @@ REGISTERED_CASES.update(
 )
 REGISTERED_CASES.update(
     {
+        "V02-A-RST-001": "test_valid_backup_begins_a_read_only_restore_pending_session",
+        "V02-A-RST-002": "test_restore_rejects_synthetic_populated_and_conflicting_targets",
+        "V02-A-RST-003": "test_restore_rejects_synthetic_populated_and_conflicting_targets",
+        "V02-A-RST-004": "test_valid_backup_begins_a_read_only_restore_pending_session",
+        "V02-A-RST-005": "test_valid_backup_begins_a_read_only_restore_pending_session",
+        "V02-A-RST-006": "test_valid_backup_begins_a_read_only_restore_pending_session",
+        "V02-A-RST-010": "test_supported_backup_schema_is_migrated_only_in_staging",
+        "V02-A-RST-011": "test_supported_backup_schema_is_migrated_only_in_staging",
+        "V02-A-RST-012": "test_unknown_or_unregistered_backup_schema_is_blocked",
+        "V02-A-RST-016": (
+            "test_abort_discards_pending_store_and_activated_backup_is_idempotent"
+        ),
+        "V02-A-RST-017": (
+            "test_abort_discards_pending_store_and_activated_backup_is_idempotent"
+        ),
+        "V02-A-PRE-022": "test_restore_start_v1_bounds_normal_and_stress_fixtures",
+    }
+)
+REGISTERED_CASES.update(
+    {
         "V02-A-RES-001": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
         "V02-A-RES-002": "test_incomplete_analysis_creates_no_result_or_maturity",
         "V02-A-RES-003": "test_incomplete_analysis_creates_no_result_or_maturity",

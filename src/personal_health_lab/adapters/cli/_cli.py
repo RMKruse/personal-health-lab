@@ -11,12 +11,15 @@ from pathlib import Path
 
 from personal_health_lab.adapters._config import load_runtime_config
 from personal_health_lab.application import (
+    AbortMetadataRestore,
+    AbortMetadataRestorePlan,
     AnalysisDefinitionId,
     AnalysisProvenance,
     AnalysisReceipt,
     AnalysisStatus,
     AssociationInterval,
     BatchDecisionTarget,
+    BeginMetadataRestore,
     CanonicalHealthType,
     CanonicalUnit,
     CapacityCheck,
@@ -49,6 +52,8 @@ from personal_health_lab.application import (
     MeasurementVersionId,
     MetadataBackupPlan,
     MetadataBackupReceipt,
+    MetadataRestorePlan,
+    MetadataRestoreReceipt,
     MigrateStore,
     OverviewSelection,
     PlanFingerprint,
@@ -56,6 +61,7 @@ from personal_health_lab.application import (
     PlausibilityRuleSpecification,
     PlausibilityRuleVersionPlan,
     PlausibilityRuleVersionReceipt,
+    RecoveryStatus,
     ResolveDataReviewCase,
     RestingHeartRateAnalysisPlan,
     RestingHeartRateAnalysisResult,
@@ -189,6 +195,21 @@ def _parser() -> argparse.ArgumentParser:
     rollback.add_argument("--json", action="store_true", dest="as_json")
     rollback.add_argument("--execute", action="store_true")
     rollback.add_argument("--expect-plan", type=PlanFingerprint)
+    restore = commands.add_parser("restore", help="Metadaten wiederherstellen")
+    restore.add_argument("backup", type=Path)
+    restore.add_argument("--json", action="store_true", dest="as_json")
+    restore.add_argument("--execute", action="store_true")
+    restore.add_argument("--expect-plan", type=PlanFingerprint)
+    abort_restore = commands.add_parser(
+        "abort-restore", help="Ausstehende Wiederherstellung abbrechen"
+    )
+    abort_restore.add_argument("--json", action="store_true", dest="as_json")
+    abort_restore.add_argument("--execute", action="store_true")
+    abort_restore.add_argument("--expect-plan", type=PlanFingerprint)
+    recovery_status = commands.add_parser(
+        "recovery-status", help="Wiederherstellungsstatus laden"
+    )
+    recovery_status.add_argument("--json", action="store_true", dest="as_json")
     return parser
 
 
@@ -429,6 +450,30 @@ def _workspace_json(status: WorkspaceStatus) -> dict[str, object]:
     }
 
 
+def _recovery_status_json(
+    status: RecoveryStatus,
+    runtime_config: Mapping[str, object],
+    workspace: WorkspaceStatus,
+) -> dict[str, object]:
+    return {
+        "kind": "recovery_status",
+        "recovery": {
+            "audit_max_position": status.audit_max_position,
+            "backup_id": str(status.backup_id),
+            "migration_steps": status.migration_steps,
+            "original_backup_sha256": status.original_backup_sha256,
+            "restore_id": str(status.restore_id),
+            "source_schema_version": status.source_schema_version,
+            "status": status.status.value,
+            "target_schema_version": status.target_schema_version,
+            "working_copy_sha256": status.working_copy_sha256,
+        },
+        "runtime_config": dict(runtime_config),
+        "schema_version": "2.0",
+        "workspace": _workspace_json(workspace),
+    }
+
+
 def _filevault_json(filevault: FileVaultCheck | None) -> dict[str, str | None] | None:
     if filevault is None:
         return None
@@ -481,6 +526,29 @@ def _write_plan_json(
             "type": "create_metadata_backup",
         }
         request_json = {"target": "<redacted>", "type": "create_metadata_backup"}
+    elif isinstance(details, MetadataRestorePlan):
+        detail_json = {
+            "audit_max_position": details.audit_max_position,
+            "backup_id": None if details.backup_id is None else str(details.backup_id),
+            "migration_steps": details.migration_steps,
+            "original_backup_sha256": details.original_backup_sha256,
+            "restore_id": None if details.restore_id is None else str(details.restore_id),
+            "source_schema_version": details.source_schema_version,
+            "source_store_id": (
+                None if details.source_store_id is None else str(details.source_store_id)
+            ),
+            "target_schema_version": details.target_schema_version,
+            "type": "begin_metadata_restore",
+            "working_copy_sha256": details.working_copy_sha256,
+        }
+        request_json = {"backup": "<redacted>", "type": "begin_metadata_restore"}
+    elif isinstance(details, AbortMetadataRestorePlan):
+        detail_json = {
+            "backup_id": None if details.backup_id is None else str(details.backup_id),
+            "restore_id": None if details.restore_id is None else str(details.restore_id),
+            "type": "abort_metadata_restore",
+        }
+        request_json = {"type": "abort_metadata_restore"}
     elif isinstance(details, StoreMigrationPlan):
         detail_json = {
             "affected_snapshot_refs": tuple(
@@ -653,6 +721,16 @@ def _write_receipt_json(
             "target_file": result.target_file,
             "type": "create_metadata_backup",
         }
+    elif isinstance(result, MetadataRestoreReceipt):
+        result_json = {
+            "backup_id": str(result.backup_id),
+            "diagnostics": result.diagnostics,
+            "original_backup_sha256": result.original_backup_sha256,
+            "restore_id": str(result.restore_id),
+            "status": result.status.value,
+            "type": "metadata_restore",
+            "working_copy_sha256": result.working_copy_sha256,
+        }
     elif isinstance(result, StoreMigrationReceipt):
         result_json = {
             "backup_file": result.backup_file,
@@ -787,6 +865,26 @@ def _print_write_plan(plan: WritePlan, workspace: WorkspaceStatus) -> None:
         )
         print(f"Wiederhergestellter Snapshot: {rollback.restored_snapshot_ref or '-'}")
         print(f"Unreferenzierter Snapshot: {rollback.current_snapshot_ref or '-'}")
+    elif isinstance(plan.details, MetadataRestorePlan):
+        restore = plan.details
+        print(f"Wiederherstellungs-ID: {restore.restore_id or '-'}")
+        print(f"Sicherungs-ID: {restore.backup_id or '-'}")
+        print(
+            f"Sicherungsschema: {restore.source_schema_version or '-'} -> "
+            f"{restore.target_schema_version}"
+        )
+        print(
+            "Migrationsschritte: "
+            + (
+                ", ".join(
+                    f"{source} -> {target}" for source, target in restore.migration_steps
+                )
+                or "-"
+            )
+        )
+    elif isinstance(plan.details, AbortMetadataRestorePlan):
+        print(f"Wiederherstellungs-ID: {plan.details.restore_id or '-'}")
+        print(f"Sicherungs-ID: {plan.details.backup_id or '-'}")
     filevault = plan.preflight.filevault
     print(
         "FileVault: "
@@ -818,11 +916,13 @@ def main(args: Sequence[str] | None = None) -> int:
     parsed = parser.parse_args(args)
     write_commands = {
         "analyze",
+        "abort-restore",
         "backup",
         "historical-review",
         "import",
         "migrate",
         "rollback-migration",
+        "restore",
         "rule",
         "review-confirm-batch",
         "review-resolve",
@@ -871,7 +971,50 @@ def main(args: Sequence[str] | None = None) -> int:
         )
         with HealthLab.open(config) as health_lab:
             workspace_status = health_lab.load_workspace_status()
-            if parsed.command == "import":
+            if parsed.command == "recovery-status":
+                recovery_status = health_lab.load_recovery_status()
+            elif parsed.command == "restore":
+                restore_request = BeginMetadataRestore(parsed.backup)
+                restore_plan = health_lab.preview_write(restore_request)
+                restore_write_receipt = None
+                if parsed.execute:
+                    assert parsed.expect_plan is not None
+                    restore_write_receipt = health_lab.execute_write(
+                        restore_request, expected_plan=parsed.expect_plan
+                    )
+                elif not parsed.as_json:
+                    _print_write_plan(restore_plan, workspace_status)
+                    if (
+                        restore_plan.approval.status is not WriteApprovalStatus.BLOCKED
+                        and input("Metadatenwiederherstellung beginnen? [j/N] ")
+                        .strip()
+                        .lower()
+                        in {"j", "ja"}
+                    ):
+                        restore_write_receipt = health_lab.execute_write(
+                            restore_request, expected_plan=restore_plan.fingerprint
+                        )
+            elif parsed.command == "abort-restore":
+                abort_restore_request = AbortMetadataRestore()
+                abort_restore_plan = health_lab.preview_write(abort_restore_request)
+                abort_restore_write_receipt = None
+                if parsed.execute:
+                    assert parsed.expect_plan is not None
+                    abort_restore_write_receipt = health_lab.execute_write(
+                        abort_restore_request, expected_plan=parsed.expect_plan
+                    )
+                elif not parsed.as_json:
+                    _print_write_plan(abort_restore_plan, workspace_status)
+                    if (
+                        abort_restore_plan.approval.status is not WriteApprovalStatus.BLOCKED
+                        and input("Wiederherstellung abbrechen? [j/N] ").strip().lower()
+                        in {"j", "ja"}
+                    ):
+                        abort_restore_write_receipt = health_lab.execute_write(
+                            abort_restore_request,
+                            expected_plan=abort_restore_plan.fingerprint,
+                        )
+            elif parsed.command == "import":
                 import_request = ImportHealthExport(parsed.package)
                 import_plan = health_lab.preview_write(import_request)
                 import_write_receipt = None
@@ -1172,7 +1315,45 @@ def main(args: Sequence[str] | None = None) -> int:
     }
     if not parsed.as_json:
         print("Konfiguration: " + json.dumps(runtime_config, ensure_ascii=False, sort_keys=True))
-    if parsed.command == "backup" and parsed.as_json:
+    if parsed.command == "recovery-status" and parsed.as_json:
+        print(
+            json.dumps(
+                _recovery_status_json(recovery_status, runtime_config, workspace_status),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    elif parsed.command == "recovery-status":
+        print(f"Wiederherstellungsstatus: {recovery_status.status.value}")
+        print(f"Wiederherstellungs-ID: {recovery_status.restore_id}")
+        print(f"Sicherungs-ID: {recovery_status.backup_id}")
+    elif parsed.command == "restore" and parsed.as_json:
+        output = (
+            _write_plan_json(restore_plan, runtime_config, workspace_status)
+            if restore_write_receipt is None
+            else _write_receipt_json(restore_write_receipt, runtime_config)
+        )
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+    elif parsed.command == "restore":
+        if restore_write_receipt is None:
+            _print_write_plan(restore_plan, workspace_status)
+            print("Metadatenwiederherstellung nicht begonnen.")
+        else:
+            print(f"Metadatenwiederherstellung: {restore_write_receipt.result.status.value}")
+    elif parsed.command == "abort-restore" and parsed.as_json:
+        output = (
+            _write_plan_json(abort_restore_plan, runtime_config, workspace_status)
+            if abort_restore_write_receipt is None
+            else _write_receipt_json(abort_restore_write_receipt, runtime_config)
+        )
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+    elif parsed.command == "abort-restore":
+        if abort_restore_write_receipt is None:
+            _print_write_plan(abort_restore_plan, workspace_status)
+            print("Wiederherstellung nicht abgebrochen.")
+        else:
+            print(f"Wiederherstellung: {abort_restore_write_receipt.result.status.value}")
+    elif parsed.command == "backup" and parsed.as_json:
         output = (
             _write_plan_json(backup_plan, runtime_config, workspace_status)
             if backup_write_receipt is None
@@ -1469,6 +1650,20 @@ def main(args: Sequence[str] | None = None) -> int:
                 f"{historical.completed_at.isoformat() if historical.completed_at else '-'}"
             )
     if parsed.command in write_commands:
+        if parsed.command == "restore":
+            if restore_write_receipt is None:
+                return 3 if restore_plan.approval.status is WriteApprovalStatus.BLOCKED else 0
+            return 3 if isinstance(restore_write_receipt.result, WriteNotStarted) else 0
+        if parsed.command == "abort-restore":
+            if abort_restore_write_receipt is None:
+                return (
+                    3
+                    if abort_restore_plan.approval.status is WriteApprovalStatus.BLOCKED
+                    else 0
+                )
+            return (
+                3 if isinstance(abort_restore_write_receipt.result, WriteNotStarted) else 0
+            )
         if parsed.command == "migrate":
             if migration_write_receipt is None:
                 return (
