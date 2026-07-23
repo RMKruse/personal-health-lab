@@ -1,26 +1,30 @@
 # personal-health-lab
 A privacy-first platform for exploring, modeling, and visualizing longitudinal personal health data.
 
-## V0.1 aus einem frischen Checkout nachweisen
+**Aktueller Stand: V0.2 – belastbare Import- und Datenqualitätsbasis.**
+
+## V0.2 aus einem frischen Checkout nachweisen
 
 Voraussetzung ist Python 3.12 oder neuer sowie [`uv`](https://docs.astral.sh/uv/). Ein frischer
 Checkout braucht keine vorbereiteten lokalen Daten. Dieser eine Ablauf installiert die gesperrte
-Umgebung und führt die vollständige V0.1-Akzeptanz aus:
+Umgebung, führt die vollständige V0.2-Akzeptanz aus und erzeugt den lokalen Akzeptanznachweis:
 
 ```bash
 uv sync --locked --all-groups
 uv run ruff check .
 uv run mypy
 uv run pytest
+uv run python scripts/v02_acceptance_evidence.py
 ```
 
 Die Suite erzeugt, importiert und analysiert `lag-signal-v1` und `null-v1` ausschließlich in
-temporären Datenspeichern. Sie prüft Signal-Recovery samt Unsicherheit, den Null-Guardrail,
-idempotenten Reimport, wiederverwendete Analyseläufe, sämtliche feindlichen Import-Fixtures ohne
-neuen Snapshot oder Staging-Reste sowie Datenmodus-, Architektur-, Typ- und Adapterverträge. CI
-führt dieselben drei Qualitätsbefehle aus.
+temporären Datenspeichern. Sie prüft zusätzlich Quellidentität und -entscheidungen,
+Plausibilitätsregeln, Datenprüfungen, Ergebnisstatus, Schreibpläne, Speicher-Preflight,
+Metadatensicherung und -wiederherstellung sowie Schema-Migrationen. CI validiert die
+Qualitätsprüfungen unter Linux, die Plattformprüfungen unter macOS und veröffentlicht den
+V0.2-Akzeptanznachweis als Artefakt.
 
-## V0.1 lokal starten
+## V0.2 lokal starten
 
 Die leere Übersicht lässt sich im synthetischen Modus über das Production-CLI laden. Synthetische
 und reale Daten erhalten bewusst zwei verschiedene Speicherorte:
@@ -43,9 +47,10 @@ uv run healthlab \
   overview --json
 ```
 
-Die drei Produktionsbefehle sind `import <export.zip>`, `analyze` und `overview`; jeder
-akzeptiert `--json`. Ihre JSON-Ausgaben folgen dem mitinstallierten Schema
-`personal_health_lab/adapters/cli/schemas/output-1.0.schema.json`. Effektive Speicherpfade
+Das Production-CLI bietet Übersicht, Import, Analyse und Datenprüfung sowie Befehle für
+Plausibilitätsregeln, Sicherung, Wiederherstellung und Migration. `uv run healthlab --help` zeigt
+die vollständige Liste. Die JSON-Ausgaben folgen dem mitinstallierten Schema
+`personal_health_lab/adapters/cli/schemas/output-2.0.schema.json`; effektive Speicherpfade
 erscheinen darin ausschließlich als `<redacted>`.
 
 Exit-Code `0` bedeutet Erfolg oder No-op (`duplicate`, `reused`), `3` ein erwartbar
@@ -106,13 +111,19 @@ realisierten Anzahlen stehen zusätzlich in den Szenario-Metadaten.
 `healthlab-dev` besitzt keine Produktions- oder Real-Store-Konfiguration und verweigert Ziele
 innerhalb eines bestehenden HealthLab-Datenspeichers.
 
-## V0.1-Betrieb und Methodik
+## V0.2-Betrieb und Methodik
 
 `healthlab-dev` erzeugt synthetische Pakete; `healthlab` importiert und analysiert sie über dieselbe
 `HealthLab`-Schnittstelle wie Streamlit. Der beim Start gebundene Datenmodus bleibt unveränderlich,
 und synthetische und reale Daten verwenden physisch getrennte Speicherorte. Imports werden atomar
 aus Staging veröffentlicht; identische Pakete liefern `duplicate`, identische erfolgreiche
 Analyseläufe `reused`.
+
+Alle schreibenden Operationen werden zuerst nebenwirkungsfrei geplant und erst mit dem erwarteten
+Plan-Fingerprint ausgeführt. V0.2 ergänzt versionierte Plausibilitätsregeln, prüfbare
+Quellentscheidungen, lokale Korrekturen, Ergebnisstatus, Metadatensicherungen und getestete
+Vorwärtsmigrationen. Speicherplatz und unter macOS der FileVault-Status werden vor relevanten
+Schreibvorgängen geprüft.
 
 Die eingebaute Analysedefinition `lag-signal-v1` modelliert alle sieben Verzögerungen gemeinsam als
 regularisiertes lineares Modell. Sie benötigt mindestens 30 vollständige Tage, stuft Ergebnisse ab
@@ -145,7 +156,7 @@ und XML-Entitäten werden einheitlich mit `invalid_health_export` abgewiesen.
 - [Technisches und betriebliches Glossar](./docs/TECHNICAL_GLOSSARY.md)
 - [Architekturentscheidungen](./docs/adr/)
 
-## V0.1-Modulabhängigkeiten
+## V0.2-Modulabhängigkeiten
 
 ```mermaid
 flowchart LR
@@ -153,13 +164,26 @@ flowchart LR
     UI["Streamlit-Adapter"] --> APP
     TEST["Akzeptanztests"] --> APP
     APP --> IMP["health_import"]
+    APP --> QUALITY["data_quality"]
+    APP --> RECOVERY["recovery"]
+    APP --> MIGRATION["migration"]
     APP --> ANA["resting_hr_analysis"]
     APP --> OVR["overview"]
+    APP --> STORE["storage"]
+    IMP --> QUALITY
+    IMP --> RECOVERY
     IMP --> STORE["storage"]
+    RECOVERY --> QUALITY
+    RECOVERY --> MIGRATION
+    RECOVERY --> STORE
+    MIGRATION --> STORE
+    QUALITY --> STORE
     ANA --> STORE
     OVR --> STORE
     IMP --> DATA["health_data"]
+    QUALITY --> DATA
     ANA --> DATA
+    OVR --> DATA
     STORE --> DATA
     DCLI["Development-CLI-Adapter"] -.-> SYN["synthetic_export"]
 ```
@@ -168,7 +192,8 @@ Verbindliche Regeln:
 
 - Adapter hängen vom Anwendungsmodul ab, niemals umgekehrt.
 - `health_data` hängt von keinem anderen Projektmodul ab.
-- `storage` kennt kanonische Typen, aber keine Analyse- oder UI-Logik.
+- `data_quality`, `recovery` und `migration` besitzen ihre jeweiligen Fachverträge.
+- `storage` kennt kanonische Typen, aber keine Fach-, Analyse- oder UI-Logik.
 - Der Development-CLI-Adapter darf `synthetic_export` verwenden; das reale Anwendungsmodul und der reale Datenmodus nicht.
 - Neue Abhängigkeiten dürfen keinen Zyklus erzeugen.
 
@@ -179,11 +204,10 @@ with HealthLab.open(runtime_config) as app:
     request = ImportHealthExport(package_path)
     plan = app.preview_write(request)
     app.execute_write(request, expected_plan=plan.fingerprint)
-    app.run_resting_hr_analysis(config)
     app.load_overview(selection)
 ```
 
-Der erste V0.2-Tracer führt den Import über Schreibvorschau und ausdrückliche Ausführung;
-die noch nicht migrierten Analyse- und Leseoperationen bleiben vorläufig auf der V0.1-Seam.
-CLI, Streamlit und End-to-End-Tests verwenden dasselbe Interface. Import-, Speicher-,
-Qualitäts- und Analyselogik bleibt in den tiefen internen Modulen.
+Alle V0.2-Schreiboperationen verwenden `preview_write` und `execute_write`; kleine benannte
+Leseprojektionen liefern Übersicht, Datenprüfung, Regeln, Workspace-, Wiederherstellungs- und
+Migrationsstatus. CLI, Streamlit und End-to-End-Tests verwenden dasselbe Interface. Import-,
+Speicher-, Qualitäts- und Analyselogik bleibt in den tiefen internen Modulen.
