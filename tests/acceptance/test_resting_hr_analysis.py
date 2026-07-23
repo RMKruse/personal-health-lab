@@ -1,20 +1,140 @@
+import fcntl
 from datetime import date
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 
 from personal_health_lab.application import (
     AnalysisDefinitionId,
+    AnalysisReceipt,
     AnalysisStatus,
     DataMode,
     HealthLab,
+    ImportHealthExport,
+    ImportReceipt,
     ModelMaturityStatus,
     OverviewSelection,
     OverviewStatus,
-    RestingHeartRateAnalysisConfig,
+    RestingHeartRateAnalysisPlan,
+    RunRestingHeartRateAnalysis,
     RuntimeConfig,
+    WriteNotStarted,
+    WriteNotStartedStatus,
 )
+from personal_health_lab.application import _application as application_module
 from personal_health_lab.synthetic_export import GenerationOptions, generate_export
+
+
+def _execute_import(health_lab: HealthLab, package_path: Path) -> ImportReceipt | WriteNotStarted:
+    request = ImportHealthExport(package_path)
+    plan = health_lab.preview_write(request)
+    return health_lab.execute_write(request, expected_plan=plan.fingerprint).result
+
+
+def _execute_analysis(
+    health_lab: HealthLab, request: RunRestingHeartRateAnalysis
+) -> AnalysisReceipt:
+    plan = health_lab.preview_write(request)
+    result = health_lab.execute_write(request, expected_plan=plan.fingerprint).result
+    assert isinstance(result, AnalysisReceipt)
+    return result
+
+
+def test_analysis_preview_is_read_only_and_execution_rechecks_the_request(tmp_path: Path) -> None:
+    runtime = RuntimeConfig(
+        mode=DataMode.SYNTHETIC,
+        synthetic_store=tmp_path / "store",
+        real_store=tmp_path / "real-store",
+    )
+    request = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v2"))
+
+    with HealthLab.open(runtime) as health_lab:
+        before = health_lab.load_overview(OverviewSelection())
+        plan = health_lab.preview_write(request)
+        after = health_lab.load_overview(OverviewSelection())
+        changed = health_lab.execute_write(
+            RunRestingHeartRateAnalysis(
+                AnalysisDefinitionId("lag-signal-v2"), start_date=date(2024, 1, 1)
+            ),
+            expected_plan=plan.fingerprint,
+        ).result
+        receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint).result
+
+    assert before == after
+    assert isinstance(plan.details, RestingHeartRateAnalysisPlan)
+    assert plan.details.base_snapshot_ref is None
+    assert isinstance(changed, WriteNotStarted)
+    assert changed.status is WriteNotStartedStatus.PLAN_CHANGED
+    assert isinstance(receipt, AnalysisReceipt)
+    assert receipt.status is AnalysisStatus.INSUFFICIENT_DATA
+
+
+def test_analysis_store_busy_is_write_not_started(tmp_path: Path) -> None:
+    runtime = RuntimeConfig(
+        mode=DataMode.SYNTHETIC,
+        synthetic_store=tmp_path / "store",
+        real_store=tmp_path / "real-store",
+    )
+    request = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v2"))
+
+    with HealthLab.open(runtime) as health_lab:
+        plan = health_lab.preview_write(request)
+        with (runtime.active_store / ".writer.lock").open("a+b") as writer_lock:
+            fcntl.flock(writer_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = health_lab.execute_write(request, expected_plan=plan.fingerprint).result
+
+    assert isinstance(result, WriteNotStarted)
+    assert result.status is WriteNotStartedStatus.STORE_BUSY
+
+
+def test_analysis_rechecks_the_snapshot_under_the_writer_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_package = generate_export("null-v1", 42, tmp_path / "first")
+    second_package = generate_export("null-v1", 43, tmp_path / "second")
+    runtime = RuntimeConfig(
+        mode=DataMode.SYNTHETIC,
+        synthetic_store=tmp_path / "store",
+        real_store=tmp_path / "real-store",
+    )
+    request = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v2"))
+    with HealthLab.open(runtime) as health_lab:
+        _execute_import(health_lab, first_package.export_path)
+        plan = health_lab.preview_write(request)
+
+    execution_started = Event()
+    continue_execution = Event()
+    original_execute = application_module.execute_analysis
+
+    def delayed_execute(**kwargs):
+        execution_started.set()
+        assert continue_execution.wait(10)
+        return original_execute(**kwargs)
+
+    monkeypatch.setattr(application_module, "execute_analysis", delayed_execute)
+    results: list[object] = []
+
+    def execute() -> None:
+        with HealthLab.open(runtime) as health_lab:
+            results.append(
+                health_lab.execute_write(request, expected_plan=plan.fingerprint).result
+            )
+
+    thread = Thread(target=execute)
+    thread.start()
+    assert execution_started.wait(10)
+    try:
+        with HealthLab.open(runtime) as health_lab:
+            _execute_import(health_lab, second_package.export_path)
+    finally:
+        continue_execution.set()
+        thread.join(10)
+
+    assert not thread.is_alive()
+    assert len(results) == 1
+    assert isinstance(results[0], WriteNotStarted)
+    assert results[0].status is WriteNotStartedStatus.PLAN_CHANGED
 
 
 def test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis(tmp_path: Path) -> None:
@@ -25,17 +145,17 @@ def test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis(tmp_path: P
         synthetic_store=tmp_path / "store",
         real_store=tmp_path / "real-store",
     )
-    analysis = RestingHeartRateAnalysisConfig(
-        analysis_definition_id=AnalysisDefinitionId("lag-signal-v1")
+    analysis = RunRestingHeartRateAnalysis(
+        analysis_definition_id=AnalysisDefinitionId("lag-signal-v2")
     )
 
     with HealthLab.open(runtime) as health_lab:
-        imported = health_lab.import_health_export(package.export_path)
-        first = health_lab.run_resting_hr_analysis(analysis)
+        imported = _execute_import(health_lab, package.export_path)
+        first = _execute_analysis(health_lab, analysis)
         first_overview = health_lab.load_overview(OverviewSelection())
 
     with HealthLab.open(runtime) as health_lab:
-        second = health_lab.run_resting_hr_analysis(analysis)
+        second = _execute_analysis(health_lab, analysis)
         second_overview = health_lab.load_overview(OverviewSelection())
 
     assert first.status is AnalysisStatus.COMPLETED
@@ -100,17 +220,22 @@ def test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis(tmp_path: P
         provisional_selection = OverviewSelection(
             start_date=date(2024, 1, 1), end_date=date(2024, 6, 30)
         )
-        changed_config = health_lab.run_resting_hr_analysis(
-            RestingHeartRateAnalysisConfig(
+        changed_config = _execute_analysis(
+            health_lab,
+            RunRestingHeartRateAnalysis(
                 analysis_definition_id=analysis.analysis_definition_id,
                 start_date=provisional_selection.start_date,
                 end_date=provisional_selection.end_date,
             )
         )
         provisional_overview = health_lab.load_overview(provisional_selection)
-        newer_import = health_lab.import_health_export(newer_package.export_path)
+        previous_snapshot_plan = health_lab.preview_write(analysis)
+        newer_import = _execute_import(health_lab, newer_package.export_path)
+        stale_execution = health_lab.execute_write(
+            analysis, expected_plan=previous_snapshot_plan.fingerprint
+        ).result
         newer_overview = health_lab.load_overview(OverviewSelection())
-        changed_snapshot = health_lab.run_resting_hr_analysis(analysis)
+        changed_snapshot = _execute_analysis(health_lab, analysis)
 
     assert changed_config.status is AnalysisStatus.COMPLETED
     assert changed_config.model_maturity is ModelMaturityStatus.EXPLORATORY
@@ -129,6 +254,8 @@ def test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis(tmp_path: P
     assert changed_config.provenance.environment_lock_hash == first.provenance.environment_lock_hash
 
     assert newer_import.snapshot_ref != first.snapshot_ref
+    assert isinstance(stale_execution, WriteNotStarted)
+    assert stale_execution.status is WriteNotStartedStatus.PLAN_CHANGED
     assert newer_overview.resting_hr_analysis is None
     assert changed_snapshot.status is AnalysisStatus.COMPLETED
     assert changed_snapshot.analysis_run_id != first.analysis_run_id
@@ -156,9 +283,9 @@ def test_null_scenario_does_not_present_a_stable_association(tmp_path: Path) -> 
     )
 
     with HealthLab.open(runtime) as health_lab:
-        health_lab.import_health_export(package.export_path)
-        receipt = health_lab.run_resting_hr_analysis(
-            RestingHeartRateAnalysisConfig(AnalysisDefinitionId("lag-signal-v1"))
+        _execute_import(health_lab, package.export_path)
+        receipt = _execute_analysis(
+            health_lab, RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v2"))
         )
         result = health_lab.load_overview(OverviewSelection()).resting_hr_analysis
 
@@ -211,10 +338,11 @@ def test_analysis_reports_insufficient_and_unstable_inputs_with_stable_diagnosti
             real_store=tmp_path / f"{name}-real-store",
         )
         with HealthLab.open(runtime) as health_lab:
-            health_lab.import_health_export(package.export_path)
+            _execute_import(health_lab, package.export_path)
             receipts.append(
-                health_lab.run_resting_hr_analysis(
-                    RestingHeartRateAnalysisConfig(AnalysisDefinitionId("lag-signal-v1"))
+                _execute_analysis(
+                    health_lab,
+                    RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v2")),
                 )
             )
 

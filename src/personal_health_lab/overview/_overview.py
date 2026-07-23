@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal, Self
 
 from personal_health_lab import DataMode
-from personal_health_lab.health_data import DailyHealthSeries
+from personal_health_lab.health_data import (
+    DailyHealthSeries,
+    DataQualityStatus,
+    ModelMaturityStatus,
+    ReproducibilityStatus,
+)
 from personal_health_lab.storage import (
     AnalysisProvenance,
     LocalStore,
@@ -42,6 +47,8 @@ class Overview:
     message: str
     daily_series: tuple[DailyHealthSeries, ...] = ()
     resting_hr_analysis: RestingHeartRateAnalysisResult | None = None
+    analysis_history: tuple[RestingHeartRateAnalysisResult, ...] = ()
+    last_reviewed_analysis: RestingHeartRateAnalysisResult | None = None
     last_ready_analysis_provenance: AnalysisProvenance | None = None
     import_count: int = 0
     package_count: int = 0
@@ -50,6 +57,21 @@ class Overview:
     measurement_version_count: int = 0
     quarantined_import_count: int = 0
     schema_version: Literal["1.0"] = "1.0"
+
+
+def _classify_legacy_reproducibility(
+    result: RestingHeartRateAnalysisResult,
+) -> RestingHeartRateAnalysisResult:
+    if result.reproducibility is not ReproducibilityStatus.NOT_RECORDED:
+        return result
+    return replace(
+        result,
+        reproducibility=(
+            ReproducibilityStatus.LOCAL_DEVELOPMENT
+            if result.provenance is not None and result.provenance.code_dirty
+            else ReproducibilityStatus.REPRODUCIBLE
+        ),
+    )
 
 
 class OverviewReader:
@@ -71,6 +93,12 @@ class OverviewReader:
         analysis = self._store.load_latest_resting_hr_analysis(
             selection.start_date, selection.end_date
         )
+        history = self._store.load_resting_hr_analysis_history(
+            selection.start_date, selection.end_date
+        )
+        if analysis is not None:
+            analysis = _classify_legacy_reproducibility(analysis)
+        history = tuple(_classify_legacy_reproducibility(item) for item in history)
         if not daily_series:
             return Overview(
                 status=OverviewStatus.EMPTY,
@@ -86,20 +114,27 @@ class OverviewReader:
         return Overview(
             status=(
                 OverviewStatus.PROVISIONAL
-                if analysis is not None and analysis.model_maturity == "exploratory"
+                if analysis is not None
+                and analysis.model_maturity is ModelMaturityStatus.EXPLORATORY
                 else OverviewStatus.READY
             ),
             selection=selection,
-            message=(
-                f"Modellreife: {analysis.model_maturity}."
-                if analysis is not None
-                else "Importierte tägliche Gesundheitsdaten sind verfügbar."
-            ),
+            message="Importierte tägliche Gesundheitsdaten sind verfügbar.",
             daily_series=daily_series,
             resting_hr_analysis=analysis,
+            analysis_history=history,
+            last_reviewed_analysis=next(
+                (
+                    item
+                    for item in history
+                    if item.data_status is DataQualityStatus.REVIEWED
+                ),
+                None,
+            ),
             last_ready_analysis_provenance=(
                 self._store.load_latest_robust_analysis_provenance()
-                if analysis is not None and analysis.model_maturity == "exploratory"
+                if analysis is not None
+                and analysis.model_maturity is ModelMaturityStatus.EXPLORATORY
                 else None
             ),
             import_count=counts.import_count,

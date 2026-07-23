@@ -7,10 +7,13 @@ PACKAGE_ROOT = Path(__file__).parents[2] / "src/personal_health_lab"
 MODULES = {
     "adapters",
     "application",
+    "data_quality",
     "health_data",
     "health_import",
+    "migration",
     "overview",
     "package_root",
+    "recovery",
     "resting_hr_analysis",
     "runtime",
     "storage",
@@ -18,10 +21,23 @@ MODULES = {
 }
 ALLOWED_DEPENDENCIES = {
     "adapters": {"application", "package_root", "synthetic_export"},
-    "application": {"health_import", "overview", "package_root", "resting_hr_analysis"},
+    "application": {
+        "health_import",
+        "migration",
+        "health_data",
+        "data_quality",
+        "overview",
+        "package_root",
+        "recovery",
+        "resting_hr_analysis",
+        "storage",
+    },
     "health_data": set(),
-    "health_import": {"health_data", "storage"},
+    "data_quality": {"health_data", "storage"},
+    "health_import": {"data_quality", "health_data", "recovery", "storage"},
+    "migration": {"storage"},
     "overview": {"health_data", "package_root", "storage"},
+    "recovery": {"data_quality", "health_data", "migration", "storage"},
     "package_root": {"runtime"},
     "resting_hr_analysis": {"health_data", "storage"},
     "runtime": set(),
@@ -142,10 +158,33 @@ def test_only_development_cli_can_reach_the_synthetic_generator() -> None:
     production_imports = [
         str(path.relative_to(PACKAGE_ROOT))
         for path in adapters_root.rglob("*.py")
-        if "dev_cli" not in path.parts
-        and "synthetic_export" in path.read_text(encoding="utf-8")
+        if "dev_cli" not in path.parts and "synthetic_export" in path.read_text(encoding="utf-8")
     ]
 
     assert production_imports == []
     assert "personal_health_lab.application" not in development_cli
     assert "personal_health_lab.storage" not in development_cli
+
+
+def test_production_adapters_only_import_the_application_interface() -> None:
+    production_adapters = (
+        PACKAGE_ROOT / "adapters/cli",
+        PACKAGE_ROOT / "adapters/streamlit",
+    )
+    imports: set[str] = set()
+    for root in production_adapters:
+        for path in root.rglob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if isinstance(node, ast.Import):
+                    names = (alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                    names = (node.module,)
+                else:
+                    continue
+                imports.update(
+                    name.split(".")[1]
+                    for name in names
+                    if name.startswith("personal_health_lab.")
+                )
+
+    assert imports - {"adapters"} == {"application"}

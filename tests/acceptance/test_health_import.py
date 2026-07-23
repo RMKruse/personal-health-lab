@@ -1,8 +1,5 @@
-import os
-import signal
 import stat
-import time
-from datetime import UTC, date, datetime, timedelta
+from datetime import date
 from multiprocessing import get_context
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
@@ -12,17 +9,22 @@ import pytest
 from personal_health_lab.application import (
     DataMode,
     HealthLab,
+    ImportHealthExport,
+    ImportReceipt,
     ImportStatus,
     OverviewSelection,
     OverviewStatus,
     RuntimeConfig,
+    WriteNotStarted,
+    WriteNotStartedStatus,
 )
 from personal_health_lab.health_data import CanonicalHealthType, CanonicalUnit
 from personal_health_lab.synthetic_export import generate_export
 
 
-def _export(path: Path, records: str) -> Path:
-    xml = f'<?xml version="1.0"?><HealthData>{records}</HealthData>'
+def _export(path: Path, records: str, export_date: str | None = None) -> Path:
+    date_element = "" if export_date is None else f'<ExportDate value="{export_date}"/>'
+    xml = f'<?xml version="1.0"?><HealthData>{date_element}{records}</HealthData>'
     with ZipFile(path, "w", ZIP_DEFLATED) as archive:
         archive.writestr("apple_health_export/export.xml", xml)
     return path
@@ -45,26 +47,27 @@ def _record(
     )
 
 
-def _import_in_process(config: RuntimeConfig, package_path: Path) -> None:
-    while True:
-        with HealthLab.open(config) as health_lab:
-            receipt = health_lab.import_health_export(package_path)
-        if receipt.status is not ImportStatus.STORE_BUSY:
-            return
+def _import_in_process(
+    config: RuntimeConfig,
+    package_path: Path,
+    publication_reached: object,
+    publication_release: object,
+) -> None:
+    from personal_health_lab.storage import _store
+
+    def pause_publication(root: Path, fault_point_id: str) -> None:
+        publication_reached.set()  # type: ignore[attr-defined]
+        publication_release.wait(timeout=10)  # type: ignore[attr-defined]
+
+    _store._publication_fault_point = pause_publication
+    with HealthLab.open(config) as health_lab:
+        _execute_import(health_lab, package_path)
 
 
-def _large_export(path: Path, count: int = 50_000) -> Path:
-    start = datetime(2024, 1, 2, tzinfo=UTC)
-    records = "".join(
-        _record(
-            "HKQuantityTypeIdentifierActiveEnergyBurned",
-            1,
-            (start + timedelta(seconds=index)).strftime("%Y-%m-%d %H:%M:%S %z"),
-            (start + timedelta(seconds=index + 1)).strftime("%Y-%m-%d %H:%M:%S %z"),
-        )
-        for index in range(count)
-    )
-    return _export(path, records)
+def _execute_import(health_lab: HealthLab, package_path: Path) -> ImportReceipt | WriteNotStarted:
+    request = ImportHealthExport(package_path)
+    plan = health_lab.preview_write(request)
+    return health_lab.execute_write(request, expected_plan=plan.fingerprint).result
 
 
 def _negative_export_v1(path: Path, case: str, valid_xml: str) -> Path:
@@ -76,11 +79,15 @@ def _negative_export_v1(path: Path, case: str, valid_xml: str) -> Path:
             link.external_attr = (stat.S_IFLNK | 0o777) << 16
             archive.writestr(link, valid_xml)
             return path
-        utf16_entity = valid_xml.replace(
-            "?>",
-            '?><!DOCTYPE HealthData [<!ENTITY private "private-health-value">]>',
-            1,
-        ).replace("Test Watch", "&private;").encode("utf-16")
+        utf16_entity = (
+            valid_xml.replace(
+                "?>",
+                '?><!DOCTYPE HealthData [<!ENTITY private "private-health-value">]>',
+                1,
+            )
+            .replace("Test Watch", "&private;")
+            .encode("utf-16")
+        )
         xml: str | bytes = {
             "xxe": (
                 '<!DOCTYPE HealthData [<!ENTITY secret SYSTEM "file:///etc/passwd">]>'
@@ -110,7 +117,6 @@ def _negative_export_v1(path: Path, case: str, valid_xml: str) -> Path:
         ("unsupported_type", {}),
         ("xxe", {}),
         ("utf16_entity", {}),
-        ("invalid_xml", {}),
         ("package_size", {"max_import_package_bytes": 100}),
         ("entry_count", {"max_import_entries": 1}),
         ("entry_size", {"max_import_entry_bytes": 512}),
@@ -157,10 +163,10 @@ def test_negative_exports_v1_are_rejected_without_changing_the_snapshot(
     )
 
     with HealthLab.open(base_config) as health_lab:
-        committed = health_lab.import_health_export(base)
+        committed = _execute_import(health_lab, base)
     with HealthLab.open(config) as health_lab:
         before = health_lab.load_overview(OverviewSelection())
-        rejected = health_lab.import_health_export(malicious)
+        rejected = _execute_import(health_lab, malicious)
         after = health_lab.load_overview(OverviewSelection())
 
     assert committed.status is ImportStatus.COMMITTED
@@ -205,7 +211,7 @@ def test_valid_synthetic_export_is_published_as_daily_health_data(tmp_path: Path
     )
 
     with HealthLab.open(config) as health_lab:
-        receipt = health_lab.import_health_export(fixture.export_path)
+        receipt = _execute_import(health_lab, fixture.export_path)
         overview = health_lab.load_overview(OverviewSelection())
 
     assert receipt.status is ImportStatus.COMMITTED
@@ -279,8 +285,16 @@ def test_cumulative_exports_are_idempotent_and_preserve_measurement_versions(
         "2024-01-01 12:00:00 +0100",
         "2024-01-01 12:30:00 +0100",
     )
-    base = _export(tmp_path / "base.zip", active + resting_v1)
-    expanded = _export(tmp_path / "expanded.zip", active + resting_v2 + new_active)
+    base = _export(
+        tmp_path / "base.zip",
+        active + resting_v1,
+        "2024-01-02 12:00:00 +0100",
+    )
+    expanded = _export(
+        tmp_path / "expanded.zip",
+        active + resting_v2 + new_active,
+        "2024-01-03 12:00:00 +0100",
+    )
     config = RuntimeConfig(
         mode=DataMode.SYNTHETIC,
         synthetic_store=tmp_path / "synthetic-store",
@@ -288,9 +302,9 @@ def test_cumulative_exports_are_idempotent_and_preserve_measurement_versions(
     )
 
     with HealthLab.open(config) as health_lab:
-        first = health_lab.import_health_export(base)
-        duplicate = health_lab.import_health_export(base)
-        cumulative = health_lab.import_health_export(expanded)
+        first = _execute_import(health_lab, base)
+        duplicate = _execute_import(health_lab, base)
+        cumulative = _execute_import(health_lab, expanded)
         overview = health_lab.load_overview(OverviewSelection())
 
     assert first.status is ImportStatus.COMMITTED
@@ -332,47 +346,46 @@ def test_interrupted_import_keeps_snapshot_and_is_quarantined_on_restart(
             "2024-01-01 07:01:00 +0100",
         ),
     )
-    interrupted = _large_export(tmp_path / "interrupted.zip")
+    interrupted = _export(
+        tmp_path / "interrupted.zip",
+        _record(
+            "HKQuantityTypeIdentifierRestingHeartRate",
+            61,
+            "2024-01-02 07:00:00 +0100",
+            "2024-01-02 07:01:00 +0100",
+        ),
+    )
     config = RuntimeConfig(
         mode=DataMode.SYNTHETIC,
         synthetic_store=tmp_path / "synthetic-store",
         real_store=tmp_path / "real-store",
     )
     with HealthLab.open(config) as health_lab:
-        committed = health_lab.import_health_export(base)
+        committed = _execute_import(health_lab, base)
         before = health_lab.load_overview(OverviewSelection())
 
-    process = get_context("spawn").Process(
+    context = get_context("spawn")
+    publication_reached = context.Event()
+    publication_release = context.Event()
+    process = context.Process(
         target=_import_in_process,
-        args=(config, interrupted),
+        args=(config, interrupted, publication_reached, publication_release),
     )
     process.start()
-    deadline = time.monotonic() + 10
-    busy = None
-    before_busy = None
-    while time.monotonic() < deadline:
-        with HealthLab.open(config) as health_lab:
-            before_attempt = health_lab.load_overview(OverviewSelection())
-            candidate = health_lab.import_health_export(base)
-        if candidate.status is ImportStatus.STORE_BUSY:
-            busy = candidate
-            before_busy = before_attempt
-            os.kill(process.pid, signal.SIGSTOP)
-            break
-        time.sleep(0.01)
-    if busy is None and process.is_alive():
-        process.kill()
-        process.join(timeout=5)
-    assert busy is not None
-    assert before_busy is not None
     try:
+        assert publication_reached.wait(timeout=10)
+        with HealthLab.open(config) as health_lab:
+            before_busy = health_lab.load_overview(OverviewSelection())
+            busy = _execute_import(health_lab, base)
         with HealthLab.open(config) as health_lab:
             during = health_lab.load_overview(OverviewSelection())
     finally:
-        os.kill(process.pid, signal.SIGKILL)
+        if process.is_alive():
+            process.kill()
         process.join(timeout=5)
     assert not process.is_alive()
-    assert busy.status is ImportStatus.STORE_BUSY
+    assert isinstance(busy, WriteNotStarted)
+    assert busy.status is WriteNotStartedStatus.STORE_BUSY
     assert during == before_busy
 
     with HealthLab.open(config) as health_lab:

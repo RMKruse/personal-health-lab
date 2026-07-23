@@ -5,7 +5,8 @@
   "oneOf": [
     {"$ref": "#/$defs/importOutput"},
     {"$ref": "#/$defs/analysisOutput"},
-    {"$ref": "#/$defs/overviewOutput"}
+    {"$ref": "#/$defs/overviewOutput"},
+    {"$ref": "#/$defs/dataReviewOutput"}
   ],
   "$defs": {
     "nullableString": {
@@ -99,6 +100,9 @@
         "bootstrap_successes",
         "complete_days",
         "feature_dependency",
+        "input_completeness",
+        "maximum_time_series_gap_days",
+        "outcome_standard_deviation",
         "model_readiness"
       ],
       "properties": {
@@ -112,6 +116,9 @@
         "bootstrap_successes": {"type": "integer", "minimum": 0},
         "complete_days": {"type": "integer", "minimum": 0},
         "feature_dependency": {"enum": ["acceptable", "high"]},
+        "input_completeness": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "maximum_time_series_gap_days": {"type": ["integer", "null"], "minimum": 0},
+        "outcome_standard_deviation": {"type": ["number", "null"], "exclusiveMinimum": 0},
         "model_readiness": {"enum": ["exploratory", "robust"]}
       }
     },
@@ -122,7 +129,12 @@
         "block_length_days",
         "bootstrap_method",
         "interval_level",
+        "max_feature_dependency",
+        "maximum_time_series_gap_days",
+        "minimum_bootstrap_success_rate",
+        "minimum_input_completeness",
         "minimum_observations",
+        "minimum_outcome_standard_deviation",
         "random_seed",
         "resample_count",
         "ridge_penalty",
@@ -132,7 +144,12 @@
         "block_length_days": {"type": "integer"},
         "bootstrap_method": {"const": "moving_block"},
         "interval_level": {"type": "number"},
+        "max_feature_dependency": {"type": ["number", "null"]},
+        "maximum_time_series_gap_days": {"type": ["integer", "null"], "minimum": 0},
+        "minimum_bootstrap_success_rate": {"type": ["number", "null"]},
+        "minimum_input_completeness": {"type": ["number", "null"]},
         "minimum_observations": {"type": "integer"},
+        "minimum_outcome_standard_deviation": {"type": ["number", "null"]},
         "random_seed": {"type": "integer"},
         "resample_count": {"type": "integer"},
         "ridge_penalty": {"type": "number"},
@@ -189,28 +206,76 @@
       "additionalProperties": false,
       "required": [
         "analysis_definition_id",
+        "completed_at",
         "cumulative_association",
+        "data_status",
+        "data_status_reasons",
+        "status_facts_recorded",
         "diagnostics",
+        "freshness",
         "lag_associations",
         "methodology",
         "model_maturity",
+        "maturity_criteria",
         "personal_standard_deviation_kcal",
         "provenance",
+        "reproducibility",
         "snapshot_ref"
       ],
       "properties": {
         "analysis_definition_id": {"type": "string"},
+        "completed_at": {"type": ["string", "null"], "format": "date-time"},
         "cumulative_association": {"$ref": "#/$defs/cumulativeAssociation"},
+        "data_status": {"enum": ["provisional", "reviewed"]},
+        "data_status_reasons": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["code", "evidence_ids"],
+            "properties": {
+              "code": {"enum": ["open_review_case", "passive_coverage_gap"]},
+              "evidence_ids": {"type": "array", "items": {"type": "string"}}
+            }
+          }
+        },
         "diagnostics": {"$ref": "#/$defs/analysisDiagnostics"},
+        "freshness": {"enum": ["current", "stale"]},
         "lag_associations": {
           "type": "array",
           "items": {"$ref": "#/$defs/lagAssociation"}
         },
         "methodology": {"$ref": "#/$defs/methodology"},
         "model_maturity": {"enum": ["exploratory", "robust"]},
+        "maturity_criteria": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["code", "observed_value", "passed", "threshold"],
+            "properties": {
+              "code": {
+                "enum": [
+                  "minimum_observations",
+                  "robust_observations",
+                  "input_completeness",
+                  "feature_dependency",
+                  "bootstrap_success_rate",
+                  "outcome_variation",
+                  "time_series_continuity"
+                ]
+              },
+              "observed_value": {"type": ["number", "string"]},
+              "passed": {"type": "boolean"},
+              "threshold": {"type": ["number", "string"]}
+            }
+          }
+        },
         "personal_standard_deviation_kcal": {"type": "number"},
         "provenance": {"$ref": "#/$defs/analysisProvenance"},
-        "snapshot_ref": {"type": "string"}
+        "reproducibility": {"enum": ["reproducible", "local_development", "not_recorded"]},
+        "snapshot_ref": {"type": "string"},
+        "status_facts_recorded": {"type": "boolean"}
       }
     },
     "dailyValue": {
@@ -285,7 +350,7 @@
         "schema_version": {"const": "1.0"},
         "snapshot_ref": {"$ref": "#/$defs/nullableString"},
         "status": {
-          "enum": ["committed", "duplicate", "rejected", "quarantined", "store_busy"]
+          "enum": ["committed", "duplicate", "rejected", "quarantined", "restore_pending", "store_busy"]
         }
       }
     },
@@ -330,7 +395,9 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "analysis_history",
         "daily_series",
+        "last_reviewed_analysis",
         "message",
         "provenance",
         "resting_hr_analysis",
@@ -340,11 +407,16 @@
         "status"
       ],
       "properties": {
+        "analysis_history": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/analysisResult"}
+        },
         "daily_series": {
           "type": "array",
           "items": {"$ref": "#/$defs/dailySeries"}
         },
         "message": {"type": "string"},
+        "last_reviewed_analysis": {"$ref": "#/$defs/analysisResult"},
         "provenance": {
           "type": "object",
           "additionalProperties": false,
@@ -370,6 +442,65 @@
         "schema_version": {"const": "1.0"},
         "selection": {"$ref": "#/$defs/selection"},
         "status": {"enum": ["empty", "ready", "provisional"]}
+      }
+    },
+    "dataReviewOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cases",
+        "runtime_config",
+        "schema_version",
+        "selection",
+        "snapshot_ref"
+      ],
+      "properties": {
+        "cases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "case_id",
+              "allowed_actions",
+              "candidate_version_ids",
+              "evidence_fingerprint",
+              "kind",
+              "logical_measurement_id",
+              "measurement_version_id",
+              "rule_version_id"
+            ],
+            "properties": {
+              "case_id": {"type": "string"},
+              "allowed_actions": {
+                "type": "array",
+                "items": {"enum": ["confirm", "correct", "exclude_local", "accept_source", "reject", "prefer", "split"]}
+              },
+              "candidate_version_ids": {
+                "type": "array",
+                "items": {"type": "string"}
+              },
+              "evidence_fingerprint": {"type": "string"},
+              "kind": {
+                "enum": ["source_conflict", "suspected_source_deletion", "plausibility", "continued_override", "rule_definition"]
+              },
+              "logical_measurement_id": {"$ref": "#/$defs/nullableString"},
+              "measurement_version_id": {"$ref": "#/$defs/nullableString"},
+              "rule_version_id": {"$ref": "#/$defs/nullableString"}
+            }
+          }
+        },
+        "runtime_config": {"$ref": "#/$defs/runtimeConfig"},
+        "schema_version": {"const": "1.0"},
+        "selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": {"type": ["string", "null"]}
+          }
+        },
+        "snapshot_ref": {"$ref": "#/$defs/nullableString"}
       }
     }
   }

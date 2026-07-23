@@ -128,6 +128,9 @@ personal-health-lab/
 │       ├── application/
 │       ├── health_data/
 │       ├── health_import/
+│       ├── data_quality/
+│       ├── recovery/
+│       ├── migration/
 │       ├── resting_hr_analysis/
 │       ├── storage/
 │       ├── overview/
@@ -153,18 +156,31 @@ flowchart LR
     CLI["CLI-Adapter"] --> APP["application"]
     UI["Streamlit-Adapter"] --> APP
     APP --> IMP["health_import"]
+    APP --> QUALITY["data_quality"]
+    APP --> RECOVERY["recovery"]
+    APP --> MIGRATION["migration"]
     APP --> ANA["resting_hr_analysis"]
     APP --> OVR["overview"]
+    APP --> STORE["storage"]
+    IMP --> QUALITY
+    IMP --> RECOVERY
     IMP --> STORE["storage"]
+    RECOVERY --> QUALITY
+    RECOVERY --> MIGRATION
+    RECOVERY --> STORE
+    MIGRATION --> STORE
+    QUALITY --> STORE
     ANA --> STORE
     OVR --> STORE
     IMP --> DATA["health_data"]
+    QUALITY --> DATA
     ANA --> DATA
+    OVR --> DATA
     STORE --> DATA
     DCLI["Development-CLI-Adapter"] -.-> SYN["synthetic_export"]
 ```
 
-Produktionsadapter hängen vom Anwendungsmodul ab, niemals umgekehrt. Der Development-CLI-Adapter darf zusätzlich `synthetic_export` verwenden. `health_data` hängt von keinem anderen Projektmodul ab. `storage` kennt kanonische Typen, aber keine Analyse- oder UI-Logik. Das reale Anwendungsmodul bleibt von `synthetic_export` unabhängig. Neue Abhängigkeiten dürfen keinen Zyklus erzeugen.
+Produktionsadapter hängen vom Anwendungsmodul ab, niemals umgekehrt. `application` besitzt den gemeinsamen Vorschau-/Ausführungsablauf einschließlich Preflight und darf dafür direkt von `storage` abhängen. `data_quality` besitzt Regeln, Prüfworkflow, Entscheidungen und fachliche Snapshot-Auflösung; `recovery` besitzt Sicherung und Wiederherstellung; `migration` besitzt den gemeinsamen Migrationsvertrag. `health_import` delegiert im Normalbetrieb an `data_quality` und im Zustand `restore_pending` an `recovery`, ohne dass `application` diese Schritte orchestriert. Der Development-CLI-Adapter darf zusätzlich `synthetic_export` verwenden. `health_data` hängt von keinem anderen Projektmodul ab, `storage` kennt keine Fach-, Analyse- oder UI-Logik, und neue Abhängigkeiten dürfen keinen Zyklus erzeugen.
 
 Ein automatischer Architekturtest prüft diese Regeln und lehnt verbotene Modulimporte sowie Abhängigkeitszyklen ab.
 
@@ -198,20 +214,25 @@ Alle öffentlichen Modulexporte sind vollständig typisiert. `mypy` läuft minde
 
    CLI und Streamlit rechtfertigen eine gemeinsame Anwendungs-Seam. Weitere Seams entstehen erst bei mindestens zwei realen Adaptern; V0.1 abstrahiert den lokalen Speicher nicht hypothetisch.
 
-### V0.1-Modularchitektur
+### Übergang von V0.1 zu V0.2
 
 CLI und Streamlit sind zwei Adapter an derselben Anwendungs-Seam. Sie verwenden dasselbe Interface und enthalten keine Import-, Speicher-, Datenqualitäts- oder Analyselogik. Das CLI stellt zuerst den vollständig reproduzierbaren Ablauf bereit; Streamlit ergänzt anschließend die interaktive Darstellung.
 
-Das externe V0.1-Interface bleibt auf drei Operationen begrenzt:
+Der erste V0.2-Tracer ersetzt die benannte V0.1-Importmethode durch den gemeinsamen
+Schreibplan. Analyse und Overview bleiben bis zu ihren eigenen Umsetzungstickets auf der
+V0.1-Seam:
 
 ```python
 with HealthLab.open(runtime_config) as app:
-    import_receipt = app.import_health_export(package_path)
+    request = ImportHealthExport(package_path)
+    plan = app.preview_write(request)
+    import_receipt = app.execute_write(request, expected_plan=plan.fingerprint)
     analysis_receipt = app.run_resting_hr_analysis(config)
     overview = app.load_overview(selection)
 
-# Interface:
-# import_health_export(package_path: Path) -> ImportReceipt
+# Übergangs-Interface:
+# preview_write(request: ImportHealthExport) -> WritePlan
+# execute_write(request, expected_plan=...) -> WriteReceipt
 # run_resting_hr_analysis(config: RestingHeartRateAnalysisConfig) -> AnalysisReceipt
 # load_overview(selection: OverviewSelection) -> Overview
 ```
@@ -220,7 +241,7 @@ Receipts enthalten stabile IDs, Status und Diagnosen, aber keine Parquet-, SQLit
 
 | Receipt | Pflichtinhalt |
 |---|---|
-| `ImportReceipt` | `operation_id`, `import_id`, Status, Paket-Hash, optionale `SnapshotRef`, Datensatzzähler, Anzahl Auffälligkeiten und datensparsame Diagnosen |
+| `WriteReceipt` mit `ImportReceipt` | Plan-Fingerprint, finale Vorprüfung, `operation_id`, `import_id`, Status, Paket-Hash, optionale `SnapshotRef`, Datensatzzähler, Anzahl Auffälligkeiten und datensparsame Diagnosen |
 | `AnalysisReceipt` | `operation_id`, `analysis_run_id`, Status, `SnapshotRef`, `analysis_definition_id`, Modellreifestatus, optionale Ergebnisreferenz und datensparsame Diagnosen |
 
 Receipts enthalten keine einzelnen Gesundheitswerte. Detaildaten werden über `Overview` beziehungsweise spätere dedizierte Leseoperationen geladen.
@@ -283,17 +304,61 @@ Die CLI-Seam besitzt zwei getrennte Einstiegspunkte: `healthlab` für Import, An
 
 Die Exitcode-Klassen sind: `0` für Erfolg oder idempotenten No-op, `2` für ungültige CLI-Verwendung, `3` für einen erwartbaren nicht abgeschlossenen Zustand und `1` für einen unerwarteten technischen Defekt. Der JSON-Body enthält stets den konkreten typisierten Status.
 
-Streamlit verwendet `session_state` ausschließlich für flüchtige UI-Auswahl und Navigation. Import-, Prüf- und Analysezustände bleiben hinter dem Anwendungs-Interface persistent. Caches dürfen nur unveränderliche Overview-Daten halten und müssen Snapshot- oder Run-IDs im Cache-Key führen.
+Jede V0.2-Schreiboperation verwendet unabhängig vom aktuellen Schutz- und Freigabestatus denselben zweistufigen Anwendungsvertrag: eine nebenwirkungsfreie typisierte Schreibvorschau und deren ausdrückliche Ausführung. Sämtliche fachlichen Eingaben sind vor der Vorschau festgelegt und im Plan-Fingerprint gebunden; Bearbeiten verwirft den Plan. Die menschenlesbare CLI zeigt Vorschau und Bestätigung innerhalb eines Aufrufs. Im JSON-Modus liefert der erste Aufruf den vollständigen Plan; der zweite wiederholt dieselben Argumente und führt nur bei neu berechnetem identischem Fingerprint aus. Angezeigte Pläne werden nicht persistiert.
 
-`load_overview(selection)` liefert ein präsentationsneutrales `Overview` mit Zeitreihen, Trends, Unsicherheit, Qualitäts- und Quellenstatus, Analyseverweisen, Methodik und Provenienz. CLI serialisiert dieses Modell als Tabelle oder JSON; Streamlit visualisiert es. Adapter dürfen keine fachliche Daten- oder Interpretationslogik ergänzen.
+Die öffentliche V0.2-Seam ersetzt die benannten schreibenden V0.1-Methoden durch genau zwei Methoden:
 
-Das interne `overview`-Modul ist die einzige Leseprojektion für CLI und Streamlit. Es verbirgt Snapshot- und Ergebniswahl, Statusmarker, Zeitreihen-, Provenienz- und Methodikabfragen; Adapter greifen niemals direkt auf das Speichermodul zu.
+```python
+with HealthLab.open(runtime_config) as app:
+    plan = app.preview_write(request)
+    receipt = app.execute_write(request, expected_plan=plan.fingerprint)
+
+# Interface:
+# preview_write(request: WriteRequest) -> WritePlan
+# execute_write(
+#     request: WriteRequest,
+#     *,
+#     expected_plan: PlanFingerprint,
+# ) -> WriteReceipt
+```
+
+`WriteRequest` ist eine geschlossene Union aus `ImportHealthExport`, `RunRestingHeartRateAnalysis`, `ResolveDataReviewCase`, `ConfirmDataReviewBatch`, `RevokeDataReviewDecision`, `CreatePlausibilityRuleVersion`, `RunHistoricalReview`, `CreateMetadataBackup`, `BeginMetadataRestore`, `AbortMetadataRestore`, `MigrateStore` und `RollbackMigration`. Der Widerrufsauftrag adressiert typisiert entweder eine einzelne Entscheidungs-ID oder eine Sammelaktions-ID. `ResolveDataReviewCase.resolution` ist selbst eine geschlossene Union für Datenbestätigung, Datenkorrektur, lokalen Messungsausschluss, Quellwertübernahme, Quellenlöschungsentscheidung und Konfliktauflösung. Eine neue vollständige Plausibilitätsregelversion deckt Erstanlage, Änderung, Deaktivierung, Reaktivierung und die ausdrückliche Übernahme einer ausgelieferten Empfehlung ab.
+
+`WritePlan` und `WriteReceipt` sind unveränderliche gemeinsame Hüllen. Operationsspezifische Plandetails und Ergebnisse bleiben geschlossene typisierte Unions statt öffentlicher Generics, Protocols oder Vererbungshierarchien. Der Plan enthält Fingerprint, `WriteApproval` mit `ready`, `confirmation_required` oder `blocked`, typisierte Bestätigungsgründe, Details und Diagnosen. Die ausdrückliche Ausführung des identischen Fingerprints bestätigt sämtliche Gründe gemeinsam; ein separates Bestätigungsargument gibt es nicht. Das Receipt enthält Operations-ID, Plan-Fingerprint, operationsspezifisches oder `WriteNotStarted`-Ergebnis, finalen Preflight und Diagnosen. `plan_changed`, `blocked` und `store_busy` sind typisierte nicht gestartete Ergebnisse; nur unerwartete technische Defekte verlassen die Seam als Ausnahme.
+
+`ImportHealthExport` ist im Zustand `restore_pending` weiterhin derselbe öffentliche Auftrag, rekonstruiert intern aber ausschließlich die benötigten Quellenidentitäten. Sobald der letzte benötigte Export alle Referenzen schließt, aktiviert dieselbe Operation das bereits gemeinsam bestätigte Overlay atomar; ein zusätzlicher `CompleteRestore`-Auftrag existiert nicht. Sicherungsschema-Migrationen bleiben Bestandteil von `BeginMetadataRestore`, und einzelne Migrationsschritte werden nicht öffentlich. Bei synchroner Ausführung bedeutet Abbruch vor der Migration lediglich, nicht auszuführen; ein fehlgeschlagener erneuter Versuch beginnt über `MigrateStore` frisch.
+
+Eine Sammelbestätigung macht Filter, Anzahl, stabile Fall-IDs und entscheidungsrelevante Werte der vollständigen materialisierten Treffermenge prüfbar. Streamlit darf dafür eine paginierte Tabelle und die CLI den nativen Pager verwenden; JSON enthält die vollständige Liste. Kein Adapter kürzt still oder rekonstruiert die Treffermenge selbst.
+
+Streamlit verwendet `session_state` ausschließlich für flüchtige UI-Auswahl und Navigation. Import-, Prüf- und Analysezustände bleiben hinter dem Anwendungs-Interface persistent. Caches dürfen nur unveränderliche Leseprojektionsdaten halten und müssen die jeweils relevanten Snapshot-, Run-, Regel-, Audit- oder Sicherungs-IDs im Cache-Key führen.
+
+V0.2-Schreibvorschauen erscheinen inline auf der jeweils zuständigen Fachseite. Ein Seitenwechsel verwirft sie; global bleibt nur ein schreibgeschützter Workspace-Status, keine Operationswarteschlange. `migration_required` fokussiert ausschließlich „Migration und Diagnose“, `restore_pending` ausschließlich „Sicherung und Wiederherstellung“; die übrigen Seitennamen bleiben zur Orientierung sichtbar, sind aber deaktiviert. Diese Navigation ist Präsentationslogik, während zulässige Operationen, Plan, Freigabestatus, Diagnosen und Ausführung vollständig aus dem gemeinsamen Anwendungs-Interface stammen.
+
+`application` ist die einzige öffentliche Lese-Seam für CLI und Streamlit, veröffentlicht in V0.2 aber mehrere kleine benannte Projektionen statt eines anwachsenden Gesamt-`Overview` oder eines generischen Query-Bus:
+
+```python
+app.load_workspace_status() -> WorkspaceStatus
+app.load_overview(selection) -> Overview | ProjectionUnavailable
+app.load_data_review(selection) -> DataReview | ProjectionUnavailable
+app.load_data_review_case(case_id) -> DataReviewCaseDetail | ProjectionUnavailable
+app.load_plausibility_rules() -> PlausibilityRules | ProjectionUnavailable
+app.load_recovery_status() -> RecoveryStatus | ProjectionUnavailable
+app.load_migration_diagnostics() -> MigrationDiagnostics | ProjectionUnavailable
+```
+
+`HealthLab.open` verändert den Datenspeicher niemals und öffnet auch bei `migration_required`, `restore_pending` oder einem unbekannten neueren Schema eine eingeschränkte Sitzung, solange der Speicher noch sicher diagnostizierbar ist. `WorkspaceStatus` enthält Datenmodus, Datenspeicher-ID, Betriebszustand sowie die fachlich zulässigen Lese- und Schreiboperationen. Die Anwendung erzwingt diese Zulässigkeit zusätzlich; ein unzulässiger oder nicht vorhandener Lesezugriff liefert `ProjectionUnavailable` mit typisiertem Code und datensparsamer Diagnose statt einer erwartbaren Ausnahme. Beschädigte oder technisch nicht diagnostizierbare Speicher bleiben technische Fehler.
+
+`load_overview(selection)` liefert ein präsentationsneutrales `Overview` mit Zeitreihen, Trends, Unsicherheit, Qualitäts- und Quellenstatus, Analyseverweisen, Methodik und Provenienz. `load_data_review` liefert die vollständige unveränderliche Trefferliste für seinen typisierten Filter; Streamlit paginiert nur visuell, während die CLI den nativen Pager verwendet. `ConfirmDataReviewBatch` verwendet denselben Filtertyp, materialisiert die exakte Menge erneut und bindet sie vollständig in den Plan-Fingerprint. Cursor, Storage-Paging und eine künstliche V0.2-Mengenobergrenze existieren nicht.
+
+Projektionen liefern typisierte Werte, Begründungscodes und fachlich zulässige Aktionen, aber keine fertigen UI-Texte. Benutzertexte wie Notizen und Pflichtbegründungen bleiben Fachdatum. Produktionsadapter importieren sämtliche Requests, Pläne, Receipts, Projektionen, IDs, Enums und Ausnahmen ausschließlich über `personal_health_lab.application`; sie greifen niemals direkt auf Speicher- oder interne Lesemodule zu. Benutzerausgewählte Paket-, Sicherungs- und Zielpfade dürfen Eingaben sein, interne oder unredigierte Speicherpfade und konkrete SQLite-, Parquet-, DuckDB-, Staging- oder Tabellenformen erscheinen weder in Projektionen noch in Receipts.
+
+Das interne `overview`-Modul besitzt `Overview`, `data_quality` besitzt Datenprüfung, Datenprüffalldetail und Plausibilitätsregeln, `recovery` besitzt Sicherung und Wiederherstellung, und `migration` besitzt Migration und Diagnose. Diese Module liefern unveränderliche präsentationsneutrale Projektionen und opake IDs, die `application` gezielt weiterexportiert; nur interne Ergebnisse, Status und Fehler werden dort einmalig in den gemeinsamen öffentlichen Schreibvertrag übersetzt.
 
 `OverviewSelection` enthält ausschließlich den gewünschten Zeitraum beziehungsweise eines der festen Zeitfenster. Das Modul wählt aktuelle wirksame Analyseergebnisse selbst und liefert Qualitäts-, Quellen- und Provenienzstatus immer vollständig; rein visuelles Ein- und Ausblenden bleibt Sache des Adapters.
 
 `Overview` zeigt immer das neueste Ergebnis. Ist es vorläufig oder veraltet, verweist das Ansichtsmodell zusätzlich auf das letzte nicht vorläufige Ergebnis; ein stilles Zurückfallen auf einen älteren Stand ist ausgeschlossen.
 
-Ohne vorhandene Daten liefert `load_overview` ein gültiges `Overview` mit typisiertem Zustand `empty`; weitere erwartbare Zustände sind `ready` und `provisional`. Nur technische Defekte lösen eine Ausnahme aus.
+Ohne vorhandene Daten liefert `load_overview` ein gültiges `Overview` mit typisiertem Zustand `empty`; weitere erwartbare Zustände sind `ready` und `provisional`. Das bisherige freie `Overview.message` entfällt zugunsten typisierter Status- und Begründungscodes.
 
 Analysekonfigurationen sind unveränderliche, typisierte und versionierte Objekte. Das externe Objekt enthält nur benutzerrelevante Angaben wie Zeitraum und `analysis_definition_id`. Lag-Fenster, Skalierung, Regularisierung, Bootstrap-Regel, Diagnostik und Seeds gehören zur versionierten internen Analysedefinition und werden in der Methodikansicht transparent dargestellt. Eine methodische Änderung erzeugt eine neue Analysedefinition statt einer stillen Parameteränderung.
 
@@ -308,7 +373,9 @@ config = RestingHeartRateAnalysisConfig(
     end_date=date(2026, 1, 1),
 )
 
-receipt = app.run_resting_hr_analysis(config)
+request = RunRestingHeartRateAnalysis(config=config)
+plan = app.preview_write(request)
+receipt = app.execute_write(request, expected_plan=plan.fingerprint)
 ```
 
 ---
@@ -443,7 +510,11 @@ Parquet-Schema-Migrationen verändern keine veröffentlichte Datensatzversion in
 
 Nicht mehr referenzierte Datensatzversionen werden ausschließlich nach einer Vorschau mit Referenzen und geschätztem Speichergewinn sowie einer ausdrücklichen Benutzerbestätigung gelöscht. Es gibt keine automatische Parquet-Bereinigung im MVP.
 
-Vor Importen und Copy-on-write-Migrationen prüft die Anwendung den geschätzten Speicherbedarf einschließlich einer Sicherheitsreserve. Bei voraussichtlich unzureichendem freien Speicher beginnt der Vorgang nicht.
+Vor Importen, Metadatensicherungen, Wiederherstellungsschritten und Copy-on-write-Migrationen prüft die Anwendung den geschätzten Speicherbedarf einschließlich einer Sicherheitsreserve. Bei voraussichtlich unzureichendem oder nicht konservativ schätzbarem freien Speicher beginnt der Vorgang nicht.
+
+Die versionierte Operationsschätzung berechnet pro tatsächlichem Zielvolume den Spitzenwert der gleichzeitig lebenden zusätzlichen Allokationen. Ein Full-Snapshot-Import verwendet kanonisch gezählte Eingabebytes sowie gebundene Bounds für Parquet-Ausgabe, DuckDB-Scratch, SQLite-Wachstum und Journal. Eine Metadatensicherung zählt ihren kanonischen Encoder vorab und ersetzt die temporäre Datei auf demselben Volume atomar. Die gestufte Wiederherstellung besitzt getrennte Kapazitätsgates für Beginn, jeden Quellimport und Aktivierung; bereits persistierte Wiederherstellungsfakten sind dabei Basis des nächsten Schritts und nicht erneut Zusatzbedarf. Jeder registrierte Migrationsschritt deklariert seine Ziel- und Scratch-Bounds. Alte Snapshots bleiben Basis und eine mögliche APFS-Copy-on-write-Ersparnis wird niemals angerechnet. Fehlt ein Bound, lautet der Kapazitätsbefund `unknown` und blockiert.
+
+Versionierte synthetische Allokations-Fixtures messen je Phase `st_blocks × 512` und müssen für normales V0.2-Volumen sowie einen größeren Stressfall unter der jeweiligen Operationsschätzung bleiben. Änderungen an Writer, Dateiformat, Scratch-Grenze, Phasen-Liveness oder Schätzformel erzeugen eine neue Schätzmethodenversion. Der Preflight bleibt dennoch eine Momentaufnahme; `ENOSPC` muss jede Operation atomar abbrechen und den aktiven Zustand unverändert lassen.
 
 Pro Datenspeicher darf genau eine schreibende Operation gleichzeitig aktiv sein. Importe, Migrationen, Wiederherstellungen und das Speichern eines Modelllaufs benötigen denselben exklusiven Schreib-Lock; snapshot-basierte Leser dürfen parallel arbeiten. Ein weiterer Schreiber erhält den erwartbaren Status `store_busy`.
 
@@ -778,7 +849,9 @@ Ein reproduzierter Modelllauf muss zusätzlich:
 
 Bytegenaue Gleichheit von Gleitkommaartefakten ist nicht erforderlich, sofern die versionierte fachliche Toleranz eingehalten wird.
 
-Ein Modelllauf aus einem nicht committed Arbeitsstand speichert neben dem Git-Commit `dirty=true` und einen Hash des relevanten lokalen Diffs, nicht dessen Inhalt. Der Lauf wird als „lokaler Entwicklungsstand“ gekennzeichnet und nur bei identischem Diff-Hash wiederverwendet.
+Ein Modelllauf aus einem nicht committed Arbeitsstand speichert neben dem Git-Commit `dirty=true` und einen Hash des relevanten lokalen Diffs, nicht dessen Inhalt. Der Lauf wird als „lokaler Entwicklungsstand“ gekennzeichnet und nur bei identischem Diff-Hash wiederverwendet. Geht der Diff verloren, bleibt das Ergebnis historisch nachvollziehbar, ist aber nicht erneut ausführbar und darf nicht als reproduzierbar bezeichnet werden. Seine statistische Modellreife bleibt davon unabhängig; auch ein solcher Lauf kann deshalb `robust` sein. Ein Lauf aus einem sauberen Commit erfüllt bei erhaltener Snapshot-, Konfigurations- und Umgebungsbasis den Reproduzierbarkeitsvertrag.
+
+V0.2 bereinigt frühere Datensatz-Snapshots und Analyseartefakte nicht automatisch. Für jeden historischen Modelllauf bleiben mindestens Snapshot, Ergebnisartefakt, Run- und Ergebnis-ID, Analysedefinition, Konfiguration, Code- und Umgebungsidentität sowie die beim Lauf festgehaltenen Ergebnisstatus und Begründungsfakten erhalten. Eine spätere Speicherbereinigung ist ein eigener, ausdrücklich bestätigter Lebenszyklus und nicht Teil der V0.2-Ergebnisstatusregeln.
 
 ---
 

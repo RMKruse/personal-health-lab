@@ -8,6 +8,7 @@ import os
 import subprocess
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
+from itertools import pairwise
 from pathlib import Path
 from random import Random
 from statistics import correlation, fmean, pstdev
@@ -15,7 +16,17 @@ from types import MappingProxyType
 from typing import Literal
 from uuid import uuid4
 
-from personal_health_lab.health_data import CanonicalHealthType, DailyHealthSeries
+from personal_health_lab.health_data import (
+    AnalysisDataStatusReason,
+    CanonicalHealthType,
+    DailyHealthSeries,
+    DataQualityStatus,
+    DataStatusReasonCode,
+    ModelMaturityCriterion,
+    ModelMaturityCriterionCode,
+    ModelMaturityStatus,
+    ReproducibilityStatus,
+)
 from personal_health_lab.storage import (
     AnalysisDefinitionId as AnalysisDefinitionId,
 )
@@ -53,11 +64,16 @@ class _AnalysisDefinition:
     bootstrap_resamples: int
     bootstrap_seed: int
     interval_level: float
+    minimum_input_completeness: float
+    max_feature_dependency: float
+    minimum_bootstrap_success_rate: float
+    minimum_outcome_standard_deviation: float
+    maximum_time_series_gap_days: int
 
 
 _DEFINITIONS = MappingProxyType(
     {
-        AnalysisDefinitionId("lag-signal-v1"): _AnalysisDefinition(
+        AnalysisDefinitionId("lag-signal-v2"): _AnalysisDefinition(
             ridge_penalty=1.0,
             minimum_observations=30,
             robust_observations=180,
@@ -65,6 +81,11 @@ _DEFINITIONS = MappingProxyType(
             bootstrap_resamples=250,
             bootstrap_seed=20260713,
             interval_level=0.95,
+            minimum_input_completeness=0.95,
+            max_feature_dependency=0.98,
+            minimum_bootstrap_success_rate=0.95,
+            minimum_outcome_standard_deviation=0.0,
+            maximum_time_series_gap_days=1,
         )
     }
 )
@@ -77,7 +98,7 @@ class AnalysisExecution:
     status: Literal["completed", "reused", "insufficient_data", "unstable", "store_busy"]
     snapshot_id: SnapshotId | None
     analysis_definition_id: AnalysisDefinitionId
-    model_maturity: Literal["exploratory", "robust"] | None
+    model_maturity: ModelMaturityStatus | None
     result_id: AnalysisResultId | None
     diagnostics: tuple[str, ...] = ()
     provenance: AnalysisProvenance | None = None
@@ -96,6 +117,10 @@ class _ReproductionContext:
 
 class AnalysisError(RuntimeError):
     """The built-in analysis could not be completed safely."""
+
+
+class AnalysisInputChanged(AnalysisError):
+    """The active snapshot no longer matches the authorized analysis plan."""
 
 
 class _InsufficientData(RuntimeError):
@@ -278,7 +303,8 @@ def _fit(
     if len(rows) < definition.minimum_observations:
         raise _InsufficientData("insufficient_complete_days")
     outcomes = [value for _, _, value in rows]
-    if pstdev(outcomes) == 0:
+    outcome_standard_deviation = pstdev(outcomes)
+    if outcome_standard_deviation == 0:
         raise _Unstable("constant_outcome")
     coefficients = _coefficients(rows, definition)
     bootstrap = _bootstrap(rows, definition)
@@ -301,9 +327,26 @@ def _fit(
         for left in range(7)
         for right in range(left + 1, 7)
     )
+    selected_resting_days = {
+        day
+        for day in resting
+        if (start_date is None or day >= start_date)
+        and (end_date is None or day <= end_date)
+    }
+    input_completeness = len(rows) / len(selected_resting_days)
+    bootstrap_success_rate = len(bootstrap) / definition.bootstrap_resamples
+    maximum_time_series_gap_days = max(
+        ((right - left).days for left, right in pairwise(day for day, _, _ in rows)),
+        default=0,
+    )
     maturity: Literal["exploratory", "robust"] = (
         "robust"
-        if len(rows) >= definition.robust_observations and max_dependency < 0.98
+        if len(rows) >= definition.robust_observations
+        and input_completeness >= definition.minimum_input_completeness
+        and max_dependency < definition.max_feature_dependency
+        and bootstrap_success_rate >= definition.minimum_bootstrap_success_rate
+        and outcome_standard_deviation > definition.minimum_outcome_standard_deviation
+        and maximum_time_series_gap_days <= definition.maximum_time_series_gap_days
         else "exploratory"
     )
 
@@ -346,11 +389,16 @@ def _fit(
     )
     diagnostics = AnalysisDiagnostics(
         complete_days=len(rows),
-        feature_dependency="acceptable" if max_dependency < 0.98 else "high",
+        feature_dependency=(
+            "acceptable" if max_dependency < definition.max_feature_dependency else "high"
+        ),
         bootstrap_successes=len(bootstrap),
         bootstrap_resamples=definition.bootstrap_resamples,
         model_readiness=maturity,
         association_guardrail=guardrail,
+        input_completeness=input_completeness,
+        outcome_standard_deviation=outcome_standard_deviation,
+        maximum_time_series_gap_days=maximum_time_series_gap_days,
     )
 
     return RestingHeartRateAnalysisResult(
@@ -370,7 +418,7 @@ def _fit(
             ),
             None,
         ),
-        model_maturity=maturity,
+        model_maturity=ModelMaturityStatus(maturity),
         diagnostics=diagnostics,
         methodology=AnalysisMethodology(
             ridge_penalty=definition.ridge_penalty,
@@ -381,6 +429,123 @@ def _fit(
             resample_count=definition.bootstrap_resamples,
             random_seed=definition.bootstrap_seed,
             interval_level=definition.interval_level,
+            minimum_input_completeness=definition.minimum_input_completeness,
+            max_feature_dependency=definition.max_feature_dependency,
+            minimum_bootstrap_success_rate=definition.minimum_bootstrap_success_rate,
+            minimum_outcome_standard_deviation=(
+                definition.minimum_outcome_standard_deviation
+            ),
+            maximum_time_series_gap_days=definition.maximum_time_series_gap_days,
+        ),
+    )
+
+
+def _freeze_status_facts(
+    result: RestingHeartRateAnalysisResult,
+    series: tuple[DailyHealthSeries, ...],
+    start_date: date | None,
+    end_date: date | None,
+    open_review_case_ids: tuple[str, ...],
+) -> RestingHeartRateAnalysisResult:
+    reasons: list[AnalysisDataStatusReason] = []
+    if open_review_case_ids:
+        reasons.append(
+            AnalysisDataStatusReason(
+                DataStatusReasonCode.OPEN_REVIEW_CASE,
+                open_review_case_ids,
+            )
+        )
+    daily = {item.data_type: {value.day for value in item.values} for item in series}
+    active_days = daily.get(CanonicalHealthType.ACTIVE_ENERGY, set())
+    resting_days = daily.get(CanonicalHealthType.APPLE_RESTING_HEART_RATE, set())
+    if active_days:
+        first_complete_candidate = min(active_days) + timedelta(days=7)
+        gaps = sorted(
+            {
+                day - timedelta(days=lag)
+                for day in resting_days
+                if day >= first_complete_candidate
+                and (start_date is None or day >= start_date)
+                and (end_date is None or day <= end_date)
+                for lag in range(1, 8)
+                if day - timedelta(days=lag) not in active_days
+            }
+        )
+        if gaps:
+            reasons.append(
+                AnalysisDataStatusReason(
+                    DataStatusReasonCode.PASSIVE_COVERAGE_GAP,
+                    tuple(f"active_energy:{day.isoformat()}" for day in gaps),
+                )
+            )
+    diagnostics = result.diagnostics
+    methodology = result.methodology
+    assert diagnostics.input_completeness is not None
+    assert diagnostics.outcome_standard_deviation is not None
+    assert diagnostics.maximum_time_series_gap_days is not None
+    assert methodology.minimum_input_completeness is not None
+    assert methodology.max_feature_dependency is not None
+    assert methodology.minimum_bootstrap_success_rate is not None
+    assert methodology.minimum_outcome_standard_deviation is not None
+    assert methodology.maximum_time_series_gap_days is not None
+    criteria = (
+        ModelMaturityCriterion(
+            ModelMaturityCriterionCode.MINIMUM_OBSERVATIONS,
+            diagnostics.complete_days >= methodology.minimum_observations,
+            float(diagnostics.complete_days),
+            float(methodology.minimum_observations),
+        ),
+        ModelMaturityCriterion(
+            ModelMaturityCriterionCode.ROBUST_OBSERVATIONS,
+            diagnostics.complete_days >= methodology.robust_observations,
+            float(diagnostics.complete_days),
+            float(methodology.robust_observations),
+        ),
+        ModelMaturityCriterion(
+            ModelMaturityCriterionCode.INPUT_COMPLETENESS,
+            diagnostics.input_completeness >= methodology.minimum_input_completeness,
+            diagnostics.input_completeness,
+            methodology.minimum_input_completeness,
+        ),
+        ModelMaturityCriterion(
+            ModelMaturityCriterionCode.FEATURE_DEPENDENCY,
+            diagnostics.feature_dependency == "acceptable",
+            diagnostics.feature_dependency,
+            f"correlation < {methodology.max_feature_dependency}",
+        ),
+        ModelMaturityCriterion(
+            ModelMaturityCriterionCode.BOOTSTRAP_SUCCESS_RATE,
+            diagnostics.bootstrap_successes
+            >= diagnostics.bootstrap_resamples * methodology.minimum_bootstrap_success_rate,
+            diagnostics.bootstrap_successes / diagnostics.bootstrap_resamples,
+            methodology.minimum_bootstrap_success_rate,
+        ),
+        ModelMaturityCriterion(
+            ModelMaturityCriterionCode.OUTCOME_VARIATION,
+            diagnostics.outcome_standard_deviation
+            > methodology.minimum_outcome_standard_deviation,
+            diagnostics.outcome_standard_deviation,
+            methodology.minimum_outcome_standard_deviation,
+        ),
+        ModelMaturityCriterion(
+            ModelMaturityCriterionCode.TIME_SERIES_CONTINUITY,
+            diagnostics.maximum_time_series_gap_days
+            <= methodology.maximum_time_series_gap_days,
+            float(diagnostics.maximum_time_series_gap_days),
+            float(methodology.maximum_time_series_gap_days),
+        ),
+    )
+    return replace(
+        result,
+        data_status=(
+            DataQualityStatus.PROVISIONAL if reasons else DataQualityStatus.REVIEWED
+        ),
+        data_status_reasons=tuple(reasons),
+        maturity_criteria=criteria,
+        reproducibility=(
+            ReproducibilityStatus.LOCAL_DEVELOPMENT
+            if result.provenance is not None and result.provenance.code_dirty
+            else ReproducibilityStatus.REPRODUCIBLE
         ),
     )
 
@@ -393,6 +558,8 @@ def run_resting_hr_analysis(
     start_date: date | None,
     end_date: date | None,
     config_schema_version: str,
+    expected_snapshot_id: SnapshotId | None,
+    open_review_case_ids: tuple[str, ...],
 ) -> AnalysisExecution:
     definition = _DEFINITIONS.get(analysis_definition_id)
     if definition is None:
@@ -417,6 +584,8 @@ def run_resting_hr_analysis(
     try:
         input_start = None if start_date is None else start_date - timedelta(days=7)
         snapshot_id, series = store.load_analysis_input(input_start, end_date)
+        if snapshot_id != expected_snapshot_id:
+            raise AnalysisInputChanged
         if snapshot_id is None:
             store.persist_analysis_receipt(
                 operation_id=operation_id,
@@ -478,7 +647,13 @@ def run_resting_hr_analysis(
             start_date,
             end_date,
         )
-        result = replace(result, provenance=candidate)
+        result = _freeze_status_facts(
+            replace(result, provenance=candidate),
+            series,
+            start_date,
+            end_date,
+            open_review_case_ids,
+        )
         receipt_diagnostics = (
             f"model_readiness_{result.model_maturity}",
             result.diagnostics.association_guardrail,
@@ -554,6 +729,8 @@ def run_resting_hr_analysis(
             diagnostics,
             failed_provenance,
         )
+    except AnalysisInputChanged:
+        raise
     except Exception as error:
         raise AnalysisError("Ruhepulsanalyse konnte nicht abgeschlossen werden.") from error
     finally:
@@ -564,6 +741,7 @@ __all__ = [
     "AnalysisDefinitionId",
     "AnalysisError",
     "AnalysisExecution",
+    "AnalysisInputChanged",
     "AnalysisProvenance",
     "AnalysisResultId",
     "AnalysisRunId",

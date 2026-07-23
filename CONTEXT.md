@@ -207,51 +207,79 @@ _Avoid_: eigenständige Messung, einziges Energiemerkmal des Modells
 ### Datenqualität und Ergebnisstatus
 
 **Plausibilitätsauffälligkeit**:
-Ein durch eine Regel markierter Messwert oder Zeitraum, der möglicherweise unvollständig oder fehlerhaft ist und eine Benutzerprüfung benötigt. Eine Auffälligkeit ist kein Beweis für einen Datenfehler.
+Ein durch eine Regel markierter Messwert oder Zeitraum, der möglicherweise unvollständig oder fehlerhaft ist und eine Benutzerprüfung benötigt. Pro Quellmessungsversion und Plausibilitätsregelversion entsteht höchstens eine Auffälligkeit; sie hält alle verletzten Regelbestandteile, verwendeten Grenzen und den Historienstichtag als Begründungen fest. Eine veränderte Menge von Begründungen ist eine andere Art der Auffälligkeit. Eine Auffälligkeit ist kein Beweis für einen Datenfehler.
 _Avoid_: automatisch erkannter Fehler, automatisch zu löschender Wert
 
+**Datenprüffall**:
+Eine aktuell entscheidungsbedürftige Frage zur lokalen analytischen Verwendung von Quelldaten. Er kann durch eine Plausibilitätsauffälligkeit, die erneute Prüfung einer Korrektur oder eines lokalen Messungsausschlusses, eine vermutete Quellenlöschung oder einen Quellmessungskonflikt entstehen; höchstens eine Auflösung ist wirksam, eine spätere löst die frühere ab und ihr Widerruf öffnet den Fall, ohne eine ältere Auflösung zu reaktivieren, und solange irgendein wirksamer Fall offen ist, bleibt der Datenstand vorläufig.
+_Avoid_: Datenfehler, ausschließlich Plausibilitätsauffälligkeit
+
 **Plausibilitätsregel**:
-Eine versionierte Regel, die feste, vom Benutzer anpassbare Unter- oder Obergrenzen und/oder einen aus der persönlichen Datenhistorie abgeleiteten Referenzbereich verwendet. Sie erzeugt Plausibilitätsauffälligkeiten, aber keine medizinischen Warnungen.
+Eine pro kanonischem Datentyp unveränderlich versionierte vollständige Regelkonfiguration, die feste, vom Benutzer anpassbare Unter- oder Obergrenzen und/oder einen aus der persönlichen Datenhistorie abgeleiteten Referenzbereich verwendet. Der Benutzer kann feste Grenzen sowie die aktiven Regelbestandteile ändern; Grenzen sind endlich, stehen in der kanonischen Einheit und steigen bei beidseitiger Angabe von unten nach oben. Die Parameter und Sonderfälle der persönlichen Methodik bleiben versionierte eingebaute Methodik. Änderungen an Grenzen, aktivierten Regelbestandteilen oder Algorithmusparametern erzeugen eine neue Version. Der mit wachsender Historie neu berechnete persönliche Referenzbereich ist dagegen ein Auswertungsergebnis und keine neue Regelversion; jede erzeugte Auffälligkeit hält die tatsächlich verwendeten Grenzen und den Historienstichtag fest. Plausibilitätsregeln erzeugen Plausibilitätsauffälligkeiten, aber keine medizinischen Warnungen.
 _Avoid_: Sicherheitsgrenze, Diagnosegrenze
 
 **Persönlicher Referenzbereich**:
-Ein aus der bisherigen persönlichen Datenhistorie abgeleiteter Bereich typischer Werte, der sich mit wachsender Datenbasis aktualisieren darf. Er ergänzt feste Plausibilitätsgrenzen und ist kein populationsbezogener medizinischer Referenzbereich.
+Ein aus der bisherigen persönlichen Datenhistorie abgeleiteter Bereich typischer Werte, der sich mit wachsender Datenbasis aktualisieren darf. Jeder Prüfzyklus hält dafür den bei seinem Start aktuell wirksamen Datensatz-Snapshot fest und verwendet je Messwert ausschließlich die darin enthaltene frühere Historie. Korrekturen und verspätete Importe können deshalb in späteren Prüfzyklen andere Grenzen ergeben; frühere Auffälligkeiten bleiben mit ihren damals verwendeten Grenzen reproduzierbar. Der persönliche Referenzbereich ergänzt feste Plausibilitätsgrenzen und ist kein populationsbezogener medizinischer Referenzbereich.
 _Avoid_: medizinischer Normbereich, feste Grenze
 
 **Regelgültigkeit**:
-Der Zeitraum, in dem eine Version einer Plausibilitätsregel anhand des Messzeitpunkts angewendet wird. Änderungen gelten ab Beginn der aktuellen lokalen Kalenderwoche und für zukünftige Messzeitpunkte; bereits bestätigte Werte der laufenden Woche dürfen erneut zur Prüfung geöffnet werden, abgeschlossene Wochen werden nicht neu bewertet. Verspätet importierte Daten werden mit der am Messzeitpunkt gültigen Regel geprüft.
+Der Zeitraum, in dem eine Version einer Plausibilitätsregel anhand des Messzeitpunkts angewendet wird. Die erste Regelversion eines zuvor bewusst ungeregelten Datentyps gilt ohne untere Zeitgrenze. Für spätere Änderungen ist der Gültigkeitsbeginn Montag 00:00 der bei der Änderung aktiven lokalen ISO-Kalenderwoche; Zeitzone und Offset werden mit der Regelversion festgehalten und bestimmen einen einzigen Zeitpunkt. Messungen werden anhand ihres tatsächlichen Zeitpunkts damit verglichen, sodass Reisen keine unterschiedlichen Gültigkeitsgrenzen erzeugen. Eine Regeländerung bewertet alle derzeit wirksamen Quellmessungsversionen seit diesem Wochenbeginn unter der neuen Version in einem eigenen Prüfzyklus neu. Frühere Auffälligkeiten bleiben im Audit, sind für den aktuellen Prüfstatus aber abgelöst; ältere abgeschlossene Wochen werden nicht neu bewertet. Eine verspätet importierte Quellmessungsversion wird mit der am Messzeitpunkt gültigen Regel geprüft und erzeugt eine mögliche Auffälligkeit im aktuellen Importprüfzyklus. Frühere Prüfzyklen und bereits vorhandene Messungen desselben Zeitraums bleiben unverändert.
 _Avoid_: globale rückwirkende Neuberechnung
 
 **Datenbestätigung**:
-Die bewusste Benutzerangabe, dass ein angezeigter auffälliger Wert oder Zeitraum nach Prüfung für die Analyse verwendet werden darf. Sie dokumentiert die Prüfung, garantiert aber nicht die objektive Richtigkeit der Daten.
+Die bewusste Benutzerangabe, dass ein angezeigter auffälliger Wert oder Zeitraum nach Prüfung für die Analyse verwendet werden darf. Sie gilt genau für die geprüfte Quellmessungsversion, die erzeugende Plausibilitätsregelversion und die Art der Auffälligkeit. Eine neue Quellmessungs- oder Regelversion kann daher einen neuen offenen Prüffall erzeugen; die frühere Bestätigung bleibt als Audit-Historie erhalten. Die Bestätigung dokumentiert die Prüfung, garantiert aber nicht die objektive Richtigkeit der Daten.
 _Avoid_: automatische Freigabe, Wahrheitsnachweis
 
 **Datenkorrektur**:
-Eine nachvollziehbare, begründete Ersetzung eines importierten Werts für zukünftige lokale Analysen, ohne den ursprünglichen Rohwert zu verändern. Sie verweist auf die zugrunde liegende Quellmessungsversion, besitzt einen eigenen Änderungszeitpunkt und wird im MVP nicht nach HealthKit zurückgeschrieben. Erscheint eine neue Quellversion, bleibt die Korrektur vorläufig wirksam, wird aber erneut zur Prüfung geöffnet.
+Eine nachvollziehbare, begründete Ersetzung eines importierten Werts mit oder ohne Plausibilitätsauffälligkeit, ohne den ursprünglichen Rohwert zu verändern; sie verweist auf die zugrunde liegende Quellmessungsversion und wird im MVP nicht nach HealthKit zurückgeschrieben. Sie schließt eine vorhandene zugehörige Auffälligkeit ohne zusätzliche Datenbestätigung und wirkt ab dem nächsten Datensatz-Snapshot; bei einer neuen Quellmessungsversion bleibt sie vorläufig wirksam, bis der neue Quellwert übernommen, korrigiert oder lokal ausgeschlossen wird.
 _Avoid_: Überschreiben, Löschen des Rohwerts
 
+**Lokaler Messungsausschluss**:
+Die bewusste, begründete Entscheidung, eine vorhandene, als falsch erkannte Quellmessungsversion ohne bekannten Ersatzwert aus zukünftigen lokalen Analysen auszuschließen, während Rohwert und Audit-Historie erhalten bleiben. Sie schließt den zugehörigen Datenprüffall und wirkt ab dem nächsten Datensatz-Snapshot; bei einer neuen Quellmessungsversion bleibt sie vorläufig wirksam, bis der neue Quellwert übernommen, korrigiert oder erneut versionsgebunden ausgeschlossen wird, und behauptet anders als eine bestätigte Quellenlöschung nicht, dass die Messung in der Quelle gelöscht wurde.
+_Avoid_: Datenkorrektur, Quellenlöschung, Löschen des Rohwerts
+
+**Quellwertübernahme**:
+Die bewusste Entscheidung, eine plausible neue Quellmessungsversion anstelle einer vorläufig weiterwirkenden älteren Korrektur oder eines lokalen Messungsausschlusses zu verwenden. Sie macht den neuen Quellwert ab dem nächsten Datensatz-Snapshot wirksam und beendet den offenen Datenprüffall, ohne die für frühere Versionen gültigen Entscheidungen zu widerrufen; ein weiterhin auffälliger neuer Wert benötigt stattdessen eine Datenbestätigung.
+_Avoid_: Entscheidungswiderruf, Datenbestätigung eines unauffälligen Werts
+
+**Bevorzugte Datenkorrektur**:
+Die aktuelle, weder abgelöste noch widerrufene Datenkorrektur einer Quellmessungsversion. Frühere Korrekturen bleiben dauerhaft abgelöste Audit-Historie; wird die aktuelle Korrektur widerrufen, gilt wieder der Quellwert und ein weiterhin aktueller Datenprüffall öffnet sich erneut.
+_Avoid_: Korrekturstapel, automatisch wiederbelebte Korrektur
+
+**Entscheidungswiderruf**:
+Die bewusste, verpflichtend begründete Aufhebung einer früheren Benutzerentscheidung durch eine neue unveränderliche Auditentscheidung. Sie wirkt ausschließlich auf danach aufgelöste Datensatz-Snapshots; frühere Snapshots und Analysen bleiben unverändert reproduzierbar.
+_Avoid_: Löschen der Entscheidung, rückwirkende Änderung
+
 **Wirksamer Analysewert**:
-Der für eine konkrete Analyse gültige Wert: entweder der unveränderte importierte Wert oder dessen bevorzugte Datenkorrektur. Die jeweils verwendete Version muss reproduzierbar bleiben.
+Der für eine konkrete Analyse gültige Wert: entweder der unveränderte importierte Wert oder dessen bevorzugte Datenkorrektur. Ein offener Datenprüffall schließt ihn nicht aus, sondern macht damit berechnete Ergebnisse vorläufig; nur eine ausdrückliche Ausschlussentscheidung entfernt die Messung, und die jeweils verwendete Version bleibt reproduzierbar.
 _Avoid_: Rohwert, automatisch endgültiger Wert
 
 **Veraltetes Analyseergebnis**:
-Ein vorhandenes Ergebnis, dessen zugrunde liegende Daten nachträglich bestätigt oder korrigiert wurden. Es bleibt zur Nachvollziehbarkeit erhalten, darf aber nicht als aktuelles Ergebnis präsentiert werden.
+Ein vorhandenes Ergebnis, dessen Snapshot-Referenz nicht mit dem aktuell aktiven Datensatz-Snapshot übereinstimmt. Jede Veröffentlichung eines abweichenden aktiven Snapshots macht alle an den vorherigen Snapshot gebundenen Ergebnisse veraltet, unabhängig davon, ob sich Daten innerhalb ihres Analysezeitraums oder ihrer Datentypen geändert haben. „Aktuell“ oder „veraltet“ ist die aus der aktiven Snapshot-Referenz abgeleitete Aktualitätsdimension und bleibt unabhängig von Datenstatus und Modellreife. Das Ergebnis bleibt unverändert an seinen damaligen Datensatz-Snapshot gebunden und darf nicht als aktuell präsentiert werden.
 _Avoid_: aktuelles Ergebnis, gelöschter Modelllauf
 
+**Aktuelles Analyseergebnis**:
+Ein vorhandenes Ergebnis, dessen Snapshot-Referenz mit dem aktuell aktiven Datensatz-Snapshot übereinstimmt. Wird ein früherer unveränderlicher Snapshot bewusst wieder aktiviert, gelten seine daran gebundenen Ergebnisse erneut als aktuell; ihr gespeicherter Datenstatus und ihre Modellreife ändern sich dadurch nicht. Die Aktivierungshistorie der Snapshots hält die zwischenzeitliche Veraltung nachvollziehbar.
+_Avoid_: neuester Modelllauf unabhängig vom Snapshot, nachträglich neu berechnetes Ergebnis
+
 **Vorläufiges Analyseergebnis**:
-Ein Ergebnis, dessen Datensatz-Snapshot ungeprüfte Plausibilitätsauffälligkeiten oder unvollständig beobachtete Aktivitätstage enthält. Es darf angezeigt werden, muss seinen vorläufigen Status und die Gründe sichtbar tragen und kann nach Datenprüfung oder späterer Modellanpassung durch eine Neuberechnung abgelöst werden.
+Ein Ergebnis, dessen Datensatz-Snapshot einen beliebigen aktuell wirksamen offenen Datenprüffall enthält oder dessen ausgewählte Eingabedaten einen unvollständig beobachteten Aktivitätstag des verwendeten Datentyps und Zeitraums einschließen. Offene Datenprüffälle wirken unabhängig von Datentyp und Analysezeitraum global auf alle Ergebnisse des Snapshots; passive Abdeckungslücken wirken nur auf tatsächlich davon abhängige Ergebnisse. „Vorläufig“ oder „geprüft“ ist der Datenstatus und bleibt unabhängig von Aktualität und Modellreife. Das Ergebnis darf angezeigt werden, muss seinen vorläufigen Status und die Gründe sichtbar tragen und kann nach Datenprüfung oder späterer Modellanpassung durch eine Neuberechnung abgelöst werden. Ein späterer Snapshot ohne den Grund ändert den Datenstatus des alten Ergebnisses nicht; dieses bleibt vorläufig und wird zusätzlich veraltet.
 _Avoid_: bestätigtes Ergebnis, fehlerfreies Ergebnis
 
+**Geprüftes Analyseergebnis**:
+Ein Ergebnis, dessen Datensatz-Snapshot keine aktuell wirksamen offenen Datenprüffälle enthält und dessen ausgewählte Eingabedaten keine für den verwendeten Datentyp und Zeitraum festgestellte passive Abdeckungslücke einschließen. Der Datenstatus behauptet weder objektive Fehlerfreiheit noch statistische Belastbarkeit.
+_Avoid_: garantiert fehlerfreies Ergebnis, belastbares Analyseergebnis
+
 **Modellreifeprüfung**:
-Die modellspezifische Prüfung, ob Datenmenge, Vollständigkeit, Merkmalsabhängigkeiten, Schätzstabilität und Zeitreihendiagnostik eine belastbare Darstellung erlauben. Sie ersetzt eine starre Mindestzahl von Kalendertagen.
+Die modellspezifische Prüfung, ob Datenmenge, Vollständigkeit, Merkmalsabhängigkeiten, Schätzstabilität und Zeitreihendiagnostik eine belastbare Darstellung erlauben. Ihre verpflichtenden Kriterien und Schwellen gehören zur versionierten Analysedefinition und müssen für ein belastbares Ergebnis sämtlich bestanden sein. Eine spätere Analysedefinition klassifiziert frühere Ergebnisse nicht neu. Die Modellreifeprüfung ersetzt eine starre Mindestzahl von Kalendertagen und bleibt vom technischen Laufstatus getrennt.
 _Avoid_: pauschale 90-Tage-Regel, erfolgreiche Programmausführung
 
 **Exploratives Analyseergebnis**:
-Ein formal berechnetes Ergebnis, dessen Modellreifeprüfung nicht vollständig bestanden wurde. Es darf zur Untersuchung angezeigt werden, muss aber sichtbar von einem belastbaren Ergebnis unterschieden sein.
+Ein formal berechnetes Ergebnis, das mindestens ein verpflichtendes Kriterium der Modellreifeprüfung nicht bestanden hat. Ein nicht berechenbarer oder numerisch gescheiterter Modelllauf erzeugt dagegen kein exploratives Analyseergebnis. „Explorativ“ oder „belastbar“ ist die Modellreife und bleibt unabhängig von Aktualität und Datenstatus. Ein exploratives Ergebnis darf zur Untersuchung angezeigt werden, muss aber sichtbar von einem belastbaren Ergebnis unterschieden sein.
 _Avoid_: belastbares Ergebnis, fehlgeschlagener Modelllauf
 
 **Belastbares Analyseergebnis**:
-Ein Ergebnis, dessen festgelegte Modellreifeprüfung bestanden wurde. Der Status bezeichnet statistische Stabilität im definierten Modell und ist weder ein Kausalitäts- noch ein medizinischer Gültigkeitsnachweis.
+Ein Ergebnis, das sämtliche verpflichtenden Kriterien der mit seiner Analysedefinition versionierten Modellreifeprüfung bestanden hat. Seine Modellreife ist unabhängig von Aktualität und Datenstatus; ein belastbares Ergebnis kann deshalb beispielsweise aktuell und vorläufig oder veraltet und geprüft sein. Der Status bezeichnet statistische Stabilität im definierten Modell und ist weder ein Kausalitäts- noch ein medizinischer Gültigkeitsnachweis.
 _Avoid_: kausaler Nachweis, medizinische Aussage
 
 ### Quellenabdeckung

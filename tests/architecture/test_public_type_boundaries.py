@@ -1,8 +1,10 @@
 import inspect
-from dataclasses import FrozenInstanceError
+from collections.abc import Mapping
+from dataclasses import FrozenInstanceError, is_dataclass
+from enum import Enum
 from pathlib import Path
 from types import ModuleType
-from typing import Any, cast, get_args, get_type_hints
+from typing import Any, cast, get_args, get_origin, get_type_hints
 
 import pytest
 
@@ -11,6 +13,7 @@ import personal_health_lab.application as application
 import personal_health_lab.health_data as health_data
 import personal_health_lab.health_import as health_import
 import personal_health_lab.overview as overview_module
+import personal_health_lab.recovery as recovery
 import personal_health_lab.storage as storage
 import personal_health_lab.synthetic_export as synthetic_export
 from personal_health_lab.adapters import cli, dev_cli
@@ -21,6 +24,9 @@ from personal_health_lab.application import (
     OverviewSelection,
     OverviewStatus,
     RuntimeConfig,
+    WritePlanDetails,
+    WriteRequest,
+    WriteResult,
 )
 
 
@@ -61,6 +67,7 @@ def test_public_module_exports_are_fully_typed_without_any() -> None:
         health_data,
         health_import,
         overview_module,
+        recovery,
         storage,
         synthetic_export,
         cli,
@@ -78,6 +85,64 @@ def test_public_overview_values_are_immutable() -> None:
 
     with pytest.raises(FrozenInstanceError):
         overview.message = "verändert"  # type: ignore[misc]
+
+
+def test_public_application_values_are_immutable_and_storage_neutral() -> None:
+    projection_methods = (
+        "load_data_review",
+        "load_data_review_case",
+        "load_migration_diagnostics",
+        "load_overview",
+        "load_plausibility_rules",
+        "load_recovery_status",
+        "load_workspace_status",
+    )
+    request_values = set(get_args(WriteRequest))
+    public_values = set(get_args(WritePlanDetails) + get_args(WriteResult))
+    public_values.update(
+        get_type_hints(getattr(application.HealthLab, method))["return"]
+        for method in projection_methods
+    )
+    visited: set[tuple[object, bool]] = set()
+
+    def inspect_boundary(value: object, *, allow_input_path: bool = False) -> None:
+        visit = (value, allow_input_path)
+        if visit in visited:
+            return
+        visited.add(visit)
+        origin = get_origin(value)
+        if origin is not None:
+            assert origin not in {dict, list}
+            assert not (isinstance(origin, type) and issubclass(origin, Mapping))
+            for argument in get_args(value):
+                inspect_boundary(argument, allow_input_path=allow_input_path)
+            return
+        if value in {str, int, float, bool, bytes, type(None), Any}:
+            return
+        if not inspect.isclass(value):
+            return
+        assert value is not Path or allow_input_path
+        assert value.__module__.split(".", 1)[0] not in {
+            "duckdb",
+            "pandas",
+            "pyarrow",
+            "sqlite3",
+        }
+        assert value.__name__.lower() not in {"dataframe", "repository", "row", "table", "port"}
+        assert not value.__name__.endswith("Repository")
+        if issubclass(value, Enum):
+            return
+        if not value.__module__.startswith("personal_health_lab"):
+            return
+        assert is_dataclass(value), f"mutable or opaque public boundary value: {value}"
+        assert value.__dataclass_params__.frozen
+        for annotation in get_type_hints(value).values():
+            inspect_boundary(annotation, allow_input_path=allow_input_path)
+
+    for public_value in public_values:
+        inspect_boundary(public_value)
+    for request_value in request_values:
+        inspect_boundary(request_value, allow_input_path=True)
 
 
 def test_external_runtime_config_is_validated_at_runtime(tmp_path: Path) -> None:

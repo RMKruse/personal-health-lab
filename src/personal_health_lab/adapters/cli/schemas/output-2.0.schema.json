@@ -1,0 +1,938 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:personal-health-lab:cli-output:2.0",
+  "title": "HealthLab production CLI write output 2.0",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/writePlanOutput"
+    },
+    {
+      "$ref": "#/$defs/writeReceiptOutput"
+    },
+    {
+      "$ref": "#/$defs/dataReviewOutput"
+    },
+    {
+      "$ref": "#/$defs/plausibilityRulesOutput"
+    },
+    {
+      "$ref": "#/$defs/recoveryStatusOutput"
+    }
+  ],
+  "$defs": {
+    "nullableString": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "recoveryStatusOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "recovery", "runtime_config", "schema_version", "workspace"],
+      "properties": {
+        "kind": {"const": "recovery_status"},
+        "recovery": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["audit_max_position", "backup_id", "migration_steps", "original_backup_sha256", "restore_id", "source_schema_version", "status", "target_schema_version", "working_copy_sha256"],
+          "properties": {
+            "audit_max_position": {"type": "integer", "minimum": 0},
+            "backup_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+            "migration_steps": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "prefixItems": [{"type": "integer"}, {"type": "integer"}],
+                "items": false
+              }
+            },
+            "original_backup_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "restore_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+            "source_schema_version": {"type": "integer", "minimum": 1},
+            "status": {"const": "pending"},
+            "target_schema_version": {"type": "integer", "minimum": 1},
+            "working_copy_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        "runtime_config": {"$ref": "#/$defs/runtimeConfig"},
+        "schema_version": {"const": "2.0"},
+        "workspace": {"$ref": "#/$defs/workspace"}
+      }
+    },
+    "plausibilityRulesOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rules", "runtime_config", "schema_version"],
+      "properties": {
+        "rules": {"type": "array", "items": {"type": "object"}},
+        "runtime_config": {"$ref": "#/$defs/runtimeConfig"},
+        "schema_version": {"const": "2.0"}
+      }
+    },
+    "runtimeConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_import_compression_ratio",
+        "max_import_entries",
+        "max_import_entry_bytes",
+        "max_import_package_bytes",
+        "max_import_uncompressed_bytes",
+        "mode",
+        "real_store",
+        "schema_version",
+        "synthetic_store"
+      ],
+      "properties": {
+        "max_import_compression_ratio": {
+          "type": "number",
+          "minimum": 1
+        },
+        "max_import_entries": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_import_entry_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_import_package_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_import_uncompressed_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "mode": {
+          "enum": [
+            "synthetic",
+            "real"
+          ]
+        },
+        "real_store": {
+          "const": "<redacted>"
+        },
+        "schema_version": {
+          "const": "1.0"
+        },
+        "synthetic_store": {
+          "const": "<redacted>"
+        }
+      }
+    },
+    "dataReviewOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cases", "cycles", "runtime_config", "schema_version", "selection", "snapshot_ref", "status"],
+      "properties": {
+        "cases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["allowed_actions", "candidate_version_ids", "case_id", "detail", "evidence_fingerprint", "kind", "logical_measurement_id", "measurement_version_id", "rule_version_id"],
+            "properties": {
+              "allowed_actions": {
+                "type": "array",
+                "items": {"enum": ["confirm", "correct", "exclude_local", "accept_source", "reject", "prefer", "split"]}
+              },
+              "candidate_version_ids": {
+                "type": "array",
+                "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+              },
+              "case_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+              "detail": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["canonical_unit", "effective_value", "effective_value_source", "measured_at", "reasons", "source_type"],
+                "properties": {
+                  "canonical_unit": {"enum": ["kcal", "count/min", null]},
+                  "effective_value": {"type": ["number", "null"]},
+                  "effective_value_source": {"enum": ["source", "correction", "none", null]},
+                  "measured_at": {"$ref": "#/$defs/nullableString"},
+                  "reasons": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["code", "lower_bound", "upper_bound", "unit"],
+                      "properties": {
+                        "code": {"enum": ["below_fixed_lower_bound", "above_fixed_upper_bound", "below_personal_lower_bound", "above_personal_upper_bound"]},
+                        "lower_bound": {"type": "number"},
+                        "upper_bound": {"type": ["number", "null"]},
+                        "unit": {"type": "string"}
+                      }
+                    }
+                  },
+                  "source_type": {"$ref": "#/$defs/nullableString"}
+                }
+              },
+              "evidence_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "kind": {"enum": ["plausibility", "continued_override", "rule_definition", "suspected_source_deletion", "source_conflict"]},
+              "logical_measurement_id": {"$ref": "#/$defs/nullableString"},
+              "measurement_version_id": {"$ref": "#/$defs/nullableString"},
+              "rule_version_id": {"$ref": "#/$defs/nullableString"}
+            }
+          }
+        },
+        "cycles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["base_snapshot_ref", "cycle_id", "end_date", "kind", "open_case_count", "rule_version_id", "snapshot_ref", "start_date", "status"],
+            "properties": {
+              "base_snapshot_ref": {"$ref": "#/$defs/nullableString"},
+              "cycle_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+              "end_date": {"$ref": "#/$defs/nullableString"},
+              "kind": {"enum": ["import", "rule_version", "historical"]},
+              "open_case_count": {"type": "integer", "minimum": 0},
+              "rule_version_id": {"$ref": "#/$defs/nullableString"},
+              "snapshot_ref": {"type": "string"},
+              "start_date": {"$ref": "#/$defs/nullableString"},
+              "status": {"enum": ["open", "closed"]}
+            }
+          }
+        },
+        "runtime_config": {"$ref": "#/$defs/runtimeConfig"},
+        "schema_version": {"const": "2.0"},
+        "selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {"kind": {"type": ["string", "null"]}}
+        },
+        "snapshot_ref": {"$ref": "#/$defs/nullableString"},
+        "status": {"enum": ["reviewed", "provisional"]}
+      }
+    },
+    "writeApproval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "ready",
+            "confirmation_required",
+            "blocked"
+          ]
+        }
+      }
+    },
+    "fileVaultCheck": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "reason",
+            "status",
+            "target_volume"
+          ],
+          "properties": {
+            "reason": {
+              "enum": [
+                null,
+                "unsupported_platform",
+                "mount_unresolved",
+                "disk_info_unavailable",
+                "volume_identity_missing",
+                "volume_locked",
+                "apfs_state_unavailable",
+                "filevault_state_unavailable",
+                "filevault_state_unreported",
+                "encryption_state_unconfirmed",
+                "probe_failed"
+              ]
+            },
+            "status": {
+              "enum": [
+                "protected",
+                "unprotected",
+                "transitioning",
+                "unknown"
+              ]
+            },
+            "target_volume": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "capacityCheck": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "available_bytes",
+            "estimate_bytes",
+            "fragment_size",
+            "method_id",
+            "minimum_remaining_bytes",
+            "reason",
+            "required_bytes",
+            "safety_margin_bytes",
+            "status",
+            "target_volume"
+          ],
+          "properties": {
+            "available_bytes": {"type": ["integer", "null"], "minimum": 0},
+            "estimate_bytes": {"type": ["integer", "null"], "minimum": 0},
+            "fragment_size": {"type": ["integer", "null"], "minimum": 1},
+            "method_id": {"enum": ["cow-migration/v1", "full-snapshot-import/v1", "metadata-backup/v1", "restore-activate/v1", "restore-source-import/v1", "restore-start/v1"]},
+            "minimum_remaining_bytes": {"type": "integer", "minimum": 0},
+            "reason": {
+              "enum": [
+                null,
+                "estimate_unknown",
+                "space_unknown",
+                "target_read_only",
+                "target_unwritable"
+              ]
+            },
+            "required_bytes": {"type": ["integer", "null"], "minimum": 0},
+            "safety_margin_bytes": {"type": ["integer", "null"], "minimum": 0},
+            "status": {"enum": ["ready", "insufficient", "unknown", "unwritable"]},
+            "target_volume": {"type": "string", "pattern": "^(volume-[0-9a-f]{12}|unresolved)$"}
+          }
+        }
+      ]
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "allowed_reads",
+        "allowed_writes",
+        "mode",
+        "person_binding",
+        "state",
+        "store_id"
+      ],
+      "properties": {
+        "allowed_reads": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "allowed_writes": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "mode": {
+          "enum": ["synthetic", "real"]
+        },
+        "person_binding": {
+          "enum": ["unbound", "bound", "pending"]
+        },
+        "state": {
+          "enum": ["ready", "migration_required", "restore_pending"]
+        },
+        "store_id": {
+          "$ref": "#/$defs/nullableString"
+        }
+      }
+    },
+    "importResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "anomaly_count",
+        "diagnostics",
+        "import_id",
+        "logical_measurement_count",
+        "measurement_version_count",
+        "source_occurrence_count",
+        "package_hash",
+        "package_record_count",
+        "record_count",
+        "snapshot_ref",
+        "status",
+        "type"
+      ],
+      "properties": {
+        "anomaly_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "import_id": {
+          "type": "string"
+        },
+        "logical_measurement_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "measurement_version_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source_occurrence_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "package_hash": {
+          "type": "string"
+        },
+        "package_record_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "record_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "snapshot_ref": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "status": {
+          "enum": [
+            "committed",
+            "duplicate",
+            "rejected",
+            "quarantined",
+            "restore_pending"
+          ]
+        },
+        "type": {
+          "const": "import_health_export"
+        }
+      }
+    },
+    "writeNotStarted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "diagnostics",
+        "status",
+        "type"
+      ],
+      "properties": {
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "status": {
+          "enum": [
+            "plan_changed",
+            "blocked",
+            "store_busy"
+          ]
+        },
+        "type": {
+          "const": "write_not_started"
+        }
+      }
+    },
+    "plausibilityRuleResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["diagnostics", "rule_version_id", "snapshot_ref", "status", "type"],
+      "properties": {
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "rule_version_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "snapshot_ref": {"$ref": "#/$defs/nullableString"},
+        "status": {"const": "committed"},
+        "type": {"const": "create_plausibility_rule_version"}
+      }
+    },
+    "dataReviewDecisionResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decision_id", "diagnostics", "snapshot_ref", "status", "type"],
+      "properties": {
+        "decision_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "snapshot_ref": {"type": "string"},
+        "status": {"const": "committed"},
+        "type": {"const": "data_review_decision"}
+      }
+    },
+    "dataReviewBatchResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["batch_action_id", "decision_ids", "diagnostics", "snapshot_ref", "status", "type"],
+      "properties": {
+        "batch_action_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "decision_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[0-9a-f]{32}$"}
+        },
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "snapshot_ref": {"type": "string"},
+        "status": {"const": "committed"},
+        "type": {"const": "data_review_batch"}
+      }
+    },
+    "historicalReviewResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cycle_id", "diagnostics", "open_case_count", "snapshot_ref", "status", "type"],
+      "properties": {
+        "cycle_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "open_case_count": {"type": "integer", "minimum": 0},
+        "snapshot_ref": {"type": "string"},
+        "status": {"const": "committed"},
+        "type": {"const": "run_historical_review"}
+      }
+    },
+    "restingHeartRateAnalysisResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["analysis", "analysis_definition_id", "analysis_run_id", "diagnostics", "model_maturity", "provenance", "result_ref", "snapshot_ref", "status", "type"],
+      "properties": {
+        "analysis": {"type": ["object", "null"]},
+        "analysis_definition_id": {"type": "string"},
+        "analysis_run_id": {"type": "string"},
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "model_maturity": {"enum": ["exploratory", "robust", null]},
+        "provenance": {"type": ["object", "null"]},
+        "result_ref": {"$ref": "#/$defs/nullableString"},
+        "snapshot_ref": {"$ref": "#/$defs/nullableString"},
+        "status": {"enum": ["completed", "reused", "insufficient_data", "unstable"]},
+        "type": {"const": "run_resting_heart_rate_analysis"}
+      }
+    },
+    "storeMigrationResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backup_file", "diagnostics", "source_version", "status", "steps", "target_version", "type"],
+      "properties": {
+        "backup_file": {"$ref": "#/$defs/nullableString"},
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "source_version": {"type": "integer", "minimum": 1},
+        "status": {"enum": ["completed", "no_op"]},
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [{"type": "integer"}, {"type": "integer"}],
+            "items": false
+          }
+        },
+        "target_version": {"type": "integer", "minimum": 1},
+        "type": {"const": "migrate_store"}
+      }
+    },
+    "migrationRollbackResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backup_file", "diagnostics", "migration_operation_id", "restored_snapshot_ref", "source_version", "status", "target_version", "type", "unreferenced_snapshot_ref"],
+      "properties": {
+        "backup_file": {"type": "string"},
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "migration_operation_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "restored_snapshot_ref": {"$ref": "#/$defs/nullableString"},
+        "source_version": {"type": "integer", "minimum": 1},
+        "status": {"const": "completed"},
+        "target_version": {"type": "integer", "minimum": 1},
+        "type": {"const": "rollback_migration"},
+        "unreferenced_snapshot_ref": {"$ref": "#/$defs/nullableString"}
+      }
+    },
+    "metadataRestoreResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backup_id", "diagnostics", "original_backup_sha256", "restore_id", "status", "type", "working_copy_sha256"],
+      "properties": {
+        "backup_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "diagnostics": {"type": "array", "items": {"type": "string"}},
+        "original_backup_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "restore_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "status": {"enum": ["pending", "aborted", "no_op"]},
+        "type": {"const": "metadata_restore"},
+        "working_copy_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "writePlanOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approval",
+        "confirmations",
+        "details",
+        "diagnostics",
+        "fingerprint",
+        "kind",
+        "preflight",
+        "request",
+        "runtime_config",
+        "schema_version",
+        "workspace"
+      ],
+      "properties": {
+        "approval": {
+          "$ref": "#/$defs/writeApproval"
+        },
+        "confirmations": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "real_import_same_person",
+              "filevault_unprotected",
+              "filevault_transitioning",
+              "filevault_unknown",
+              "metadata_backup_point_in_time",
+              "metadata_restore",
+              "store_migration",
+              "migration_rollback"
+            ]
+          }
+        },
+        "details": {
+          "oneOf": [
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["package_hash", "package_size", "type"],
+              "properties": {
+                "package_hash": {"type": "string"},
+                "package_size": {"type": "integer", "minimum": 0},
+                "type": {"const": "import_health_export"}
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["audit_max_position", "backup_id", "migration_steps", "original_backup_sha256", "restore_id", "source_schema_version", "source_store_id", "target_schema_version", "type", "working_copy_sha256"],
+              "properties": {
+                "audit_max_position": {"type": ["integer", "null"], "minimum": 0},
+                "backup_id": {"$ref": "#/$defs/nullableString"},
+                "migration_steps": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "prefixItems": [{"type": "integer"}, {"type": "integer"}],
+                    "items": false
+                  }
+                },
+                "original_backup_sha256": {"$ref": "#/$defs/nullableString"},
+                "restore_id": {"$ref": "#/$defs/nullableString"},
+                "source_schema_version": {"type": ["integer", "null"], "minimum": 1},
+                "source_store_id": {"$ref": "#/$defs/nullableString"},
+                "target_schema_version": {"type": "integer", "minimum": 1},
+                "type": {"const": "begin_metadata_restore"},
+                "working_copy_sha256": {"$ref": "#/$defs/nullableString"}
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["backup_id", "restore_id", "type"],
+              "properties": {
+                "backup_id": {"$ref": "#/$defs/nullableString"},
+                "restore_id": {"$ref": "#/$defs/nullableString"},
+                "type": {"const": "abort_metadata_restore"}
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["active_snapshot_ref", "previous_version_id", "proposed_version_id", "type"],
+              "properties": {
+                "active_snapshot_ref": {"$ref": "#/$defs/nullableString"},
+                "previous_version_id": {"$ref": "#/$defs/nullableString"},
+                "proposed_version_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "type": {"const": "create_plausibility_rule_version"}
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["active_snapshot_ref", "case_id", "type"],
+              "properties": {
+                "active_snapshot_ref": {"$ref": "#/$defs/nullableString"},
+                "case_id": {"$ref": "#/$defs/nullableString"},
+                "type": {"const": "data_review_decision"}
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["active_snapshot_ref", "count", "matches", "selection", "type"],
+              "properties": {
+                "active_snapshot_ref": {"$ref": "#/$defs/nullableString"},
+                "count": {"type": "integer", "minimum": 0},
+                "matches": {
+                  "type": "array",
+                  "items": {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["canonical_unit", "case_id", "effective_value", "evidence_fingerprint", "kind", "measurement_version_id", "rule_version_id"],
+                    "properties": {
+                      "canonical_unit": {"type": ["string", "null"]},
+                      "case_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                      "effective_value": {"type": ["number", "null"]},
+                      "evidence_fingerprint": {"type": "string"},
+                      "kind": {"type": "string"},
+                      "measurement_version_id": {"$ref": "#/$defs/nullableString"},
+                      "rule_version_id": {"$ref": "#/$defs/nullableString"}
+                    }
+                  }
+                },
+                "selection": {
+                  "type": "object", "additionalProperties": false,
+                  "required": ["kind"],
+                  "properties": {"kind": {"type": ["string", "null"]}}
+                },
+                "type": {"const": "confirm_data_review_batch"}
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["active_snapshot_ref", "batch_action_id", "count", "decision_ids", "type"],
+              "properties": {
+                "active_snapshot_ref": {"$ref": "#/$defs/nullableString"},
+                "batch_action_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                "count": {"type": "integer", "minimum": 0},
+                "decision_ids": {"type": "array", "items": {"type": "string", "pattern": "^[0-9a-f]{32}$"}},
+                "type": {"const": "revoke_data_review_batch"}
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["base_snapshot_ref", "end_date", "rule_version_id", "start_date", "type"],
+              "properties": {
+                "base_snapshot_ref": {"$ref": "#/$defs/nullableString"},
+                "end_date": {"type": "string"},
+                "rule_version_id": {"type": "string"},
+                "start_date": {"type": "string"},
+                "type": {"const": "run_historical_review"}
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["analysis_definition_id", "base_snapshot_ref", "end_date", "schema_version", "start_date", "type"],
+              "properties": {
+                "analysis_definition_id": {"type": "string"},
+                "base_snapshot_ref": {"$ref": "#/$defs/nullableString"},
+                "end_date": {"$ref": "#/$defs/nullableString"},
+                "schema_version": {"const": "1.0"},
+                "start_date": {"$ref": "#/$defs/nullableString"},
+                "type": {"const": "run_resting_heart_rate_analysis"}
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["affected_snapshot_refs", "backup_file", "existing_analyses_become_stale", "source_version", "steps", "target_version", "type"],
+              "properties": {
+                "affected_snapshot_refs": {"type": "array", "items": {"type": "string"}},
+                "backup_file": {"$ref": "#/$defs/nullableString"},
+                "existing_analyses_become_stale": {"type": "boolean"},
+                "source_version": {"type": ["integer", "null"]},
+                "steps": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "prefixItems": [{"type": "integer"}, {"type": "integer"}],
+                    "items": false
+                  }
+                },
+                "target_version": {"type": "integer", "minimum": 1},
+                "type": {"const": "migrate_store"}
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["backup_file", "backup_sha256", "current_snapshot_ref", "migration_operation_id", "restored_snapshot_ref", "source_version", "target_version", "type"],
+              "properties": {
+                "backup_file": {"$ref": "#/$defs/nullableString"},
+                "backup_sha256": {"$ref": "#/$defs/nullableString"},
+                "current_snapshot_ref": {"$ref": "#/$defs/nullableString"},
+                "migration_operation_id": {"$ref": "#/$defs/nullableString"},
+                "restored_snapshot_ref": {"$ref": "#/$defs/nullableString"},
+                "source_version": {"type": ["integer", "null"]},
+                "target_version": {"type": ["integer", "null"]},
+                "type": {"const": "rollback_migration"}
+              }
+            }
+          ]
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "fingerprint": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "kind": {
+          "const": "write_plan"
+        },
+        "preflight": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["capacity", "filevault"],
+          "properties": {
+            "capacity": {"$ref": "#/$defs/capacityCheck"},
+            "filevault": {"$ref": "#/$defs/fileVaultCheck"}
+          }
+        },
+        "request": {
+          "oneOf": [
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["package", "type"],
+              "properties": {
+                "package": {"const": "<redacted>"},
+                "type": {"const": "import_health_export"}
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["backup", "type"],
+              "properties": {
+                "backup": {"const": "<redacted>"},
+                "type": {"const": "begin_metadata_restore"}
+              }
+            },
+            {
+              "type": "object", "additionalProperties": false,
+              "required": ["type"],
+              "properties": {
+                "type": {"enum": ["abort_metadata_restore", "confirm_data_review_batch", "create_plausibility_rule_version", "data_review_decision", "migrate_store", "rollback_migration", "revoke_data_review_batch", "run_historical_review", "run_resting_heart_rate_analysis"]}
+              }
+            }
+          ]
+        },
+        "runtime_config": {
+          "$ref": "#/$defs/runtimeConfig"
+        },
+        "schema_version": {
+          "const": "2.0"
+        },
+        "workspace": {
+          "$ref": "#/$defs/workspace"
+        }
+      }
+    },
+    "writeReceiptOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "diagnostics",
+        "final_preflight",
+        "kind",
+        "operation_id",
+        "plan_fingerprint",
+        "result",
+        "runtime_config",
+        "schema_version"
+      ],
+      "properties": {
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "final_preflight": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "approval",
+            "confirmations",
+            "capacity",
+            "diagnostics",
+            "filevault"
+          ],
+          "properties": {
+            "approval": {
+              "$ref": "#/$defs/writeApproval"
+            },
+            "confirmations": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "real_import_same_person",
+                  "filevault_unprotected",
+                  "filevault_transitioning",
+                  "filevault_unknown",
+                  "metadata_backup_point_in_time",
+                  "metadata_restore",
+                  "store_migration",
+                  "migration_rollback"
+                ]
+              }
+            },
+            "diagnostics": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "capacity": {
+              "$ref": "#/$defs/capacityCheck"
+            },
+            "filevault": {
+              "$ref": "#/$defs/fileVaultCheck"
+            }
+          }
+        },
+        "kind": {
+          "const": "write_receipt"
+        },
+        "operation_id": {
+          "type": "string"
+        },
+        "plan_fingerprint": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "result": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/importResult"
+            },
+            {
+              "$ref": "#/$defs/writeNotStarted"
+            },
+            {
+              "$ref": "#/$defs/plausibilityRuleResult"
+            },
+            {
+              "$ref": "#/$defs/dataReviewDecisionResult"
+            },
+            {
+              "$ref": "#/$defs/dataReviewBatchResult"
+            },
+            {
+              "$ref": "#/$defs/historicalReviewResult"
+            },
+            {
+              "$ref": "#/$defs/restingHeartRateAnalysisResult"
+            },
+            {
+              "$ref": "#/$defs/storeMigrationResult"
+            },
+            {
+              "$ref": "#/$defs/migrationRollbackResult"
+            },
+            {
+              "$ref": "#/$defs/metadataRestoreResult"
+            }
+          ]
+        },
+        "runtime_config": {
+          "$ref": "#/$defs/runtimeConfig"
+        },
+        "schema_version": {
+          "const": "2.0"
+        }
+      }
+    }
+  }
+}

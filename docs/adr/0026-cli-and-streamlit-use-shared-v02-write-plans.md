@@ -1,0 +1,3 @@
+# CLI und Streamlit verwenden gemeinsame V0.2-Schreibpläne
+
+Jede V0.2-Schreiboperation wird unabhängig vom Freigabestatus über denselben typisierten Vorschau- und Ausführungsvertrag des Anwendungsmoduls angeboten, damit CLI und Streamlit weder Zulässigkeit noch Bestätigungen, Diagnosen oder Wirkungen selbst bestimmen. Die interaktive CLI bestätigt innerhalb eines Aufrufs, die zustandslose JSON-Variante wiederholt ihre Argumente mit einem neu geprüften Plan-Fingerprint, und Streamlit verwirft seine inline dargestellte Vorschau beim Seitenwechsel; dadurch bleiben Adapter fachlich gleichwertig, ohne persistente Planwarteschlange.

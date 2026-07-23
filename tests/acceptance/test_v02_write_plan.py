@@ -1,0 +1,789 @@
+from __future__ import annotations
+
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import tomllib
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
+
+import pytest
+
+from personal_health_lab.application import (
+    CapacityCheck,
+    CapacityReason,
+    CapacityStatus,
+    DataMode,
+    FileVaultCheck,
+    FileVaultReason,
+    FileVaultStatus,
+    HealthLab,
+    HealthLabError,
+    ImportHealthExport,
+    ImportReceipt,
+    ImportStatus,
+    OverviewSelection,
+    PersonBindingStatus,
+    PlanFingerprint,
+    RuntimeConfig,
+    WriteApprovalStatus,
+    WriteNotStarted,
+    WriteNotStartedStatus,
+)
+from personal_health_lab.storage import (
+    LocalStore,
+    StoreError,
+    full_snapshot_import_estimate,
+    probe_capacity,
+)
+
+MATRIX_PATH = Path(__file__).with_name("v02_matrix.toml")
+EXPECTED_CONTRACT_GROUPS = {
+    "ADP": 4,
+    "API": 7,
+    "ARC": 3,
+    "BAK": 4,
+    "ERR": 4,
+    "MIG": 7,
+    "PRE": 8,
+    "RES": 5,
+    "REV": 8,
+    "RST": 6,
+    "RULE": 8,
+    "SRC": 7,
+    "STO": 6,
+}
+EXPECTED_CASE_GROUPS = {
+    "ADP": 11,
+    "API": 23,
+    "ARC": 7,
+    "BAK": 10,
+    "ERR": 11,
+    "MIG": 20,
+    "PRE": 34,
+    "RES": 15,
+    "REV": 26,
+    "RST": 18,
+    "RULE": 28,
+    "SRC": 24,
+    "STO": 18,
+}
+
+
+def _matrix() -> dict[str, object]:
+    with MATRIX_PATH.open("rb") as source:
+        return tomllib.load(source)
+
+
+def _cases_for(runner: str) -> list[dict[str, object]]:
+    return [case for case in _matrix()["case"] if case["runner"] == runner]
+
+
+def _validate_matrix(matrix: dict[str, object]) -> None:
+    assert matrix["schema_version"] == 1
+    assert matrix["release"] == "v0.2"
+    sections = {
+        name: matrix.get(name, []) for name in ("contract", "fixture", "fault_point", "case")
+    }
+    all_ids: list[str] = []
+    for rows in sections.values():
+        assert isinstance(rows, list)
+        all_ids.extend(row["id"] for row in rows)
+    assert len(all_ids) == len(set(all_ids)), "duplicate V0.2 matrix ID"
+
+    contract_ids = {row["id"] for row in sections["contract"]}
+    fixture_ids = {row["id"] for row in sections["fixture"]}
+    fault_point_ids = {row["id"] for row in sections["fault_point"]}
+    registered_cases = {row["id"]: row["runner"] for row in sections["case"]}
+    assert contract_ids == {
+        f"V02-C-{group}-{number:03d}"
+        for group, count in EXPECTED_CONTRACT_GROUPS.items()
+        for number in range(1, count + 1)
+    }
+    assert set(registered_cases) == {
+        f"V02-A-{group}-{number:03d}"
+        for group, count in EXPECTED_CASE_GROUPS.items()
+        for number in range(1, count + 1)
+    }
+    assert contract_ids == {
+        contract_id
+        for case in sections["case"]
+        for contract_id in case["contracts"]
+    }, "uncovered V0.2 contract"
+    assert all(
+        len(fixture["sha256"]) == 64 and set(fixture["sha256"]) <= set("0123456789abcdef")
+        for fixture in sections["fixture"]
+    )
+    inline_fixture_prefixes = (
+        "V02-F-SYS-CAPACITY",
+        "V02-F-SYS-ALLOC",
+        "V02-F-SYS-ENOSPC",
+        "V02-F-SYS-UNWRITABLE",
+    )
+    for fixture in sections["fixture"]:
+        if fixture["id"].startswith(inline_fixture_prefixes):
+            assert hashlib.sha256(fixture["parameters"].encode()).hexdigest() == fixture["sha256"]
+    assert fault_point_ids == {
+        fault_point
+        for case in sections["case"]
+        for fault_point in case.get("fault_points", ())
+    }, "uncovered V0.2 fault point"
+    required_case_fields = {
+        "id",
+        "contracts",
+        "fixtures",
+        "runner",
+        "initial_state",
+        "operation",
+        "level",
+        "expected_result",
+        "expected_effect",
+        "forbidden_side_effects",
+    }
+    for case in sections["case"]:
+        assert required_case_fields <= case.keys(), f"incomplete case row {case['id']}"
+        assert set(case["contracts"]) <= contract_ids, f"invalid contract reference in {case['id']}"
+        assert set(case["fixtures"]) <= fixture_ids, f"invalid fixture reference in {case['id']}"
+        assert set(case.get("fault_points", ())) <= fault_point_ids, (
+            f"invalid fault-point reference in {case['id']}"
+        )
+
+
+def _package(
+    path: Path, value: int = 60, *, record_count: int = 1, input_bytes: int | None = None
+) -> Path:
+    if record_count == 1 and input_bytes is None:
+        records = [
+            '<Record type="HKQuantityTypeIdentifierRestingHeartRate" '
+            'sourceName="Test Watch" sourceVersion="1" device="Test Device" '
+            'unit="count/min" creationDate="2024-01-01 07:01:00 +0100" '
+            'startDate="2024-01-01 07:00:00 +0100" '
+            f'endDate="2024-01-01 07:01:00 +0100" value="{value}"/>'
+        ]
+    else:
+        records = []
+    start = datetime(2024, 1, 1, 7, tzinfo=UTC)
+    for index in range(len(records), record_count):
+        record_start = start + timedelta(minutes=index)
+        record_end = record_start + timedelta(minutes=1)
+        records.append(
+            '<Record type="HKQuantityTypeIdentifierRestingHeartRate" '
+            'sourceName="Test Watch" sourceVersion="1" device="Test Device" '
+            'unit="count/min" '
+            f'creationDate="{record_end:%Y-%m-%d %H:%M:%S} +0000" '
+            f'startDate="{record_start:%Y-%m-%d %H:%M:%S} +0000" '
+            f'endDate="{record_end:%Y-%m-%d %H:%M:%S} +0000" '
+            f'value="{value + index % 10}"/>'
+        )
+    xml = f'<?xml version="1.0"?><HealthData>{"".join(records)}</HealthData>'
+    if input_bytes is not None:
+        padding = input_bytes - len(xml.encode())
+        if padding < 7:
+            raise ValueError("input_bytes is too small for the generated fixture")
+        payload = hashlib.shake_256(str(path).encode()).hexdigest((padding + 1) // 2)[
+            : padding - 7
+        ]
+        xml = xml.replace("</HealthData>", f"<!--{payload}--></HealthData>")
+        assert len(xml.encode()) == input_bytes
+    export = ZipInfo("apple_health_export/export.xml", date_time=(1980, 1, 1, 0, 0, 0))
+    export.compress_type = ZIP_DEFLATED
+    with ZipFile(path, "w") as archive:
+        archive.writestr(export, xml)
+    return path
+
+
+def _config(tmp_path: Path) -> RuntimeConfig:
+    return RuntimeConfig(
+        mode=DataMode.SYNTHETIC,
+        synthetic_store=tmp_path / "synthetic-store",
+        real_store=tmp_path / "real-store",
+    )
+
+
+def _store_files(root: Path) -> dict[Path, bytes]:
+    return {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+
+def test_v02_matrix_is_well_formed_and_fully_registered() -> None:
+    _validate_matrix(_matrix())
+
+
+def test_import_plan_includes_full_snapshot_capacity(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    request = ImportHealthExport(_package(tmp_path / "health.zip"))
+
+    with HealthLab.open(config) as health_lab:
+        plan = health_lab.preview_write(request)
+
+    assert plan.preflight.capacity.method_id == "full-snapshot-import/v1"
+    assert plan.preflight.capacity.estimate_bytes > 0
+    assert plan.preflight.capacity.required_bytes > plan.preflight.capacity.estimate_bytes
+    assert plan.preflight.capacity.target_volume.startswith("volume-")
+
+
+def test_import_capacity_uses_the_hard_exact_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    estimate = full_snapshot_import_estimate(776_061, 294_403, 4096)
+    assert estimate is not None
+    required = estimate + max((estimate + 3) // 4, 256 * 1024**2) + 1024**3
+    available = required
+    monkeypatch.setattr(os, "access", lambda path, mode: True)
+    monkeypatch.setattr(
+        os,
+        "statvfs",
+        lambda path: SimpleNamespace(
+            f_bavail=available,
+            f_frsize=1,
+            f_flag=0,
+        ),
+    )
+
+    exact = probe_capacity(tmp_path, estimate)
+    available -= 1
+    short = probe_capacity(tmp_path, estimate)
+    unknown = probe_capacity(tmp_path, None)
+
+    assert exact.status is CapacityStatus.READY
+    assert exact.required_bytes == required
+    assert short.status is CapacityStatus.INSUFFICIENT
+    assert unknown.status is CapacityStatus.UNKNOWN
+    assert unknown.reason is CapacityReason.ESTIMATE_UNKNOWN
+
+
+def test_import_capacity_public_plan_states(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    request = ImportHealthExport(_package(tmp_path / "health.zip"))
+    available = 0
+
+    def controlled_statvfs(path: Path) -> SimpleNamespace:
+        return SimpleNamespace(f_bavail=available, f_frsize=1, f_flag=0)
+
+    with HealthLab.open(config) as health_lab:
+        initial = health_lab.preview_write(request)
+        estimate = full_snapshot_import_estimate(
+            initial.details.input_bytes,
+            0,
+            1,
+            record_count=initial.details.record_count,
+        )
+        assert estimate is not None
+        required = estimate + max((estimate + 3) // 4, 256 * 1024**2) + 1024**3
+        available = required
+        monkeypatch.setattr(os, "access", lambda path, mode: True)
+        monkeypatch.setattr(os, "statvfs", controlled_statvfs)
+
+        exact = health_lab.preview_write(request)
+        available -= 1
+        short = health_lab.preview_write(request)
+        monkeypatch.setattr(os, "statvfs", lambda path: (_ for _ in ()).throw(OSError()))
+        unknown_space = health_lab.preview_write(request)
+        monkeypatch.setattr(os, "statvfs", controlled_statvfs)
+        monkeypatch.setattr(
+            "personal_health_lab.storage._store.full_snapshot_import_estimate",
+            lambda *args, **kwargs: None,
+        )
+        unknown_estimate = health_lab.preview_write(request)
+
+    assert exact.approval.status is WriteApprovalStatus.READY
+    assert short.approval.status is WriteApprovalStatus.BLOCKED
+    assert unknown_space.approval.status is WriteApprovalStatus.BLOCKED
+    assert unknown_space.preflight.capacity.reason is CapacityReason.SPACE_UNKNOWN
+    assert unknown_estimate.approval.status is WriteApprovalStatus.BLOCKED
+    assert unknown_estimate.preflight.capacity.reason is CapacityReason.ESTIMATE_UNKNOWN
+
+
+def test_full_snapshot_import_v1_formula_contract(tmp_path: Path) -> None:
+    normal = full_snapshot_import_estimate(776_061, 294_403, 4096, record_count=730)
+    stress = full_snapshot_import_estimate(
+        776_061 * 8, 294_403 * 8, 4096, record_count=730 * 8
+    )
+
+    assert normal == 6_934_528
+    assert stress == 54_968_320
+    assert full_snapshot_import_estimate(1, 0, 4096, writer_bound=False) is None
+    assert full_snapshot_import_estimate(1, 0, 4096, scratch_bound=False) is None
+
+    config = _config(tmp_path)
+    request = ImportHealthExport(_package(tmp_path / "method.zip"))
+    with HealthLab.open(config) as health_lab:
+        plan = health_lab.preview_write(request)
+    assert plan.preflight.capacity.method_id == "full-snapshot-import/v1"
+
+
+def test_full_snapshot_import_requires_writer_and_scratch_bounds(
+    tmp_path: Path,
+) -> None:
+    store = LocalStore.open_writer(tmp_path / "store", DataMode.SYNTHETIC)
+    try:
+        temporary = store._query.execute(
+            "SELECT current_setting('temp_directory')"
+        ).fetchone()
+        bound = store.preflight_full_snapshot_import(1024, 1)
+        store._scratch_bound = False
+        unbound_scratch = store.preflight_full_snapshot_import(1024, 1)
+        unbound_writer = store.preflight_full_snapshot_import(1024, 1, writer_bound=False)
+    finally:
+        store.close()
+
+    assert bound.method_id == "full-snapshot-import/v1"
+    assert temporary == (str(tmp_path / "store" / ".duckdb-temp"),)
+    assert bound.estimate_bytes is not None
+    assert unbound_scratch.status is CapacityStatus.UNKNOWN
+    assert unbound_scratch.reason is CapacityReason.ESTIMATE_UNKNOWN
+    assert unbound_writer.status is CapacityStatus.UNKNOWN
+    assert unbound_writer.reason is CapacityReason.ESTIMATE_UNKNOWN
+
+
+def _allocated_tree(root: Path) -> int:
+    return sum(
+        path.stat().st_blocks * 512
+        for path in (root, *root.rglob("*"))
+        if path.exists()
+    )
+
+
+@pytest.mark.parametrize("factor", (1, 8), ids=("normal", "stress"))
+def test_full_snapshot_import_v1_measures_real_writer_phases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factor: int
+) -> None:
+    config = _config(tmp_path)
+    base = _package(
+        tmp_path / "base.zip",
+        record_count=128 * factor,
+        input_bytes=294_403 * factor,
+    )
+    candidate = _package(
+        tmp_path / "candidate.zip",
+        70,
+        record_count=256 * factor,
+        input_bytes=776_061 * factor,
+    )
+
+    with HealthLab.open(config) as health_lab:
+        base_plan = health_lab.preview_write(ImportHealthExport(base))
+        base_receipt = health_lab.execute_write(
+            ImportHealthExport(base), expected_plan=base_plan.fingerprint
+        )
+        assert isinstance(base_receipt.result, ImportReceipt)
+
+        request = ImportHealthExport(candidate)
+        plan = health_lab.preview_write(request)
+        baseline = _allocated_tree(config.active_store)
+        phases: dict[str, int] = {}
+
+        def measure(root: Path, phase: str) -> None:
+            phases[phase] = max(0, _allocated_tree(root) - baseline)
+
+        monkeypatch.setattr(
+            "personal_health_lab.storage._store._allocation_checkpoint", measure
+        )
+        receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+
+    assert isinstance(receipt.result, ImportReceipt)
+    assert receipt.result.status is ImportStatus.COMMITTED
+    assert set(phases) == {"combined", "staged", "activated"}
+    assert max(phases.values()) <= plan.preflight.capacity.estimate_bytes
+
+
+def test_import_capacity_is_rechecked_under_the_writer_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checks = 0
+
+    def preflight(
+        store: LocalStore, input_bytes: int, record_count: int = 0
+    ) -> CapacityCheck:
+        nonlocal checks
+        checks += 1
+        ready = checks < 3
+        return CapacityCheck(
+            CapacityStatus.READY if ready else CapacityStatus.INSUFFICIENT,
+            "volume-test",
+            "full-snapshot-import/v1",
+            1,
+            256 * 1024**2,
+            1024**3,
+            1024**3 + 256 * 1024**2 + (1 if ready else 0),
+            1024**3 + 256 * 1024**2 + 1,
+            4096,
+        )
+
+    monkeypatch.setattr(LocalStore, "preflight_full_snapshot_import", preflight)
+    config = _config(tmp_path)
+    request = ImportHealthExport(_package(tmp_path / "health.zip"))
+
+    with HealthLab.open(config) as health_lab:
+        plan = health_lab.preview_write(request)
+        receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+
+        assert isinstance(receipt.result, WriteNotStarted)
+        assert receipt.result.status is WriteNotStartedStatus.BLOCKED
+        assert receipt.final_preflight.capacity is not None
+        assert receipt.final_preflight.capacity.status is CapacityStatus.INSUFFICIENT
+        assert health_lab.load_overview(OverviewSelection()).snapshot_count == 0
+
+
+def test_enospc_after_positive_preflight_keeps_the_active_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+
+    with HealthLab.open(config) as health_lab:
+        first_request = ImportHealthExport(_package(tmp_path / "first.zip"))
+        first_plan = health_lab.preview_write(first_request)
+        first = health_lab.execute_write(first_request, expected_plan=first_plan.fingerprint)
+        assert isinstance(first.result, ImportReceipt)
+        assert first.result.snapshot_ref is not None
+
+        request = ImportHealthExport(_package(tmp_path / "second.zip", 61))
+        plan = health_lab.preview_write(request)
+
+        replace = Path.replace
+        phases: list[str] = []
+
+        monkeypatch.setattr(
+            "personal_health_lab.storage._store._allocation_checkpoint",
+            lambda root, phase: phases.append(phase),
+        )
+
+        def fail_activation(source: Path, target: Path) -> Path:
+            if source.parent.name == "staging":
+                raise OSError(errno.ENOSPC, "injected full volume")
+            return replace(source, target)
+
+        monkeypatch.setattr(Path, "replace", fail_activation)
+        receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+
+        assert isinstance(receipt.result, ImportReceipt)
+        assert receipt.result.status is ImportStatus.QUARANTINED
+        assert phases == ["combined", "staged"]
+        overview = health_lab.load_overview(OverviewSelection())
+        assert overview.snapshot_count == 1
+        assert overview.measurement_version_count == 1
+        quarantine = (
+            config.active_store / "quarantine" / "imports" / str(receipt.result.import_id)
+        )
+        assert (quarantine / "staging" / "measurement_versions.parquet").exists()
+        assert json.loads((quarantine / "diagnostic.json").read_text()) == {
+            "diagnostic": "capacity_exhausted"
+        }
+
+
+@pytest.mark.parametrize(
+    ("failure_errno", "diagnostic"),
+    ((errno.EROFS, "target_read_only"), (errno.EACCES, "target_unwritable")),
+)
+def test_target_becoming_unwritable_during_publish_is_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_errno: int,
+    diagnostic: str,
+) -> None:
+    config = _config(tmp_path)
+    with HealthLab.open(config) as health_lab:
+        first = ImportHealthExport(_package(tmp_path / "first.zip"))
+        first_plan = health_lab.preview_write(first)
+        committed = health_lab.execute_write(first, expected_plan=first_plan.fingerprint)
+        assert isinstance(committed.result, ImportReceipt)
+
+        request = ImportHealthExport(_package(tmp_path / "second.zip", 61))
+        plan = health_lab.preview_write(request)
+        replace = Path.replace
+
+        def fail_activation(source: Path, target: Path) -> Path:
+            if source.parent.name == "staging":
+                raise OSError(failure_errno, "injected target protection")
+            return replace(source, target)
+
+        monkeypatch.setattr(Path, "replace", fail_activation)
+        receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+        overview = health_lab.load_overview(OverviewSelection())
+
+    assert isinstance(receipt.result, ImportReceipt)
+    assert receipt.result.status is ImportStatus.QUARANTINED
+    assert receipt.result.diagnostics == (diagnostic,)
+    assert overview.snapshot_count == 1
+    assert overview.measurement_version_count == 1
+
+
+def test_recovery_quarantines_snapshot_from_crash_before_catalog_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    request = ImportHealthExport(_package(tmp_path / "health.zip"))
+
+    def crash_before_commit(root: Path, phase: str) -> None:
+        if phase == "activated":
+            raise RuntimeError("injected crash before catalog commit")
+
+    with HealthLab.open(config) as health_lab:
+        plan = health_lab.preview_write(request)
+        monkeypatch.setattr(
+            "personal_health_lab.storage._store._allocation_checkpoint",
+            crash_before_commit,
+        )
+        with pytest.raises(RuntimeError, match="injected crash"):
+            health_lab.execute_write(request, expected_plan=plan.fingerprint)
+
+    monkeypatch.undo()
+    with HealthLab.open(config) as health_lab:
+        overview = health_lab.load_overview(OverviewSelection())
+
+    assert overview.snapshot_count == 0
+    assert overview.quarantined_import_count == 1
+    quarantined = list((config.active_store / "quarantine" / "imports").iterdir())
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "snapshot" / "measurement_versions.parquet").exists()
+
+
+def test_recovery_reconciles_personal_quarantine_before_binding_commit(
+    tmp_path: Path,
+) -> None:
+    config = RuntimeConfig(DataMode.REAL, tmp_path / "synthetic", tmp_path / "real")
+    with HealthLab.open(config):
+        pass
+    quarantine = config.active_store / "quarantine" / "imports" / ("a" * 32)
+    staging = quarantine / "staging"
+    staging.mkdir(parents=True)
+    (staging / "manifest.json").write_text(
+        json.dumps(
+            {
+                "operation_id": "b" * 32,
+                "import_id": "a" * 32,
+                "snapshot_id": "c" * 32,
+                "status": "published",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (quarantine / "diagnostic.json").write_text(
+        json.dumps({"diagnostic": "target_read_only"}), encoding="utf-8"
+    )
+
+    with HealthLab.open(config) as health_lab:
+        workspace = health_lab.load_workspace_status()
+        overview = health_lab.load_overview(OverviewSelection())
+
+    assert workspace.person_binding is PersonBindingStatus.BOUND
+    assert overview.quarantined_import_count == 1
+
+
+def test_unwritable_or_locked_import_target_is_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    request = ImportHealthExport(_package(tmp_path / "health.zip"))
+    with HealthLab.open(config) as health_lab:
+        monkeypatch.setattr(os, "access", lambda path, mode: False)
+        unwritable_plan = health_lab.preview_write(request)
+
+    assert unwritable_plan.approval.status is WriteApprovalStatus.BLOCKED
+    assert unwritable_plan.preflight.capacity.reason is CapacityReason.TARGET_UNWRITABLE
+
+    monkeypatch.setattr(os, "access", lambda path, mode: True)
+    monkeypatch.setattr(
+        os,
+        "statvfs",
+        lambda path: SimpleNamespace(
+            f_bavail=10 * 1024**3,
+            f_frsize=4096,
+            f_flag=getattr(os, "ST_RDONLY", 1),
+        ),
+    )
+    read_only = probe_capacity(tmp_path, 1)
+    assert read_only.status is CapacityStatus.UNWRITABLE
+    assert read_only.reason is CapacityReason.TARGET_READ_ONLY
+
+    monkeypatch.undo()
+    monkeypatch.setattr(
+        "personal_health_lab.application._application.probe_filevault",
+        lambda path: FileVaultCheck(
+            FileVaultStatus.UNKNOWN,
+            "redacted-volume",
+            FileVaultReason.VOLUME_LOCKED,
+        ),
+    )
+    config = RuntimeConfig(
+        DataMode.REAL,
+        tmp_path / "synthetic",
+        tmp_path / "real",
+    )
+    request = ImportHealthExport(_package(tmp_path / "health.zip"))
+
+    with HealthLab.open(config) as health_lab:
+        plan = health_lab.preview_write(request)
+
+    assert plan.approval.status is WriteApprovalStatus.BLOCKED
+    assert "target_locked" in plan.diagnostics
+
+
+def test_writer_open_failure_is_typed_blocked_when_target_became_unwritable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    request = ImportHealthExport(_package(tmp_path / "health.zip"))
+
+    with HealthLab.open(config) as health_lab:
+        plan = health_lab.preview_write(request)
+
+        def fail_open(*args: object, **kwargs: object) -> LocalStore:
+            monkeypatch.setattr(os, "access", lambda path, mode: False)
+            raise StoreError("read-only")
+
+        monkeypatch.setattr(
+            LocalStore,
+            "open_writer",
+            fail_open,
+        )
+        receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+
+    assert isinstance(receipt.result, WriteNotStarted)
+    assert receipt.result.status is WriteNotStartedStatus.BLOCKED
+    assert receipt.final_preflight.capacity.reason is CapacityReason.TARGET_UNWRITABLE
+
+
+def test_existing_unwritable_store_can_open_read_only_to_report_blocked_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    request = ImportHealthExport(_package(tmp_path / "health.zip"))
+    with HealthLab.open(config):
+        pass
+
+    monkeypatch.setattr(
+        LocalStore,
+        "_try_writer_lock",
+        lambda root: (_ for _ in ()).throw(StoreError("read-only")),
+    )
+    monkeypatch.setattr(os, "access", lambda path, mode: False)
+    with HealthLab.open(config) as health_lab:
+        plan = health_lab.preview_write(request)
+
+    assert plan.approval.status is WriteApprovalStatus.BLOCKED
+    assert plan.preflight.capacity.reason is CapacityReason.TARGET_UNWRITABLE
+
+
+def test_competing_import_writer_keeps_readers_available(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    request = ImportHealthExport(_package(tmp_path / "health.zip"))
+
+    with HealthLab.open(config) as health_lab:
+        plan = health_lab.preview_write(request)
+        with (config.active_store / ".writer.lock").open("a+b") as writer_lock:
+            fcntl.flock(writer_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+            overview = health_lab.load_overview(OverviewSelection())
+
+    assert isinstance(receipt.result, WriteNotStarted)
+    assert receipt.result.status is WriteNotStartedStatus.STORE_BUSY
+    assert overview.snapshot_count == 0
+
+
+@pytest.mark.parametrize(
+    "case",
+    _cases_for("test_v02_import_write_contract"),
+    ids=lambda case: case["id"],
+)
+def test_v02_import_write_contract(
+    case: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case_id = case["id"]
+    config = _config(tmp_path)
+    package = _package(tmp_path / "health.zip")
+    import_fixture = next(
+        fixture
+        for fixture in _matrix()["fixture"]
+        if fixture["id"] == "V02-F-DOM-IMPORT-001"
+    )
+    assert hashlib.sha256(package.read_bytes()).hexdigest() == import_fixture["sha256"]
+    request = ImportHealthExport(package)
+
+    with HealthLab.open(config) as health_lab:
+        before = _store_files(config.active_store)
+        plan = health_lab.preview_write(request)
+
+        if case_id in {"V02-A-API-004", "V02-A-API-006"}:
+            assert plan.approval.status is WriteApprovalStatus.READY
+            assert _store_files(config.active_store) == before
+        elif case_id == "V02-A-API-005":
+            receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+            assert isinstance(receipt.result, ImportReceipt)
+            assert receipt.result.status is ImportStatus.COMMITTED
+            assert health_lab.load_overview(OverviewSelection()).snapshot_count == 1
+        elif case_id == "V02-A-API-007":
+            changed = health_lab.preview_write(
+                ImportHealthExport(_package(tmp_path / "changed.zip", 61))
+            )
+            assert changed.fingerprint != plan.fingerprint
+            assert _store_files(config.active_store) == before
+        elif case_id == "V02-A-API-010":
+            receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+            assert receipt.plan_fingerprint == plan.fingerprint
+            fingerprint = str(plan.fingerprint).encode()
+            assert all(
+                fingerprint not in content for content in _store_files(config.active_store).values()
+            )
+        elif case_id == "V02-A-API-011":
+            blocked = health_lab.preview_write(ImportHealthExport(tmp_path / "missing.zip"))
+            assert {status.value for status in WriteApprovalStatus} == {
+                "ready",
+                "confirmation_required",
+                "blocked",
+            }
+            assert plan.approval.status is WriteApprovalStatus.READY
+            assert blocked.approval.status is WriteApprovalStatus.BLOCKED
+        elif case_id == "V02-A-API-012":
+            blocked_request = ImportHealthExport(tmp_path / "missing.zip")
+            blocked_plan = health_lab.preview_write(blocked_request)
+            blocked = health_lab.execute_write(
+                blocked_request,
+                expected_plan=blocked_plan.fingerprint,
+            )
+            assert isinstance(blocked.result, WriteNotStarted)
+            assert blocked.result.status is WriteNotStartedStatus.BLOCKED
+
+            changed = _package(tmp_path / "health.zip", 61)
+            stale = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+            assert changed == request.package_path
+            assert isinstance(stale.result, WriteNotStarted)
+            assert stale.result.status is WriteNotStartedStatus.PLAN_CHANGED
+
+            with (config.active_store / ".writer.lock").open("a+b") as writer_lock:
+                fcntl.flock(writer_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                busy_plan = health_lab.preview_write(request)
+                busy = health_lab.execute_write(request, expected_plan=busy_plan.fingerprint)
+            assert isinstance(busy.result, WriteNotStarted)
+            assert busy.result.status is WriteNotStartedStatus.STORE_BUSY
+        elif case_id == "V02-A-API-013":
+            receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+            assert isinstance(receipt.result, ImportReceipt)
+            assert {status.value for status in ImportStatus} == {
+                "committed",
+                "duplicate",
+                "rejected",
+                "quarantined",
+                "restore_pending",
+                "store_busy",
+            }
+        elif case_id == "V02-A-API-014":
+
+            def fail_publish(*args: object, **kwargs: object) -> None:
+                raise StoreError("injected technical defect")
+
+            assert _store_files(config.active_store)
+            monkeypatch.setattr(LocalStore, "publish_import", fail_publish)
+            with pytest.raises(HealthLabError):
+                health_lab.execute_write(request, expected_plan=plan.fingerprint)
+        else:
+            raise AssertionError(f"unhandled V0.2 case: {case_id}")
+
+    assert isinstance(plan.fingerprint, PlanFingerprint)

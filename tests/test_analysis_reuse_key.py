@@ -5,7 +5,10 @@ from personal_health_lab.application import (
     AnalysisDefinitionId,
     DataMode,
     HealthLab,
-    RestingHeartRateAnalysisConfig,
+    ImportHealthExport,
+    OverviewSelection,
+    ReproducibilityStatus,
+    RunRestingHeartRateAnalysis,
     RuntimeConfig,
     SnapshotRef,
 )
@@ -20,13 +23,22 @@ def test_reuse_requires_every_reproduction_identity_to_match(tmp_path: Path) -> 
         real_store=tmp_path / "real-store",
     )
     with HealthLab.open(runtime) as health_lab:
-        health_lab.import_health_export(package.export_path)
-        receipt = health_lab.run_resting_hr_analysis(
-            RestingHeartRateAnalysisConfig(AnalysisDefinitionId("lag-signal-v1"))
-        )
+        request = ImportHealthExport(package.export_path)
+        plan = health_lab.preview_write(request)
+        health_lab.execute_write(request, expected_plan=plan.fingerprint)
+        request = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v2"))
+        plan = health_lab.preview_write(request)
+        receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint).result
+        result = health_lab.load_overview(OverviewSelection()).resting_hr_analysis
 
     provenance = receipt.provenance
     assert provenance is not None
+    assert result is not None
+    assert result.reproducibility is (
+        ReproducibilityStatus.LOCAL_DEVELOPMENT
+        if provenance.code_dirty
+        else ReproducibilityStatus.REPRODUCIBLE
+    )
     changed_candidates = (
         replace(provenance, snapshot_id=SnapshotRef("different")),
         replace(provenance, config_hash="different"),
