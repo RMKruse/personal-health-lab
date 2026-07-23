@@ -1,8 +1,114 @@
+import tomllib
 from collections.abc import Callable
+from enum import Enum
+from inspect import isclass
 from pathlib import Path
+from typing import Any, get_args, get_type_hints
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
+
+import personal_health_lab.application as application
+from personal_health_lab.application import HealthLab, WritePlanDetails, WriteRequest, WriteResult
+
+_V02_MATRIX = Path(__file__).parent / "acceptance/v02_matrix.toml"
+_PROHIBITED_ACTIVE_MARKERS = {"skip", "skipif", "xfail", "flaky", "rerun", "reruns"}
+_READ_PROJECTION_METHODS = {
+    "load_data_review",
+    "load_data_review_case",
+    "load_migration_diagnostics",
+    "load_overview",
+    "load_plausibility_rules",
+    "load_recovery_status",
+    "load_workspace_status",
+}
+_ADAPTER_VARIANTS = {
+    variant.__name__
+    for union in (WriteRequest, WritePlanDetails, WriteResult)
+    for variant in get_args(union)
+}
+_ADAPTER_VARIANTS |= {
+    get_type_hints(getattr(HealthLab, method))["return"].__name__
+    for method in _READ_PROJECTION_METHODS
+}
+_ADAPTER_VARIANTS |= {
+    name
+    for name in application.__all__
+    if (
+        isclass(value := getattr(application, name))
+        and (
+            (
+                issubclass(value, Enum)
+                and ("Status" in name or "Reason" in name or name == "DataReviewAction")
+            )
+            or issubclass(value, Exception)
+        )
+    )
+}
+_ACTIVE_V02_NODES: set[str] = set()
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "v02_adapter(side, *variants): behavioral evidence for public adapter variants",
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    if any(not argument.startswith("-") for argument in config.invocation_params.args):
+        return
+    with _V02_MATRIX.open("rb") as source:
+        cases = tomllib.load(source)["case"]
+    runners = {case["runner"] for case in cases}
+    collected: dict[str, set[str]] = {}
+    parity = {"cli": set(), "streamlit": set()}
+    for item in items:
+        runner = getattr(item, "originalname", None) or item.name.split("[", 1)[0]
+        collected.setdefault(runner, set()).add(item.nodeid.split("[", 1)[0])
+        if runner in runners:
+            _ACTIVE_V02_NODES.add(item.nodeid)
+            prohibited = _PROHIBITED_ACTIVE_MARKERS & {
+                marker.name for marker in item.iter_markers()
+            }
+            if prohibited:
+                raise pytest.UsageError(
+                    f"active V0.2 runner {runner} uses prohibited markers: {sorted(prohibited)}"
+                )
+        for marker in item.iter_markers("v02_adapter"):
+            side, *variants = marker.args
+            if side not in parity:
+                raise pytest.UsageError(f"unknown V0.2 adapter side: {side}")
+            parity[side].update(variants)
+
+    missing = runners - collected.keys()
+    duplicate = {
+        runner: nodes
+        for runner, nodes in collected.items()
+        if runner in runners and len(nodes) > 1
+    }
+    if missing or duplicate:
+        raise pytest.UsageError(
+            f"invalid V0.2 runner registry; missing={sorted(missing)}, duplicate={duplicate}"
+        )
+    for side, variants in parity.items():
+        if variants != _ADAPTER_VARIANTS:
+            raise pytest.UsageError(
+                f"incomplete {side} V0.2 adapter parity; "
+                f"missing={sorted(_ADAPTER_VARIANTS - variants)}, "
+                f"unexpected={sorted(variants - _ADAPTER_VARIANTS)}"
+            )
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(
+    item: pytest.Item, call: pytest.CallInfo[Any]
+) -> Any:
+    outcome = yield
+    report = outcome.get_result()
+    if item.nodeid in _ACTIVE_V02_NODES and report.skipped:
+        report.outcome = "failed"
+        report.longrepr = f"active V0.2 runner skipped during {report.when}: {item.nodeid}"
 
 
 @pytest.fixture

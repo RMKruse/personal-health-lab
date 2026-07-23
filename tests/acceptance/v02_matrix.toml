@@ -832,6 +832,12 @@ forbidden_side_effects = ["raw-value mutation", "old snapshot mutation", "older 
 
 
 [[contract]]
+id = "V02-C-API-001"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "WriteRequest contains exactly the twelve decided requests and the closed resolution and revocation-target unions."
+evidence = ["positive", "negative", "boundary"]
+
+[[contract]]
 id = "V02-C-API-002"
 source = "https://github.com/RMKruse/personal-health-lab/issues/33"
 statement = "Every write uses a side-effect-free preview and explicit execution."
@@ -848,6 +854,66 @@ id = "V02-C-API-004"
 source = "https://github.com/RMKruse/personal-health-lab/issues/33"
 statement = "Plans, receipts, and expected outcomes are closed typed values."
 evidence = ["positive", "negative", "fault"]
+
+[[contract]]
+id = "V02-C-API-005"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "HealthLab.open is read-only and safely exposes restricted sessions."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V02-C-API-006"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Exactly seven named typed projections form the public read seam."
+evidence = ["positive", "negative", "boundary"]
+
+[[contract]]
+id = "V02-C-API-007"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Public application values expose no internal storage representation."
+evidence = ["positive", "negative", "architecture"]
+
+[[contract]]
+id = "V02-C-ERR-001"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Expected outcomes remain typed values while technical defects cross the public seam as small exceptions."
+evidence = ["positive", "negative", "fault"]
+
+[[contract]]
+id = "V02-C-ERR-002"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Human and JSON CLI exit codes and versioned output remain stable."
+evidence = ["positive", "negative", "boundary"]
+
+[[contract]]
+id = "V02-C-ERR-003"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Every durable transition remains data-loss safe at its registered fault points."
+evidence = ["fault", "transition", "recovery"]
+
+[[contract]]
+id = "V02-C-ERR-004"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Real-mode diagnostics, receipts, JSON, logs, and preflight remain data-minimizing and redact internal paths."
+evidence = ["positive", "negative", "security"]
+
+[[contract]]
+id = "V02-C-ARC-001"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "The production dependency graph follows the decided allowlist, forbids cross-module deep imports, and remains acyclic."
+evidence = ["architecture", "positive", "negative"]
+
+[[contract]]
+id = "V02-C-ARC-002"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Public module boundaries expose only fully typed immutable storage-neutral values."
+evidence = ["architecture", "positive", "negative"]
+
+[[contract]]
+id = "V02-C-ARC-003"
+source = "https://github.com/RMKruse/personal-health-lab/issues/33"
+statement = "Acceptance, internal fault, and adapter tests remain assigned to their decided deep seams."
+evidence = ["architecture", "positive", "negative"]
 
 [[contract]]
 id = "V02-C-PRE-001"
@@ -1096,160 +1162,460 @@ expected_effect = "none"
 forbidden_side_effects = ["technical defect encoded as business outcome"]
 
 [[case]]
-id = "V02-A-RHR-001"
-contracts = ["V02-C-API-002", "V02-C-API-004"]
+id = "V02-A-API-001"
+contracts = ["V02-C-API-001"]
 fixtures = []
-runner = "test_analysis_preview_is_read_only_and_execution_rechecks_the_request"
-initial_state = "empty temporary store"
-operation = "preview RunRestingHeartRateAnalysis"
-level = "application"
-expected_result = "ready WritePlan with RestingHeartRateAnalysisPlan"
+runner = "test_public_application_surface_is_exact_and_closed"
+initial_state = "public application type aliases"
+operation = "inspect every request, plan-detail, and result variant"
+level = "architecture"
+expected_result = "twelve typed request and plan variants"
 expected_effect = "none"
-forbidden_side_effects = ["analysis receipt", "writer lock"]
+forbidden_side_effects = ["missing request variant","untyped result"]
 
 [[case]]
-id = "V02-A-RHR-002"
-contracts = ["V02-C-API-002", "V02-C-API-004"]
+id = "V02-A-API-002"
+contracts = ["V02-C-API-001"]
 fixtures = []
-runner = "test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis"
-initial_state = "active lag-signal snapshot"
-operation = "execute identical analysis request and expected fingerprint twice"
-level = "application"
-expected_result = "completed then reused AnalysisReceipt"
-expected_effect = "one immutable analysis result"
-forbidden_side_effects = ["rebuilt statistical methodology"]
-
-[[case]]
-id = "V02-A-RHR-003"
-contracts = ["V02-C-API-003", "V02-C-API-004"]
-fixtures = []
-runner = "test_analysis_rechecks_the_snapshot_under_the_writer_lock"
-initial_state = "previewed analysis followed by a newer active snapshot"
-operation = "execute with the stale analysis fingerprint"
-level = "application"
-expected_result = "WriteNotStarted plan_changed"
+runner = "test_unknown_public_union_variants_are_rejected"
+initial_state = "public request annotations"
+operation = "inspect unknown union boundaries"
+level = "architecture"
+expected_result = "closed request, resolution, and target unions"
 expected_effect = "none"
-forbidden_side_effects = ["analysis of a snapshot not authorized by the plan"]
+forbidden_side_effects = ["open-ended command type","unknown variant"]
 
 [[case]]
-id = "V02-A-RHR-004"
-contracts = ["V02-C-API-004"]
+id = "V02-A-API-003"
+contracts = ["V02-C-API-001"]
 fixtures = []
-runner = "test_analysis_store_busy_is_write_not_started"
-initial_state = "previewed analysis with unavailable writer"
-operation = "execute RunRestingHeartRateAnalysis"
-level = "application"
-expected_result = "WriteNotStarted store_busy"
+runner = "test_review_decision_requests_enforce_mandatory_reasons"
+initial_state = "public decision request dataclasses"
+operation = "inspect mandatory reason-bearing request types"
+level = "architecture"
+expected_result = "typed mandatory fields"
 expected_effect = "none"
-forbidden_side_effects = ["AnalysisReceipt store_busy", "analysis persistence"]
+forbidden_side_effects = ["optional correction reason","optional revocation reason"]
 
 [[case]]
-id = "V02-A-RHR-005"
-contracts = ["V02-C-API-004"]
+id = "V02-A-API-008"
+contracts = ["V02-C-API-003"]
 fixtures = []
-runner = "test_analysis_reports_insufficient_and_unstable_inputs_with_stable_diagnostics"
-initial_state = "sparse, constant, and incomplete synthetic analysis inputs"
-operation = "execute RunRestingHeartRateAnalysis"
+runner = "test_changed_filevault_preflight_requires_a_new_plan"
+initial_state = "previewed real write with changed protection facts"
+operation = "execute stale fingerprint"
 level = "application"
-expected_result = "typed insufficient_data, unstable, and completed AnalysisReceipt values"
-expected_effect = "result only for completed analysis"
-forbidden_side_effects = ["result row for insufficient or unstable analysis"]
+expected_result = "plan_changed"
+expected_effect = "none"
+forbidden_side_effects = ["write under changed authorization facts"]
 
 [[case]]
-id = "V02-A-RHR-006"
-contracts = ["V02-C-ADP-001", "V02-C-ADP-002"]
+id = "V02-A-API-009"
+contracts = ["V02-C-API-003"]
 fixtures = []
-runner = "test_cli_runs_and_exposes_the_built_in_lag_analysis"
-initial_state = "active lag-signal snapshot"
-operation = "preview, confirm, and execute the human CLI analysis"
+runner = "test_filevault_improvement_to_protected_may_continue"
+initial_state = "previewed real write whose protection improves"
+operation = "execute original fingerprint"
+level = "application"
+expected_result = "typed completed outcome"
+expected_effect = "one authorized write"
+forbidden_side_effects = ["new confirmation","plan_changed for improvement"]
+
+[[case]]
+id = "V02-A-API-015"
+contracts = ["V02-C-API-005"]
+fixtures = []
+runner = "test_opening_an_existing_healthlab_is_read_only"
+initial_state = "existing current store"
+operation = "open and close HealthLab"
+level = "application"
+expected_result = "ready session"
+expected_effect = "none"
+forbidden_side_effects = ["catalog mutation","implicit recovery"]
+
+[[case]]
+id = "V02-A-API-016"
+contracts = ["V02-C-API-005"]
+fixtures = []
+runner = "test_migration_required_session_only_allows_diagnosis_and_migration"
+initial_state = "restricted store schema"
+operation = "open and inspect allowed operations"
+level = "application"
+expected_result = "diagnostic restricted session"
+expected_effect = "none"
+forbidden_side_effects = ["implicit migration","domain read"]
+
+[[case]]
+id = "V02-A-API-017"
+contracts = ["V02-C-API-005","V02-C-ERR-001"]
+fixtures = []
+runner = "test_active_snapshot_hash_mismatch_blocks_open"
+initial_state = "corrupted active snapshot"
+operation = "open HealthLab"
+level = "application"
+expected_result = "HealthLabError"
+expected_effect = "none"
+forbidden_side_effects = ["best-effort read","internal exception leak"]
+
+[[case]]
+id = "V02-A-API-018"
+contracts = ["V02-C-API-006"]
+fixtures = []
+runner = "test_public_module_exports_are_fully_typed_without_any"
+initial_state = "seven public read projections"
+operation = "inspect exported return annotations"
+level = "architecture"
+expected_result = "fully typed presentation-neutral values"
+expected_effect = "none"
+forbidden_side_effects = ["Any","storage row"]
+
+[[case]]
+id = "V02-A-API-019"
+contracts = ["V02-C-API-006"]
+fixtures = []
+runner = "test_migration_required_session_only_allows_diagnosis_and_migration"
+initial_state = "restricted session"
+operation = "request unavailable projection"
+level = "application"
+expected_result = "ProjectionUnavailable or HealthLabError"
+expected_effect = "none"
+forbidden_side_effects = ["partial projection","implicit repair"]
+
+[[case]]
+id = "V02-A-API-020"
+contracts = ["V02-C-API-006"]
+fixtures = []
+runner = "test_large_batch_plan_remains_complete"
+initial_state = "large open data-review set"
+operation = "load data review and build batch plan"
+level = "application"
+expected_result = "complete immutable cases"
+expected_effect = "none"
+forbidden_side_effects = ["storage paging","truncation"]
+
+[[case]]
+id = "V02-A-API-021"
+contracts = ["V02-C-API-006"]
+fixtures = []
+runner = "test_cli_prints_empty_overview_as_versioned_json"
+initial_state = "empty store"
+operation = "load and render overview"
 level = "adapter"
-expected_result = "typed completed or reused analysis receipt"
-expected_effect = "shared application analysis execution"
-forbidden_side_effects = ["adapter statistical logic"]
+expected_result = "typed empty overview"
+expected_effect = "none"
+forbidden_side_effects = ["free-text-only state","invented data"]
 
 [[case]]
-id = "V02-A-RHR-007"
-contracts = ["V02-C-ADP-001", "V02-C-ADP-002"]
+id = "V02-A-API-022"
+contracts = ["V02-C-API-007"]
 fixtures = []
-runner = "test_cli_runs_and_exposes_the_built_in_lag_analysis"
-initial_state = "active lag-signal snapshot"
-operation = "JSON preview followed by identical --execute --expect-plan call"
-level = "adapter"
-expected_result = "versioned typed WritePlan then WriteReceipt JSON"
-expected_effect = "shared application analysis execution"
-forbidden_side_effects = ["one-call JSON execution", "adapter statistical logic"]
+runner = "test_production_adapters_only_import_the_application_interface"
+initial_state = "production adapter sources"
+operation = "inspect project imports"
+level = "architecture"
+expected_result = "application-only cross-module dependency"
+expected_effect = "none"
+forbidden_side_effects = ["storage deep import","business-module import"]
 
 [[case]]
-id = "V02-A-RHR-008"
-contracts = ["V02-C-ADP-001", "V02-C-ADP-003"]
+id = "V02-A-API-023"
+contracts = ["V02-C-API-007"]
+fixtures = []
+runner = "test_public_application_values_are_immutable_and_storage_neutral"
+initial_state = "public application values"
+operation = "inspect dataclass and annotation boundaries"
+level = "architecture"
+expected_result = "immutable storage-neutral values"
+expected_effect = "none"
+forbidden_side_effects = ["dictionary","SQL row","DataFrame","internal path"]
+
+[[case]]
+id = "V02-A-ERR-001"
+contracts = ["V02-C-ERR-001"]
+fixtures = []
+runner = "test_public_application_surface_is_exact_and_closed"
+initial_state = "closed public outcome unions"
+operation = "inspect WriteResult"
+level = "architecture"
+expected_result = "typed expected outcomes"
+expected_effect = "none"
+forbidden_side_effects = ["internal error value","untyped status"]
+
+[[case]]
+id = "V02-A-ERR-002"
+contracts = ["V02-C-ERR-001"]
+fixtures = []
+runner = "test_active_snapshot_hash_mismatch_blocks_open"
+initial_state = "corrupted store"
+operation = "open through HealthLab"
+level = "application"
+expected_result = "small HealthLabError"
+expected_effect = "none"
+forbidden_side_effects = ["storage exception leak","corrupt read"]
+
+[[case]]
+id = "V02-A-ERR-003"
+contracts = ["V02-C-ERR-002"]
+fixtures = []
+runner = "test_cli_prints_empty_overview_as_versioned_json"
+initial_state = "successful no-op read"
+operation = "run JSON CLI"
+level = "adapter"
+expected_result = "exit 0 and versioned JSON"
+expected_effect = "none"
+forbidden_side_effects = ["stderr output","missing schema version"]
+
+[[case]]
+id = "V02-A-ERR-004"
+contracts = ["V02-C-ERR-002"]
+fixtures = []
+runner = "test_cli_returns_usage_error_for_unknown_arguments_and_invalid_config"
+initial_state = "invalid CLI invocation"
+operation = "parse arguments"
+level = "adapter"
+expected_result = "exit 2"
+expected_effect = "none"
+forbidden_side_effects = ["store write","traceback"]
+
+[[case]]
+id = "V02-A-ERR-005"
+contracts = ["V02-C-ERR-002"]
+fixtures = []
+runner = "test_cli_returns_expected_incomplete_for_rejected_import"
+initial_state = "expected incomplete write"
+operation = "run JSON CLI"
+level = "adapter"
+expected_result = "exit 3 and typed result"
+expected_effect = "none"
+forbidden_side_effects = ["exit 1","partial write"]
+
+[[case]]
+id = "V02-A-ERR-006"
+contracts = ["V02-C-ERR-002"]
+fixtures = []
+runner = "test_installed_cli_contracts_streams_and_redacts_technical_errors"
+initial_state = "unexpected technical defect"
+operation = "run installed CLI"
+level = "adapter"
+expected_result = "exit 1 and redacted stderr"
+expected_effect = "none"
+forbidden_side_effects = ["stdout receipt","path disclosure"]
+
+[[case]]
+id = "V02-A-ERR-007"
+contracts = ["V02-C-ERR-003"]
+fixtures = []
+runner = "test_v02_matrix_is_well_formed_and_fully_registered"
+initial_state = "all registered durable fault points"
+operation = "validate matrix fault coverage"
+level = "architecture"
+expected_result = "every fault point claimed by an active case"
+expected_effect = "none"
+forbidden_side_effects = ["unregistered transition","unclaimed fault case"]
+
+[[case]]
+id = "V02-A-ERR-008"
+contracts = ["V02-C-ERR-003"]
+fixtures = []
+runner = "test_recovery_quarantines_snapshot_from_crash_before_catalog_commit"
+initial_state = "unreferenced publication artifact after crash"
+operation = "reopen store"
+level = "storage"
+expected_result = "old state active and remainder quarantined"
+expected_effect = "quarantine evidence"
+forbidden_side_effects = ["automatic continuation","partial activation"]
+
+[[case]]
+id = "V02-A-ERR-009"
+contracts = ["V02-C-ERR-004"]
+fixtures = []
+runner = "test_installed_cli_contracts_streams_and_redacts_technical_errors"
+initial_state = "real-mode technical failure"
+operation = "inspect CLI streams"
+level = "adapter"
+expected_result = "redacted error class and message"
+expected_effect = "none"
+forbidden_side_effects = ["health value","secret","internal path"]
+
+[[case]]
+id = "V02-A-ERR-010"
+contracts = ["V02-C-ERR-004"]
+fixtures = []
+runner = "test_real_macos_platform_probes_succeed_and_redact"
+initial_state = "real platform probes and diagnostics"
+operation = "inspect public probe evidence"
+level = "storage"
+expected_result = "typed redacted findings"
+expected_effect = "none"
+forbidden_side_effects = ["raw target path","untyped probe output"]
+
+[[case]]
+id = "V02-A-ERR-011"
+contracts = ["V02-C-ERR-004"]
+fixtures = []
+runner = "test_negative_exports_v1_are_rejected_without_changing_the_snapshot"
+initial_state = "untrusted invalid package"
+operation = "execute import"
+level = "application"
+expected_result = "minimal rejected outcome"
+expected_effect = "none"
+forbidden_side_effects = ["payload retention","sensitive diagnostic"]
+
+[[case]]
+id = "V02-A-ADP-001"
+contracts = ["V02-C-ADP-001"]
+fixtures = []
+runner = "test_adapter_parity_registry_is_exact_and_closed"
+initial_state = "twelve public write requests"
+operation = "inspect both production mappings"
+level = "adapter"
+expected_result = "both adapters cover every request"
+expected_effect = "none"
+forbidden_side_effects = ["adapter-only request","business logic branch"]
+
+[[case]]
+id = "V02-A-ADP-002"
+contracts = ["V02-C-ADP-002"]
+fixtures = []
+runner = "test_cli_maps_store_migration_plan_and_receipt"
+initial_state = "confirmation-required write"
+operation = "run human CLI preview and confirmation"
+level = "adapter"
+expected_result = "one-call preview and explicit execution"
+expected_effect = "shared application write"
+forbidden_side_effects = ["hidden execution","adapter migration logic"]
+
+[[case]]
+id = "V02-A-ADP-003"
+contracts = ["V02-C-ADP-002"]
+fixtures = []
+runner = "test_real_json_import_renders_shared_confirmation_plan"
+initial_state = "real JSON write"
+operation = "preview then repeat with execute and fingerprint"
+level = "adapter"
+expected_result = "two-call versioned JSON contract"
+expected_effect = "shared application write"
+forbidden_side_effects = ["one-call JSON execution","unbound fingerprint"]
+
+[[case]]
+id = "V02-A-ADP-005"
+contracts = ["V02-C-ADP-003"]
 fixtures = []
 runner = "test_streamlit_shows_imported_daily_series"
-initial_state = "active lag-signal snapshot"
-operation = "preview and explicitly execute analysis in Streamlit"
+initial_state = "inline Streamlit preview"
+operation = "inspect locked fields and discard action"
 level = "adapter"
-expected_result = "inline pinned preview with locked inputs and discard action"
-expected_effect = "shared application analysis execution"
-forbidden_side_effects = ["persistent UI plan", "adapter statistical logic"]
+expected_result = "ephemeral preview"
+expected_effect = "none"
+forbidden_side_effects = ["persistent plan queue","editable authorized inputs"]
 
 [[case]]
-id = "V02-A-RHR-009"
-contracts = ["V02-C-ADP-001", "V02-C-ADP-003"]
+id = "V02-A-ADP-006"
+contracts = ["V02-C-ADP-003"]
 fixtures = []
-runner = "test_streamlit_shows_the_same_empty_overview"
-initial_state = "empty temporary store"
-operation = "preview and execute analysis in Streamlit"
+runner = "test_streamlit_page_change_discards_pending_preview"
+initial_state = "Streamlit preview followed by page change"
+operation = "change page"
 level = "adapter"
-expected_result = "insufficient_data warning"
+expected_result = "preview removed and inputs enabled"
 expected_effect = "none"
-forbidden_side_effects = ["adapter exception", "analysis result"]
+forbidden_side_effects = ["stale preview reuse","persistent UI plan"]
 
 [[case]]
-id = "V02-A-RHR-010"
-contracts = ["V02-C-ADP-001", "V02-C-ADP-003"]
+id = "V02-A-ADP-007"
+contracts = ["V02-C-ADP-003"]
 fixtures = []
-runner = "test_streamlit_maps_unstable_analysis"
-initial_state = "constant synthetic analysis outcome"
-operation = "preview and execute analysis in Streamlit"
+runner = "test_streamlit_focuses_migration_in_restricted_session"
+initial_state = "restricted workspace"
+operation = "render Streamlit"
 level = "adapter"
-expected_result = "unstable warning"
+expected_result = "only required recovery or migration flow enabled"
 expected_effect = "none"
-forbidden_side_effects = ["adapter exception", "analysis result"]
+forbidden_side_effects = ["unrelated domain action","stale cache"]
 
 [[case]]
-id = "V02-A-RHR-011"
-contracts = ["V02-C-ADP-001", "V02-C-ADP-003"]
+id = "V02-A-ARC-001"
+contracts = ["V02-C-ARC-001"]
 fixtures = []
-runner = "test_streamlit_maps_store_busy_analysis"
-initial_state = "previewed analysis with unavailable writer"
-operation = "execute analysis in Streamlit"
-level = "adapter"
-expected_result = "store_busy warning"
+runner = "test_modules_only_import_allowed_project_modules"
+initial_state = "production source graph"
+operation = "compare imports with allowlist"
+level = "architecture"
+expected_result = "all dependencies allowed"
 expected_effect = "none"
-forbidden_side_effects = ["adapter exception", "AnalysisReceipt store_busy"]
+forbidden_side_effects = ["forbidden edge"]
 
 [[case]]
-id = "V02-A-RHR-012"
-contracts = ["V02-C-ADP-001", "V02-C-ADP-003"]
+id = "V02-A-ARC-002"
+contracts = ["V02-C-ARC-001"]
 fixtures = []
-runner = "test_streamlit_maps_plan_changed_analysis"
-initial_state = "previewed analysis followed by a newer active snapshot"
-operation = "execute stale analysis preview in Streamlit"
-level = "adapter"
-expected_result = "plan_changed warning"
+runner = "test_cross_module_deep_imports_are_forbidden"
+initial_state = "production source graph"
+operation = "check deep imports and cycles"
+level = "architecture"
+expected_result = "no deep import or cycle"
 expected_effect = "none"
-forbidden_side_effects = ["adapter exception", "analysis of unauthorized snapshot"]
+forbidden_side_effects = ["adapter internal import","dependency cycle"]
 
 [[case]]
-id = "V02-A-RHR-013"
-contracts = ["V02-C-ADP-001", "V02-C-ADP-002"]
+id = "V02-A-ARC-003"
+contracts = ["V02-C-ARC-002"]
 fixtures = []
-runner = "test_json_cli_analysis_reports_plan_changed"
-initial_state = "JSON analysis plan followed by a newer active snapshot"
-operation = "execute stale --expect-plan"
-level = "adapter"
-expected_result = "typed plan_changed JSON with exit code 3"
+runner = "test_public_module_exports_are_fully_typed_without_any"
+initial_state = "public module exports"
+operation = "resolve every public type hint"
+level = "architecture"
+expected_result = "fully typed exports"
 expected_effect = "none"
-forbidden_side_effects = ["adapter exception", "analysis of unauthorized snapshot"]
+forbidden_side_effects = ["Any","missing annotation"]
+
+[[case]]
+id = "V02-A-ARC-004"
+contracts = ["V02-C-ARC-002"]
+fixtures = []
+runner = "test_public_application_values_are_immutable_and_storage_neutral"
+initial_state = "public boundary dataclasses"
+operation = "inspect frozen status and annotations"
+level = "architecture"
+expected_result = "immutable storage-neutral values"
+expected_effect = "none"
+forbidden_side_effects = ["dictionary","table","repository port"]
+
+[[case]]
+id = "V02-A-ARC-005"
+contracts = ["V02-C-ARC-003"]
+fixtures = []
+runner = "test_import_publishes_one_validated_four_file_snapshot"
+initial_state = "temporary real SQLite, Parquet, and DuckDB artifacts"
+operation = "exercise domain behavior through HealthLab"
+level = "application"
+expected_result = "typed plan and receipt"
+expected_effect = "real temporary artifacts"
+forbidden_side_effects = ["in-memory repository fake","adapter assertion"]
+
+[[case]]
+id = "V02-A-ARC-006"
+contracts = ["V02-C-ARC-003"]
+fixtures = []
+runner = "test_publication_fault_keeps_old_snapshot_active_and_quarantines_remainder"
+initial_state = "private durable fault point"
+operation = "inject publication fault"
+level = "storage"
+expected_result = "old state or complete new state"
+expected_effect = "quarantine evidence"
+forbidden_side_effects = ["fake storage path","partial state"]
+
+[[case]]
+id = "V02-A-ARC-007"
+contracts = ["V02-C-ARC-003"]
+fixtures = []
+runner = "test_production_adapters_only_import_the_application_interface"
+initial_state = "production adapter tests and sources"
+operation = "verify mapping-only ownership"
+level = "architecture"
+expected_result = "adapter-only presentation and interaction"
+expected_effect = "none"
+forbidden_side_effects = ["domain calculation","in-memory table fake"]
 
 [[case]]
 id = "V02-A-PRE-001"
@@ -1279,7 +1645,7 @@ forbidden_side_effects = ["new ID for a complete copy", "merge", "synchronizatio
 id = "V02-A-PRE-003"
 contracts = ["V02-C-PRE-001", "V02-C-PRE-002"]
 fixtures = ["V02-F-DOM-IMPORT-001"]
-runner = "test_legacy_real_store_gets_identity_only_after_confirmed_execution"
+runner = "test_populated_legacy_real_store_migrates_copy_on_write"
 initial_state = "non-empty legacy real store without V0.2 identity"
 operation = "preview, abort, then execute the same import plan"
 level = "application"

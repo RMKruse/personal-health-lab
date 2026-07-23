@@ -173,12 +173,28 @@ def _render_health_import(config: RuntimeConfig) -> None:
         st.rerun()
 
 
+def _discard_pending_previews() -> None:
+    import_request = st.session_state.get("import_request")
+    if isinstance(import_request, ImportHealthExport):
+        import_request.package_path.unlink(missing_ok=True)
+    for prefix in ("import", "backup", "restore", "analysis", "review", "rule", "historical"):
+        st.session_state.pop(f"{prefix}_request", None)
+        st.session_state.pop(f"{prefix}_plan", None)
+
+
 try:
     config = load_runtime_config()
 except (KeyError, ValueError, ConfigurationError):
     st.error("HealthLab-Konfiguration oder lokaler Datenspeicher ist ungültig.")
     st.stop()
 
+st.radio(
+    "Seite",
+    ("Übersicht", "Datenprüfung"),
+    key="active_page",
+    horizontal=True,
+    on_change=_discard_pending_previews,
+)
 st.title("HealthLab Übersicht")
 try:
     with HealthLab.open(config) as health_lab:

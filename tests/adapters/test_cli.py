@@ -16,6 +16,7 @@ from personal_health_lab.adapters.cli import main
 from personal_health_lab.application import (
     CreateMetadataBackup,
     DataMode,
+    FeatureNotAvailableError,
     HealthLab,
     ImportHealthExport,
     RuntimeConfig,
@@ -98,6 +99,13 @@ def _execute_json_analysis(
     return exit_code, receipt
 
 
+@pytest.mark.v02_adapter(
+    "cli",
+    "CreateMetadataBackup",
+    "MetadataBackupPlan",
+    "MetadataBackupReceipt",
+    "MetadataBackupStatus",
+)
 def test_cli_maps_metadata_backup_without_exposing_its_path(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -131,6 +139,16 @@ def test_cli_maps_metadata_backup_without_exposing_its_path(
     assert str(tmp_path) not in receipt_text
 
 
+@pytest.mark.v02_adapter(
+    "cli",
+    "BeginMetadataRestore",
+    "AbortMetadataRestore",
+    "MetadataRestorePlan",
+    "AbortMetadataRestorePlan",
+    "MetadataRestoreReceipt",
+    "MetadataRestoreStatus",
+    "RecoveryStatus",
+)
 def test_cli_maps_metadata_restore_status_and_abort_without_exposing_paths(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -284,6 +302,7 @@ def test_cli_completes_restore_through_the_shared_import_command(
         assert health_lab.load_workspace_status().state.value == "ready"
 
 
+@pytest.mark.v02_adapter("cli", "DataReviewAction", "DataReviewCycleStatus")
 def test_cli_projects_source_conflicts_from_the_shared_data_review(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -327,6 +346,19 @@ def test_cli_projects_source_conflicts_from_the_shared_data_review(
     assert output["cases"][0]["detail"]["reasons"] == []
 
 
+@pytest.mark.v02_adapter(
+    "cli",
+    "ResolveDataReviewCase",
+    "RevokeDataReviewDecision",
+    "DataReviewDecisionPlan",
+    "DataReviewBatchRevokePlan",
+    "WriteDecisionReceipt",
+    "WriteBatchDecisionReceipt",
+    "DataReview",
+    "DataReviewCaseDetail",
+    "DataReviewAction",
+    "DataReviewCycleStatus",
+)
 def test_cli_maps_data_review_plan_receipt_and_revocation(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -378,6 +410,7 @@ def test_cli_maps_data_review_plan_receipt_and_revocation(
     _assert_json_contract(json.loads(capsys.readouterr().out))
 
 
+@pytest.mark.v02_adapter("cli", "ConfirmDataReviewBatch", "DataReviewBatchPlan")
 def test_json_cli_keeps_the_complete_batch_and_reports_plan_changed(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -518,6 +551,7 @@ def test_cli_maps_correction_inputs(
     _assert_json_contract(json.loads(capsys.readouterr().out))
 
 
+@pytest.mark.v02_adapter("cli", "ReviewReasonCode")
 def test_cli_projects_the_personal_range_finding(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -553,6 +587,9 @@ def test_cli_projects_the_personal_range_finding(
     assert reason["lower_bound"] < 64 < reason["upper_bound"] + 1
 
 
+@pytest.mark.v02_adapter(
+    "cli", "RunHistoricalReview", "HistoricalReviewPlan", "HistoricalReviewReceipt"
+)
 def test_cli_maps_the_pinned_historical_review_plan(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -592,6 +629,15 @@ def test_cli_maps_the_pinned_historical_review_plan(
     assert receipt["result"]["type"] == "run_historical_review"
 
 
+@pytest.mark.v02_adapter(
+    "cli",
+    "CapacityReason",
+    "CapacityStatus",
+    "FileVaultReason",
+    "FileVaultStatus",
+    "PersonBindingStatus",
+    "WriteApprovalStatus",
+)
 def test_real_json_import_renders_shared_confirmation_plan(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -649,6 +695,13 @@ def test_real_json_import_renders_shared_confirmation_plan(
     ]
 
 
+@pytest.mark.v02_adapter(
+    "cli",
+    "CreatePlausibilityRuleVersion",
+    "PlausibilityRuleVersionPlan",
+    "PlausibilityRuleVersionReceipt",
+    "PlausibilityRules",
+)
 def test_cli_projects_and_creates_plausibility_rule_versions(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -716,6 +769,7 @@ def test_cli_returns_expected_incomplete_for_rejected_import(
     assert captured.err == ""
 
 
+@pytest.mark.v02_adapter("cli", "WriteNotStarted", "WriteNotStartedStatus")
 def test_cli_returns_expected_incomplete_while_store_is_busy(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -810,6 +864,11 @@ def test_json_cli_analysis_reports_plan_changed(
     assert receipt["result"]["status"] == "plan_changed"
 
 
+@pytest.mark.v02_adapter(
+    "cli",
+    "ConfigurationError",
+    "HealthLabError",
+)
 def test_installed_cli_contracts_streams_and_redacts_technical_errors(tmp_path: Path) -> None:
     executable = Path(sys.executable).with_name("healthlab")
     common_args = [
@@ -858,6 +917,33 @@ def test_installed_cli_contracts_streams_and_redacts_technical_errors(tmp_path: 
     assert failure.stderr == (
         "ERROR healthlab_failed error_class=HealthLabError\nTechnischer HealthLab-Fehler.\n"
     )
+
+
+@pytest.mark.v02_adapter("cli", "FeatureNotAvailableError")
+def test_cli_translates_feature_not_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        HealthLab,
+        "open",
+        lambda _config: (_ for _ in ()).throw(FeatureNotAvailableError("unavailable")),
+    )
+
+    assert (
+        main(
+            [
+                "--mode",
+                "synthetic",
+                "--synthetic-store",
+                str(tmp_path / "synthetic"),
+                "overview",
+            ]
+        )
+        == 1
+    )
+    assert "Technischer HealthLab-Fehler." in capsys.readouterr().err
 
 
 def test_cli_returns_usage_error_for_unknown_arguments_and_invalid_config(
@@ -937,6 +1023,16 @@ def test_cli_prints_empty_overview_as_versioned_json(
     }
 
 
+@pytest.mark.v02_adapter(
+    "cli",
+    "ImportHealthExport",
+    "ImportHealthExportPlan",
+    "ImportReceipt",
+    "ImportStatus",
+    "Overview",
+    "OverviewStatus",
+    "WorkspaceStatus",
+)
 def test_cli_imports_export_and_prints_daily_series(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -974,6 +1070,13 @@ def test_cli_imports_export_and_prints_daily_series(
     assert overview["provenance"]["quarantined_import_count"] == 0
 
 
+@pytest.mark.v02_adapter(
+    "cli",
+    "RunRestingHeartRateAnalysis",
+    "RestingHeartRateAnalysisPlan",
+    "AnalysisReceipt",
+    "AnalysisStatus",
+)
 def test_cli_runs_and_exposes_the_built_in_lag_analysis(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1078,6 +1181,17 @@ def test_cli_runs_and_exposes_the_built_in_lag_analysis(
     assert insufficient["result"]["provenance"]["result_ref"] is None
 
 
+@pytest.mark.v02_adapter(
+    "cli",
+    "MigrateStore",
+    "RollbackMigration",
+    "StoreMigrationPlan",
+    "RollbackMigrationPlan",
+    "StoreMigrationReceipt",
+    "RollbackMigrationReceipt",
+    "MigrationDiagnostics",
+    "MigrationStatus",
+)
 def test_cli_maps_store_migration_plan_and_receipt(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

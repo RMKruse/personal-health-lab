@@ -42,366 +42,36 @@ from personal_health_lab.storage import (
 )
 
 MATRIX_PATH = Path(__file__).with_name("v02_matrix.toml")
-REGISTERED_CASES = {
-    case_id: "test_v02_import_write_contract"
-    for case_id in (
-        "V02-A-API-004",
-        "V02-A-API-005",
-        "V02-A-API-006",
-        "V02-A-API-007",
-        "V02-A-API-010",
-        "V02-A-API-011",
-        "V02-A-API-012",
-        "V02-A-API-013",
-        "V02-A-API-014",
-    )
+EXPECTED_CONTRACT_GROUPS = {
+    "ADP": 4,
+    "API": 7,
+    "ARC": 3,
+    "BAK": 4,
+    "ERR": 4,
+    "MIG": 7,
+    "PRE": 8,
+    "RES": 5,
+    "REV": 8,
+    "RST": 6,
+    "RULE": 8,
+    "SRC": 7,
+    "STO": 6,
 }
-REGISTERED_CASES.update(
-    {
-        "V02-A-RHR-001": (
-            "test_analysis_preview_is_read_only_and_execution_rechecks_the_request"
-        ),
-        "V02-A-RHR-002": "test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis",
-        "V02-A-RHR-003": "test_analysis_rechecks_the_snapshot_under_the_writer_lock",
-        "V02-A-RHR-004": "test_analysis_store_busy_is_write_not_started",
-        "V02-A-RHR-005": (
-            "test_analysis_reports_insufficient_and_unstable_inputs_with_stable_diagnostics"
-        ),
-        "V02-A-RHR-006": "test_cli_runs_and_exposes_the_built_in_lag_analysis",
-        "V02-A-RHR-007": "test_cli_runs_and_exposes_the_built_in_lag_analysis",
-        "V02-A-RHR-008": "test_streamlit_shows_imported_daily_series",
-        "V02-A-RHR-009": "test_streamlit_shows_the_same_empty_overview",
-        "V02-A-RHR-010": "test_streamlit_maps_unstable_analysis",
-        "V02-A-RHR-011": "test_streamlit_maps_store_busy_analysis",
-        "V02-A-RHR-012": "test_streamlit_maps_plan_changed_analysis",
-        "V02-A-RHR-013": "test_json_cli_analysis_reports_plan_changed",
-        "V02-A-PRE-001": "test_new_store_has_stable_identity_and_immutable_mode",
-        "V02-A-PRE-002": "test_complete_store_copy_retains_the_same_identity",
-        "V02-A-PRE-003": (
-            "test_legacy_real_store_gets_identity_only_after_confirmed_execution"
-        ),
-        "V02-A-PRE-004": "test_new_store_has_stable_identity_and_immutable_mode",
-        "V02-A-PRE-005": "test_real_import_uses_one_typed_confirmation_plan",
-        "V02-A-PRE-006": "test_real_store_binds_only_after_a_decided_personal_import",
-        "V02-A-PRE-007": "test_quarantined_real_import_binds_the_store",
-        "V02-A-PRE-008": "test_pending_person_binding_is_visible_in_workspace_status",
-        "V02-A-PRE-009": "test_real_import_uses_one_typed_confirmation_plan",
-        "V02-A-PRE-010": "test_real_import_uses_one_typed_confirmation_plan",
-        "V02-A-PRE-011": "test_synthetic_import_skips_filevault_probe",
-        "V02-A-PRE-012": "test_hardware_encryption_without_filevault_is_unprotected",
-        "V02-A-PRE-013": "test_real_import_uses_one_typed_confirmation_plan",
-        "V02-A-PRE-014": "test_filevault_is_rechecked_after_the_writer_lock",
-        "V02-A-PRE-015": "test_filevault_improvement_to_protected_may_continue",
-    }
-)
-REGISTERED_CASES.update(
-    {
-        "V02-A-MIG-001": "test_current_store_migration_is_a_no_op_without_backup",
-        "V02-A-MIG-002": "test_registered_store_migration_chain_executes_as_one_operation",
-        "V02-A-MIG-003": "test_registered_store_migration_chain_executes_as_one_operation",
-        "V02-A-MIG-004": "test_unregistered_jump_or_downgrade_is_blocked",
-        "V02-A-MIG-005": "test_migration_required_session_only_allows_diagnosis_and_migration",
-        "V02-A-MIG-006": "test_abandoning_migration_plan_changes_nothing",
-        "V02-A-MIG-007": "test_registered_store_migration_chain_executes_as_one_operation",
-        "V02-A-MIG-008": "test_migration_uses_one_backup_and_one_writer_lock",
-        "V02-A-MIG-009": "test_failed_backup_or_capacity_preflight_prevents_migration_start",
-        "V02-A-MIG-010": "test_populated_store_is_migrated_copy_on_write",
-        "V02-A-MIG-011": "test_migration_makes_existing_analysis_stale",
-        "V02-A-MIG-012": "test_populated_store_is_migrated_copy_on_write",
-        "V02-A-MIG-013": "test_migration_validation_failure_prevents_activation",
-        "V02-A-MIG-014": "test_missing_cow_migration_bound_blocks_plan",
-        "V02-A-MIG-015": "test_migration_fault_keeps_old_snapshot_and_retry_starts_fresh",
-        "V02-A-MIG-016": "test_migration_fault_keeps_old_snapshot_and_retry_starts_fresh",
-        "V02-A-MIG-017": "test_migration_fault_keeps_old_snapshot_and_retry_starts_fresh",
-        "V02-A-MIG-018": "test_direct_migration_rollback_restores_backup_and_old_snapshot",
-        "V02-A-MIG-019": "test_later_successful_state_change_blocks_migration_rollback",
-        "V02-A-MIG-020": "test_direct_migration_rollback_restores_backup_and_old_snapshot",
-        "V02-A-ADP-010": "test_streamlit_focuses_migration_in_restricted_session",
-        "V02-A-PRE-025": "test_cow_migration_v1_bounds_normal_and_stress_fixtures",
-    }
-)
-REGISTERED_CASES.update(
-    {
-        "V02-A-BAK-001": "test_metadata_backup_is_one_redacted_portable_sqlite_file",
-        "V02-A-BAK-002": "test_metadata_backup_is_one_redacted_portable_sqlite_file",
-        "V02-A-BAK-003": "test_metadata_backup_is_one_redacted_portable_sqlite_file",
-        "V02-A-BAK-004": (
-            "test_metadata_backup_hash_survives_vacuum_and_same_target_is_no_op"
-        ),
-        "V02-A-BAK-005": "test_metadata_backup_is_one_redacted_portable_sqlite_file",
-        "V02-A-BAK-006": (
-            "test_metadata_backup_hash_survives_vacuum_and_same_target_is_no_op"
-        ),
-        "V02-A-BAK-007": "test_metadata_backup_conflict_blocks_without_overwriting",
-        "V02-A-BAK-008": "test_metadata_backup_is_real_only",
-        "V02-A-BAK-009": "test_metadata_backup_capacity_is_rechecked_under_the_writer_lock",
-        "V02-A-BAK-010": "test_cli_maps_metadata_backup_without_exposing_its_path",
-        "V02-A-PRE-021": "test_metadata_backup_v1_measures_populated_writer_phases",
-    }
-)
-REGISTERED_CASES.update(
-    {
-        "V02-A-RST-001": "test_valid_backup_begins_a_read_only_restore_pending_session",
-        "V02-A-RST-002": "test_restore_rejects_synthetic_populated_and_conflicting_targets",
-        "V02-A-RST-003": "test_restore_rejects_synthetic_populated_and_conflicting_targets",
-        "V02-A-RST-004": "test_valid_backup_begins_a_read_only_restore_pending_session",
-        "V02-A-RST-005": "test_valid_backup_begins_a_read_only_restore_pending_session",
-        "V02-A-RST-006": "test_valid_backup_begins_a_read_only_restore_pending_session",
-        "V02-A-RST-007": "test_restore_sources_match_exactly_and_activate_overlay_once",
-        "V02-A-RST-008": "test_restore_sources_match_exactly_and_activate_overlay_once",
-        "V02-A-RST-009": "test_restore_sources_match_exactly_and_activate_overlay_once",
-        "V02-A-RST-010": "test_supported_backup_schema_is_migrated_only_in_staging",
-        "V02-A-RST-011": "test_supported_backup_schema_is_migrated_only_in_staging",
-        "V02-A-RST-012": "test_unknown_or_unregistered_backup_schema_is_blocked",
-        "V02-A-RST-013": "test_restore_sources_match_exactly_and_activate_overlay_once",
-        "V02-A-RST-014": (
-            "test_restore_activation_fault_rolls_back_overlay_and_retries"
-        ),
-        "V02-A-RST-015": "test_restore_sources_match_exactly_and_activate_overlay_once",
-        "V02-A-RST-016": (
-            "test_abort_discards_pending_store_and_activated_backup_is_idempotent"
-        ),
-        "V02-A-RST-017": (
-            "test_abort_discards_pending_store_and_activated_backup_is_idempotent"
-        ),
-        "V02-A-RST-018": (
-            "test_restore_keeps_superseded_conflict_resolution_tombstoned"
-        ),
-        "V02-A-PRE-022": "test_restore_start_v1_bounds_normal_and_stress_fixtures",
-        "V02-A-PRE-023": "test_restore_sources_match_exactly_and_activate_overlay_once",
-        "V02-A-PRE-024": (
-            "test_restore_activate_v1_bounds_snapshot_and_overlay_allocation"
-        ),
-        "V02-A-ADP-009": (
-            "test_streamlit_completes_restore_through_the_shared_import_controls"
-        ),
-    }
-)
-REGISTERED_CASES.update(
-    {
-        "V02-A-RES-001": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
-        "V02-A-RES-002": "test_incomplete_analysis_creates_no_result_or_maturity",
-        "V02-A-RES-003": "test_incomplete_analysis_creates_no_result_or_maturity",
-        "V02-A-RES-004": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
-        "V02-A-RES-005": "test_reactivating_an_immutable_snapshot_rederives_current_freshness",
-        "V02-A-RES-006": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
-        "V02-A-RES-007": "test_passive_coverage_gaps_only_mark_results_that_use_them",
-        "V02-A-RES-008": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
-        "V02-A-RES-009": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
-        "V02-A-RES-010": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
-        "V02-A-RES-011": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
-        "V02-A-RES-012": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
-        "V02-A-RES-013": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
-        "V02-A-RES-014": "test_reuse_requires_every_reproduction_identity_to_match",
-        "V02-A-RES-015": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
-        "V02-A-STO-013": "test_analysis_results_keep_frozen_status_facts_and_separate_history",
-        "V02-A-STO-014": "test_incomplete_analysis_creates_no_result_or_maturity",
-        "V02-A-ADP-008": "test_cli_and_streamlit_project_analysis_status_axes",
-    }
-)
-REGISTERED_CASES.update(
-    {
-        "V02-A-RULE-001": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
-        "V02-A-RULE-002": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
-        "V02-A-RULE-003": (
-            "test_personal_range_uses_previous_effective_days_and_keeps_earlier_findings"
-        ),
-        "V02-A-RULE-004": "test_personal_range_is_inclusive_and_skips_unready_inputs",
-        "V02-A-RULE-005": "test_personal_range_is_inclusive_and_skips_unready_inputs",
-        "V02-A-RULE-006": "test_personal_range_is_inclusive_and_skips_unready_inputs",
-        "V02-A-RULE-007": (
-            "test_personal_range_uses_previous_effective_days_and_keeps_earlier_findings"
-        ),
-        "V02-A-RULE-008": "test_personal_range_uses_corrections_instead_of_source_values",
-        "V02-A-RULE-009": (
-            "test_personal_range_uses_previous_effective_days_and_keeps_earlier_findings"
-        ),
-        **{
-            f"V02-A-RULE-{number:03d}": (
-                "test_plausibility_rule_versions_are_typed_immutable_and_time_bound"
-            )
-            for number in range(10, 16)
-        },
-        "V02-A-RULE-016": (
-            "test_imports_use_the_stored_rule_timeline_without_backfilling_inactive_weeks"
-        ),
-        "V02-A-RULE-017": (
-            "test_rule_change_reevaluates_only_measurements_since_its_local_week_boundary"
-        ),
-        "V02-A-RULE-018": (
-            "test_deactivation_and_reactivation_leave_a_time_bound_gap"
-        ),
-        "V02-A-RULE-019": (
-            "test_imports_use_the_stored_rule_timeline_without_backfilling_inactive_weeks"
-        ),
-        "V02-A-RULE-020": (
-            "test_historical_review_pins_its_basis_and_reuses_only_identical_confirmations"
-        ),
-        "V02-A-RULE-021": "test_late_measurement_uses_the_rule_for_its_measurement_time",
-        "V02-A-RULE-022": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
-        "V02-A-RULE-023": (
-            "test_historical_review_pins_its_basis_and_reuses_only_identical_confirmations"
-        ),
-        "V02-A-RULE-024": (
-            "test_historical_review_pins_its_basis_and_reuses_only_identical_confirmations"
-        ),
-        "V02-A-RULE-025": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
-        "V02-A-RULE-026": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
-        "V02-A-RULE-027": "test_unknown_source_type_is_cataloged_and_requests_a_rule_once",
-        "V02-A-RULE-028": "test_unknown_source_type_is_cataloged_and_requests_a_rule_once",
-        "V02-A-REV-001": "test_clean_import_cycle_closes_immediately",
-        "V02-A-REV-002": (
-            "test_import_rule_change_and_historical_cycles_close_independently"
-        ),
-        "V02-A-REV-003": "test_clean_import_cycle_closes_immediately",
-        "V02-A-REV-004": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
-        "V02-A-REV-005": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
-        "V02-A-REV-006": "test_fixed_rules_are_inclusive_and_keep_flagged_source_values",
-        "V02-A-REV-007": (
-            "test_new_flagged_source_version_requires_confirmation_after_local_exclusion"
-        ),
-        "V02-A-REV-008": "test_correction_without_a_case_can_be_revoked_to_the_clean_source",
-        "V02-A-REV-009": (
-            "test_new_flagged_source_version_requires_confirmation_after_local_exclusion"
-        ),
-        "V02-A-REV-010": "test_corrections_supersede_forward_and_revocation_uses_source",
-        "V02-A-REV-011": "test_corrections_supersede_forward_and_revocation_uses_source",
-        "V02-A-REV-012": "test_deletion_decisions_and_reappearance_are_forward_only",
-        "V02-A-REV-013": (
-            "test_new_clean_source_version_can_replace_a_continued_correction"
-        ),
-        "V02-A-REV-014": (
-            "test_new_clean_source_version_can_replace_a_continued_correction"
-        ),
-        "V02-A-REV-015": (
-            "test_new_flagged_source_version_requires_confirmation_after_local_exclusion"
-        ),
-        "V02-A-REV-016": (
-            "test_new_flagged_source_version_requires_confirmation_after_local_exclusion"
-        ),
-        "V02-A-REV-017": (
-            "test_batch_confirmation_materializes_every_value_and_revokes_only_effective_members"
-        ),
-        "V02-A-REV-018": (
-            "test_large_batch_plan_remains_complete"
-        ),
-        "V02-A-REV-019": (
-            "test_batch_confirmation_fails_atomically_when_the_match_set_changes"
-        ),
-        "V02-A-REV-020": (
-            "test_batch_confirmation_materializes_every_value_and_revokes_only_effective_members"
-        ),
-        "V02-A-REV-021": (
-            "test_batch_confirmation_materializes_every_value_and_revokes_only_effective_members"
-        ),
-        "V02-A-ADP-004": "test_json_cli_keeps_the_complete_batch_and_reports_plan_changed",
-        "V02-A-ADP-011": "test_json_cli_keeps_the_complete_batch_and_reports_plan_changed",
-        "V02-A-REV-022": "test_review_decision_requests_enforce_mandatory_reasons",
-        "V02-A-REV-023": (
-            "test_new_clean_source_version_can_replace_a_continued_correction"
-        ),
-        "V02-A-REV-024": (
-            "test_confirmation_stales_but_never_rewrites_an_existing_analysis"
-        ),
-        "V02-A-REV-025": (
-            "test_confirmation_stales_but_never_rewrites_an_existing_analysis"
-        ),
-        "V02-A-REV-026": (
-            "test_confirmation_stales_but_never_rewrites_an_existing_analysis"
-        ),
-    }
-)
-REGISTERED_CASES.update(
-    {
-        **{
-            f"V02-A-SRC-{number:03d}": (
-                "test_package_occurrences_and_measurement_versions_remain_separate"
-            )
-            for number in range(1, 4)
-        },
-        **{
-            f"V02-A-SRC-{number:03d}": (
-                "test_only_the_newest_ordered_export_governs_source_versions"
-            )
-            for number in range(4, 7)
-        },
-        "V02-A-SRC-007": (
-            "test_strong_and_natural_identity_create_only_payload_versions"
-        ),
-        "V02-A-SRC-008": (
-            "test_strong_and_natural_identity_create_only_payload_versions"
-        ),
-        "V02-A-SRC-009": (
-            "test_identity_collision_is_visible_in_the_public_data_review_projection"
-        ),
-        "V02-A-SRC-010": (
-            "test_strong_and_natural_identity_create_only_payload_versions"
-        ),
-        **{
-            f"V02-A-SRC-{number:03d}": (
-                "test_comparable_exports_open_one_deletion_case_per_absence_phase"
-            )
-            for number in range(11, 14)
-        },
-        **{
-            f"V02-A-SRC-{number:03d}": ("test_deletion_decisions_and_reappearance_are_forward_only")
-            for number in range(14, 17)
-        },
-        **{
-            f"V02-A-SRC-{number:03d}": "test_conflicts_can_be_preferred_split_and_revoked"
-            for number in range(17, 20)
-        },
-        "V02-A-SRC-020": "test_a_newer_unambiguous_version_supersedes_conflict_preference",
-        "V02-A-SRC-021": "test_deletion_decisions_and_reappearance_are_forward_only",
-        "V02-A-STO-001": "test_import_publishes_one_validated_four_file_snapshot",
-        "V02-A-STO-002": "test_sqlite_catalog_and_audit_constraints_are_hard",
-        "V02-A-STO-003": "test_import_publishes_one_validated_four_file_snapshot",
-        "V02-A-STO-004": "test_sqlite_catalog_and_audit_constraints_are_hard",
-        "V02-A-STO-005": "test_sqlite_catalog_and_audit_constraints_are_hard",
-        "V02-A-STO-006": "test_sqlite_catalog_and_audit_constraints_are_hard",
-        "V02-A-STO-007": "test_import_publishes_one_validated_four_file_snapshot",
-        "V02-A-STO-008": (
-            "test_snapshot_validation_rejects_every_closed_contract_violation"
-        ),
-        "V02-A-STO-009": (
-            "test_resolved_measurement_disposition_xor_accepts_closed_variants"
-        ),
-        "V02-A-STO-010": "test_import_publishes_one_validated_four_file_snapshot",
-        "V02-A-STO-011": "test_manifest_rejects_nested_non_schema_fields",
-        "V02-A-STO-012": "test_import_publishes_one_validated_four_file_snapshot",
-        "V02-A-STO-015": "test_import_publishes_one_validated_four_file_snapshot",
-        "V02-A-STO-016": (
-            "test_publication_fault_keeps_old_snapshot_active_and_quarantines_remainder"
-        ),
-        "V02-A-STO-017": "test_import_publishes_one_validated_four_file_snapshot",
-        "V02-A-STO-018": (
-            "test_publication_fault_keeps_old_snapshot_active_and_quarantines_remainder"
-        ),
-        "V02-A-SRC-022": (
-            "test_negative_exports_v1_are_rejected_without_changing_the_snapshot"
-        ),
-        "V02-A-SRC-023": "test_recognized_package_validation_failure_is_quarantined",
-        "V02-A-SRC-024": "test_import_publishes_one_validated_four_file_snapshot",
-    }
-)
-REGISTERED_CASES.update(
-    {
-        **{
-            f"V02-A-PRE-{number:03d}": "test_import_capacity_public_plan_states"
-            for number in range(16, 20)
-        },
-        "V02-A-PRE-020": "test_full_snapshot_import_v1_formula_contract",
-        "V02-A-PRE-026": "test_full_snapshot_import_requires_writer_and_scratch_bounds",
-        "V02-A-PRE-027": "test_full_snapshot_import_requires_writer_and_scratch_bounds",
-        "V02-A-PRE-028": "test_full_snapshot_import_v1_formula_contract",
-        "V02-A-PRE-029": "test_full_snapshot_import_v1_formula_contract",
-        "V02-A-PRE-030": "test_full_snapshot_import_v1_measures_real_writer_phases",
-        "V02-A-PRE-031": "test_import_capacity_uses_the_hard_exact_boundary",
-        "V02-A-PRE-032": "test_enospc_after_positive_preflight_keeps_the_active_snapshot",
-        "V02-A-PRE-033": "test_unwritable_or_locked_import_target_is_blocked",
-        "V02-A-PRE-034": "test_competing_import_writer_keeps_readers_available",
-    }
-)
+EXPECTED_CASE_GROUPS = {
+    "ADP": 11,
+    "API": 23,
+    "ARC": 7,
+    "BAK": 10,
+    "ERR": 11,
+    "MIG": 20,
+    "PRE": 34,
+    "RES": 15,
+    "REV": 26,
+    "RST": 18,
+    "RULE": 28,
+    "SRC": 24,
+    "STO": 18,
+}
 
 
 def _matrix() -> dict[str, object]:
@@ -429,6 +99,21 @@ def _validate_matrix(matrix: dict[str, object]) -> None:
     fixture_ids = {row["id"] for row in sections["fixture"]}
     fault_point_ids = {row["id"] for row in sections["fault_point"]}
     registered_cases = {row["id"]: row["runner"] for row in sections["case"]}
+    assert contract_ids == {
+        f"V02-C-{group}-{number:03d}"
+        for group, count in EXPECTED_CONTRACT_GROUPS.items()
+        for number in range(1, count + 1)
+    }
+    assert set(registered_cases) == {
+        f"V02-A-{group}-{number:03d}"
+        for group, count in EXPECTED_CASE_GROUPS.items()
+        for number in range(1, count + 1)
+    }
+    assert contract_ids == {
+        contract_id
+        for case in sections["case"]
+        for contract_id in case["contracts"]
+    }, "uncovered V0.2 contract"
     assert all(
         len(fixture["sha256"]) == 64 and set(fixture["sha256"]) <= set("0123456789abcdef")
         for fixture in sections["fixture"]
@@ -442,8 +127,25 @@ def _validate_matrix(matrix: dict[str, object]) -> None:
     for fixture in sections["fixture"]:
         if fixture["id"].startswith(inline_fixture_prefixes):
             assert hashlib.sha256(fixture["parameters"].encode()).hexdigest() == fixture["sha256"]
-    assert registered_cases == REGISTERED_CASES, "unregistered or unclaimed V0.2 case"
+    assert fault_point_ids == {
+        fault_point
+        for case in sections["case"]
+        for fault_point in case.get("fault_points", ())
+    }, "uncovered V0.2 fault point"
+    required_case_fields = {
+        "id",
+        "contracts",
+        "fixtures",
+        "runner",
+        "initial_state",
+        "operation",
+        "level",
+        "expected_result",
+        "expected_effect",
+        "forbidden_side_effects",
+    }
     for case in sections["case"]:
+        assert required_case_fields <= case.keys(), f"incomplete case row {case['id']}"
         assert set(case["contracts"]) <= contract_ids, f"invalid contract reference in {case['id']}"
         assert set(case["fixtures"]) <= fixture_ids, f"invalid fixture reference in {case['id']}"
         assert set(case.get("fault_points", ())) <= fault_point_ids, (

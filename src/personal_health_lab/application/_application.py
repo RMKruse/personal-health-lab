@@ -10,7 +10,7 @@ from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
-from typing import Literal, Self
+from typing import Literal, Self, get_args
 from uuid import uuid4
 
 from personal_health_lab import DataMode
@@ -484,6 +484,8 @@ class ResolveDataReviewCase:
     resolution: DataReviewResolution
 
     def __post_init__(self) -> None:
+        if not isinstance(self.resolution, get_args(DataReviewResolution)):
+            raise ConfigurationError("Unbekannter Datenprüfentscheid.")
         if self.case_id is None and not isinstance(self.resolution, DataCorrection):
             raise ConfigurationError("Nur eine Datenkorrektur darf ohne Prüffall erfolgen.")
 
@@ -522,6 +524,9 @@ class BatchDecisionTarget:
     batch_action_id: DataReviewBatchActionId
 
 
+DataReviewDecisionTarget = SingleDecisionTarget | BatchDecisionTarget
+
+
 @dataclass(frozen=True, slots=True)
 class ConfirmDataReviewBatch:
     selection: DataReviewSelection
@@ -530,10 +535,12 @@ class ConfirmDataReviewBatch:
 
 @dataclass(frozen=True, slots=True)
 class RevokeDataReviewDecision:
-    target: SingleDecisionTarget | BatchDecisionTarget
+    target: DataReviewDecisionTarget
     reason: str
 
     def __post_init__(self) -> None:
+        if not isinstance(self.target, get_args(DataReviewDecisionTarget)):
+            raise ConfigurationError("Unbekanntes Widerrufsziel.")
         if not self.reason.strip():
             raise ConfigurationError("Widerruf verlangt einen Grund.")
 
@@ -1081,6 +1088,8 @@ class HealthLab:
 
     def preview_write(self, request: WriteRequest) -> WritePlan:
         self._require_open()
+        if not isinstance(request, get_args(WriteRequest)):
+            raise ConfigurationError("Unbekannter Schreibauftrag.")
         if isinstance(request, BeginMetadataRestore):
             return self._build_metadata_restore_plan(request)
         if isinstance(request, AbortMetadataRestore):
@@ -1101,8 +1110,11 @@ class HealthLab:
             return self._build_historical_review_plan(request)
         if isinstance(request, CreatePlausibilityRuleVersion):
             return self._build_plausibility_rule_plan(request)
-        if not isinstance(request, ImportHealthExport):
+        if isinstance(
+            request, (ResolveDataReviewCase, ConfirmDataReviewBatch, RevokeDataReviewDecision)
+        ):
             return self._build_data_review_plan(request)
+        assert isinstance(request, ImportHealthExport)
         filevault = (
             probe_filevault(self._config.active_store)
             if self._config.mode is DataMode.REAL

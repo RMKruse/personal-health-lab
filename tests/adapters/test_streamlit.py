@@ -14,7 +14,9 @@ from personal_health_lab.application import (
     AnalysisDefinitionId,
     CreateMetadataBackup,
     DataMode,
+    FeatureNotAvailableError,
     HealthLab,
+    HealthLabError,
     ImportHealthExport,
     RunRestingHeartRateAnalysis,
     RuntimeConfig,
@@ -51,6 +53,17 @@ def test_streamlit_shows_the_same_empty_overview(
     assert not app.get("vega_lite_chart")
 
 
+@pytest.mark.v02_adapter(
+    "streamlit",
+    "MigrateStore",
+    "RollbackMigration",
+    "StoreMigrationPlan",
+    "RollbackMigrationPlan",
+    "StoreMigrationReceipt",
+    "RollbackMigrationReceipt",
+    "MigrationDiagnostics",
+    "MigrationStatus",
+)
 def test_streamlit_focuses_migration_in_restricted_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -141,6 +154,7 @@ def test_streamlit_focuses_migration_in_restricted_session(
     assert any(item.value == "Datenspeichermigration" for item in app.subheader)
 
 
+@pytest.mark.v02_adapter("streamlit", "ConfigurationError")
 def test_streamlit_translates_invalid_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -155,6 +169,35 @@ def test_streamlit_translates_invalid_configuration(
     )
 
 
+@pytest.mark.v02_adapter("streamlit", "FeatureNotAvailableError", "HealthLabError")
+@pytest.mark.parametrize("error_type", (FeatureNotAvailableError, HealthLabError))
+def test_streamlit_translates_application_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[HealthLabError],
+) -> None:
+    monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
+    monkeypatch.setattr(
+        HealthLab,
+        "open",
+        lambda _config: (_ for _ in ()).throw(error_type("unavailable")),
+    )
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
+
+    app = AppTest.from_file(str(app_path)).run()
+
+    assert not app.exception
+    assert app.error[0].value == (
+        "HealthLab-Konfiguration oder lokaler Datenspeicher ist ungültig."
+    )
+
+
+@pytest.mark.v02_adapter(
+    "streamlit",
+    "CreateMetadataBackup",
+    "MetadataBackupPlan",
+    "MetadataBackupReceipt",
+    "MetadataBackupStatus",
+)
 def test_streamlit_plans_and_executes_metadata_backup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -176,12 +219,22 @@ def test_streamlit_plans_and_executes_metadata_backup(
     assert any("Audit-Höchststand: 0" in item.value for item in app.caption)
     assert all(str(tmp_path) not in item.value for item in app.caption)
     next(button for button in app.button if button.label == "Metadatensicherung ausführen").click()
-    app.run()
+    app.run(timeout=10)
 
     assert target.is_file()
     assert any("Metadatensicherung: completed" in item.value for item in app.success)
 
 
+@pytest.mark.v02_adapter(
+    "streamlit",
+    "BeginMetadataRestore",
+    "AbortMetadataRestore",
+    "MetadataRestorePlan",
+    "AbortMetadataRestorePlan",
+    "MetadataRestoreReceipt",
+    "MetadataRestoreStatus",
+    "RecoveryStatus",
+)
 def test_streamlit_focuses_pending_metadata_restore_and_can_abort(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -265,7 +318,7 @@ def test_streamlit_completes_restore_through_the_shared_import_controls(
         ("apple-health-export.zip", fixture.export_path.read_bytes(), "application/zip")
     )
     next(button for button in app.button if button.label == "Health-Export prüfen").click()
-    app.run()
+    app.run(timeout=10)
     assert not app.exception
     assert any("Methode restore-activate/v1" in item.value for item in app.caption)
     next(button for button in app.button if button.label == "Vorschau ausführen").click()
@@ -276,6 +329,13 @@ def test_streamlit_completes_restore_through_the_shared_import_controls(
     assert any(item.value == "Status: ready" for item in app.markdown)
 
 
+@pytest.mark.v02_adapter(
+    "streamlit",
+    "CreatePlausibilityRuleVersion",
+    "PlausibilityRuleVersionPlan",
+    "PlausibilityRuleVersionReceipt",
+    "PlausibilityRules",
+)
 def test_streamlit_projects_plausibility_rules(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -291,6 +351,9 @@ def test_streamlit_projects_plausibility_rules(
     assert any("apple_resting_heart_rate" in item.value for item in app.caption)
 
 
+@pytest.mark.v02_adapter(
+    "streamlit", "RunHistoricalReview", "HistoricalReviewPlan", "HistoricalReviewReceipt"
+)
 def test_streamlit_shows_the_pinned_historical_review_plan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -327,6 +390,20 @@ def test_streamlit_shows_the_pinned_historical_review_plan(
     assert any(button.label == "Historische Prüfung ausführen" for button in app.button)
 
 
+@pytest.mark.v02_adapter(
+    "streamlit",
+    "ImportHealthExport",
+    "ImportHealthExportPlan",
+    "ImportReceipt",
+    "ImportStatus",
+    "RunRestingHeartRateAnalysis",
+    "RestingHeartRateAnalysisPlan",
+    "AnalysisReceipt",
+    "AnalysisStatus",
+    "Overview",
+    "OverviewStatus",
+    "WorkspaceStatus",
+)
 def test_streamlit_shows_imported_daily_series(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -373,6 +450,8 @@ def test_streamlit_shows_imported_daily_series(
     next(button for button in app.button if button.label == "Ruhepulsanalyse prüfen").click().run()
 
     assert any(button.label == "Ruhepulsanalyse ausführen" for button in app.button)
+
+
     assert any("Gepinnter Snapshot:" in item.value for item in app.caption)
     assert app.date_input[0].disabled
     assert app.date_input[1].disabled
@@ -433,6 +512,29 @@ def test_streamlit_shows_imported_daily_series(
     assert any("Letztes robustes Ergebnis" in item.value for item in app.warning)
 
 
+def test_streamlit_page_change_discards_pending_preview(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = generate_export("lag-signal-v1", 42, tmp_path / "fixture")
+    monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
+    monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(tmp_path / "synthetic"))
+    monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(tmp_path / "real"))
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
+
+    app = AppTest.from_file(str(app_path)).run()
+    app.file_uploader[0].set_value(
+        ("apple-health-export.zip", fixture.export_path.read_bytes(), "application/zip")
+    )
+    app.button[0].click().run()
+
+    assert any(item.value == "Schreibvorschau" for item in app.subheader)
+
+    app.radio[0].set_value("Datenprüfung").run()
+
+    assert not app.exception
+    assert all(item.value != "Schreibvorschau" for item in app.subheader)
+
+
 def test_streamlit_maps_unstable_analysis(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -462,6 +564,7 @@ def test_streamlit_maps_unstable_analysis(
     assert any("Analysestatus: unstable" in message.value for message in app.warning)
 
 
+@pytest.mark.v02_adapter("streamlit", "WriteNotStarted", "WriteNotStartedStatus")
 def test_streamlit_maps_store_busy_analysis(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -512,6 +615,15 @@ def test_streamlit_maps_plan_changed_analysis(
     assert any("Analysestatus: plan_changed" in message.value for message in app.warning)
 
 
+@pytest.mark.v02_adapter(
+    "streamlit",
+    "CapacityReason",
+    "CapacityStatus",
+    "FileVaultReason",
+    "FileVaultStatus",
+    "PersonBindingStatus",
+    "WriteApprovalStatus",
+)
 def test_streamlit_renders_the_shared_real_import_confirmation_plan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -541,6 +653,7 @@ def test_streamlit_renders_the_shared_real_import_confirmation_plan(
     assert any(button.label == "Bestätigen und ausführen" for button in app.button)
 
 
+@pytest.mark.v02_adapter("streamlit", "DataReviewAction", "DataReviewCycleStatus")
 def test_streamlit_projects_source_conflicts_from_the_shared_data_review(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -574,6 +687,7 @@ def test_streamlit_projects_source_conflicts_from_the_shared_data_review(
     assert any("Details:" in item.value for item in app.caption)
 
 
+@pytest.mark.v02_adapter("streamlit", "ReviewReasonCode")
 def test_streamlit_projects_the_personal_range_finding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -597,6 +711,7 @@ def test_streamlit_projects_the_personal_range_finding(
     assert any("above_personal_upper_bound" in item.value for item in app.caption)
 
 
+@pytest.mark.v02_adapter("streamlit", "ConfirmDataReviewBatch", "DataReviewBatchPlan")
 def test_streamlit_previews_the_application_materialized_batch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -616,13 +731,26 @@ def test_streamlit_previews_the_application_materialized_batch(
     app = AppTest.from_file(str(app_path)).run()
 
     next(button for button in app.button if button.label == "Sammelbestätigung prüfen").click()
-    app.run()
+    app.run(timeout=10)
 
     assert not app.exception
     assert app.dataframe
     assert any(button.label == "Datenprüfentscheidung ausführen" for button in app.button)
 
 
+@pytest.mark.v02_adapter(
+    "streamlit",
+    "ResolveDataReviewCase",
+    "RevokeDataReviewDecision",
+    "DataReviewDecisionPlan",
+    "DataReviewBatchRevokePlan",
+    "WriteDecisionReceipt",
+    "WriteBatchDecisionReceipt",
+    "DataReview",
+    "DataReviewCaseDetail",
+    "DataReviewAction",
+    "DataReviewCycleStatus",
+)
 def test_streamlit_can_plan_a_data_correction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -651,6 +779,20 @@ def test_streamlit_can_plan_a_data_correction(
     assert any(button.label == "Datenprüfentscheidung ausführen" for button in app.button)
 
 
+@pytest.mark.v02_adapter(
+    "cli",
+    "DataQualityStatus",
+    "DataStatusReasonCode",
+    "ModelMaturityStatus",
+    "ReproducibilityStatus",
+)
+@pytest.mark.v02_adapter(
+    "streamlit",
+    "DataQualityStatus",
+    "DataStatusReasonCode",
+    "ModelMaturityStatus",
+    "ReproducibilityStatus",
+)
 def test_cli_and_streamlit_project_analysis_status_axes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
