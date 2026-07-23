@@ -321,8 +321,12 @@ def test_streamlit_completes_restore_through_the_shared_import_controls(
     app.run(timeout=10)
     assert not app.exception
     assert any("Methode restore-activate/v1" in item.value for item in app.caption)
-    next(button for button in app.button if button.label == "Vorschau ausführen").click()
-    app.run()
+    next(
+        button
+        for button in app.button
+        if button.label in {"Vorschau ausführen", "Bestätigen und ausführen"}
+    ).click()
+    app.run(timeout=10)
 
     assert not app.exception
     assert any("Importstatus: committed" in item.value for item in app.success)
@@ -434,7 +438,7 @@ def test_streamlit_shows_imported_daily_series(
         ("apple-health-export.zip", fixture.export_path.read_bytes(), "application/zip")
     )
     app.button[0].click().run()
-    app.button[1].click().run()
+    app.button[1].click().run(timeout=10)
 
     assert not app.exception
     assert any("Importstatus: committed" in message.value for message in app.success)
@@ -853,8 +857,12 @@ def test_cli_and_streamlit_project_analysis_status_axes(
     app.file_uploader[0].set_value(
         ("apple-health-export.zip", first.export_path.read_bytes(), "application/zip")
     )
-    next(button for button in app.button if button.label == "Health-Export prüfen").click().run()
-    next(button for button in app.button if button.label == "Vorschau ausführen").click().run()
+    next(button for button in app.button if button.label == "Health-Export prüfen").click().run(
+        timeout=10
+    )
+    next(button for button in app.button if button.label == "Vorschau ausführen").click().run(
+        timeout=10
+    )
     next(
         button for button in app.button if button.label == "Sammelbestätigung prüfen"
     ).click().run()

@@ -1,8 +1,5 @@
-import os
-import signal
 import stat
-import time
-from datetime import UTC, date, datetime, timedelta
+from datetime import date
 from multiprocessing import get_context
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
@@ -50,35 +47,27 @@ def _record(
     )
 
 
-def _import_in_process(config: RuntimeConfig, package_path: Path) -> None:
-    while True:
-        with HealthLab.open(config) as health_lab:
-            receipt = _execute_import(health_lab, package_path)
-        if not (
-            isinstance(receipt, WriteNotStarted)
-            and receipt.status is WriteNotStartedStatus.STORE_BUSY
-        ):
-            return
+def _import_in_process(
+    config: RuntimeConfig,
+    package_path: Path,
+    publication_reached: object,
+    publication_release: object,
+) -> None:
+    from personal_health_lab.storage import _store
+
+    def pause_publication(root: Path, fault_point_id: str) -> None:
+        publication_reached.set()  # type: ignore[attr-defined]
+        publication_release.wait(timeout=10)  # type: ignore[attr-defined]
+
+    _store._publication_fault_point = pause_publication
+    with HealthLab.open(config) as health_lab:
+        _execute_import(health_lab, package_path)
 
 
 def _execute_import(health_lab: HealthLab, package_path: Path) -> ImportReceipt | WriteNotStarted:
     request = ImportHealthExport(package_path)
     plan = health_lab.preview_write(request)
     return health_lab.execute_write(request, expected_plan=plan.fingerprint).result
-
-
-def _large_export(path: Path, count: int = 50_000) -> Path:
-    start = datetime(2024, 1, 2, tzinfo=UTC)
-    records = "".join(
-        _record(
-            "HKQuantityTypeIdentifierActiveEnergyBurned",
-            1,
-            (start + timedelta(seconds=index)).strftime("%Y-%m-%d %H:%M:%S %z"),
-            (start + timedelta(seconds=index + 1)).strftime("%Y-%m-%d %H:%M:%S %z"),
-        )
-        for index in range(count)
-    )
-    return _export(path, records)
 
 
 def _negative_export_v1(path: Path, case: str, valid_xml: str) -> Path:
@@ -357,7 +346,15 @@ def test_interrupted_import_keeps_snapshot_and_is_quarantined_on_restart(
             "2024-01-01 07:01:00 +0100",
         ),
     )
-    interrupted = _large_export(tmp_path / "interrupted.zip")
+    interrupted = _export(
+        tmp_path / "interrupted.zip",
+        _record(
+            "HKQuantityTypeIdentifierRestingHeartRate",
+            61,
+            "2024-01-02 07:00:00 +0100",
+            "2024-01-02 07:01:00 +0100",
+        ),
+    )
     config = RuntimeConfig(
         mode=DataMode.SYNTHETIC,
         synthetic_store=tmp_path / "synthetic-store",
@@ -367,43 +364,27 @@ def test_interrupted_import_keeps_snapshot_and_is_quarantined_on_restart(
         committed = _execute_import(health_lab, base)
         before = health_lab.load_overview(OverviewSelection())
 
-    process = get_context("spawn").Process(
+    context = get_context("spawn")
+    publication_reached = context.Event()
+    publication_release = context.Event()
+    process = context.Process(
         target=_import_in_process,
-        args=(config, interrupted),
+        args=(config, interrupted, publication_reached, publication_release),
     )
     process.start()
-    deadline = time.monotonic() + 10
-    busy = None
-    before_busy = None
-    while time.monotonic() < deadline:
-        with HealthLab.open(config) as health_lab:
-            before_attempt = health_lab.load_overview(OverviewSelection())
-            candidate = _execute_import(health_lab, base)
-        if (
-            isinstance(candidate, WriteNotStarted)
-            and candidate.status is WriteNotStartedStatus.STORE_BUSY
-        ):
-            staging = config.active_store / "staging"
-            if not staging.exists() or not any(staging.iterdir()):
-                time.sleep(0.01)
-                continue
-            busy = candidate
-            before_busy = before_attempt
-            os.kill(process.pid, signal.SIGSTOP)
-            break
-        time.sleep(0.01)
-    if busy is None and process.is_alive():
-        process.kill()
-        process.join(timeout=5)
-    assert busy is not None
-    assert before_busy is not None
     try:
+        assert publication_reached.wait(timeout=10)
+        with HealthLab.open(config) as health_lab:
+            before_busy = health_lab.load_overview(OverviewSelection())
+            busy = _execute_import(health_lab, base)
         with HealthLab.open(config) as health_lab:
             during = health_lab.load_overview(OverviewSelection())
     finally:
-        os.kill(process.pid, signal.SIGKILL)
+        if process.is_alive():
+            process.kill()
         process.join(timeout=5)
     assert not process.is_alive()
+    assert isinstance(busy, WriteNotStarted)
     assert busy.status is WriteNotStartedStatus.STORE_BUSY
     assert during == before_busy
 

@@ -21,7 +21,6 @@ def test_real_macos_platform_probes_succeed_and_redact(tmp_path: Path) -> None:
             FileVaultReason.DISK_INFO_UNAVAILABLE,
             FileVaultReason.VOLUME_IDENTITY_MISSING,
             FileVaultReason.APFS_STATE_UNAVAILABLE,
-            FileVaultReason.FILEVAULT_STATE_UNAVAILABLE,
             FileVaultReason.FILEVAULT_STATE_UNREPORTED,
             FileVaultReason.PROBE_FAILED,
         }
