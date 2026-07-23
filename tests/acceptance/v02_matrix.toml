@@ -3034,10 +3034,22 @@ source = "https://github.com/RMKruse/personal-health-lab/issues/33"
 evidence = ["positive", "negative", "transition"]
 
 [[contract]]
+id = "V02-C-RST-003"
+statement = "Restore source imports match exact logical and version identities plus content fingerprints and remain pending until every required reference exists."
+source = "https://github.com/RMKruse/personal-health-lab/issues/54"
+evidence = ["positive", "negative", "boundary", "transition"]
+
+[[contract]]
 id = "V02-C-RST-004"
 statement = "Supported backup schemas migrate forward in an isolated working copy and never mutate the original backup."
 source = "https://github.com/RMKruse/personal-health-lab/issues/33"
 evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V02-C-RST-005"
+statement = "The closing source import atomically activates the restored metadata overlay, audit history, person binding, and exactly one snapshot without reviving tombstoned state."
+source = "https://github.com/RMKruse/personal-health-lab/issues/54"
+evidence = ["positive", "negative", "fault", "transition"]
 
 [[contract]]
 id = "V02-C-RST-006"
@@ -3145,6 +3157,42 @@ expected_effect = "none"
 forbidden_side_effects = ["implicit continuation", "catalog mutation"]
 
 [[case]]
+id = "V02-A-RST-007"
+contracts = ["V02-C-RST-003"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_restore_sources_match_exactly_and_activate_overlay_once"
+initial_state = "restore-pending store with required source references"
+operation = "import an exact source package"
+level = "application"
+expected_result = "matched references"
+expected_effect = "durable restore source staging"
+forbidden_side_effects = ["similar-ID match", "early snapshot activation"]
+
+[[case]]
+id = "V02-A-RST-008"
+contracts = ["V02-C-RST-003"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_restore_sources_match_exactly_and_activate_overlay_once"
+initial_state = "restore-pending store with incomplete exact references"
+operation = "import changed-content and missing-ID packages"
+level = "application"
+expected_result = "restore_pending"
+expected_effect = "none"
+forbidden_side_effects = ["content-only match", "regular review cases"]
+
+[[case]]
+id = "V02-A-RST-009"
+contracts = ["V02-C-RST-003"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_restore_sources_match_exactly_and_activate_overlay_once"
+initial_state = "restore-pending store before final source"
+operation = "inspect storage state"
+level = "storage"
+expected_result = "no active snapshot"
+expected_effect = "none"
+forbidden_side_effects = ["partial overlay", "ready person binding"]
+
+[[case]]
 id = "V02-A-RST-010"
 contracts = ["V02-C-RST-004"]
 fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
@@ -3181,6 +3229,42 @@ expected_effect = "none"
 forbidden_side_effects = ["best-effort migration", "working-copy creation"]
 
 [[case]]
+id = "V02-A-RST-013"
+contracts = ["V02-C-RST-005"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_restore_sources_match_exactly_and_activate_overlay_once"
+initial_state = "all but the closing source imported"
+operation = "execute closing source import"
+level = "storage"
+expected_result = "committed import receipt"
+expected_effect = "one atomic overlay and snapshot activation"
+forbidden_side_effects = ["second snapshot", "audit discontinuity"]
+
+[[case]]
+id = "V02-A-RST-014"
+contracts = ["V02-C-RST-005"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_restore_activation_fault_rolls_back_overlay_and_retries"
+initial_state = "restore activation at durable commit boundary"
+operation = "activate restored overlay"
+level = "storage"
+expected_result = "all-or-nothing publication"
+expected_effect = "single committed activation"
+forbidden_side_effects = ["partial metadata copy", "partial person binding"]
+
+[[case]]
+id = "V02-A-RST-015"
+contracts = ["V02-C-RST-003", "V02-C-RST-005"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_restore_sources_match_exactly_and_activate_overlay_once"
+initial_state = "one required source reference missing"
+operation = "import unrelated source data"
+level = "application"
+expected_result = "restore_pending"
+expected_effect = "none"
+forbidden_side_effects = ["partial activation", "missing-reference substitution"]
+
+[[case]]
 id = "V02-A-RST-016"
 contracts = ["V02-C-RST-006"]
 fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
@@ -3205,6 +3289,18 @@ expected_effect = "none"
 forbidden_side_effects = ["new session", "store replacement"]
 
 [[case]]
+id = "V02-A-RST-018"
+contracts = ["V02-C-RST-005", "V02-C-RST-006"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_restore_keeps_superseded_conflict_resolution_tombstoned"
+initial_state = "backup with a superseded conflict resolution"
+operation = "complete source reconstruction"
+level = "application"
+expected_result = "replacement split remains effective"
+expected_effect = "tombstone and decision history restored"
+forbidden_side_effects = ["revoked correction revival", "superseded state revival"]
+
+[[case]]
 id = "V02-A-PRE-022"
 contracts = ["V02-C-PRE-006"]
 fixtures = ["V02-F-SYS-ALLOC-RESTORE-NORMAL-V1", "V02-F-SYS-ALLOC-RESTORE-STRESS-V1"]
@@ -3215,3 +3311,39 @@ level = "storage"
 expected_result = "restore-start/v1 conservative bound"
 expected_effect = "pending restore"
 forbidden_side_effects = ["base allocation counted as new", "unbounded working copy"]
+
+[[case]]
+id = "V02-A-PRE-023"
+contracts = ["V02-C-PRE-006", "V02-C-PRE-007"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_restore_sources_match_exactly_and_activate_overlay_once"
+initial_state = "restore-pending store and non-closing source package"
+operation = "preflight source staging"
+level = "storage"
+expected_result = "restore-source-import/v1 conservative estimate"
+expected_effect = "none"
+forbidden_side_effects = ["unversioned estimate", "early activation"]
+
+[[case]]
+id = "V02-A-PRE-024"
+contracts = ["V02-C-PRE-006", "V02-C-PRE-007"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_restore_activate_v1_bounds_snapshot_and_overlay_allocation"
+initial_state = "restore-pending store and closing source package"
+operation = "preflight atomic activation"
+level = "storage"
+expected_result = "restore-activate/v1 conservative estimate"
+expected_effect = "none"
+forbidden_side_effects = ["unversioned estimate", "partial overlay"]
+
+[[case]]
+id = "V02-A-ADP-009"
+contracts = ["V02-C-ADP-001", "V02-C-ADP-002", "V02-C-ADP-003", "V02-C-ADP-004"]
+fixtures = ["V02-F-DOM-METADATA-RESTORE-V1"]
+runner = "test_streamlit_completes_restore_through_the_shared_import_controls"
+initial_state = "restore-pending workspace"
+operation = "complete restore through the production import controls"
+level = "adapter"
+expected_result = "shared import preview and committed receipt"
+expected_effect = "ready restored workspace"
+forbidden_side_effects = ["adapter restore logic", "path disclosure"]

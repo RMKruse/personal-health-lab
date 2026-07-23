@@ -147,16 +147,34 @@ REGISTERED_CASES.update(
         "V02-A-RST-004": "test_valid_backup_begins_a_read_only_restore_pending_session",
         "V02-A-RST-005": "test_valid_backup_begins_a_read_only_restore_pending_session",
         "V02-A-RST-006": "test_valid_backup_begins_a_read_only_restore_pending_session",
+        "V02-A-RST-007": "test_restore_sources_match_exactly_and_activate_overlay_once",
+        "V02-A-RST-008": "test_restore_sources_match_exactly_and_activate_overlay_once",
+        "V02-A-RST-009": "test_restore_sources_match_exactly_and_activate_overlay_once",
         "V02-A-RST-010": "test_supported_backup_schema_is_migrated_only_in_staging",
         "V02-A-RST-011": "test_supported_backup_schema_is_migrated_only_in_staging",
         "V02-A-RST-012": "test_unknown_or_unregistered_backup_schema_is_blocked",
+        "V02-A-RST-013": "test_restore_sources_match_exactly_and_activate_overlay_once",
+        "V02-A-RST-014": (
+            "test_restore_activation_fault_rolls_back_overlay_and_retries"
+        ),
+        "V02-A-RST-015": "test_restore_sources_match_exactly_and_activate_overlay_once",
         "V02-A-RST-016": (
             "test_abort_discards_pending_store_and_activated_backup_is_idempotent"
         ),
         "V02-A-RST-017": (
             "test_abort_discards_pending_store_and_activated_backup_is_idempotent"
         ),
+        "V02-A-RST-018": (
+            "test_restore_keeps_superseded_conflict_resolution_tombstoned"
+        ),
         "V02-A-PRE-022": "test_restore_start_v1_bounds_normal_and_stress_fixtures",
+        "V02-A-PRE-023": "test_restore_sources_match_exactly_and_activate_overlay_once",
+        "V02-A-PRE-024": (
+            "test_restore_activate_v1_bounds_snapshot_and_overlay_allocation"
+        ),
+        "V02-A-ADP-009": (
+            "test_streamlit_completes_restore_through_the_shared_import_controls"
+        ),
     }
 )
 REGISTERED_CASES.update(
@@ -1051,6 +1069,7 @@ def test_v02_import_write_contract(
                 "duplicate",
                 "rejected",
                 "quarantined",
+                "restore_pending",
                 "store_busy",
             }
         elif case_id == "V02-A-API-014":

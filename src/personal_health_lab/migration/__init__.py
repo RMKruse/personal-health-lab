@@ -2,8 +2,8 @@
 
 from personal_health_lab.storage import MigrationRollbackFacts, current_store_schema_version
 
-_REGISTERED_STEPS = ((1, 2), (2, 3), (3, 4), (4, 5))
-_REGISTERED_BACKUP_STEPS = ((1, 2),)
+_REGISTERED_STEPS = ((1, 2), (2, 3), (3, 4), (4, 5), (5, 6))
+_REGISTERED_BACKUP_STEPS = ((1, 2), (2, 3))
 
 
 def _plan_adjacent_migration(

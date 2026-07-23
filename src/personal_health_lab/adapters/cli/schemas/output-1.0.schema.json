@@ -350,7 +350,7 @@
         "schema_version": {"const": "1.0"},
         "snapshot_ref": {"$ref": "#/$defs/nullableString"},
         "status": {
-          "enum": ["committed", "duplicate", "rejected", "quarantined", "store_busy"]
+          "enum": ["committed", "duplicate", "rejected", "quarantined", "restore_pending", "store_busy"]
         }
       }
     },

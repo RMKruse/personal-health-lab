@@ -49,6 +49,7 @@ from personal_health_lab.application import (
     RollbackMigrationPlan,
     RunHistoricalReview,
     RunRestingHeartRateAnalysis,
+    RuntimeConfig,
     SingleDecisionTarget,
     SourceConflictResolution,
     SourceConflictStrategy,
@@ -64,6 +65,112 @@ from personal_health_lab.application import (
 
 def _chart_data(values: object) -> str:
     return f"data:application/json,{quote(json.dumps(values, separators=(',', ':')))}"
+
+
+def _render_health_import(config: RuntimeConfig) -> None:
+    import_plan = st.session_state.get("import_plan")
+    uploaded = st.file_uploader(
+        "Apple-Health-Export",
+        type="zip",
+        disabled=import_plan is not None,
+    )
+    if st.button("Health-Export prüfen", disabled=uploaded is None or import_plan is not None):
+        request = None
+        try:
+            assert uploaded is not None
+            uploaded.seek(0)
+            with NamedTemporaryFile(suffix=".zip", delete=False) as package:
+                shutil.copyfileobj(uploaded, package)
+                package.flush()
+                request = ImportHealthExport(Path(package.name))
+            with HealthLab.open(config) as health_lab:
+                plan = health_lab.preview_write(request)
+            st.session_state["import_request"] = request
+            st.session_state["import_plan"] = plan
+            st.rerun()
+        except (OSError, HealthLabError):
+            if request is not None:
+                request.package_path.unlink(missing_ok=True)
+            st.error("Health-Export konnte nicht importiert werden.")
+
+    import_plan = st.session_state.get("import_plan")
+    if import_plan is None:
+        return
+    import_request = st.session_state["import_request"]
+    st.subheader("Schreibvorschau")
+    st.write(f"Freigabe: {import_plan.approval.status.value}")
+    st.code(str(import_plan.fingerprint))
+    st.caption(
+        f"Paket: {import_plan.details.package_size} Bytes · "
+        f"SHA-256 {import_plan.details.package_hash or '-'}"
+    )
+    st.caption(
+        "Bestätigungen: "
+        + (", ".join(confirmation.value for confirmation in import_plan.confirmations) or "-")
+    )
+    filevault = import_plan.preflight.filevault
+    st.caption(
+        "FileVault: "
+        + (
+            f"{filevault.status.value} · Ziel {filevault.target_volume}"
+            + (f" · Grund {filevault.reason.value}" if filevault.reason else "")
+            if filevault
+            else "-"
+        )
+    )
+    capacity = import_plan.preflight.capacity
+    st.caption(
+        "Kapazität: "
+        + (
+            f"{capacity.status.value} · Ziel {capacity.target_volume} · "
+            f"Methode {capacity.method_id} · Schätzung {capacity.estimate_bytes} · "
+            f"Marge {capacity.safety_margin_bytes} · Mindestrest "
+            f"{capacity.minimum_remaining_bytes} · Verfügbar {capacity.available_bytes}"
+            if capacity
+            else "-"
+        )
+    )
+    st.caption("Diagnosen: " + (", ".join(import_plan.diagnostics) or "-"))
+    execute_label = (
+        "Bestätigen und ausführen"
+        if import_plan.approval.status is WriteApprovalStatus.CONFIRMATION_REQUIRED
+        else "Vorschau ausführen"
+    )
+    if st.button(
+        execute_label,
+        disabled=import_plan.approval.status is WriteApprovalStatus.BLOCKED,
+    ):
+        import_failed = False
+        try:
+            with HealthLab.open(config) as health_lab:
+                write_receipt = health_lab.execute_write(
+                    import_request,
+                    expected_plan=import_plan.fingerprint,
+                )
+            import_result = write_receipt.result
+            st.session_state["last_import_status"] = import_result.status
+            st.session_state["last_import_snapshot"] = (
+                str(import_result.snapshot_ref or "-")
+                if isinstance(import_result, ImportReceipt)
+                else "-"
+            )
+            st.session_state["last_import_diagnostics"] = (
+                ", ".join(import_result.diagnostics) or "-"
+            )
+        except (OSError, HealthLabError):
+            import_failed = True
+            st.error("Health-Export konnte nicht importiert werden.")
+        finally:
+            import_request.package_path.unlink(missing_ok=True)
+            st.session_state.pop("import_request", None)
+            st.session_state.pop("import_plan", None)
+        if not import_failed:
+            st.rerun()
+    if st.button("Vorschau verwerfen und bearbeiten"):
+        import_request.package_path.unlink(missing_ok=True)
+        st.session_state.pop("import_request", None)
+        st.session_state.pop("import_plan", None)
+        st.rerun()
 
 
 try:
@@ -177,6 +284,7 @@ if workspace_status.state is WorkspaceState.RESTORE_PENDING:
             or "-"
         )
     )
+    _render_health_import(config)
     if st.button(
         "Wiederherstellung abbrechen",
         disabled=abort_restore_plan.approval.status is WriteApprovalStatus.BLOCKED,
@@ -228,106 +336,7 @@ if rollback_plan.details.migration_operation_id is not None:
         except HealthLabError:
             st.error("Migrationsrollback konnte nicht ausgeführt werden.")
 
-import_plan = st.session_state.get("import_plan")
-uploaded = st.file_uploader(
-    "Apple-Health-Export",
-    type="zip",
-    disabled=import_plan is not None,
-)
-if st.button("Health-Export prüfen", disabled=uploaded is None or import_plan is not None):
-    request = None
-    try:
-        assert uploaded is not None
-        uploaded.seek(0)
-        with NamedTemporaryFile(suffix=".zip", delete=False) as package:
-            shutil.copyfileobj(uploaded, package)
-            package.flush()
-            request = ImportHealthExport(Path(package.name))
-        with HealthLab.open(config) as health_lab:
-            plan = health_lab.preview_write(request)
-        st.session_state["import_request"] = request
-        st.session_state["import_plan"] = plan
-        st.rerun()
-    except (OSError, HealthLabError):
-        if request is not None:
-            request.package_path.unlink(missing_ok=True)
-        st.error("Health-Export konnte nicht importiert werden.")
-
-import_plan = st.session_state.get("import_plan")
-if import_plan is not None:
-    import_request = st.session_state["import_request"]
-    st.subheader("Schreibvorschau")
-    st.write(f"Freigabe: {import_plan.approval.status.value}")
-    st.code(str(import_plan.fingerprint))
-    st.caption(
-        f"Paket: {import_plan.details.package_size} Bytes · "
-        f"SHA-256 {import_plan.details.package_hash or '-'}"
-    )
-    st.caption(
-        "Bestätigungen: "
-        + (", ".join(confirmation.value for confirmation in import_plan.confirmations) or "-")
-    )
-    filevault = import_plan.preflight.filevault
-    st.caption(
-        "FileVault: "
-        + (
-            f"{filevault.status.value} · Ziel {filevault.target_volume}"
-            + (f" · Grund {filevault.reason.value}" if filevault.reason else "")
-            if filevault
-            else "-"
-        )
-    )
-    capacity = import_plan.preflight.capacity
-    st.caption(
-        "Kapazität: "
-        + (
-            f"{capacity.status.value} · Ziel {capacity.target_volume} · "
-            f"Methode {capacity.method_id} · Schätzung {capacity.estimate_bytes} · "
-            f"Marge {capacity.safety_margin_bytes} · Mindestrest "
-            f"{capacity.minimum_remaining_bytes} · Verfügbar {capacity.available_bytes}"
-            if capacity
-            else "-"
-        )
-    )
-    st.caption("Diagnosen: " + (", ".join(import_plan.diagnostics) or "-"))
-    execute_disabled = import_plan.approval.status is WriteApprovalStatus.BLOCKED
-    execute_label = (
-        "Bestätigen und ausführen"
-        if import_plan.approval.status is WriteApprovalStatus.CONFIRMATION_REQUIRED
-        else "Vorschau ausführen"
-    )
-    if st.button(execute_label, disabled=execute_disabled):
-        import_failed = False
-        try:
-            with HealthLab.open(config) as health_lab:
-                write_receipt = health_lab.execute_write(
-                    import_request,
-                    expected_plan=import_plan.fingerprint,
-                )
-            import_result = write_receipt.result
-            st.session_state["last_import_status"] = import_result.status
-            st.session_state["last_import_snapshot"] = (
-                str(import_result.snapshot_ref or "-")
-                if isinstance(import_result, ImportReceipt)
-                else "-"
-            )
-            st.session_state["last_import_diagnostics"] = (
-                ", ".join(import_result.diagnostics) or "-"
-            )
-        except (OSError, HealthLabError):
-            import_failed = True
-            st.error("Health-Export konnte nicht importiert werden.")
-        finally:
-            import_request.package_path.unlink(missing_ok=True)
-            st.session_state.pop("import_request", None)
-            st.session_state.pop("import_plan", None)
-        if not import_failed:
-            st.rerun()
-    if st.button("Vorschau verwerfen und bearbeiten"):
-        import_request.package_path.unlink(missing_ok=True)
-        st.session_state.pop("import_request", None)
-        st.session_state.pop("import_plan", None)
-        st.rerun()
+_render_health_import(config)
 
 with st.expander("Sicherung & Wiederherstellung"):
     backup_plan = st.session_state.get("backup_plan")

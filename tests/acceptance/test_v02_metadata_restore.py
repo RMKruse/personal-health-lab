@@ -1,28 +1,44 @@
 import hashlib
 import shutil
 import sqlite3
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
+import duckdb
 import pytest
 
+import personal_health_lab.recovery as recovery_module
 from personal_health_lab.application import (
     AbortMetadataRestore,
     BeginMetadataRestore,
+    CanonicalUnit,
     CreateMetadataBackup,
+    DataCorrection,
     DataMode,
+    DataReviewSelection,
     FileVaultCheck,
     FileVaultStatus,
     HealthLab,
     HealthLabError,
     ImportHealthExport,
+    ImportReceipt,
+    ImportStatus,
     MetadataRestorePlan,
     MetadataRestoreReceipt,
     MetadataRestoreStatus,
     MigrateStore,
     OverviewSelection,
+    ResolveDataReviewCase,
+    RevokeDataReviewDecision,
     RuntimeConfig,
+    SingleDecisionTarget,
+    SourceConflictResolution,
+    SourceConflictStrategy,
     WorkspaceState,
     WriteApprovalStatus,
+    WriteDecisionReceipt,
 )
 from personal_health_lab.synthetic_export import generate_export
 
@@ -44,6 +60,39 @@ def _backup(root: Path) -> tuple[RuntimeConfig, Path, bytes]:
         receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
         assert receipt.result.status.value == "completed"
     return config, target, target.read_bytes()
+
+
+def _source_package(path: Path, records: tuple[tuple[str | None, float], ...]) -> Path:
+    measured_at = datetime(2024, 1, 1, tzinfo=timezone(timedelta(hours=1)))
+    body = []
+    for index, (sync_id, value) in enumerate(records):
+        timestamp = measured_at.replace(minute=index)
+        metadata = (
+            ""
+            if sync_id is None
+            else (
+                '<MetadataEntry key="HKMetadataKeySyncIdentifier" '
+                f'value="{sync_id}"/>'
+            )
+        )
+        body.append(
+            '<Record type="HKQuantityTypeIdentifierRestingHeartRate" '
+            'sourceName="Restore Watch" sourceVersion="1" device="Restore Device" '
+            f'unit="count/min" creationDate="{timestamp:%Y-%m-%d %H:%M:%S %z}" '
+            f'startDate="{timestamp:%Y-%m-%d %H:%M:%S %z}" '
+            f'endDate="{timestamp:%Y-%m-%d %H:%M:%S %z}" value="{value}">'
+            f"{metadata}</Record>"
+        )
+    xml = (
+        '<?xml version="1.0"?><HealthData>'
+        '<ExportDate value="2024-03-01 00:00:00 +0000"/>'
+        f"{''.join(body)}</HealthData>"
+    )
+    entry = ZipInfo("apple_health_export/export.xml", date_time=(1980, 1, 1, 0, 0, 0))
+    entry.compress_type = ZIP_DEFLATED
+    with ZipFile(path, "w") as archive:
+        archive.writestr(entry, xml)
+    return path
 
 
 def _execute_begin(config: RuntimeConfig, backup: Path) -> MetadataRestoreReceipt:
@@ -108,6 +157,369 @@ def test_valid_backup_begins_a_read_only_restore_pending_session(tmp_path: Path)
     assert backup.read_bytes() == original
 
 
+def test_restore_sources_match_exactly_and_activate_overlay_once(tmp_path: Path) -> None:
+    source = _config(tmp_path / "source")
+    original = _source_package(
+        tmp_path / "original.zip", (("restore-a", 300), ("restore-b", 301))
+    )
+    backup = tmp_path / "metadata.sqlite3"
+    with HealthLab.open(source) as health_lab:
+        request = ImportHealthExport(original)
+        plan = health_lab.preview_write(request)
+        imported = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+        assert isinstance(imported.result, ImportReceipt)
+        backup_request = CreateMetadataBackup(backup)
+        backup_plan = health_lab.preview_write(backup_request)
+        health_lab.execute_write(backup_request, expected_plan=backup_plan.fingerprint)
+
+    target = _config(tmp_path / "target")
+    _execute_begin(target, backup)
+    first_exact = _source_package(
+        tmp_path / "first-exact.zip", (("restore-a", 300),)
+    )
+    duplicate_export = tmp_path / "duplicate-export.zip"
+    with ZipFile(first_exact) as source_archive, ZipFile(duplicate_export, "w") as target_archive:
+        target_archive.writestr(
+            "apple_health_export/export.xml",
+            source_archive.read("apple_health_export/export.xml"),
+        )
+    candidates = (
+        _source_package(tmp_path / "changed.zip", (("restore-a", 299),)),
+        _source_package(tmp_path / "missing-id.zip", ((None, 300),)),
+        first_exact,
+        duplicate_export,
+    )
+    for package in candidates:
+        allocated_before = _allocated_tree(target.active_store)
+        with HealthLab.open(target) as health_lab:
+            request = ImportHealthExport(package)
+            plan = health_lab.preview_write(request)
+            assert plan.preflight.capacity is not None
+            assert plan.preflight.capacity.method_id == "restore-source-import/v1"
+            estimate = plan.preflight.capacity.estimate_bytes
+            assert estimate is not None
+            receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+            assert isinstance(receipt.result, ImportReceipt)
+            assert receipt.result.status is ImportStatus.RESTORE_PENDING
+            assert health_lab.load_workspace_status().state is WorkspaceState.RESTORE_PENDING
+        assert _allocated_tree(target.active_store) - allocated_before <= estimate
+        with sqlite3.connect(target.active_store / "metadata.sqlite3") as metadata:
+            assert metadata.execute("SELECT count(*) FROM active_snapshot").fetchone() == (0,)
+
+    allocated_before = _allocated_tree(target.active_store)
+    with HealthLab.open(target) as health_lab:
+        request = ImportHealthExport(
+            _source_package(
+                tmp_path / "last-exact.zip", ((None, 300), ("restore-b", 301))
+            )
+        )
+        plan = health_lab.preview_write(request)
+        assert plan.preflight.capacity is not None
+        assert plan.preflight.capacity.method_id == "restore-activate/v1"
+        estimate = plan.preflight.capacity.estimate_bytes
+        assert estimate is not None
+        receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+        assert isinstance(receipt.result, ImportReceipt)
+        assert receipt.result.status is ImportStatus.COMMITTED
+        assert receipt.result.source_occurrence_count == 5
+        assert health_lab.load_workspace_status().state is WorkspaceState.READY
+        assert health_lab.load_overview(OverviewSelection()).snapshot_count == 1
+    assert _allocated_tree(target.active_store) - allocated_before <= estimate
+
+    with sqlite3.connect(target.active_store / "metadata.sqlite3") as metadata:
+        assert metadata.execute("SELECT count(*) FROM active_snapshot").fetchone() == (1,)
+        assert metadata.execute("SELECT count(*) FROM dataset_snapshots").fetchone() == (1,)
+        assert metadata.execute("SELECT count(*) FROM exports").fetchone() == (4,)
+        assert metadata.execute(
+            "SELECT activated_at_utc IS NOT NULL FROM metadata_restores"
+        ).fetchone() == (1,)
+        assert metadata.execute(
+            "SELECT audit_position FROM audit_events ORDER BY audit_position"
+        ).fetchall() == [(1,), (2,)]
+
+
+def test_restore_keeps_revoked_correction_tombstoned(tmp_path: Path) -> None:
+    source = _config(tmp_path / "source")
+    package = _source_package(tmp_path / "source.zip", (("restore-a", 60),))
+    backup = tmp_path / "metadata.sqlite3"
+    with HealthLab.open(source) as health_lab:
+        import_request = ImportHealthExport(package)
+        health_lab.execute_write(
+            import_request,
+            expected_plan=health_lab.preview_write(import_request).fingerprint,
+        )
+        version_id = (
+            health_lab.load_overview(OverviewSelection())
+            .daily_series[0]
+            .values[0]
+            .measurement_version_ids[0]
+        )
+        correction = ResolveDataReviewCase(
+            None,
+            DataCorrection(
+                version_id,
+                61,
+                CanonicalUnit.BEATS_PER_MINUTE,
+                "temporary correction",
+            ),
+        )
+        corrected = health_lab.execute_write(
+            correction, expected_plan=health_lab.preview_write(correction).fingerprint
+        ).result
+        assert isinstance(corrected, WriteDecisionReceipt)
+        revoke = RevokeDataReviewDecision(
+            SingleDecisionTarget(corrected.decision_id), "correction withdrawn"
+        )
+        health_lab.execute_write(
+            revoke, expected_plan=health_lab.preview_write(revoke).fingerprint
+        )
+        backup_request = CreateMetadataBackup(backup)
+        health_lab.execute_write(
+            backup_request,
+            expected_plan=health_lab.preview_write(backup_request).fingerprint,
+        )
+
+    target = _config(tmp_path / "target")
+    _execute_begin(target, backup)
+    with HealthLab.open(target) as health_lab:
+        request = ImportHealthExport(package)
+        receipt = health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+        assert isinstance(receipt.result, ImportReceipt)
+        assert receipt.result.status is ImportStatus.COMMITTED
+        assert (
+            health_lab.load_overview(OverviewSelection()).daily_series[0].values[0].value
+            == 60
+        )
+
+    with sqlite3.connect(target.active_store / "metadata.sqlite3") as metadata:
+        assert metadata.execute("SELECT count(*) FROM metadata_tombstones").fetchone() == (1,)
+        assert metadata.execute(
+            "SELECT count(*) FROM data_review_decisions"
+        ).fetchone() == (1,)
+
+
+def test_restore_keeps_superseded_conflict_resolution_tombstoned(
+    tmp_path: Path, source_conflict_package: Callable[[Path], Path]
+) -> None:
+    source = _config(tmp_path / "source")
+    package = source_conflict_package(tmp_path / "source.zip")
+    backup = tmp_path / "metadata.sqlite3"
+    with HealthLab.open(source) as health_lab:
+        import_request = ImportHealthExport(package)
+        health_lab.execute_write(
+            import_request,
+            expected_plan=health_lab.preview_write(import_request).fingerprint,
+        )
+        conflict = health_lab.load_data_review(DataReviewSelection()).cases[0]
+        prefer = ResolveDataReviewCase(
+            conflict.case_id,
+            SourceConflictResolution(
+                SourceConflictStrategy.PREFER,
+                preferred_version_id=conflict.candidate_version_ids[0],
+            ),
+        )
+        preferred = health_lab.execute_write(
+            prefer, expected_plan=health_lab.preview_write(prefer).fingerprint
+        ).result
+        assert isinstance(preferred, WriteDecisionReceipt)
+        revoke = RevokeDataReviewDecision(
+            SingleDecisionTarget(preferred.decision_id), "replace preference"
+        )
+        health_lab.execute_write(
+            revoke, expected_plan=health_lab.preview_write(revoke).fingerprint
+        )
+        reopened = health_lab.load_data_review(DataReviewSelection()).cases[0]
+        split = ResolveDataReviewCase(
+            reopened.case_id,
+            SourceConflictResolution(SourceConflictStrategy.SPLIT),
+        )
+        split_result = health_lab.execute_write(
+            split, expected_plan=health_lab.preview_write(split).fingerprint
+        ).result
+        assert isinstance(split_result, WriteDecisionReceipt)
+        backup_request = CreateMetadataBackup(backup)
+        health_lab.execute_write(
+            backup_request,
+            expected_plan=health_lab.preview_write(backup_request).fingerprint,
+        )
+        source_overview = health_lab.load_overview(OverviewSelection())
+
+    target = _config(tmp_path / "target")
+    _execute_begin(target, backup)
+    with HealthLab.open(target) as health_lab:
+        request = ImportHealthExport(package)
+        receipt = health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+        assert isinstance(receipt.result, ImportReceipt)
+        assert receipt.result.status is ImportStatus.COMMITTED
+        assert health_lab.load_data_review(DataReviewSelection()).cases == ()
+        assert receipt.result.snapshot_ref is not None
+        restored_snapshot = receipt.result.snapshot_ref
+        assert health_lab.load_overview(OverviewSelection()) == source_overview
+    resolved = (
+        target.active_store
+        / "parquet"
+        / "snapshots"
+        / str(restored_snapshot)
+        / "resolved_measurements.parquet"
+    )
+    with duckdb.connect() as connection:
+        rows = connection.execute(
+            "SELECT conflict_resolution_decision_id FROM read_parquet(?) "
+            "ORDER BY logical_measurement_id",
+            [str(resolved)],
+        ).fetchall()
+    assert rows == [(str(split_result.decision_id),), (str(split_result.decision_id),)]
+    with sqlite3.connect(target.active_store / "metadata.sqlite3") as metadata:
+        assert metadata.execute("SELECT count(*) FROM metadata_tombstones").fetchone() == (1,)
+        assert metadata.execute(
+            "SELECT count(*) FROM data_review_decisions"
+        ).fetchone() == (2,)
+
+
+def test_restore_activation_fault_rolls_back_overlay_and_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _config(tmp_path / "source")
+    package = _source_package(tmp_path / "source.zip", (("restore-a", 60),))
+    backup = tmp_path / "metadata.sqlite3"
+    with HealthLab.open(source) as health_lab:
+        request = ImportHealthExport(package)
+        health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+        backup_request = CreateMetadataBackup(backup)
+        health_lab.execute_write(
+            backup_request,
+            expected_plan=health_lab.preview_write(backup_request).fingerprint,
+        )
+
+    target = _config(tmp_path / "target")
+    _execute_begin(target, backup)
+
+    def fail_before_commit(_root: Path, fault_point: str) -> None:
+        if fault_point == "import.before_sqlite_commit/v1":
+            raise RuntimeError("activation fault")
+
+    monkeypatch.setattr(
+        "personal_health_lab.storage._store._publication_fault_point",
+        fail_before_commit,
+    )
+    with HealthLab.open(target) as health_lab:
+        request = ImportHealthExport(package)
+        with pytest.raises(RuntimeError, match="activation fault"):
+            health_lab.execute_write(
+                request, expected_plan=health_lab.preview_write(request).fingerprint
+            )
+    monkeypatch.undo()
+
+    with HealthLab.open(target) as health_lab:
+        assert health_lab.load_workspace_status().state is WorkspaceState.RESTORE_PENDING
+        assert (
+            health_lab.preview_write(AbortMetadataRestore()).approval.status
+            is not WriteApprovalStatus.BLOCKED
+        )
+        request = ImportHealthExport(package)
+        retried = health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+        assert isinstance(retried.result, ImportReceipt)
+        assert retried.result.status is ImportStatus.COMMITTED
+    with sqlite3.connect(target.active_store / "metadata.sqlite3") as metadata:
+        assert metadata.execute("SELECT count(*) FROM active_snapshot").fetchone() == (1,)
+        assert metadata.execute("SELECT count(*) FROM metadata_restores").fetchone() == (1,)
+
+
+def test_restore_working_copy_tamper_blocks_source_activation(tmp_path: Path) -> None:
+    source = _config(tmp_path / "source")
+    package = _source_package(tmp_path / "source.zip", (("restore-a", 60),))
+    backup = tmp_path / "metadata.sqlite3"
+    with HealthLab.open(source) as health_lab:
+        request = ImportHealthExport(package)
+        health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+        backup_request = CreateMetadataBackup(backup)
+        health_lab.execute_write(
+            backup_request,
+            expected_plan=health_lab.preview_write(backup_request).fingerprint,
+        )
+    target = _config(tmp_path / "target")
+    recovery = _execute_begin(target, backup)
+    working = (
+        target.active_store
+        / "recovery"
+        / str(recovery.restore_id)
+        / "working.sqlite3"
+    )
+    with sqlite3.connect(working) as metadata:
+        metadata.execute("DELETE FROM required_source_refs")
+
+    with HealthLab.open(target) as health_lab:
+        plan = health_lab.preview_write(ImportHealthExport(package))
+        assert plan.approval.status is WriteApprovalStatus.BLOCKED
+        assert plan.diagnostics == ("health_export_unavailable",)
+        assert health_lab.load_workspace_status().state is WorkspaceState.RESTORE_PENDING
+    with sqlite3.connect(target.active_store / "metadata.sqlite3") as metadata:
+        assert metadata.execute("SELECT count(*) FROM active_snapshot").fetchone() == (0,)
+
+
+def test_restore_source_publish_fault_is_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _config(tmp_path / "source")
+    full = _source_package(
+        tmp_path / "full.zip", (("restore-a", 60), ("restore-b", 61))
+    )
+    partial = _source_package(tmp_path / "partial.zip", (("restore-a", 60),))
+    backup = tmp_path / "metadata.sqlite3"
+    with HealthLab.open(source) as health_lab:
+        request = ImportHealthExport(full)
+        health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+        backup_request = CreateMetadataBackup(backup)
+        health_lab.execute_write(
+            backup_request,
+            expected_plan=health_lab.preview_write(backup_request).fingerprint,
+        )
+    target = _config(tmp_path / "target")
+    _execute_begin(target, backup)
+
+    def fail_before_publish(_root: Path, fault_point: str) -> None:
+        if fault_point == "restore-source.before_publish/v1":
+            raise RuntimeError("source publish fault")
+
+    monkeypatch.setattr(
+        "personal_health_lab.recovery._restore_fault_point", fail_before_publish
+    )
+    with HealthLab.open(target) as health_lab:
+        request = ImportHealthExport(partial)
+        with pytest.raises(RuntimeError, match="source publish fault"):
+            health_lab.execute_write(
+                request, expected_plan=health_lab.preview_write(request).fingerprint
+            )
+    monkeypatch.undo()
+
+    with HealthLab.open(target) as health_lab:
+        assert (
+            health_lab.preview_write(AbortMetadataRestore()).approval.status
+            is not WriteApprovalStatus.BLOCKED
+        )
+        request = ImportHealthExport(partial)
+        retried = health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+        assert isinstance(retried.result, ImportReceipt)
+        assert retried.result.status is ImportStatus.RESTORE_PENDING
+    source_directory = next((target.active_store / "recovery").glob("*/sources"))
+    assert len(tuple(source_directory.glob("*.zip"))) == 1
+    assert not tuple(source_directory.glob("*.tmp"))
+
+
 def test_restore_rejects_synthetic_populated_and_conflicting_targets(tmp_path: Path) -> None:
     _, backup, _ = _backup(tmp_path)
     synthetic = _config(tmp_path / "synthetic-target", DataMode.SYNTHETIC)
@@ -149,6 +561,21 @@ def test_supported_backup_schema_is_migrated_only_in_staging(tmp_path: Path) -> 
     with sqlite3.connect(backup) as metadata:
         metadata.execute("UPDATE backup_manifest SET backup_schema_version = 1 WHERE singleton = 1")
         metadata.execute("DROP TABLE backup_migration_provenance")
+        for table in (
+            "source_absence_suppressions",
+            "restored_publications",
+            "required_source_refs",
+            "resolved_overlay_facts",
+            "open_review_overlay_facts",
+        ):
+            metadata.execute(f"DROP TABLE {table}")
+        canonical_hash = recovery_module._canonical_hash(
+            metadata, recovery_module._LEGACY_CONTENT_TABLES
+        )
+        metadata.execute(
+            "UPDATE backup_manifest SET canonical_content_sha256 = ? WHERE singleton = 1",
+            (canonical_hash,),
+        )
     legacy = backup.read_bytes()
     target = _config(tmp_path / "target")
 
@@ -156,7 +583,7 @@ def test_supported_backup_schema_is_migrated_only_in_staging(tmp_path: Path) -> 
         request = BeginMetadataRestore(backup)
         plan = health_lab.preview_write(request)
         assert isinstance(plan.details, MetadataRestorePlan)
-        assert plan.details.migration_steps == ((1, 2),)
+        assert plan.details.migration_steps == ((1, 2), (2, 3))
         receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
         recovery = health_lab.load_recovery_status()
 
@@ -166,7 +593,7 @@ def test_supported_backup_schema_is_migrated_only_in_staging(tmp_path: Path) -> 
     assert recovery.original_backup_sha256 == hashlib.sha256(legacy).hexdigest()
     assert recovery.working_copy_sha256 != recovery.original_backup_sha256
     assert recovery.source_schema_version == 1
-    assert recovery.target_schema_version == 2
+    assert recovery.target_schema_version == 3
 
 
 def test_unknown_or_unregistered_backup_schema_is_blocked(
@@ -175,7 +602,7 @@ def test_unknown_or_unregistered_backup_schema_is_blocked(
     _, backup, _ = _backup(tmp_path)
     target = _config(tmp_path / "target")
     with sqlite3.connect(backup) as metadata:
-        metadata.execute("UPDATE backup_manifest SET backup_schema_version = 3 WHERE singleton = 1")
+        metadata.execute("UPDATE backup_manifest SET backup_schema_version = 4 WHERE singleton = 1")
     with HealthLab.open(target) as health_lab:
         newer = health_lab.preview_write(BeginMetadataRestore(backup))
     assert newer.approval.status is WriteApprovalStatus.BLOCKED
@@ -365,3 +792,50 @@ def test_restore_start_v1_bounds_normal_and_stress_fixtures(
     assert plan.preflight.capacity.fragment_size is not None
     assert plan.preflight.capacity.estimate_bytes % plan.preflight.capacity.fragment_size == 0
     assert max(phases.values()) <= plan.preflight.capacity.estimate_bytes
+
+
+@pytest.mark.parametrize("padding_bytes", (0, 4 * 1024**2), ids=("normal", "stress"))
+def test_restore_activate_v1_bounds_snapshot_and_overlay_allocation(
+    tmp_path: Path, padding_bytes: int
+) -> None:
+    source = _config(tmp_path / "source")
+    package = _source_package(tmp_path / "source.zip", (("restore-a", 60),))
+    backup = tmp_path / "metadata.sqlite3"
+    with HealthLab.open(source) as health_lab:
+        request = ImportHealthExport(package)
+        health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+        backup_request = CreateMetadataBackup(backup)
+        health_lab.execute_write(
+            backup_request,
+            expected_plan=health_lab.preview_write(backup_request).fingerprint,
+        )
+    if padding_bytes:
+        with sqlite3.connect(backup) as metadata:
+            metadata.execute("CREATE TABLE padding (value BLOB) STRICT")
+            metadata.execute("INSERT INTO padding VALUES (zeroblob(?))", (padding_bytes,))
+            metadata.execute("DROP TABLE padding")
+
+    target = _config(tmp_path / f"target-{padding_bytes}")
+    recovery = _execute_begin(target, backup)
+    working = (
+        target.active_store
+        / "recovery"
+        / str(recovery.restore_id)
+        / "working.sqlite3"
+    )
+    working_allocation = working.stat().st_blocks * 512
+    allocated_before = _allocated_tree(target.active_store)
+    with HealthLab.open(target) as health_lab:
+        request = ImportHealthExport(package)
+        plan = health_lab.preview_write(request)
+        assert plan.preflight.capacity is not None
+        assert plan.preflight.capacity.method_id == "restore-activate/v1"
+        estimate = plan.preflight.capacity.estimate_bytes
+        assert estimate is not None
+        assert estimate >= 2 * working_allocation
+        receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+        assert isinstance(receipt.result, ImportReceipt)
+        assert receipt.result.status is ImportStatus.COMMITTED
+    assert _allocated_tree(target.active_store) - allocated_before <= estimate

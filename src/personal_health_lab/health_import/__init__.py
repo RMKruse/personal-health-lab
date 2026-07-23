@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import shutil
 import stat
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal
 from uuid import uuid4
@@ -22,7 +23,17 @@ from personal_health_lab.health_data import (
     LogicalMeasurementId,
     MeasurementVersionId,
 )
+from personal_health_lab.recovery import (
+    RestoreSourceInspection,
+    inspect_restore_sources,
+    load_restore_source_packages,
+    load_restore_working_copy,
+    preflight_restore_source_import,
+    restore_source_resolver,
+    stage_restore_source_package,
+)
 from personal_health_lab.storage import (
+    CapacityCheck,
     ExportFact,
     ImportId,
     LocalStore,
@@ -58,7 +69,9 @@ class _RejectedPackage(ValueError):
 class HealthImportResult:
     operation_id: OperationId
     import_id: ImportId
-    status: Literal["committed", "duplicate", "quarantined", "rejected"]
+    status: Literal[
+        "committed", "duplicate", "quarantined", "rejected", "restore_pending"
+    ]
     package_hash: str
     snapshot_id: SnapshotId | None
     record_count: int
@@ -74,6 +87,13 @@ class HealthImportResult:
 class HealthExportEstimate:
     input_bytes: int
     record_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class RestoreHealthExportInspection:
+    estimate: HealthExportEstimate
+    sources: RestoreSourceInspection
+    capacity: CapacityCheck
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,6 +303,243 @@ def estimate_health_export(
         return HealthExportEstimate(max(package_size, 1), 0)
 
 
+def _restore_exports(
+    package_path: Path,
+    *,
+    store: LocalStore,
+    target_root: Path,
+    max_package_bytes: int,
+    max_entries: int,
+    max_entry_bytes: int,
+    max_uncompressed_bytes: int,
+    max_compression_ratio: float,
+) -> tuple[
+    tuple[_ParsedExport, ...],
+    tuple[CanonicalHealthRecord, ...],
+    int,
+    tuple[tuple[str, datetime | None, str, tuple[CanonicalHealthRecord, ...]], ...],
+]:
+    paths = (*load_restore_source_packages(store, target_root), package_path)
+    packages: dict[str, Path] = {}
+    for path in paths:
+        with path.open("rb") as package:
+            packages[hashlib.file_digest(package, "sha256").hexdigest()] = path
+    parsed_packages = tuple(
+        (
+            _records(
+                path,
+                max_package_bytes=max_package_bytes,
+                max_entries=max_entries,
+                max_entry_bytes=max_entry_bytes,
+                max_uncompressed_bytes=max_uncompressed_bytes,
+                max_compression_ratio=max_compression_ratio,
+            ),
+            package_hash,
+        )
+        for package_hash, path in packages.items()
+    )
+    packages_by_export: dict[str, tuple[_ParsedExport, str]] = {}
+    for export, package_hash in parsed_packages:
+        current = packages_by_export.get(export.export_id)
+        if current is None or package_hash < current[1]:
+            packages_by_export[export.export_id] = (export, package_hash)
+    ordered_packages = tuple(
+        sorted(
+            packages_by_export.values(),
+            key=lambda item: (
+                item[0].export_date is not None,
+                datetime.min.replace(tzinfo=UTC)
+                if item[0].export_date is None
+                else item[0].export_date,
+                item[0].export_id,
+            ),
+            reverse=True,
+        )
+    )
+    exports = tuple(item[0] for item in ordered_packages)
+    records = {
+        str(record.measurement_version_id): record
+        for export in reversed(exports)
+        for record in export.records
+    }
+    return (
+        exports,
+        tuple(records.values()),
+        sum(path.stat().st_size for path in packages.values()),
+        tuple(
+            (export.export_id, export.export_date, package_hash, export.records)
+            for export, package_hash in ordered_packages
+        ),
+    )
+
+
+def inspect_restore_health_export(
+    package_path: Path,
+    *,
+    store: LocalStore,
+    target_root: Path,
+    max_package_bytes: int,
+    max_entries: int,
+    max_entry_bytes: int,
+    max_uncompressed_bytes: int,
+    max_compression_ratio: float,
+) -> RestoreHealthExportInspection:
+    _, records, input_bytes, _ = _restore_exports(
+        package_path,
+        store=store,
+        target_root=target_root,
+        max_package_bytes=max_package_bytes,
+        max_entries=max_entries,
+        max_entry_bytes=max_entry_bytes,
+        max_uncompressed_bytes=max_uncompressed_bytes,
+        max_compression_ratio=max_compression_ratio,
+    )
+    sources = inspect_restore_sources(store, target_root, records)
+    estimate = HealthExportEstimate(max(input_bytes, 1), len(records))
+    return RestoreHealthExportInspection(
+        estimate,
+        sources,
+        preflight_restore_source_import(
+            store,
+            target_root,
+            input_bytes=estimate.input_bytes,
+            record_count=estimate.record_count,
+            complete=sources.complete,
+        ),
+    )
+
+
+def _import_restore_health_export(
+    package_path: Path,
+    *,
+    store: LocalStore,
+    target_root: Path,
+    max_package_bytes: int,
+    max_entries: int,
+    max_entry_bytes: int,
+    max_uncompressed_bytes: int,
+    max_compression_ratio: float,
+) -> HealthImportResult:
+    operation_id = OperationId(uuid4().hex)
+    import_id = ImportId(uuid4().hex)
+    snapshot_id = SnapshotId(uuid4().hex)
+    package_hash = ""
+    try:
+        with package_path.open("rb") as package:
+            package_hash = hashlib.file_digest(package, "sha256").hexdigest()
+        current = _records(
+            package_path,
+            max_package_bytes=max_package_bytes,
+            max_entries=max_entries,
+            max_entry_bytes=max_entry_bytes,
+            max_uncompressed_bytes=max_uncompressed_bytes,
+            max_compression_ratio=max_compression_ratio,
+        )
+        exports, records, _, restore_exports = _restore_exports(
+            package_path,
+            store=store,
+            target_root=target_root,
+            max_package_bytes=max_package_bytes,
+            max_entries=max_entries,
+            max_entry_bytes=max_entry_bytes,
+            max_uncompressed_bytes=max_uncompressed_bytes,
+            max_compression_ratio=max_compression_ratio,
+        )
+        inspection = inspect_restore_sources(store, target_root, records)
+    except (_RejectedPackage, OSError, BadZipFile, NotImplementedError):
+        return HealthImportResult(
+            operation_id,
+            import_id,
+            "rejected",
+            package_hash,
+            None,
+            0,
+            diagnostics=("invalid_health_export",),
+        )
+    except (KeyError, ParseError, RuntimeError, ValueError):
+        return HealthImportResult(
+            operation_id,
+            import_id,
+            "quarantined",
+            package_hash,
+            None,
+            0,
+            diagnostics=("invalid_health_data",),
+        )
+
+    stage_restore_source_package(store, target_root, package_path, package_hash)
+    if not inspection.complete:
+        return HealthImportResult(
+            operation_id,
+            import_id,
+            "restore_pending",
+            package_hash,
+            None,
+            0,
+            package_record_count=len(current.records),
+            logical_measurement_count=len(
+                {str(record.logical_measurement_id) for record in records}
+            ),
+            measurement_version_count=len(records),
+            diagnostics=("restore_sources_pending",),
+        )
+
+    session = store.load_restore_session()
+    if session is None:
+        raise HealthImportError("Wiederherstellungssitzung fehlt.")
+    working = load_restore_working_copy(store, target_root)
+    governing_export = exports[0]
+    export_id = governing_export.export_id
+    export_date = governing_export.export_date
+    store.start_import(
+        operation_id=operation_id,
+        import_id=import_id,
+        snapshot_id=snapshot_id,
+    )
+    try:
+        published = store.publish_import(
+            operation_id=operation_id,
+            import_id=import_id,
+            package_hash=package_hash,
+            snapshot_id=snapshot_id,
+            export_id=export_id,
+            export_date=export_date,
+            records=records,
+            unknown_source_types=tuple(
+                sorted(
+                    {
+                        source_type
+                        for export in exports
+                        for source_type in export.unknown_source_types
+                    }
+                )
+            ),
+            governing_export_id=export_id,
+            resolve_sources=restore_source_resolver(working),
+            restore_overlay=working,
+            restore_overlay_sha256=session.working_copy_sha256,
+            restore_exports=restore_exports,
+        )
+    except (OSError, StoreError):
+        store.reject_import(import_id, package_hash)
+        raise
+    shutil.rmtree(working.parent / "sources", ignore_errors=True)
+    return HealthImportResult(
+        operation_id,
+        import_id,
+        published.status,
+        package_hash,
+        published.snapshot_id,
+        published.record_count,
+        package_record_count=len(current.records),
+        logical_measurement_count=published.logical_measurement_count,
+        measurement_version_count=published.measurement_version_count,
+        source_occurrence_count=published.source_occurrence_count,
+        anomaly_count=published.anomaly_count,
+        diagnostics=published.diagnostics,
+    )
+
+
 def import_health_export(
     package_path: Path,
     *,
@@ -292,7 +549,21 @@ def import_health_export(
     max_entry_bytes: int,
     max_uncompressed_bytes: int,
     max_compression_ratio: float,
+    target_root: Path | None = None,
 ) -> HealthImportResult:
+    if store.load_restore_session() is not None:
+        if target_root is None:
+            raise HealthImportError("Wiederherstellungsziel fehlt.")
+        return _import_restore_health_export(
+            package_path,
+            store=store,
+            target_root=target_root,
+            max_package_bytes=max_package_bytes,
+            max_entries=max_entries,
+            max_entry_bytes=max_entry_bytes,
+            max_uncompressed_bytes=max_uncompressed_bytes,
+            max_compression_ratio=max_compression_ratio,
+        )
     operation_id = OperationId(uuid4().hex)
     import_id = ImportId(uuid4().hex)
     snapshot_id = SnapshotId(uuid4().hex)
@@ -412,7 +683,9 @@ __all__ = [
     "LogicalMeasurementId",
     "MeasurementVersionId",
     "OperationId",
+    "RestoreHealthExportInspection",
     "SnapshotId",
     "estimate_health_export",
     "import_health_export",
+    "inspect_restore_health_export",
 ]

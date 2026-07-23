@@ -290,7 +290,7 @@
             "available_bytes": {"type": ["integer", "null"], "minimum": 0},
             "estimate_bytes": {"type": ["integer", "null"], "minimum": 0},
             "fragment_size": {"type": ["integer", "null"], "minimum": 1},
-            "method_id": {"enum": ["cow-migration/v1", "full-snapshot-import/v1", "metadata-backup/v1", "restore-start/v1"]},
+            "method_id": {"enum": ["cow-migration/v1", "full-snapshot-import/v1", "metadata-backup/v1", "restore-activate/v1", "restore-source-import/v1", "restore-start/v1"]},
             "minimum_remaining_bytes": {"type": "integer", "minimum": 0},
             "reason": {
               "enum": [
@@ -405,7 +405,8 @@
             "committed",
             "duplicate",
             "rejected",
-            "quarantined"
+            "quarantined",
+            "restore_pending"
           ]
         },
         "type": {

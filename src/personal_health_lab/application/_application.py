@@ -41,6 +41,7 @@ from personal_health_lab.health_import import (
     SnapshotId,
     estimate_health_export,
     import_health_export,
+    inspect_restore_health_export,
 )
 from personal_health_lab.migration import plan_migration_rollback, plan_store_migration
 from personal_health_lab.overview import Overview, OverviewReader, OverviewSelection
@@ -198,6 +199,7 @@ class ImportStatus(StrEnum):
     DUPLICATE = "duplicate"
     REJECTED = "rejected"
     QUARANTINED = "quarantined"
+    RESTORE_PENDING = "restore_pending"
     STORE_BUSY = "store_busy"
 
 
@@ -580,6 +582,7 @@ class ImportHealthExportPlan:
     package_size: int
     input_bytes: int = 0
     record_count: int = 0
+    restore_state_hash: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1858,24 +1861,47 @@ class HealthLab:
             with request.package_path.open("rb") as package:
                 package_hash = hashlib.file_digest(package, "sha256").hexdigest()
             unavailable = False
-            estimate = estimate_health_export(
-                request.package_path,
-                max_package_bytes=self._config.max_import_package_bytes,
-                max_entries=self._config.max_import_entries,
-                max_entry_bytes=self._config.max_import_entry_bytes,
-                max_uncompressed_bytes=self._config.max_import_uncompressed_bytes,
-                max_compression_ratio=self._config.max_import_compression_ratio,
-            )
-        except OSError:
+            if (
+                workspace.state is WorkspaceState.RESTORE_PENDING
+                and self._store is not None
+            ):
+                restore = inspect_restore_health_export(
+                    request.package_path,
+                    store=self._store,
+                    target_root=self._config.active_store,
+                    max_package_bytes=self._config.max_import_package_bytes,
+                    max_entries=self._config.max_import_entries,
+                    max_entry_bytes=self._config.max_import_entry_bytes,
+                    max_uncompressed_bytes=self._config.max_import_uncompressed_bytes,
+                    max_compression_ratio=self._config.max_import_compression_ratio,
+                )
+                estimate = restore.estimate
+                capacity = restore.capacity
+                restore_state_hash = restore.sources.state_hash
+            else:
+                estimate = estimate_health_export(
+                    request.package_path,
+                    max_package_bytes=self._config.max_import_package_bytes,
+                    max_entries=self._config.max_import_entries,
+                    max_entry_bytes=self._config.max_import_entry_bytes,
+                    max_uncompressed_bytes=self._config.max_import_uncompressed_bytes,
+                    max_compression_ratio=self._config.max_import_compression_ratio,
+                )
+                capacity = None
+                restore_state_hash = None
+        except (OSError, StoreError):
             package_size = 0
             package_hash = ""
             unavailable = True
             estimate = HealthExportEstimate(0, 0)
+            capacity = None
+            restore_state_hash = None
         if self._store is None:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
-        capacity = self._store.preflight_full_snapshot_import(
-            estimate.input_bytes, estimate.record_count
-        )
+        if capacity is None:
+            capacity = self._store.preflight_full_snapshot_import(
+                estimate.input_bytes, estimate.record_count
+            )
         return self._compose_import_plan(
             request,
             workspace,
@@ -1884,6 +1910,7 @@ class HealthLab:
             package_hash,
             estimate,
             capacity,
+            restore_state_hash,
             unavailable=unavailable,
         )
 
@@ -1896,6 +1923,7 @@ class HealthLab:
         package_hash: str,
         estimate: HealthExportEstimate,
         capacity: CapacityCheck,
+        restore_state_hash: str | None,
         *,
         unavailable: bool,
     ) -> WritePlan:
@@ -1929,12 +1957,20 @@ class HealthLab:
             confirmations = ()
             diagnostics = ("target_locked",)
         elif approval.status is not WriteApprovalStatus.BLOCKED and filevault is not None:
-            confirmation_list = [WriteConfirmation.REAL_IMPORT_SAME_PERSON]
+            confirmation_list = (
+                []
+                if workspace.state is WorkspaceState.RESTORE_PENDING
+                else [WriteConfirmation.REAL_IMPORT_SAME_PERSON]
+            )
             if filevault.status is not FileVaultStatus.PROTECTED:
                 confirmation_list.append(WriteConfirmation(f"filevault_{filevault.status.value}"))
             confirmations = tuple(confirmation_list)
             diagnostics = tuple(confirmation.value for confirmation in confirmations)
-            approval = WriteApproval(WriteApprovalStatus.CONFIRMATION_REQUIRED)
+            approval = WriteApproval(
+                WriteApprovalStatus.CONFIRMATION_REQUIRED
+                if confirmations
+                else WriteApprovalStatus.READY
+            )
         fingerprint = PlanFingerprint(
             hashlib.sha256(
                 json.dumps(
@@ -1954,6 +1990,7 @@ class HealthLab:
                         "store": str(self._config.active_store),
                         "store_id": str(workspace.store_id),
                         "person_binding": workspace.person_binding.value,
+                        "restore_state_hash": restore_state_hash,
                         "confirmations": [item.value for item in confirmations],
                         "filevault": (
                             None
@@ -1987,7 +2024,11 @@ class HealthLab:
         return WritePlan(
             fingerprint=fingerprint,
             details=ImportHealthExportPlan(
-                package_hash, package_size, estimate.input_bytes, estimate.record_count
+                package_hash,
+                package_size,
+                estimate.input_bytes,
+                estimate.record_count,
+                restore_state_hash,
             ),
             preflight=WritePreflight(approval, confirmations, filevault, diagnostics, capacity),
         )
@@ -2092,6 +2133,7 @@ class HealthLab:
                     current_plan.details.input_bytes, current_plan.details.record_count
                 ),
                 capacity,
+                current_plan.details.restore_state_hash,
                 unavailable=False,
             )
             for status in (FileVaultStatus.UNPROTECTED, FileVaultStatus.TRANSITIONING)
@@ -2107,6 +2149,7 @@ class HealthLab:
                     current_plan.details.input_bytes, current_plan.details.record_count
                 ),
                 capacity,
+                current_plan.details.restore_state_hash,
                 unavailable=False,
             )
             for reason in FileVaultReason
@@ -2165,13 +2208,6 @@ class HealthLab:
             )
         if not isinstance(request, ImportHealthExport):
             return self._execute_data_review_write(request, authorization_plan, expected_plan)
-        if self.load_workspace_status().state is WorkspaceState.RESTORE_PENDING:
-            return self._not_started(
-                authorization_plan,
-                WriteNotStartedStatus.BLOCKED,
-                ("restore_source_import_not_available",),
-                expected_plan,
-            )
         if not isinstance(authorization_plan.details, ImportHealthExportPlan):
             return self._not_started(
                 authorization_plan,
@@ -2252,10 +2288,35 @@ class HealthLab:
                     expected_plan,
                     filevault=final_filevault,
                 )
-            final_capacity = writer.preflight_full_snapshot_import(
-                authorization_plan.details.input_bytes,
-                authorization_plan.details.record_count,
-            )
+            if authorization_plan.details.restore_state_hash is not None:
+                restore = inspect_restore_health_export(
+                    request.package_path,
+                    store=writer,
+                    target_root=self._config.active_store,
+                    max_package_bytes=self._config.max_import_package_bytes,
+                    max_entries=self._config.max_import_entries,
+                    max_entry_bytes=self._config.max_import_entry_bytes,
+                    max_uncompressed_bytes=self._config.max_import_uncompressed_bytes,
+                    max_compression_ratio=self._config.max_import_compression_ratio,
+                )
+                if (
+                    restore.sources.state_hash
+                    != authorization_plan.details.restore_state_hash
+                ):
+                    return self._not_started_with_preflight(
+                        authorization_plan,
+                        WriteNotStartedStatus.PLAN_CHANGED,
+                        ("plan_changed",),
+                        expected_plan,
+                        filevault=final_filevault,
+                        capacity=restore.capacity,
+                    )
+                final_capacity = restore.capacity
+            else:
+                final_capacity = writer.preflight_full_snapshot_import(
+                    authorization_plan.details.input_bytes,
+                    authorization_plan.details.record_count,
+                )
             if final_capacity.status is not CapacityStatus.READY:
                 diagnostic = "capacity_" + (
                     final_capacity.reason.value
@@ -2278,6 +2339,7 @@ class HealthLab:
                 max_entry_bytes=self._config.max_import_entry_bytes,
                 max_uncompressed_bytes=self._config.max_import_uncompressed_bytes,
                 max_compression_ratio=self._config.max_import_compression_ratio,
+                target_root=self._config.active_store,
             )
         except HealthImportError as error:
             raise HealthLabError("Health-Export konnte nicht importiert werden.") from error

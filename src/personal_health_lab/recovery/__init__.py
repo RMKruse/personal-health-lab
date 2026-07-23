@@ -11,23 +11,39 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import Literal, cast
 
 from personal_health_lab.data_quality import load_review_backup_facts
+from personal_health_lab.health_data import (
+    CanonicalHealthRecord,
+    LogicalMeasurementId,
+    MeasurementVersionId,
+)
 from personal_health_lab.migration import plan_backup_migration
 from personal_health_lab.storage import (
     CapacityCheck,
     DataMode,
+    ExportFact,
     LocalStore,
+    MeasurementVersionFact,
+    OpenDataReviewCase,
+    PlausibilityRuleRecord,
+    ResolvedMeasurement,
     RestoreSessionFacts,
+    SourceOccurrenceFact,
+    SourceResolution,
+    SourceResolver,
     StoreError,
     StoreId,
     current_store_schema_version,
     probe_capacity,
 )
 
-_BACKUP_SCHEMA_VERSION = 2
+_BACKUP_SCHEMA_VERSION = 3
 _METHOD_ID = "metadata-backup/v1"
 _RESTORE_START_METHOD_ID = "restore-start/v1"
+_RESTORE_SOURCE_METHOD_ID = "restore-source-import/v1"
+_RESTORE_ACTIVATE_METHOD_ID = "restore-activate/v1"
 _IDENTITY_RULE_VERSION = "healthkit-natural/v2"
 _MAPPING_RULE_VERSION = "healthkit-canonical/v1"
 _DIRECTORY_OVERHEAD = 64 * 1024
@@ -57,6 +73,8 @@ _METADATA_TABLES = (
     "data_review_batch_actions",
     "data_review_batch_members",
     "metadata_tombstones",
+    "source_absence_suppressions",
+    "restored_publications",
 )
 _CONTENT_TABLES = (
     *_METADATA_TABLES,
@@ -64,6 +82,21 @@ _CONTENT_TABLES = (
     "snapshot_refs",
     "review_case_facts",
     "review_case_reasons",
+    "required_source_refs",
+    "resolved_overlay_facts",
+    "open_review_overlay_facts",
+)
+_LEGACY_CONTENT_TABLES = tuple(
+    table
+    for table in _CONTENT_TABLES
+    if table
+    not in {
+        "source_absence_suppressions",
+        "restored_publications",
+        "required_source_refs",
+        "resolved_overlay_facts",
+        "open_review_overlay_facts",
+    }
 )
 
 
@@ -127,13 +160,73 @@ class MetadataBackup:
     status: MetadataBackupStatus
 
 
+@dataclass(frozen=True, slots=True)
+class RestoreSourceInspection:
+    complete: bool
+    state_hash: str
+    required_count: int
+    matched_count: int
+
+
+def _payload_sha256(
+    data_type: str,
+    unit: str,
+    value: float,
+    start: str,
+    end: str,
+    source_name: str,
+    device: str,
+) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "type": data_type,
+                "unit": unit,
+                "value": value,
+                "start": start,
+                "end": end,
+                "source": source_name,
+                "device": device,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+
+def _record_payload_sha256(record: CanonicalHealthRecord) -> str:
+    return _payload_sha256(
+        record.data_type.value,
+        record.unit.value,
+        record.value,
+        record.source_start.astimezone(UTC).isoformat(),
+        record.source_end.astimezone(UTC).isoformat(),
+        record.provenance.source_name,
+        record.provenance.device,
+    )
+
+
+def _fact_payload_sha256(fact: MeasurementVersionFact) -> str:
+    return _payload_sha256(
+        fact.canonical_type,
+        fact.canonical_unit,
+        fact.canonical_value,
+        fact.source_start_utc,
+        fact.source_end_utc,
+        fact.source_name,
+        fact.device,
+    )
+
+
 def _quoted(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
 
-def _canonical_hash(connection: sqlite3.Connection) -> str:
+def _canonical_hash(
+    connection: sqlite3.Connection, tables: tuple[str, ...] = _CONTENT_TABLES
+) -> str:
     digest = hashlib.sha256()
-    for table in _CONTENT_TABLES:
+    for table in tables:
         columns = tuple(
             str(row[1]) for row in connection.execute(f"PRAGMA table_info({_quoted(table)})")
         )
@@ -151,19 +244,38 @@ def _canonical_hash(connection: sqlite3.Connection) -> str:
 
 
 def _audit_is_valid(connection: sqlite3.Connection, audit_max: int) -> bool:
-    audit = connection.execute(
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    restored_count = (
+        "+ count(restored_publications.audit_event_id) "
+        if "restored_publications" in tables
+        else ""
+    )
+    restored_join = (
+        "LEFT JOIN restored_publications USING (audit_event_id)"
+        if "restored_publications" in tables
+        else ""
+    )
+    audit_query = (
         "SELECT count(*), COALESCE(MIN(audit_position), 1), "
         "COALESCE(MAX(audit_position), 0), "
         "count(import_publications.audit_event_id) "
         "+ count(data_review_decisions.audit_event_id) "
         "+ count(metadata_tombstones.audit_event_id) "
         "+ count(migration_publications.audit_event_id) "
-        "FROM audit_events "
+        + restored_count
+        + "FROM audit_events "
         "LEFT JOIN import_publications USING (audit_event_id) "
         "LEFT JOIN data_review_decisions USING (audit_event_id) "
         "LEFT JOIN metadata_tombstones USING (audit_event_id) "
-        "LEFT JOIN migration_publications USING (audit_event_id)"
-    ).fetchone()
+        "LEFT JOIN migration_publications USING (audit_event_id) "
+        + restored_join
+    )
+    audit = connection.execute(audit_query).fetchone()
     if audit is None or tuple(map(int, audit)) != (audit_max, 1, audit_max, audit_max):
         return False
     invalid_tombstone = connection.execute(
@@ -313,6 +425,87 @@ def _source(store: LocalStore) -> sqlite3.Connection:
                 for ordinal, reason in enumerate(fact.reasons)
             ),
         )
+        source.execute(
+            "CREATE TABLE required_source_refs ("
+            "logical_measurement_id TEXT NOT NULL, measurement_version_id TEXT PRIMARY KEY, "
+            "payload_sha256 TEXT NOT NULL) STRICT"
+        )
+        source.execute(
+            "CREATE TABLE resolved_overlay_facts ("
+            "logical_measurement_id TEXT PRIMARY KEY, "
+            "selected_measurement_version_id TEXT NOT NULL, disposition TEXT NOT NULL, "
+            "effective_value REAL, canonical_unit TEXT NOT NULL, "
+            "effective_value_source TEXT NOT NULL, effective_decision_id TEXT, "
+            "correction_decision_id TEXT, source_deletion_decision_id TEXT, "
+            "conflict_resolution_decision_id TEXT) STRICT"
+        )
+        source.execute(
+            "CREATE TABLE open_review_overlay_facts ("
+            "review_case_id TEXT PRIMARY KEY, case_kind TEXT NOT NULL, "
+            "logical_measurement_id TEXT, measurement_version_id TEXT, "
+            "rule_version_id TEXT, evidence_fingerprint TEXT NOT NULL) STRICT"
+        )
+        active = store.load_active_snapshot_id()
+        active_facts = next(
+            (
+                snapshot
+                for snapshot in store.load_review_snapshot_facts()
+                if snapshot.snapshot_id == active
+            ),
+            None,
+        )
+        if active_facts is not None:
+            source.executemany(
+                "INSERT INTO required_source_refs VALUES (?, ?, ?)",
+                (
+                    (
+                        version.logical_measurement_id,
+                        version.measurement_version_id,
+                        _fact_payload_sha256(version),
+                    )
+                    for version in active_facts.versions
+                ),
+            )
+            source.executemany(
+                "INSERT INTO resolved_overlay_facts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    (
+                        item.logical_measurement_id,
+                        item.selected_measurement_version_id,
+                        item.disposition,
+                        item.effective_value,
+                        item.canonical_unit,
+                        item.effective_value_source,
+                        item.effective_decision_id,
+                        item.correction_decision_id,
+                        item.source_deletion_decision_id,
+                        item.conflict_resolution_decision_id,
+                    )
+                    for item in active_facts.measurements
+                ),
+            )
+            source.executemany(
+                "INSERT INTO open_review_overlay_facts VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    (
+                        item.review_case_id,
+                        item.kind,
+                        (
+                            None
+                            if item.logical_measurement_id is None
+                            else str(item.logical_measurement_id)
+                        ),
+                        (
+                            None
+                            if item.measurement_version_id is None
+                            else str(item.measurement_version_id)
+                        ),
+                        item.rule_version_id,
+                        item.evidence_fingerprint,
+                    )
+                    for item in active_facts.cases
+                ),
+            )
         return source
     except Exception:
         source.close()
@@ -433,8 +626,13 @@ def _read_restore_backup(path: Path) -> tuple[BackupId, StoreId, str, int, int]:
                     "AND name NOT LIKE 'sqlite_%'"
                 )
             }
-            expected_tables = {*_CONTENT_TABLES, "backup_manifest"}
-            if schema_version == 2:
+            content_tables = (
+                _CONTENT_TABLES
+                if set(_CONTENT_TABLES) <= tables
+                else _LEGACY_CONTENT_TABLES
+            )
+            expected_tables = {*content_tables, "backup_manifest"}
+            if schema_version >= 2:
                 expected_tables.add("backup_migration_provenance")
             if (
                 schema_version <= 0
@@ -449,11 +647,11 @@ def _read_restore_backup(path: Path) -> tuple[BackupId, StoreId, str, int, int]:
                 or tables != expected_tables
                 or backup.execute("PRAGMA integrity_check").fetchone() != ("ok",)
                 or backup.execute("PRAGMA foreign_key_check").fetchall()
-                or _canonical_hash(backup) != canonical_hash
+                or _canonical_hash(backup, content_tables) != canonical_hash
                 or not _audit_is_valid(backup, audit_max)
             ):
                 raise StoreError("backup_integrity_conflict")
-            if schema_version == 2:
+            if schema_version >= 2:
                 provenance = backup.execute(
                     "SELECT original_backup_id, original_content_sha256, "
                     "source_schema_version, target_schema_version "
@@ -463,8 +661,8 @@ def _read_restore_backup(path: Path) -> tuple[BackupId, StoreId, str, int, int]:
                     provenance is None
                     or str(provenance[0]) != str(backup_id)
                     or str(provenance[1]) != canonical_hash
-                    or int(provenance[2]) not in {1, 2}
-                    or int(provenance[3]) != 2
+                    or int(provenance[2]) not in {1, 2, 3}
+                    or int(provenance[3]) != schema_version
                 ):
                     raise StoreError("backup_integrity_conflict")
             return backup_id, store_id, canonical_hash, audit_max, schema_version
@@ -580,27 +778,272 @@ def preflight_metadata_restore_start(backup_path: Path, target_root: Path) -> Ca
     return probe_capacity(target_root, estimate, method_id=_RESTORE_START_METHOD_ID)
 
 
+def load_restore_working_copy(store: LocalStore, target_root: Path) -> Path:
+    session = load_metadata_restore(store)
+    working = target_root / _RESTORE_DIRECTORY / str(session.restore_id) / "working.sqlite3"
+    if (
+        session.working_copy_sha256 is None
+        or _backup_file_sha256(working) != session.working_copy_sha256
+    ):
+        raise StoreError("restore_working_copy_changed")
+    return working
+
+
+def load_restore_source_packages(store: LocalStore, target_root: Path) -> tuple[Path, ...]:
+    source_root = load_restore_working_copy(store, target_root).parent / "sources"
+    return tuple(sorted(source_root.glob("*.zip"))) if source_root.exists() else ()
+
+
+def inspect_restore_sources(
+    store: LocalStore,
+    target_root: Path,
+    records: tuple[CanonicalHealthRecord, ...],
+) -> RestoreSourceInspection:
+    working = load_restore_working_copy(store, target_root)
+    with sqlite3.connect(f"{working.resolve().as_uri()}?mode=ro", uri=True) as backup:
+        required = {
+            (str(row[0]), str(row[1]), str(row[2]))
+            for row in backup.execute(
+                "SELECT logical_measurement_id, measurement_version_id, payload_sha256 "
+                "FROM required_source_refs"
+            )
+        }
+    available = {
+        (
+            str(record.logical_measurement_id),
+            str(record.measurement_version_id),
+            _record_payload_sha256(record),
+        )
+        for record in records
+    }
+    matched = required & available
+    state_hash = hashlib.sha256(
+        json.dumps(
+            {"available": sorted(available), "required": sorted(required)},
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return RestoreSourceInspection(
+        complete=matched == required,
+        state_hash=state_hash,
+        required_count=len(required),
+        matched_count=len(matched),
+    )
+
+
+def preflight_restore_source_import(
+    store: LocalStore,
+    target_root: Path,
+    *,
+    input_bytes: int,
+    record_count: int,
+    complete: bool,
+) -> CapacityCheck:
+    if complete:
+        snapshot = store.preflight_full_snapshot_import(input_bytes, record_count)
+        try:
+            working = load_restore_working_copy(store, target_root)
+            overlay_allocation = 2 * working.stat().st_blocks * 512
+            fragment_size = os.statvfs(target_root).f_frsize
+            estimate = (
+                None
+                if snapshot.estimate_bytes is None
+                else _round_up(
+                    snapshot.estimate_bytes
+                    + overlay_allocation
+                    + _DIRECTORY_OVERHEAD,
+                    fragment_size,
+                )
+            )
+        except (OSError, StoreError, TypeError, ValueError):
+            estimate = None
+        return probe_capacity(
+            target_root,
+            estimate,
+            method_id=_RESTORE_ACTIVATE_METHOD_ID,
+        )
+    return probe_capacity(
+        target_root,
+        max(input_bytes, _MINIMUM_ESTIMATE),
+        method_id=_RESTORE_SOURCE_METHOD_ID,
+    )
+
+
+def stage_restore_source_package(
+    store: LocalStore,
+    target_root: Path,
+    package_path: Path,
+    package_hash: str,
+) -> None:
+    # ponytail: keep validated ZIPs until activation; stage normalized rows only if
+    # duplicate package allocation becomes material in real restore workloads.
+    working_directory = load_restore_working_copy(store, target_root).parent
+    source_root = working_directory / "sources"
+    source_directory_created = not source_root.exists()
+    source_root.mkdir(exist_ok=True)
+    if source_directory_created:
+        parent = os.open(working_directory, os.O_RDONLY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    target = source_root / f"{package_hash}.zip"
+    if target.exists():
+        return
+    temporary = source_root / f".{package_hash}.tmp"
+    temporary.unlink(missing_ok=True)
+    shutil.copyfile(package_path, temporary)
+    with temporary.open("rb") as package:
+        os.fsync(package.fileno())
+    _restore_fault_point(target_root, "restore-source.before_publish/v1")
+    os.replace(temporary, target)
+    directory = os.open(source_root, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    _restore_fault_point(target_root, "restore-source.after_publish/v1")
+
+
+def restore_source_resolver(path: Path) -> SourceResolver:
+    with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True) as backup:
+        measurements = tuple(
+            ResolvedMeasurement(*row)
+            for row in backup.execute("SELECT * FROM resolved_overlay_facts").fetchall()
+        )
+        review_cases = tuple(
+            OpenDataReviewCase(
+                review_case_id=str(row[0]),
+                kind=cast(
+                    Literal[
+                        "plausibility",
+                        "continued_override",
+                        "suspected_source_deletion",
+                        "source_conflict",
+                        "rule_definition",
+                    ],
+                    str(row[1]),
+                ),
+                logical_measurement_id=(
+                    None if row[2] is None else LogicalMeasurementId(str(row[2]))
+                ),
+                measurement_version_id=(
+                    None if row[3] is None else MeasurementVersionId(str(row[3]))
+                ),
+                rule_version_id=None if row[4] is None else str(row[4]),
+                evidence_fingerprint=str(row[5]),
+            )
+            for row in backup.execute("SELECT * FROM open_review_overlay_facts").fetchall()
+        )
+    def resolve_restored_sources(
+        *,
+        occurrences: tuple[SourceOccurrenceFact, ...],
+        versions: tuple[MeasurementVersionFact, ...],
+        exports: tuple[ExportFact, ...],
+        previous_measurements: tuple[ResolvedMeasurement, ...],
+        previous_review_cases: tuple[OpenDataReviewCase, ...],
+        governing_export_id: str,
+        imported_measurement_version_ids: tuple[str, ...] = (),
+        unknown_source_types: tuple[str, ...] = (),
+        suppressed_deletion_ids: frozenset[str] = frozenset(),
+        plausibility_rules: tuple[PlausibilityRuleRecord, ...] = (),
+    ) -> SourceResolution:
+        del (
+            occurrences,
+            versions,
+            exports,
+            previous_measurements,
+            previous_review_cases,
+            governing_export_id,
+            imported_measurement_version_ids,
+            unknown_source_types,
+            suppressed_deletion_ids,
+            plausibility_rules,
+        )
+        return SourceResolution(
+            measurements=measurements,
+            review_cases=review_cases,
+            new_review_case_ids=(),
+            source_type_requests=(),
+            cycle_status="open" if review_cases else "closed",
+            cycle_open_case_count=len(review_cases),
+            anomaly_count=0,
+        )
+
+    return resolve_restored_sources
+
+
 def _migrate_restore_working_copy(path: Path, inspection: MetadataRestoreInspection) -> None:
     for source, target in inspection.migration_steps:
-        if (source, target) != (1, 2):
-            raise StoreError("backup_migration_missing")
         with sqlite3.connect(path) as working:
-            working.execute(
-                "CREATE TABLE backup_migration_provenance ("
-                "singleton INTEGER PRIMARY KEY CHECK (singleton = 1), "
-                "original_backup_id TEXT NOT NULL, original_content_sha256 TEXT NOT NULL, "
-                "source_schema_version INTEGER NOT NULL, target_schema_version INTEGER NOT NULL) "
-                "STRICT"
-            )
-            working.execute(
-                "INSERT INTO backup_migration_provenance VALUES (1, ?, ?, ?, ?)",
-                (
-                    str(inspection.backup_id),
-                    inspection.canonical_content_sha256,
-                    source,
-                    target,
-                ),
-            )
+            if (source, target) == (1, 2):
+                working.execute(
+                    "CREATE TABLE backup_migration_provenance ("
+                    "singleton INTEGER PRIMARY KEY CHECK (singleton = 1), "
+                    "original_backup_id TEXT NOT NULL, original_content_sha256 TEXT NOT NULL, "
+                    "source_schema_version INTEGER NOT NULL, "
+                    "target_schema_version INTEGER NOT NULL) STRICT"
+                )
+                working.execute(
+                    "INSERT INTO backup_migration_provenance VALUES (1, ?, ?, ?, ?)",
+                    (
+                        str(inspection.backup_id),
+                        inspection.canonical_content_sha256,
+                        source,
+                        target,
+                    ),
+                )
+            elif (source, target) == (2, 3):
+                for definition in (
+                    "CREATE TABLE IF NOT EXISTS source_absence_suppressions ("
+                    "logical_measurement_id TEXT PRIMARY KEY, "
+                    "decision_id TEXT NOT NULL, "
+                    "active INTEGER NOT NULL) STRICT",
+                    "CREATE TABLE IF NOT EXISTS restored_publications ("
+                    "audit_event_id TEXT PRIMARY KEY) STRICT",
+                    "CREATE TABLE IF NOT EXISTS required_source_refs ("
+                    "logical_measurement_id TEXT NOT NULL, "
+                    "measurement_version_id TEXT PRIMARY KEY, "
+                    "payload_sha256 TEXT NOT NULL) STRICT",
+                    "CREATE TABLE IF NOT EXISTS resolved_overlay_facts ("
+                    "logical_measurement_id TEXT PRIMARY KEY, "
+                    "selected_measurement_version_id TEXT NOT NULL, "
+                    "disposition TEXT NOT NULL, effective_value REAL, "
+                    "canonical_unit TEXT NOT NULL, effective_value_source TEXT NOT NULL, "
+                    "effective_decision_id TEXT, correction_decision_id TEXT, "
+                    "source_deletion_decision_id TEXT, "
+                    "conflict_resolution_decision_id TEXT) STRICT",
+                    "CREATE TABLE IF NOT EXISTS open_review_overlay_facts ("
+                    "review_case_id TEXT PRIMARY KEY, case_kind TEXT NOT NULL, "
+                    "logical_measurement_id TEXT, measurement_version_id TEXT, "
+                    "rule_version_id TEXT, evidence_fingerprint TEXT NOT NULL) STRICT",
+                ):
+                    working.execute(definition)
+                provenance = working.execute(
+                    "SELECT source_schema_version FROM backup_migration_provenance "
+                    "WHERE singleton = 1"
+                ).fetchone()
+                if provenance is not None and int(provenance[0]) < 3:
+                    working.execute(
+                        "INSERT OR IGNORE INTO required_source_refs VALUES (?, ?, ?)",
+                        (
+                            "legacy-source-references-unavailable",
+                            "legacy-source-references-unavailable",
+                            "!",
+                        ),
+                    )
+                migrated_hash = _canonical_hash(working)
+                working.execute(
+                    "UPDATE backup_manifest SET canonical_content_sha256 = ? "
+                    "WHERE singleton = 1",
+                    (migrated_hash,),
+                )
+                working.execute(
+                    "UPDATE backup_migration_provenance SET target_schema_version = 3 "
+                    "WHERE singleton = 1"
+                )
+            else:
+                raise StoreError("backup_migration_missing")
             working.execute(
                 "UPDATE backup_manifest SET backup_schema_version = ? WHERE singleton = 1",
                 (target,),
@@ -656,10 +1099,19 @@ def begin_metadata_restore(
                 "SELECT backup_schema_version, canonical_content_sha256 "
                 "FROM backup_manifest WHERE singleton = 1"
             ).fetchone()
+            provenance = migrated.execute(
+                "SELECT original_backup_id, original_content_sha256, target_schema_version "
+                "FROM backup_migration_provenance WHERE singleton = 1"
+            ).fetchone()
             if (
-                manifest != (_BACKUP_SCHEMA_VERSION, current.canonical_content_sha256)
+                manifest is None
+                or int(manifest[0]) != _BACKUP_SCHEMA_VERSION
+                or provenance is None
+                or str(provenance[0]) != str(current.backup_id)
+                or str(provenance[1]) != current.canonical_content_sha256
+                or int(provenance[2]) != _BACKUP_SCHEMA_VERSION
                 or migrated.execute("PRAGMA integrity_check").fetchone() != ("ok",)
-                or _canonical_hash(migrated) != current.canonical_content_sha256
+                or _canonical_hash(migrated) != str(manifest[1])
             ):
                 raise StoreError("backup_migration_invalid")
         completed = MetadataRestoreInspection(
@@ -717,7 +1169,27 @@ def validate_metadata_restore_abort(
         restore_root,
         f"{restore_root}/working.sqlite3",
     }
-    if _relative_store_paths(target_root) != expected:
+    paths = _relative_store_paths(target_root)
+    source_root = f"{restore_root}/sources"
+    unexpected = paths - expected
+    if unexpected and not (
+        source_root in unexpected
+        and all(
+            path == source_root
+            or (
+                path.startswith(f"{source_root}/")
+                and (
+                    (path.endswith(".zip") and len(Path(path).stem) == 64)
+                    or (
+                        path.endswith(".tmp")
+                        and Path(path).name.startswith(".")
+                        and len(Path(path).name) == 69
+                    )
+                )
+            )
+            for path in unexpected
+        )
+    ):
         raise StoreError("restore_store_contains_unexpected_files")
     return inspection
 
@@ -882,13 +1354,20 @@ __all__ = [
     "MetadataRestoreInspection",
     "MetadataRestoreStatus",
     "RestoreId",
+    "RestoreSourceInspection",
     "begin_metadata_restore",
     "create_metadata_backup",
     "describe_metadata_backup",
     "inspect_metadata_restore",
+    "inspect_restore_sources",
     "load_metadata_restore",
+    "load_restore_source_packages",
+    "load_restore_working_copy",
     "preflight_metadata_backup",
     "preflight_metadata_restore_start",
+    "preflight_restore_source_import",
+    "restore_source_resolver",
     "stage_metadata_restore_abort",
+    "stage_restore_source_package",
     "validate_metadata_restore_abort",
 ]

@@ -117,8 +117,8 @@ def test_streamlit_focuses_migration_in_restricted_session(
 
     assert not app.exception
     assert any(item.value == "Datenspeichermigration" for item in app.subheader)
-    assert any("Schema: 2 → 5" in item.value for item in app.caption)
-    assert any("2 → 3, 3 → 4, 4 → 5" in item.value for item in app.caption)
+    assert any("Schema: 2 → 6" in item.value for item in app.caption)
+    assert any("2 → 3, 3 → 4, 4 → 5, 5 → 6" in item.value for item in app.caption)
     assert any(f"Betroffene Snapshots: {snapshot_ref}" in item.value for item in app.caption)
     assert any("Bestehende Analysen werden stale: true" in item.value for item in app.caption)
     assert not app.file_uploader
@@ -216,7 +216,7 @@ def test_streamlit_focuses_pending_metadata_restore_and_can_abort(
     assert not app.exception
     assert any(item.value == "Metadatenwiederherstellung" for item in app.subheader)
     assert any("Status: pending" in item.value for item in app.caption)
-    assert not app.file_uploader
+    assert any(item.label == "Apple-Health-Export" for item in app.file_uploader)
     assert all(button.label != "Ruhepulsanalyse prüfen" for button in app.button)
     next(button for button in app.button if button.label == "Wiederherstellung abbrechen").click()
     app.run()
@@ -224,6 +224,56 @@ def test_streamlit_focuses_pending_metadata_restore_and_can_abort(
     assert not app.exception
     assert not target.exists()
     assert any("Wiederherstellung: aborted" in item.value for item in app.success)
+
+
+def test_streamlit_completes_restore_through_the_shared_import_controls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = generate_export("null-v1", 54, tmp_path / "fixture")
+    backup = tmp_path / "private" / "metadata.sqlite3"
+    backup.parent.mkdir()
+    source_config = RuntimeConfig(
+        DataMode.REAL, tmp_path / "source-synthetic", tmp_path / "source-real"
+    )
+    with HealthLab.open(source_config) as health_lab:
+        import_request = ImportHealthExport(fixture.export_path)
+        health_lab.execute_write(
+            import_request,
+            expected_plan=health_lab.preview_write(import_request).fingerprint,
+        )
+        backup_request = CreateMetadataBackup(backup)
+        health_lab.execute_write(
+            backup_request,
+            expected_plan=health_lab.preview_write(backup_request).fingerprint,
+        )
+    target = tmp_path / "target-real"
+    monkeypatch.setenv("HEALTHLAB_MODE", "real")
+    monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(tmp_path / "target-synthetic"))
+    monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(target))
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
+
+    app = AppTest.from_file(str(app_path)).run()
+    next(
+        item for item in app.text_input if item.label == "Metadatensicherung wiederherstellen"
+    ).set_value(str(backup))
+    next(button for button in app.button if button.label == "Wiederherstellung prüfen").click()
+    app.run()
+    next(button for button in app.button if button.label == "Wiederherstellung beginnen").click()
+    app.run()
+
+    app.file_uploader[0].set_value(
+        ("apple-health-export.zip", fixture.export_path.read_bytes(), "application/zip")
+    )
+    next(button for button in app.button if button.label == "Health-Export prüfen").click()
+    app.run()
+    assert not app.exception
+    assert any("Methode restore-activate/v1" in item.value for item in app.caption)
+    next(button for button in app.button if button.label == "Vorschau ausführen").click()
+    app.run()
+
+    assert not app.exception
+    assert any("Importstatus: committed" in item.value for item in app.success)
+    assert any(item.value == "Status: ready" for item in app.markdown)
 
 
 def test_streamlit_projects_plausibility_rules(

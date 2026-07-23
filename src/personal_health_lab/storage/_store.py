@@ -43,7 +43,7 @@ from personal_health_lab.health_data import (
 _METADATA_FILE = "metadata.sqlite3"
 _PARQUET_DIRECTORY = "parquet"
 _QUERY_FILE = "query.duckdb"
-_STORE_SCHEMA_VERSION = 5
+_STORE_SCHEMA_VERSION = 6
 _WRITER_LOCK_FILE = ".writer.lock"
 _FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
 _STORE_MIGRATION_METHOD = "cow-migration/v1"
@@ -1195,6 +1195,9 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                 target_schema_version > source_schema_version
             ),
             backup_file TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS restored_publications (
+            audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id)
         ) STRICT;
         CREATE TABLE IF NOT EXISTS metadata_restores (
             restore_id TEXT PRIMARY KEY CHECK (
@@ -2574,6 +2577,11 @@ class LocalStore:
         unknown_source_types: tuple[str, ...],
         governing_export_id: str,
         resolve_sources: SourceResolver,
+        restore_overlay: Path | None = None,
+        restore_overlay_sha256: str | None = None,
+        restore_exports: tuple[
+            tuple[str, datetime | None, str, tuple[CanonicalHealthRecord, ...]], ...
+        ] = (),
     ) -> PublishImportResult:
         self._require_open()
         self._require_writer()
@@ -2589,6 +2597,9 @@ class LocalStore:
                 unknown_source_types=unknown_source_types,
                 governing_export_id=governing_export_id,
                 resolve_sources=resolve_sources,
+                restore_overlay=restore_overlay,
+                restore_overlay_sha256=restore_overlay_sha256,
+                restore_exports=restore_exports,
             )
         except (OSError, sqlite3.Error, duckdb.Error) as error:
             raise StoreError("Health-Import konnte nicht veröffentlicht werden.") from error
@@ -2606,6 +2617,11 @@ class LocalStore:
         unknown_source_types: tuple[str, ...],
         governing_export_id: str,
         resolve_sources: SourceResolver,
+        restore_overlay: Path | None,
+        restore_overlay_sha256: str | None,
+        restore_exports: tuple[
+            tuple[str, datetime | None, str, tuple[CanonicalHealthRecord, ...]], ...
+        ],
     ) -> PublishImportResult:
         observed_at = datetime.now().astimezone()
         duplicate = self._metadata.execute(
@@ -2765,11 +2781,35 @@ class LocalStore:
         version_count, logical_count = map(int, count_row)
         new_record_count = version_count - previous_count
 
-        audit_position = int(
-            self._metadata.execute(
-                "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
-            ).fetchone()[0]
-        )
+        restored_decision_refs: tuple[tuple[str, str], ...] = ()
+        restored_rule_refs: tuple[tuple[str, str], ...] = ()
+        if restore_overlay is None:
+            audit_position = int(
+                self._metadata.execute(
+                    "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+                ).fetchone()[0]
+            )
+        else:
+            with sqlite3.connect(
+                f"{restore_overlay.resolve().as_uri()}?mode=ro", uri=True
+            ) as backup:
+                audit_position = int(
+                    backup.execute(
+                        "SELECT audit_max_position + 1 FROM backup_manifest WHERE singleton = 1"
+                    ).fetchone()[0]
+                )
+                restored_decision_refs = tuple(
+                    (str(row[0]), str(row[1]))
+                    for row in backup.execute(
+                        "SELECT decision_id, decision_kind FROM decision_refs"
+                    ).fetchall()
+                )
+                restored_rule_refs = tuple(
+                    (str(row[0]), str(row[1]))
+                    for row in backup.execute(
+                        "SELECT rule_version_id, rule_kind FROM rule_version_refs"
+                    ).fetchall()
+                )
         manifest_sha256, resolution = self._stage_snapshot(
             staging,
             operation_id=operation_id,
@@ -2782,6 +2822,9 @@ class LocalStore:
             unknown_source_types=unknown_source_types,
             audit_position=audit_position,
             resolve_sources=resolve_sources,
+            restore_exports=restore_exports,
+            restored_decision_refs=restored_decision_refs,
+            restored_rule_refs=restored_rule_refs,
         )
         _allocation_checkpoint(self._root, "staged")
         _publication_fault_point(self._root, "import.before_snapshot_move/v1")
@@ -2791,18 +2834,32 @@ class LocalStore:
         completed_at = datetime.now(UTC).isoformat()
         audit_event_id = uuid4().hex
         with self._metadata:
+            if restore_overlay is not None:
+                self._activate_restore_overlay(
+                    restore_overlay, expected_sha256=restore_overlay_sha256
+                )
             self._metadata.execute(
                 "INSERT INTO write_operations VALUES (?, 'import_health_export', ?, ?, "
                 "'committed', 1)",
                 (str(operation_id), observed_at.astimezone(UTC).isoformat(), completed_at),
             )
-            self._metadata.execute(
+            exports_to_record = restore_exports or (
+                (export_id, export_date, package_hash, records),
+            )
+            self._metadata.executemany(
                 "INSERT INTO exports VALUES (?, ?, ?, ?)",
                 (
-                    export_id,
-                    package_hash,
-                    None if export_date is None else export_date.astimezone(UTC).isoformat(),
-                    "unordered" if export_date is None else "ordered",
+                    (
+                        item_export_id,
+                        item_package_hash,
+                        (
+                            None
+                            if item_export_date is None
+                            else item_export_date.astimezone(UTC).isoformat()
+                        ),
+                        "unordered" if item_export_date is None else "ordered",
+                    )
+                    for item_export_id, item_export_date, item_package_hash, _ in exports_to_record
                 ),
             )
             self._record_import(
@@ -2878,6 +2935,12 @@ class LocalStore:
                     {(str(record.logical_measurement_id),) for record in records},
                 )
             self._bind_person()
+            if restore_overlay is not None:
+                self._metadata.execute(
+                    "UPDATE metadata_restores SET activated_at_utc = ? "
+                    "WHERE activated_at_utc IS NULL",
+                    (completed_at,),
+                )
             _allocation_checkpoint(self._root, "activated")
             _publication_fault_point(self._root, "import.before_sqlite_commit/v1")
         return PublishImportResult(
@@ -2888,6 +2951,63 @@ class LocalStore:
             measurement_version_count=version_count,
             source_occurrence_count=self._snapshot_occurrence_count(snapshot_id),
             anomaly_count=resolution.anomaly_count,
+        )
+
+    def _activate_restore_overlay(self, path: Path, *, expected_sha256: str | None) -> None:
+        if expected_sha256 is None:
+            raise StoreError("restore_working_copy_changed")
+        with path.open("rb") as working:
+            if hashlib.file_digest(working, "sha256").hexdigest() != expected_sha256:
+                raise StoreError("restore_working_copy_changed")
+        with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True) as backup:
+
+            def copy(
+                table: str, *, ignore_existing: bool = False, order_by: str | None = None
+            ) -> None:
+                columns = len(backup.execute(f'PRAGMA table_info("{table}")').fetchall())
+                ordering = "" if order_by is None else f' ORDER BY "{order_by}"'
+                rows = backup.execute(f'SELECT * FROM "{table}"{ordering}').fetchall()
+                if rows:
+                    self._metadata.executemany(
+                        f'INSERT {"OR IGNORE " if ignore_existing else ""}INTO "{table}" '
+                        f'VALUES ({", ".join("?" for _ in range(columns))})',
+                        rows,
+                    )
+
+            for table in (
+                "write_operations",
+                "decision_refs",
+                "source_type_catalog",
+                "data_review_batch_actions",
+            ):
+                copy(table)
+            copy("rule_version_refs", ignore_existing=True)
+            copy("plausibility_rule_versions", ignore_existing=True)
+            copy("audit_events", order_by="audit_position")
+            for table in (
+                "data_review_decisions",
+                "data_review_batch_members",
+                "metadata_tombstones",
+                "source_absence_suppressions",
+            ):
+                copy(table)
+            payload_ids = {
+                str(row[0])
+                for table in ("data_review_decisions", "metadata_tombstones")
+                for row in backup.execute(f"SELECT audit_event_id FROM {table}").fetchall()
+            }
+            self._metadata.executemany(
+                "INSERT INTO restored_publications VALUES (?)",
+                (
+                    (str(row[0]),)
+                    for row in backup.execute(
+                        "SELECT audit_event_id FROM audit_events ORDER BY audit_position"
+                    ).fetchall()
+                    if str(row[0]) not in payload_ids
+                ),
+            )
+        self._metadata.execute(
+            "UPDATE store_identity SET person_binding = 'bound' WHERE singleton = 1"
         )
 
     def _stage_snapshot(
@@ -2904,6 +3024,11 @@ class LocalStore:
         unknown_source_types: tuple[str, ...],
         audit_position: int,
         resolve_sources: SourceResolver,
+        restore_exports: tuple[
+            tuple[str, datetime | None, str, tuple[CanonicalHealthRecord, ...]], ...
+        ],
+        restored_decision_refs: tuple[tuple[str, str], ...],
+        restored_rule_refs: tuple[tuple[str, str], ...],
     ) -> tuple[str, SourceResolution]:
         self._query.execute(
             """
@@ -2918,19 +3043,25 @@ class LocalStore:
             )
             """
         )
+        export_records = (
+            tuple((item[0], item[3]) for item in restore_exports)
+            if restore_exports
+            else ((export_id, records),)
+        )
         occurrence_rows = [
             (
-                hashlib.sha256(f"{export_id}:{ordinal}".encode()).hexdigest(),
-                export_id,
+                hashlib.sha256(f"{item_export_id}:{ordinal}".encode()).hexdigest(),
+                item_export_id,
                 ordinal,
                 str(record.logical_measurement_id),
                 str(record.measurement_version_id),
                 _MAPPING_RULE_VERSION,
                 hashlib.sha256(
-                    f"{export_id}:{ordinal}:{record.measurement_version_id}".encode()
+                    f"{item_export_id}:{ordinal}:{record.measurement_version_id}".encode()
                 ).hexdigest(),
             )
-            for ordinal, record in enumerate(records, start=1)
+            for item_export_id, item_records in export_records
+            for ordinal, record in enumerate(item_records, start=1)
         ]
         if occurrence_rows:
             self._query.executemany(
@@ -2984,10 +3115,18 @@ class LocalStore:
                 "SELECT export_id, export_date_utc FROM exports"
             ).fetchall()
         ]
-        export_rows.append(
+        export_rows.extend(
             (
-                export_id,
-                None if export_date is None else export_date.astimezone(UTC).isoformat(),
+                item_export_id,
+                (
+                    None
+                    if item_export_date is None
+                    else item_export_date.astimezone(UTC).isoformat()
+                ),
+            )
+            for item_export_id, item_export_date, _, _ in (
+                restore_exports
+                or ((export_id, export_date, "", records),)
             )
         )
         self._query.executemany("INSERT INTO export_order VALUES (?, ?)", export_rows)
@@ -3240,7 +3379,13 @@ class LocalStore:
         ).encode()
         (directory / "manifest.json").write_bytes(manifest_bytes)
         manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-        self._validate_snapshot(directory, str(snapshot_id), manifest_sha256)
+        self._validate_snapshot(
+            directory,
+            str(snapshot_id),
+            manifest_sha256,
+            additional_decision_refs=restored_decision_refs,
+            additional_rule_refs=restored_rule_refs,
+        )
         return manifest_sha256, resolution
 
     def _validate_store(self) -> None:
@@ -3274,6 +3419,16 @@ class LocalStore:
                 if "migration_publications" in tables
                 else ""
             )
+            restored_count = (
+                "+ count(restored_publications.audit_event_id)"
+                if "restored_publications" in tables
+                else ""
+            )
+            restored_join = (
+                "LEFT JOIN restored_publications USING (audit_event_id)"
+                if "restored_publications" in tables
+                else ""
+            )
             audit = self._metadata.execute(
                 f"""
                 SELECT count(*), COALESCE(MIN(audit_position), 1),
@@ -3282,11 +3437,13 @@ class LocalStore:
                        + count(data_review_decisions.audit_event_id)
                        + count(metadata_tombstones.audit_event_id)
                        {migration_count}
+                       {restored_count}
                 FROM audit_events
                 LEFT JOIN import_publications USING (audit_event_id)
                 LEFT JOIN data_review_decisions USING (audit_event_id)
                 LEFT JOIN metadata_tombstones USING (audit_event_id)
                 {migration_join}
+                {restored_join}
                 """
             ).fetchone()
             assert audit is not None
@@ -3328,6 +3485,8 @@ class LocalStore:
         manifest_sha256: str,
         *,
         expected_store_id: str | None = None,
+        additional_decision_refs: tuple[tuple[str, str], ...] = (),
+        additional_rule_refs: tuple[tuple[str, str], ...] = (),
     ) -> None:
         try:
             manifest_bytes = (directory / "manifest.json").read_bytes()
@@ -3502,6 +3661,7 @@ class LocalStore:
                 ).fetchall()
             }
         )
+        cataloged_decisions.update(additional_decision_refs)
         snapshot_rules = {
             (str(row[0]), str(row[1]))
             for row in self._query.execute(
@@ -3531,6 +3691,7 @@ class LocalStore:
                     "SELECT rule_version_id, rule_kind FROM rule_version_refs"
                 ).fetchall()
             )
+        cataloged_rules.update(additional_rule_refs)
         if not snapshot_decisions <= cataloged_decisions or not snapshot_rules <= cataloged_rules:
             raise StoreError("Snapshot-Entscheidungs- oder Regelreferenz ist nicht geschlossen.")
         invalid = self._query.execute(

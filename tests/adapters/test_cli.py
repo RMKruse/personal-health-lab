@@ -214,6 +214,76 @@ def test_cli_maps_metadata_restore_status_and_abort_without_exposing_paths(
     assert not (tmp_path / "target-real").exists()
 
 
+def test_cli_completes_restore_through_the_shared_import_command(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    package = tmp_path / "fixture.zip"
+    with ZipFile(package, "w") as archive:
+        archive.writestr(
+            "apple_health_export/export.xml",
+            '<?xml version="1.0"?><HealthData>'
+            '<ExportDate value="2024-03-01 00:00:00 +0000"/>'
+            '<Record type="HKQuantityTypeIdentifierRestingHeartRate" '
+            'sourceName="Restore Watch" sourceVersion="1" device="Restore Device" '
+            'unit="count/min" creationDate="2024-01-01 00:00:00 +0000" '
+            'startDate="2024-01-01 00:00:00 +0000" '
+            'endDate="2024-01-01 00:00:00 +0000" value="60">'
+            '<MetadataEntry key="HKMetadataKeySyncIdentifier" value="cli-restore"/>'
+            "</Record></HealthData>",
+        )
+    backup = tmp_path / "private" / "metadata.sqlite3"
+    backup.parent.mkdir()
+    source_config = RuntimeConfig(
+        DataMode.REAL, tmp_path / "source-synthetic", tmp_path / "source-real"
+    )
+    with HealthLab.open(source_config) as health_lab:
+        import_request = ImportHealthExport(package)
+        health_lab.execute_write(
+            import_request,
+            expected_plan=health_lab.preview_write(import_request).fingerprint,
+        )
+        backup_request = CreateMetadataBackup(backup)
+        health_lab.execute_write(
+            backup_request,
+            expected_plan=health_lab.preview_write(backup_request).fingerprint,
+        )
+    common = [
+        "--mode",
+        "real",
+        "--synthetic-store",
+        str(tmp_path / "target-synthetic"),
+        "--real-store",
+        str(tmp_path / "target-real"),
+    ]
+
+    assert main([*common, "restore", str(backup), "--json"]) == 0
+    restore_plan = json.loads(capsys.readouterr().out)
+    assert main(
+        [
+            *common,
+            "restore",
+            str(backup),
+            "--json",
+            "--execute",
+            "--expect-plan",
+            restore_plan["fingerprint"],
+        ]
+    ) == 0
+    capsys.readouterr()
+
+    exit_code, receipt = _execute_json_import(common, package, capsys)
+    assert exit_code == 0
+    assert receipt["result"]["status"] == "committed"
+    with HealthLab.open(
+        RuntimeConfig(
+            DataMode.REAL,
+            tmp_path / "target-synthetic",
+            tmp_path / "target-real",
+        )
+    ) as health_lab:
+        assert health_lab.load_workspace_status().state.value == "ready"
+
+
 def test_cli_projects_source_conflicts_from_the_shared_data_review(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1035,8 +1105,8 @@ def test_cli_maps_store_migration_plan_and_receipt(
     plan = json.loads(capsys.readouterr().out)
     _assert_json_contract(plan)
     assert plan["workspace"]["allowed_writes"] == ["migrate_store"]
-    assert plan["details"]["steps"] == [[2, 3], [3, 4], [4, 5]]
-    assert plan["details"]["backup_file"] == "metadata-v2-to-v5.sqlite3"
+    assert plan["details"]["steps"] == [[2, 3], [3, 4], [4, 5], [5, 6]]
+    assert plan["details"]["backup_file"] == "metadata-v2-to-v6.sqlite3"
     assert plan["details"]["affected_snapshot_refs"] == [snapshot_ref]
     assert plan["details"]["existing_analyses_become_stale"] is True
 
@@ -1044,8 +1114,8 @@ def test_cli_maps_store_migration_plan_and_receipt(
         monkeypatch.setattr("builtins.input", lambda _prompt: "n")
         assert main([*common, "migrate"]) == 0
     human_plan = capsys.readouterr().out
-    assert "Migrationskette: 2 -> 3 -> 4 -> 5" in human_plan
-    assert "Migrationssicherung: metadata-v2-to-v5.sqlite3" in human_plan
+    assert "Migrationskette: 2 -> 3 -> 4 -> 5 -> 6" in human_plan
+    assert "Migrationssicherung: metadata-v2-to-v6.sqlite3" in human_plan
     assert f"Betroffene Snapshots: {snapshot_ref}" in human_plan
     assert "Bestehende Analysen werden veraltet: ja" in human_plan
 
@@ -1062,13 +1132,13 @@ def test_cli_maps_store_migration_plan_and_receipt(
     receipt = json.loads(capsys.readouterr().out)
     _assert_json_contract(receipt)
     assert receipt["result"]["status"] == "completed"
-    assert receipt["result"]["steps"] == [[2, 3], [3, 4], [4, 5]]
+    assert receipt["result"]["steps"] == [[2, 3], [3, 4], [4, 5], [5, 6]]
 
     assert main([*common, "rollback-migration", "--json"]) == 0
     rollback_plan = json.loads(capsys.readouterr().out)
     _assert_json_contract(rollback_plan)
     assert rollback_plan["details"]["type"] == "rollback_migration"
-    assert rollback_plan["details"]["source_version"] == 5
+    assert rollback_plan["details"]["source_version"] == 6
     assert rollback_plan["details"]["target_version"] == 2
     assert rollback_plan["details"]["restored_snapshot_ref"] == snapshot_ref
 
