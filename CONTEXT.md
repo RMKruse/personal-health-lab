@@ -108,6 +108,10 @@ _Avoid_: täglicher Pflicht-Check-in
 Eine Kontextabweichung mit explizitem Beginn und Ende, insbesondere für Krankheiten und Medikamentenänderungen. Der Zeitraum ordnet allen betroffenen Tagen denselben dokumentierten Kontext zu, ohne tägliche Wiederholungseingaben zu verlangen.
 _Avoid_: Folge unabhängiger Tageseinträge
 
+**Manuelle Kontextrevision**:
+Eine unveränderliche Fassung eines manuell erfassten Kontext- oder Medikamentendatensatzes. Eine Korrektur oder Rücknahme erzeugt eine neue Revision, die erst in danach aufgelösten Datensatz-Snapshots wirkt; frühere Snapshots behalten die dort verwendete Revision.
+_Avoid_: Überschreiben, rückwirkende Änderung
+
 **Stressstufe**:
 Die ordinale tägliche Einordnung „sehr niedrig“, „niedrig“, „durchschnittlich“, „hoch“ oder „sehr hoch“. Ohne bewusste Angabe gilt „durchschnittlich“ als Baselineannahme; eine aktiv bestätigte durchschnittliche Stufe bleibt davon unterscheidbar.
 _Avoid_: klinische Stressdiagnose, kontinuierlich gemessener Stresswert
