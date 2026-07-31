@@ -97,40 +97,56 @@ Eine zeitlich zugeordnete Größe, die bei der Interpretation einer Assoziation 
 _Avoid_: gesicherter Confounder, Ursache
 
 **Baselineannahme**:
-Der ohne täglichen Check-in angenommene Normalzustand: keine Krankheit, durchschnittlicher Stress und keine Medikamentenabweichung. Eine Baselineannahme bleibt als Annahme gekennzeichnet und ist nicht gleichbedeutend mit einer aktiv bestätigten Beobachtung.
+Der ohne täglichen Check-in angenommene Normalzustand: keine Krankheit, durchschnittlicher Stress und keine Medikamentenabweichung. Er bleibt als Annahme gekennzeichnet; „keine Krankheit“ wird nicht aktiv bestätigt, eine durchschnittliche Stressstufe dagegen schon.
 _Avoid_: bestätigter Normalzustand, gemessener Wert
+
+**Kontextabdeckungsbeginn**:
+Das gemeinsame lokale Kalenderdatum, ab dem fehlende Krankheits- und Stressangaben als Baselineannahmen gelten. Frühere Lücken bleiben unbekannt, ausdrücklich erfasste frühere Angaben aber sichtbar.
+_Avoid_: rückwirkend angenommene Vollständigkeit, getrennter Abdeckungsbeginn je Merkmal
 
 **Kontextabweichung**:
 Eine manuell erfasste Abweichung von der Baselineannahme, beispielsweise Krankheit, über- oder unterdurchschnittlicher Stress oder eine Medikamentenabweichung.
 _Avoid_: täglicher Pflicht-Check-in
 
 **Kontextzeitraum**:
-Eine Kontextabweichung mit explizitem Beginn und Ende, insbesondere für Krankheiten und Medikamentenänderungen. Der Zeitraum ordnet allen betroffenen Tagen denselben dokumentierten Kontext zu, ohne tägliche Wiederholungseingaben zu verlangen.
+Eine Kontextabweichung mit explizitem Beginn und einem expliziten Ende oder fachlich zulässigem offenem Ende, insbesondere für Krankheiten und Medikamentenänderungen. Der Zeitraum ordnet allen betroffenen Tagen denselben dokumentierten Kontext zu, ohne tägliche Wiederholungseingaben zu verlangen.
 _Avoid_: Folge unabhängiger Tageseinträge
 
+**Benutzerdefinierter Kontextzeitraum**:
+Ein Kontextzeitraum mit wiederverwendbarer benutzerdefinierter Kontextbezeichnung, einschließlich gültigem lokalem Start- und Enddatum und optionaler Notiz, aber ohne Schweregrad oder frei definierbaren Wert. Unterschiedlich bezeichnete Zeiträume dürfen sich überlappen, gleich bezeichnete nicht.
+_Avoid_: einmaliger Freitext, Messwert, Schweregrad, reiner Planungseintrag
+
+**Benutzerdefinierte Kontextbezeichnung**:
+Eine wiederverwendbare Bezeichnung mit stabiler Identität aus einem eigenen, zunächst leeren Katalog für benutzerdefinierte Kontextzeiträume. Umbenennungen gelten in neuen Datensatz-Snapshots auch für historische Referenzen; eine fachliche Aufteilung erzeugt neue Bezeichnungen und verlangt die ausdrückliche Neuzuordnung der betroffenen Zeiträume.
+_Avoid_: einmaliger Freitext, Krankheitskategorie, physisches Löschen
+
 **Manuelle Kontextrevision**:
-Eine unveränderliche Fassung eines manuell erfassten Kontext- oder Medikamentendatensatzes. Eine Korrektur oder Rücknahme erzeugt eine neue Revision, die erst in danach aufgelösten Datensatz-Snapshots wirkt; frühere Snapshots behalten die dort verwendete Revision.
-_Avoid_: Überschreiben, rückwirkende Änderung
+Eine unveränderliche Fassung eines manuell erfassten Kontext- oder Medikamentendatensatzes, die in einem Datensatz-Snapshot gebunden ist. Korrektur, Rücknahme und Wiederherstellung erzeugen neue Revisionen und verändern frühere Snapshots nicht.
+_Avoid_: Überschreiben, rückwirkende Änderung, Rücknahme als Enddatum, unveröffentlichter Entwurf
 
 **Stressstufe**:
-Die ordinale tägliche Einordnung „sehr niedrig“, „niedrig“, „durchschnittlich“, „hoch“ oder „sehr hoch“. Ohne bewusste Angabe gilt „durchschnittlich“ als Baselineannahme; eine aktiv bestätigte durchschnittliche Stufe bleibt davon unterscheidbar.
-_Avoid_: klinische Stressdiagnose, kontinuierlich gemessener Stresswert
+Die ordinale Einordnung „sehr niedrig“, „niedrig“, „durchschnittlich“, „hoch“ oder „sehr hoch“ für genau einen lokalen Kalendertag. Eine aktiv bestätigte durchschnittliche Stufe bleibt von der Baselineannahme unterscheidbar.
+_Avoid_: klinische Stressdiagnose, kontinuierlich gemessener Stresswert, Stresszeitraum
 
 **Krankheitskategorie**:
-Eine wiederverwendbare, auswählbare Bezeichnung für einen Krankheitszeitraum, beispielsweise „Erkältung“. Der vorgegebene Katalog kann vom Benutzer dauerhaft um neue Kategorien erweitert werden.
-_Avoid_: einmaliger Freitext, medizinischer Diagnosecode
+Eine wiederverwendbare, auswählbare Bezeichnung mit stabiler Identität aus einem eigenen Katalog für Krankheitszeiträume. Der vorgegebene Katalog kann dauerhaft um konkrete Kategorien erweitert werden; eine unspezifische Kategorie „Sonstige“ gibt es nicht.
+_Avoid_: einmaliger Freitext, benutzerdefinierte Kontextbezeichnung, medizinischer Diagnosecode, physisches Löschen
 
 **Krankheitszeitraum**:
-Ein Kontextzeitraum mit Krankheitskategorie, Beginn, Ende und dem persönlichen Schweregrad „leicht“, „mittel“ oder „schwer“. Er dokumentiert den persönlichen Kontext und ist keine ärztlich bestätigte Diagnose.
+Ein Kontextzeitraum mit Krankheitskategorie, Beginn und dem persönlichen Schweregrad „leicht“, „mittel“ oder „schwer“. Sein Ende darf fehlen, solange die Krankheit läuft; er dokumentiert persönlichen Kontext und keine ärztlich bestätigte Diagnose.
 _Avoid_: Diagnose, unabhängige tägliche Krankheitseinträge
 
 **Überlappende Krankheitszeiträume**:
-Mehrere gleichzeitig aktive Krankheitszeiträume mit jeweils eigener Kategorie und eigenem Schweregrad. Sie bleiben getrennt erhalten; ein Tag ist nicht auf eine einzige Krankheitskategorie beschränkt.
-_Avoid_: kombinierte Gesamtdiagnose, genau eine Krankheit pro Tag
+Mehrere gleichzeitig aktive Krankheitszeiträume mit unterschiedlichen Kategorien und jeweils eigenem Schweregrad. Zeiträume derselben Kategorie dürfen sich nicht überlappen; ein Schweregradwechsel wird durch angrenzende Zeiträume abgebildet.
+_Avoid_: kombinierte Gesamtdiagnose, genau eine Krankheit pro Tag, überlappende Zeiträume derselben Kategorie
 
 **Krankheitsmerkmal**:
 Die vereinfachte Repräsentation von Krankheitszeiträumen im ersten Modell: ob an einem Tag mindestens eine Krankheit aktiv ist und welcher höchste aktive Schweregrad vorliegt. Konkrete Kategorien bleiben gespeichert, werden aber erst bei ausreichender Modellreife einzeln analysiert.
 _Avoid_: einzelne seltene Krankheit als unbedingtes Modellmerkmal, Diagnose
+
+**Tägliche Kontextansicht**:
+Die nach lokalem Kalenderdatum geordnete Sicht auf den manuellen Kontext eines Datensatz-Snapshots. Sie zeigt die Stressstufe samt Herkunft `unbekannt`, `Baselineannahme` oder `aktiv bestätigt`, alle aktiven Krankheiten mit Kategorie und Schweregrad, das Krankheitsmerkmal sowie alle aktiven benutzerdefinierten Kontextbezeichnungen. Sie bildet keinen kombinierten Kontextscore.
+_Avoid_: Verlust überlappender Kontexte, kombinierter Kontextscore
 
 **Medikamentenplan**:
 Die ab einem festgelegten Zeitpunkt gültige Baseline mit konkreten Medikamentennamen, Dosierungen und vorgesehenen Einnahmezeitpunkten. Eine bewusste Planänderung erzeugt eine neue Baseline und gilt nicht als Einnahmeabweichung.
