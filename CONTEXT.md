@@ -47,8 +47,8 @@ Die angestrebte morgendliche Gewichtsmessung an jedem Tag unter möglichst vergl
 _Avoid_: tägliche Vollständigkeit, automatisch geschätztes Tagesgewicht
 
 **Bevorzugtes Tagesgewicht**:
-Die nach Messzeitpunkt letzte Gewichtsmessung eines lokalen Kalendertags, unabhängig von Tageszeit oder ursprünglicher Apple-Health-Quelle. Sie wird als Tageswert für Trendanalysen verwendet; frühere Messungen desselben Tages bleiben als Rohdaten erhalten.
-_Avoid_: Tagesmittelwert, automatisch bevorzugte Morgenmessung
+Die nach Messzeitpunkt letzte wirksame Gewichtsmessung eines lokalen Kalendertags, unabhängig von Tageszeit oder ursprünglicher Apple-Health-Quelle. Gleichzeitige letzte Messungen mit demselben Wert liefern gemeinsam diesen Tageswert; bei unterschiedlichen Werten bleibt das Tagesgewicht bis zur Prüfung mehrdeutig. Frühere Messungen und alle beitragenden Messungsidentitäten bleiben erhalten.
+_Avoid_: Tagesmittelwert, automatisch bevorzugte Morgenmessung, willkürlicher Quellen-Tiebreaker
 
 **Messlokaler Kalendertag**:
 Der Kalendertag in der Zeitzone, die am Messzeitpunkt für den ursprünglichen HealthKit-Zeitstempel galt. Tagesaggregationen verwenden diese Zeitzone und werden nicht nach der aktuellen Mac-Zeitzone rückdatiert.
@@ -186,9 +186,21 @@ _Avoid_: paralleler Yazio-Import, mehrere gleichrangige Ernährungsquellen
 Ein über die kanonische Ernährungsquelle importierter Messwert zu Energie, Makro- oder Mikronährstoffen mit Zeitpunkt und Provenienz. Der MVP bewahrt alle verfügbaren Ernährungssamples, unabhängig davon, ob sie bereits in einem Modell verwendet werden.
 _Avoid_: bereinigte Tagesernährung, Modellmerkmal
 
+**Ernährungstag**:
+Der messlokale Kalendertag, an dem ein Ernährungssample beginnt. Auch ein über Mitternacht reichendes Sample wird diesem Starttag vollständig zugeordnet, weil seine konsumierte Menge nicht zeitproportional aufgeteilt werden kann.
+_Avoid_: anteilig aufgeteiltes Ernährungssample, Endtag
+
 **Ernährungsmerkmal**:
 Eine aus qualitätsgeprüften HealthKit-Ernährungssamples abgeleitete Modellgröße. Das erste Gewichtsmodell verwendet Gesamtenergie sowie Protein, Kohlenhydrate und Fett; weitere importierte Nährstoffe bleiben zunächst außerhalb des Modells.
 _Avoid_: einzelnes Ernährungssample, vollständiges Nährstoffmodell
+
+**Fehlender Ernährungswert**:
+Eine fehlende Beobachtung für ein Ernährungsmerkmal an einem Tag ohne Sample dieses Nährstofftyps. Sie wird weder als Nullaufnahme noch durch Fortschreibung oder Interpolation ersetzt.
+_Avoid_: Nullaufnahme, geschätzte Tagesernährung
+
+**Teilweise beobachteter Ernährungstag**:
+Ein Tag, an dem nur ein Teil der Ernährungsmerkmale durch Samples belegt ist. Jedes Merkmal bleibt unabhängig beobachtet oder fehlend; aus fehlenden Samples lässt sich nicht unterscheiden, ob nichts konsumiert oder nichts protokolliert wurde.
+_Avoid_: vollständiger Ernährungstag, fehlendes Merkmal als Null
 
 ### Gewichtstrends und Energie
 
