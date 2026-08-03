@@ -86,6 +86,22 @@ _Avoid_: Schlafqualitätsscore, klinische Schlafbewertung, automatisch interpret
 Die nachvollziehbare Abdeckung, Herkunft und Mehrdeutigkeit der Beobachtungen, aus denen Schlafmerkmale abgeleitet sind. Sie bleibt als einzelne Evidenzangaben sichtbar und wird nicht zu einer Qualitätsnote verdichtet.
 _Avoid_: kombinierte Schlafqualitätsnote, automatisch als gut oder schlecht bewerteter Schlaf
 
+**Trainingseinheit**:
+Ein als zusammenhängendes Workout aufgezeichneter Zeitraum mit originaler Trainingsart und optionalen Angaben zu Dauer, Distanz und aktiver Energie. Für Trainingsmerkmale gilt die gemeldete Dauer; nur wenn sie fehlt, wird die verstrichene Zeit zwischen Beginn und Ende verwendet. Eine unmögliche gemeldete Dauer oder negative gemeldete Summe wird zur Prüfung vorgelegt und weder stillschweigend ersetzt noch korrigiert. Die Angaben der Trainingseinheit bleiben von zeitlich überlappenden allgemeinen Aktivitätsmessungen getrennt: Sie tragen nur zu Trainingsartmerkmalen bei, während allgemeine Aktivitätsaggregate ausschließlich aus den entsprechenden Aktivitätsmessungen entstehen. Zwischen beiden Darstellungen findet weder eine automatische Zusammenführung noch eine Addition statt.
+_Avoid_: Duplikat allgemeiner Aktivitätsmessungen, zusätzliche Quelle für Tagesaggregate
+
+**Überlappende Trainingseinheiten**:
+Zwei verschiedene wirksame Trainingseinheiten, deren Zeiträume sich für eine positive Dauer überschneiden. Beide bleiben unverändert erhalten und werden weder automatisch zusammengeführt noch zeitlich beschnitten. Die Überlappung öffnet einen Datenprüffall; bis zu einer Korrektur oder einem lokalen Ausschluss tragen beide Trainingseinheiten zu ihren Trainingsartmerkmalen bei und davon abhängige Ergebnisse bleiben vorläufig.
+_Avoid_: Überlappende Aktivität, automatisch deduplizierte Trainingseinheit
+
+**Aktivitätstag**:
+Der messlokale Kalendertag, an dem eine allgemeine Aktivitätsmessung beginnt. Auch eine über Mitternacht reichende Messung trägt ihren vollständigen Wert zu diesem Starttag bei, weil Schritte, Distanz, Trainingszeit oder Energie nicht zuverlässig zeitanteilig aufgeteilt werden können. Nur ihr zeitliches Intervall für die tägliche Quellenabdeckung wird an messlokalen Tagesgrenzen geschnitten. Ein Nullwert ist eine beobachtete Null; ein negativer Wert bleibt als auffällige Beobachtung erhalten und öffnet einen Datenprüffall.
+_Avoid_: zeitanteilig aufgeteilte Aktivitätsmessung, Endtag
+
+**Überlappende Aktivitätsmessungen**:
+Zwei verschiedene wirksame allgemeine Aktivitätsmessungen desselben Aktivitätsmerkmals und derselben Quellenklasse, deren Zeiträume sich für eine positive Dauer überschneiden. Beide bleiben erhalten und tragen bis zu einer Korrektur oder einem lokalen Ausschluss zum Tagesaggregat bei; die Überlappung öffnet einen Datenprüffall und davon abhängige Ergebnisse bleiben vorläufig. Überlappungen verschiedener Aktivitätsmerkmale sind zulässig, während Watch-/iPhone-Überlappungen durch die Aktivitätsquellenregel statt durch diesen Prüffall behandelt werden.
+_Avoid_: Überlappende Aktivität, Überlappung verschiedener Aktivitätsmerkmale, automatisch deduplizierte Messung
+
 **Trainingstag**:
 Der messlokale Kalendertag, an dem eine Trainingseinheit beginnt. Eine über Mitternacht laufende Trainingseinheit wird als Ganzes diesem Starttag zugeordnet und nicht in zwei Trainingseinheiten geteilt.
 _Avoid_: Endtag, geteilte Trainingseinheit
@@ -373,15 +389,15 @@ _Avoid_: kausaler Nachweis, medizinische Aussage
 ### Quellenabdeckung
 
 **Aktivitätsquellenregel**:
-Die Apple Watch ist die Primärquelle für Schritte, Distanz und weitere automatisch erfasste Aktivitätsdaten. iPhone-Daten dürfen ausschließlich fehlende Apple-Watch-Abdeckung ergänzen und nicht überlappende Watch-Werte ersetzen oder verdoppeln.
-_Avoid_: gleichrangige Quellenaddition, iPhone als Primärquelle
+Die Apple Watch ist die Primärquelle für Schritte, Distanz und weitere automatisch erfasste Aktivitätsdaten. Eine gemeinsame, versioniert abgeleitete Watch-Abdeckungszeitachse gilt für alle Aktivitätsmerkmale; sobald ein zulässiger Watch-Datensatz für einen Zeitraum Abdeckung belegt, werden dort sämtliche überlappenden iPhone-Aktivitätsdaten unterdrückt. Ein iPhone-Datensatz darf nur dann vollständig zu Aktivitätsaggregaten beitragen, wenn sein gesamtes Intervall innerhalb einer gemeinsamen Watch-Abdeckungslücke liegt. Ein über die Lückengrenze reichender Datensatz bleibt mit Begründung sichtbar, wird aber vollständig unterdrückt und weder zeitanteilig aufgeteilt noch geschätzt. Allgemeine Aktivitätsmessungen von Drittanbietern oder unklarer Herkunft bleiben erhalten und sichtbar, tragen aber weder zu Aktivitätsaggregaten noch zu Watch-Abdeckung oder iPhone-Fallback bei. Trainingseinheiten bleiben unabhängig von ihrer Quelle gültig; mögliche Duplikate werden über überlappende Trainingseinheiten geprüft.
+_Avoid_: messgrößenspezifische Quellenaddition, gleichrangige Quellenaddition, iPhone als Primärquelle
 
 **Watch-Abdeckungslücke**:
-Ein zusammenhängender Zeitraum von standardmäßig mindestens vier Stunden ohne verwertbare, von der Apple Watch stammende Daten über die verfügbaren Watch-Messgrößen hinweg. Die Schwelle ist benutzerkonfigurierbar; das bloße Fehlen von Schritten oder Bewegung in einem kurzen Intervall gilt nicht als Abdeckungslücke.
+Ein zusammenhängender Zeitraum von standardmäßig vier Stunden ohne verwertbare, von der Apple Watch stammende Daten über die verfügbaren Watch-Messgrößen hinweg. Die Schwelle ist ein unveränderlicher Parameter der jeweiligen Ableitungsversion, als ganze Minutenzahl von 1 bis 1440 konfigurierbar und standardmäßig 240 Minuten; eine Änderung berechnet die Quellenabdeckung neu, ohne Quellmessungen zu verändern. Abdeckung dürfen eindeutig als Watch-Daten klassifizierte Aktivitätsmessungen, Trainingseinheiten und Apple-Watch-Schlafintervalle belegen; Körpergewicht, Ernährung und einzelne Apple-Ruhepulswerte belegen keine kontinuierliche Watch-Abdeckung. Alle zulässigen Watch-Intervalle werden auf einer fortlaufenden Zeitachse vereinigt. Nur eine beidseitig von Watch-Abdeckung mit gleichem UTC-Offset begrenzte Datenlücke unterhalb der konfigurierten Schwelle gilt ebenfalls als abgedeckt; eine Lücke ab der Schwelle oder zwischen unterschiedlichen UTC-Offsets gilt vollständig als Watch-Abdeckungslücke. Zeit vor dem ersten und nach dem letzten Watch-Beleg wird niemals als Watch-Abdeckung abgeleitet.
 _Avoid_: bewegungslose Minute, einzelner fehlender Aktivitätswert
 
 **Tägliche Quellenabdeckung**:
-Die sichtbare zeitliche Aufteilung einer Tagesaggregation in Apple-Watch-Abdeckung, iPhone-Fallback und unbeobachtete Zeiträume. Sie bleibt neben dem aggregierten Aktivitätswert erhalten und macht gemischte Quellen transparent.
+Die sichtbare zeitliche Aufteilung einer Tagesaggregation in Apple-Watch-Abdeckung, iPhone-Fallback und unbeobachtete Zeiträume. Sie wird für jeden messlokalen Kalendertag vom frühesten bis zum spätesten zulässigen Watch- oder iPhone-Aktivitätsmessungstag ausgewiesen, auch wenn einzelne Aktivitätsmerkmale an einem Tag fehlen. Innerhalb einer Watch-Abdeckungslücke werden zulässige iPhone-Intervalle vereinigt; nur eine beidseitig von iPhone-Evidenz mit gleichem UTC-Offset begrenzte Lücke unterhalb derselben konfigurierten Schwelle gilt ebenfalls als iPhone-Fallback. Zeit außerhalb dieser belegten oder kurz überbrückten Watch- und iPhone-Intervalle bleibt unbeobachtet. Ein unbeobachtetes Intervall zwischen unterschiedlichen UTC-Offsets wird bis zum nächsten Beleg nach dem Offset des vorherigen Belegs in messlokale Tage geschnitten; nur vor dem ersten Beleg gilt dafür der Offset des folgenden Belegs. Die Aufteilung bleibt neben dem aggregierten Aktivitätswert erhalten und macht gemischte Quellen transparent.
 _Avoid_: quellenloser Tagesgesamtwert, vollständige Tagesabdeckung
 
 **Quellenneutrale Aktivitätsanalyse**:
@@ -389,5 +405,5 @@ Die vorläufige MVP-Regel, nach der Aktivitätswerte aus Apple-Watch-Abdeckung u
 _Avoid_: qualitätsgewichtete Quelle, endgültige Quellenäquivalenz
 
 **Unvollständig beobachteter Aktivitätstag**:
-Ein Tag mit einem oder mehreren Zeiträumen ohne zulässige Watch- oder iPhone-Abdeckung. Seine vorhandenen Aktivitätswerte werden im MVP mitgerechnet, aber die Lücke und davon betroffene Analyseergebnisse werden sichtbar gekennzeichnet.
+Ein Tag mit einer beliebigen positiven unbeobachteten Dauer nach Anwendung der Watch- und iPhone-Überbrückungsregeln. Ein vollständig durch zulässigen iPhone-Fallback abgedeckter Tag ist vollständig beobachtet, bleibt aber sichtbar als iPhone-ergänzt gekennzeichnet. Vorhandene Aktivitätswerte eines unvollständig beobachteten Tags werden im MVP mitgerechnet; fehlende Aktivitätsmerkmale bleiben fehlend, und die Lücke sowie davon betroffene Analyseergebnisse werden sichtbar gekennzeichnet.
 _Avoid_: inaktiver Tag, vollständiger Tageswert
