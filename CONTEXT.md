@@ -97,7 +97,7 @@ Eine zeitlich zugeordnete Größe, die bei der Interpretation einer Assoziation 
 _Avoid_: gesicherter Confounder, Ursache
 
 **Baselineannahme**:
-Der ohne täglichen Check-in angenommene Normalzustand: keine Krankheit, durchschnittlicher Stress und keine Medikamentenabweichung. Er bleibt als Annahme gekennzeichnet; „keine Krankheit“ wird nicht aktiv bestätigt, eine durchschnittliche Stressstufe dagegen schon.
+Der ohne täglichen Check-in angenommene Normalzustand: keine Krankheit, durchschnittlicher Stress und keine dokumentierte Medikamentenabweichung. Er bleibt als Annahme gekennzeichnet; „keine Krankheit“ wird nicht aktiv bestätigt, eine durchschnittliche Stressstufe dagegen schon. Eine geplante Dosis ohne erfasste Abweichung gilt nur als planmäßig angenommen und niemals als bestätigte tatsächliche Einnahme.
 _Avoid_: bestätigter Normalzustand, gemessener Wert
 
 **Kontextabdeckungsbeginn**:
@@ -121,7 +121,7 @@ Eine wiederverwendbare Bezeichnung mit stabiler Identität aus einem eigenen, zu
 _Avoid_: einmaliger Freitext, Krankheitskategorie, physisches Löschen
 
 **Manuelle Kontextrevision**:
-Eine unveränderliche Fassung eines manuell erfassten Kontext- oder Medikamentendatensatzes, die in einem Datensatz-Snapshot gebunden ist. Korrektur, Rücknahme und Wiederherstellung erzeugen neue Revisionen und verändern frühere Snapshots nicht.
+Eine unveränderliche Fassung eines manuell erfassten Kontextdatensatzes, die in einem Datensatz-Snapshot gebunden ist. Korrektur, Rücknahme und Wiederherstellung erzeugen neue Revisionen und verändern frühere Snapshots nicht.
 _Avoid_: Überschreiben, rückwirkende Änderung, Rücknahme als Enddatum, unveröffentlichter Entwurf
 
 **Stressstufe**:
@@ -149,32 +149,60 @@ Die nach lokalem Kalenderdatum geordnete Sicht auf den manuellen Kontext eines D
 _Avoid_: Verlust überlappender Kontexte, kombinierter Kontextscore
 
 **Medikamentenplan**:
-Die ab einem festgelegten Zeitpunkt gültige Baseline mit konkreten Medikamentennamen, Dosierungen und vorgesehenen Einnahmezeitpunkten. Eine bewusste Planänderung erzeugt eine neue Baseline und gilt nicht als Einnahmeabweichung.
+Die einzige persönliche Zeitachse der ab einem festgelegten Zeitpunkt gültigen Baselines mit konkreten Medikamentennamen, Dosierungen und vorgesehenen Einnahmezeitpunkten. Der Einpersonen-Datenspeicher besitzt keine parallelen benannten Pläne, Profile oder Szenarien. Vor dem ersten dokumentierten Plan bleibt der Medikamentenstatus unbekannt; ein ausdrücklich leerer vollständiger Plan dokumentiert dagegen, dass ab seinem Beginn weder geplante Dosen noch Bedarfsmedikationen gelten. V0.3 speichert den validierten Namen unmittelbar im Planeintrag und besitzt keinen globalen Medikamentenkatalog sowie keine Wirkstoff- oder ATC-Normalisierung. Ein Medikamentenname wird getrimmt, enthält nach dem Zusammenfassen überflüssiger Leerzeichen 1 bis 120 Zeichen und keine Steuerzeichen; seine Groß-/Kleinschreibung bleibt für die Anzeige erhalten. Eine bewusste Planänderung erzeugt eine neue Baseline und gilt nicht als Einnahmeabweichung.
 _Avoid_: Medikamentenabweichung, einmalige tatsächliche Einnahme
 
+**Medikamentendosis**:
+Eine positive Dezimalmenge mit einer validierten, unmittelbar gespeicherten Einheit. Die Einheit wird getrimmt, enthält nach dem Zusammenfassen überflüssiger Leerzeichen 1 bis 32 Zeichen und keine Steuerzeichen; ihre Groß-/Kleinschreibung bleibt für die Anzeige erhalten. Eine geplante Dosis legt eine exakte Menge fest; eine Bedarfsmedikation eine Referenzmenge, von der die tatsächliche Bedarfseinnahme abweichen darf. Tatsächliche Einnahmen verwenden die Einheit ihres referenzierten Planeintrags. V0.3 rechnet Einheiten nicht automatisch um und bildet keine Regeln wie Tageshöchstdosen ab.
+_Avoid_: binäre Gleitkommazahl, unstrukturierter Dosierungsfreitext, automatische Einheitenumrechnung
+
+**Manuelle Medikamentenrevision**:
+Eine unveränderliche Fassung genau eines Medikamentenregimes, einer Einnahmeabweichung, einer Bedarfseinnahme oder einer Einnahmegrund-Kategorie, die in einem Datensatz-Snapshot gebunden ist. Jeder Medikamentenschreibvorgang ändert genau eines dieser Wurzelobjekte, verlangt einen aktiven Ausgangs-Snapshot und veröffentlicht bei Erfolg genau eine Revision und genau einen neuen aktiven Snapshot. Eine Regimerevision enthält dabei ihre vollständige Menge geplanter Dosen und Bedarfsmedikations-Einträge; V0.3 besitzt keine Entwürfe, Sammelbearbeitung oder atomare Änderung mehrerer Wurzelobjekte. Jedes Wurzelobjekt besitzt eine opake logische Identität und eine unverzweigte Folge eigener Revisionsidentitäten; Korrektur, Rücknahme und Wiederherstellung erzeugen neue Revisionen und verändern frühere Datensatz-Snapshots nicht. Geplante Dosen und Bedarfsmedikations-Einträge sind Bestandteile einer Regimerevision und besitzen keine getrennten Revisionsketten. Ihre opaken, innerhalb des Regimes eindeutigen Eintragsidentitäten bleiben in Revisionen derselben Regimeidentität erhalten; ein echter neuer Regimewechsel erzeugt neue Eintragsidentitäten. Bei einer Regimekorrektur werden alle referenzierenden Abweichungen und Bedarfseinnahmen im Ausgangs-Snapshot erneut validiert. Würde ein Bezug verschwinden oder ungültig, scheitert die Korrektur ohne automatische Neuzuordnung und ohne Teilwirkung. Eine Wiederherstellung wird gegen den aktuellen wirksamen Snapshot vollständig neu validiert. Regime, Planeinträge, Einnahmeabweichungen und Bedarfseinnahmen besitzen in V0.3 kein Freitextnotizfeld.
+_Avoid_: Überschreiben, verzweigte Revision, separat revidierter Planeintrag
+
+**Medikamentenstichtag**:
+Der in der jeweiligen Schreibvorschau gebundene zeitzonenbewusste Zeitpunkt, bis zu dem ein Datensatz-Snapshot Medikamentenregime, geplante Dosisvorkommen, Einnahmeabweichungen und Bedarfseinnahmen abbildet. Jeder neu veröffentlichte Datensatz-Snapshot bindet unabhängig vom auslösenden Import-, Kontext- oder Medikamentenschreibvorgang seinen eigenen Medikamentenstichtag und den dann wirksamen Medikamentenstand. Dadurch wächst die Zeitachse planmäßig angenommener Dosisvorkommen reproduzierbar weiter, ohne einen künstlichen Medikamentenschreibvorgang zu verlangen. Der Stichtag bleibt bei der Ausführung unverändert und verhindert, dass das Fortschreiten der Uhr einen veröffentlichten Snapshot nachträglich verändert.
+_Avoid_: bewegliches Jetzt, aktueller Anzeigezeitpunkt als historische Grenze
+
 **Medikamentenregime**:
-Die während eines Gültigkeitszeitraums aktive Version des Medikamentenplans. Ein Regimewechsel wird in Zeitachsen markiert und im Modell als möglicher Strukturbruch berücksichtigt, nicht nur als Ereignis am Änderungstag.
+Die ab einem einschließlich gültigen, zeitzonenbewussten lokalen Zeitpunkt aktive, vollständige Version des Medikamentenplans. Ihr Beginn darf nicht nach dem im Datensatz-Snapshot gebundenen Medikamentenstichtag liegen; V0.3 speichert keine zukünftigen Regimewechsel. Ihr Ende wird ausschließlich durch den Beginn des nächsten Regimes bestimmt. Dadurch können an einem Änderungstag frühere geplante Dosen noch zum alten und spätere bereits zum neuen Regime gehören. Ein echter Regimewechsel darf mit einem eindeutigen Startzeitpunkt rückwirkend zwischen bestehende Regime eingefügt werden; nur danach veröffentlichte Snapshots zeigen die entsprechend neu abgegrenzte Zeitachse. Die Einfügung wird jedoch abgelehnt, wenn der übernommene Zeitraum wirksame Einnahmeabweichungen oder Bedarfseinnahmen enthält, die Planeinträge des dadurch verkürzten Regimes referenzieren. Diese Einträge müssen zuerst ausdrücklich zurückgenommen werden; V0.3 ordnet sie nicht automatisch neu zu. Jede tatsächliche Planänderung erzeugt ein neues Regime mit allen geänderten und unveränderten Planeinträgen; das vorherige Regime bleibt unveränderlich. Die Korrektur einer fehlerhaften historischen Dokumentation erzeugt dagegen eine neue manuelle Revision derselben Regimeidentität und gilt nicht als Regimewechsel. Die Rücknahme eines irrtümlich dokumentierten Regimes entfernt es aus späteren Snapshots und lässt das vorherige Regime bis zum nächsten weitergelten; ein tatsächliches Absetzen wird durch ein neues leeres Regime dokumentiert. Eine Rücknahme mit wirksamen referenzierenden Einnahmeabweichungen oder Bedarfseinnahmen wird ohne automatische Neuzuordnung oder Kaskade abgelehnt. Alle Änderungen wirken nur in danach veröffentlichten Datensatz-Snapshots. Einnahmeabweichungen und tatsächliche Bedarfsmedikationen erzeugen kein neues Regime. Ein Regimewechsel wird in Zeitachsen markiert und im Modell als möglicher Strukturbruch berücksichtigt, nicht nur als Ereignis am Änderungstag.
 _Avoid_: einmalige Planänderung, Einnahmeabweichung
 
+**Geplante Dosis**:
+Ein Planeintrag innerhalb eines Medikamentenregimes mit konkretem Medikamentennamen, Dosis, lokaler Uhrzeit und einer nichtleeren Auswahl von Wochentagen. Die Uhrzeit gilt in der IANA-Zeitzone des Regimes und erzeugt pro ausgewähltem lokalem Kalendertag genau ein Dosisvorkommen: Eine durch Zeitumstellung übersprungene Uhrzeit verschiebt sich auf den ersten gültigen Zeitpunkt nach der Lücke, eine doppelte Uhrzeit verwendet das erste Vorkommen. Die aktuelle Anzeigezeitzone verändert historische Pläne nicht. Mehrere vorgesehene Einnahmen an einem Tag sind getrennte geplante Dosen; vollständig identische Planeinträge innerhalb eines Regimes sind unzulässig. V0.3 unterstützt keine freien Wiederholungsregeln, Intervalle wie „alle n Stunden“ oder Einnahmezeitfenster.
+_Avoid_: tatsächliche Einnahme, Bedarfsmedikation, allgemeine Kalenderregel
+
+**Geplantes Dosisvorkommen**:
+Die einzelne Soll-Einnahme, die sich für einen konkreten lokalen Zeitpunkt aus einer geplanten Dosis und dem damals gültigen Medikamentenregime ergibt. Sie ist der eindeutige Bezugspunkt einer Einnahmeabweichung.
+_Avoid_: wiederkehrender Planeintrag, bestätigte tatsächliche Einnahme
+
 **Einnahmeabweichung**:
-Eine unbeabsichtigte Abweichung vom gültigen Medikamentenplan, insbesondere eine vergessene, verspätete oder doppelte Einnahme. Sie verändert den Medikamentenplan nicht.
+Eine einmalige Abweichung von genau einem geplanten Dosisvorkommen, unabhängig davon, ob sie versehentlich oder bewusst geschieht. Dieser Bezug ist unveränderlicher Teil der logischen Abweichungsidentität und darf in einer Korrektur nicht auf ein anderes Dosisvorkommen umgehängt werden. Pro Dosisvorkommen darf höchstens eine Abweichung wirksam sein; Korrekturen revidieren dieselbe Abweichungsidentität. Sie enthält null bis mehrere tatsächliche Einnahmen mit jeweils eigenem zeitzonenbewusstem Zeitpunkt und eigener Dosis: keine bedeutet ausgelassen, eine mit abweichender Zeit oder Dosis bedeutet eine zeitliche oder mengenmäßige Abweichung und mehrere bedeuten eine doppelte oder mehrfache Einnahme. Kein tatsächlicher Zeitpunkt darf nach dem im Datensatz-Snapshot gebundenen Medikamentenstichtag liegen. Eine tatsächliche Einnahme darf auch in einer anderen Zeitzone oder am folgenden lokalen Kalendertag liegen und bleibt dennoch dem ausdrücklich gewählten Dosisvorkommen zugeordnet. Zeit-, Dosis- und Mehrfachabweichung dürfen gemeinsam auftreten; V0.3 speichert dafür keine konkurrierende starre Abweichungskategorie und kein Absichtsmerkmal. Genau eine tatsächliche Einnahme mit demselben Zeitpunkt und derselben Dosis wie das Dosisvorkommen ist keine Abweichung und wird als inhaltsgleich abgelehnt. Die einmalige Abweichung verändert den Medikamentenplan nicht; eine dauerhafte bewusste Änderung erzeugt ein neues Regime. Ein falsch zugeordnetes Objekt wird zurückgenommen und mit neuer Identität angelegt.
 _Avoid_: Planänderung, neue Baseline
 
 **Bedarfsmedikation**:
-Ein Medikament ohne festen Sollzeitpunkt, das bei einem konkreten Bedarf eingenommen werden darf. Eine Einnahme wird mit tatsächlichem Zeitpunkt, Dosis und optionalem Grund dokumentiert und gilt nicht als Einnahmeabweichung.
-_Avoid_: vergessene Einnahme, Medikamentenplanänderung
+Ein Planeintrag innerhalb eines Medikamentenregimes für ein Medikament, das ohne festen Sollzeitpunkt bei einem konkreten Bedarf eingenommen werden darf. Er darf eine geordnete Auswahl bevorzugter aktiver Einnahmegrund-Kategorien vorschlagen; diese schränkt den globalen Katalog nicht ein. Eine Änderung der Vorschlagsliste ist eine Änderung des vollständigen Regimes. Der Planeintrag ist von jeder tatsächlichen Einnahme getrennt.
+_Avoid_: Bedarfseinnahme, vergessene Einnahme, Medikamentenplanänderung
+
+**Bedarfseinnahme**:
+Die tatsächliche Einnahme einer Bedarfsmedikation mit eigenem zeitzonenbewusstem Zeitpunkt, Dosis und höchstens einer optionalen aktiven Einnahmegrund-Kategorie. Der Bezug auf den Bedarfsmedikations-Eintrag ist unveränderlicher Teil der logischen Einnahmeidentität und darf in einer Korrektur nicht umgehängt werden; ein falsch zugeordnetes Objekt wird zurückgenommen und mit neuer Identität angelegt. Ihr Zeitpunkt darf nicht nach dem im Datensatz-Snapshot gebundenen Medikamentenstichtag liegen und muss in die Gültigkeit des referenzierten Bedarfsmedikations-Eintrags fallen. Die Zeitzone der Einnahme darf von der Regime-Zeitzone abweichen und wird nicht durch die aktuelle Anzeigezeitzone umgedeutet. Jede aktive globale Kategorie ist zulässig, auch wenn sie dort nicht bevorzugt vorgeschlagen wird. Die Einnahme verändert das Medikamentenregime nicht.
+_Avoid_: Bedarfsmedikation als Planerlaubnis, Einnahmeabweichung, Medikamentenplanänderung
 
 **Medikamentenmerkmal**:
-Ein zeitlich variierendes Ereignis des Medikamentenkontexts, das im ersten Modell berücksichtigt werden kann: eine Planänderung, Einnahmeabweichung oder tatsächliche Bedarfsmedikation. Der vollständige gültige Medikamentenplan bleibt dokumentiert, wird aber nicht allein aufgrund seiner Existenz als variierendes Modellmerkmal behandelt.
+Ein zeitlich variierendes Ereignis des Medikamentenkontexts, das im ersten Modell berücksichtigt werden kann: eine Planänderung, Einnahmeabweichung oder Bedarfseinnahme. Der vollständige gültige Medikamentenplan bleibt dokumentiert, wird aber nicht allein aufgrund seiner Existenz als variierendes Modellmerkmal behandelt.
 _Avoid_: unveränderter Medikamentenplan als tägliches Ereignis
+
+**Tägliche Medikamentenansicht**:
+Die nach lokalem Kalenderdatum geordnete Sicht auf den Medikamentenkontext eines Datensatz-Snapshots bis zu dessen Medikamentenstichtag. Sie zeigt das gültige Regime und seine geplanten Dosisvorkommen jeweils als `planmäßig angenommen` oder mit der konkreten Einnahmeabweichung, alle tatsächlichen Bedarfseinnahmen sowie Regimewechsel als markierte Ereignisse. Eine Einnahmeabweichung gehört ausschließlich zum regimelokalen Kalendertag ihres geplanten Dosisvorkommens; ein tatsächlicher Einnahmezeitpunkt am Folgetag bleibt darin sichtbar und erzeugt keinen zweiten Tageseintrag. Eine Bedarfseinnahme gehört zu ihrem eigenen einnahmelokalen Kalendertag. Vor dem ersten Regime bleibt der Medikamentenstatus unbekannt. Normale Leseoperationen verwenden standardmäßig den aktiven Snapshot; Reproduktion verlangt einen ausdrücklichen früheren Snapshot. Eine getrennte Plan- und Katalogansicht zeigt die im gewählten Snapshot wirksamen Regime und Einnahmegrund-Kategorien, während eine Auditansicht für genau eine logische Identität alle Revisionen einschließlich Rücknahmen und Wiederherstellungen liefert. Zurückgezogene Objekte fehlen in normalen Ansichten standardmäßig. Die tägliche Ansicht bildet weder einen Adhärenzprozentsatz noch einen kombinierten Medikamentenscore und behandelt eine fehlende Abweichung nie als bestätigte Einnahme.
+_Avoid_: bestätigte Einnahme aus Schweigen, Adhärenzscore, kombinierter Medikamentenscore
 
 **Einnahmegrund**:
 Eine optionale Angabe zum Anlass einer Bedarfsmedikation, beispielsweise Kopfschmerzen oder Übelkeit. Im MVP ist sie Zusatzinformation zur Einnahme und kein verpflichtend eigenständig erfasster Symptomverlauf.
 _Avoid_: Diagnose, verpflichtendes Symptomtagebuch
 
 **Einnahmegrund-Kategorie**:
-Ein global wiederverwendbarer, auswählbarer Einnahmegrund aus einem vorgegebenen oder vom Benutzer ergänzten Katalog. Medikamente können passende Kategorien bevorzugt vorschlagen, ohne jeweils getrennte Kataloge zu erzeugen.
-_Avoid_: einmaliger Freitext, Diagnosecode
+Ein global wiederverwendbarer, auswählbarer Einnahmegrund aus einem anfangs leeren, vom Benutzer gepflegten Katalog. Namen werden getrimmt, enthalten 1 bis 80 Zeichen und keine Steuerzeichen; für die Eindeutigkeit werden Groß-/Kleinschreibung und überflüssige Leerzeichen ignoriert. Umbenennung, Rücknahme und Reaktivierung sind erlaubt, wobei auch zurückgezogene Einträge ihren Namen reservieren. Zurückgezogene Kategorien sind für neue Bedarfseinnahmen nicht auswählbar, bestehende Bedarfseinnahmen dürfen sie historisch weiter referenzieren. Eine Rücknahme wird jedoch abgelehnt, solange ein wirksamer Bedarfsmedikations-Eintrag die Kategorie bevorzugt vorschlägt. Eine Umbenennung ändert die historische Anzeige nur in danach veröffentlichten Snapshots. Medikamente können passende Kategorien bevorzugt vorschlagen, ohne jeweils getrennte Kataloge zu erzeugen. V0.3 besitzt weder eine Kategorie „Sonstige“ noch einen einmaligen Freitextgrund.
+_Avoid_: einmaliger Freitext, Diagnosecode, medizinisch vorgegebener Startkatalog
 
 ### Schlaf und Ernährung
 
