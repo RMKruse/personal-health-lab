@@ -58,6 +58,34 @@ _Avoid_: aktuelle Anzeigezeitzone als historische Tagesgrenze, UTC-Kalendertag
 Der messlokale Kalendertag, an dem eine Schlafnacht endet und die Person aufwacht. Schlafintervalle über Mitternacht werden als Kontext diesem Aufwachtag zugeordnet.
 _Avoid_: Einschlaftag, Aufteilung einer Nacht in zwei unabhängige Nächte
 
+**Apple-Watch-Schlaf**:
+Die aus eindeutig als Apple Watch klassifizierten Schlafintervallen abgeleitete Schlafnacht samt ihrer Merkmale. Schlafintervalle anderer oder unklarer Herkunft bleiben als kanonische Beobachtungen erhalten, tragen aber nicht zu Apple-Watch-Schlaf bei.
+_Avoid_: Schlaf aus beliebiger Quelle, Zusammenführung unklarer Schlafquellen
+
+**Schlafepisode**:
+Eine zeitlich zusammenhängende Gruppe von Apple-Watch-Schlafintervallen, zwischen denen höchstens 90 Minuten liegen. Nicht durch Intervalle abgedeckte Lücken bleiben unbekannt und werden nicht als Schlaf fortgeschrieben.
+_Avoid_: lückenlos angenommener Schlaf, Zusammenführung über lange Datenlücken
+
+**Schlafnacht**:
+Die eindeutig einzige Apple-Watch-Schlafepisode mit positiver und unter den Episoden desselben Schlaftags größter beobachteter Schlafdauer. Weitere Episoden bleiben als Nickerchen sichtbar; bei Gleichstand gibt es keine willkürlich gewählte Schlafnacht.
+_Avoid_: Summe aller Schlafepisoden eines Tages, automatisch eingerechnetes Nickerchen
+
+**Mehrdeutiges Schlafsegment**:
+Ein Zeitabschnitt, für den sich gültige Apple-Watch-Schlafintervalle fachlich widersprechen. Widersprüchliche Schlafstadien belegen Schlaf ohne eindeutiges Stadium; ein Widerspruch zwischen Wach- und Schlafzustand belegt weder Schlaf- noch Wachdauer.
+_Avoid_: willkürlich bevorzugtes Schlafstadium, doppelt gezählte Überlappung
+
+**Schlafbeobachtungsstatus**:
+Die Einordnung eines Schlaftags als `unbeobachtet`, `teilweise beobachtet` oder `beobachtet`. Unbeobachtete Merkmale bleiben fehlend; teilweise beobachtete Nächte weisen nur tatsächlich belegte Werte samt Qualitätsangaben aus und werden weder mit null noch durch Fortschreibung ergänzt.
+_Avoid_: fehlender Schlaf als Nulldauer, imputierte Schlafnacht
+
+**Schlafmerkmal**:
+Ein unmittelbar aus einer Schlafnacht abgeleiteter Zeitpunkt oder eine beobachtete Dauer für Schlaf, Wachheit, Bettzeit oder ein einzelnes Schlafstadium. V0.3 bildet weder zusammengesetzte Schlafscores noch klinische Bewertungen.
+_Avoid_: Schlafqualitätsscore, klinische Schlafbewertung, automatisch interpretierter Stufenanteil
+
+**Schlafdatenqualität**:
+Die nachvollziehbare Abdeckung, Herkunft und Mehrdeutigkeit der Beobachtungen, aus denen Schlafmerkmale abgeleitet sind. Sie bleibt als einzelne Evidenzangaben sichtbar und wird nicht zu einer Qualitätsnote verdichtet.
+_Avoid_: kombinierte Schlafqualitätsnote, automatisch als gut oder schlecht bewerteter Schlaf
+
 **Trainingstag**:
 Der messlokale Kalendertag, an dem eine Trainingseinheit beginnt. Eine über Mitternacht laufende Trainingseinheit wird als Ganzes diesem Starttag zugeordnet und nicht in zwei Trainingseinheiten geteilt.
 _Avoid_: Endtag, geteilte Trainingseinheit
