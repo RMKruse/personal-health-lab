@@ -679,7 +679,7 @@ def test_sqlite_catalog_and_audit_constraints_are_hard(tmp_path: Path) -> None:
         } <= strict_tables
         assert metadata.execute(
             "SELECT schema_version, typeof(schema_version) FROM store_identity"
-        ).fetchone() == (7, "integer")
+        ).fetchone() == (8, "integer")
 
         with pytest.raises(sqlite3.IntegrityError):
             metadata.execute(

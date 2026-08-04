@@ -9,7 +9,12 @@ from datetime import UTC, date, datetime, timedelta
 from statistics import median
 from typing import Literal
 
-from personal_health_lab.health_data import LogicalMeasurementId, MeasurementVersionId
+from personal_health_lab.health_data import (
+    CanonicalHealthType,
+    LogicalMeasurementId,
+    MeasurementVersionId,
+    canonical_unit_for,
+)
 from personal_health_lab.storage import (
     ExportFact,
     HistoricalReviewPublication,
@@ -75,6 +80,21 @@ _FIXED_RULES = (
         None,
         datetime(1970, 1, 1, tzinfo=UTC),
     ),
+)
+_NUTRITION_RECOMMENDATIONS = tuple(
+    PlausibilityRuleRecord(
+        "fixed-plausibility/v1",
+        data_type.value,
+        canonical_unit_for(data_type).value,
+        0.0,
+        None,
+        False,
+        None,
+        datetime(1970, 1, 1, tzinfo=UTC),
+        "builtin-plausibility/v1",
+    )
+    for data_type in CanonicalHealthType
+    if data_type.value.startswith("dietary_")
 )
 
 
@@ -583,6 +603,7 @@ def evaluate_plausibility_cases(
 def plausibility_rule_recommendations() -> tuple[PlausibilityRuleRecord, ...]:
     return (
         *(replace(rule, recommendation_id="builtin-plausibility/v1") for rule in _FIXED_RULES),
+        *_NUTRITION_RECOMMENDATIONS,
         PlausibilityRuleRecord(
             "fixed-plausibility/v1",
             "body_mass",

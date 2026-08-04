@@ -146,12 +146,156 @@
         }
       }
     },
+    "nutritionDataType": {
+      "enum": [
+        "dietary_biotin",
+        "dietary_caffeine",
+        "dietary_calcium",
+        "dietary_carbohydrates",
+        "dietary_chloride",
+        "dietary_cholesterol",
+        "dietary_chromium",
+        "dietary_copper",
+        "dietary_energy_consumed",
+        "dietary_fat_monounsaturated",
+        "dietary_fat_polyunsaturated",
+        "dietary_fat_saturated",
+        "dietary_fat_total",
+        "dietary_fiber",
+        "dietary_folate",
+        "dietary_iodine",
+        "dietary_iron",
+        "dietary_magnesium",
+        "dietary_manganese",
+        "dietary_molybdenum",
+        "dietary_niacin",
+        "dietary_pantothenic_acid",
+        "dietary_phosphorus",
+        "dietary_potassium",
+        "dietary_protein",
+        "dietary_riboflavin",
+        "dietary_selenium",
+        "dietary_sodium",
+        "dietary_sugar",
+        "dietary_thiamin",
+        "dietary_vitamin_a",
+        "dietary_vitamin_b12",
+        "dietary_vitamin_b6",
+        "dietary_vitamin_c",
+        "dietary_vitamin_d",
+        "dietary_vitamin_e",
+        "dietary_vitamin_k",
+        "dietary_water",
+        "dietary_zinc"
+      ]
+    },
+    "dailyNutritionFeature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "data_type",
+        "logical_measurement_ids",
+        "measurement_version_ids",
+        "quality_status",
+        "review_case_ids",
+        "unit",
+        "value"
+      ],
+      "properties": {
+        "data_type": {
+          "enum": [
+            "dietary_energy_consumed",
+            "dietary_protein",
+            "dietary_carbohydrates",
+            "dietary_fat_total"
+          ]
+        },
+        "logical_measurement_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        },
+        "measurement_version_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        },
+        "quality_status": {"enum": ["reviewed", "provisional"]},
+        "review_case_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[0-9a-f]{32}$"}
+        },
+        "unit": {"enum": ["kcal", "g"]},
+        "value": {"type": ["number", "null"]}
+      }
+    },
+    "healthKitNutritionSample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "data_type",
+        "device",
+        "disposition",
+        "effective_value",
+        "is_selected",
+        "logical_measurement_id",
+        "measurement_local_day",
+        "measurement_version_id",
+        "original_unit",
+        "original_value",
+        "review_case_ids",
+        "source_end",
+        "source_name",
+        "source_start",
+        "source_updated_at",
+        "source_version",
+        "unit",
+        "value"
+      ],
+      "properties": {
+        "data_type": {"$ref": "#/$defs/nutritionDataType"},
+        "device": {"$ref": "#/$defs/nullableString"},
+        "disposition": {
+          "enum": [
+            "included_source",
+            "included_correction",
+            "excluded_local",
+            "excluded_source_deletion",
+            null
+          ]
+        },
+        "effective_value": {"type": ["number", "null"]},
+        "is_selected": {"type": "boolean"},
+        "logical_measurement_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "measurement_local_day": {"type": "string", "format": "date"},
+        "measurement_version_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "original_unit": {"enum": ["kcal", "kJ", "mL", "L", "mcg", "mg", "g"]},
+        "original_value": {"type": "number"},
+        "review_case_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[0-9a-f]{32}$"}
+        },
+        "source_end": {"type": "string", "minLength": 1},
+        "source_name": {"$ref": "#/$defs/nullableString"},
+        "source_start": {"type": "string", "minLength": 1},
+        "source_updated_at": {"$ref": "#/$defs/nullableString"},
+        "source_version": {"$ref": "#/$defs/nullableString"},
+        "unit": {"enum": ["kcal", "mL", "g"]},
+        "value": {"type": "number"}
+      }
+    },
     "weightNutritionOutput": {
       "type": "object",
       "additionalProperties": false,
       "required": [
         "days",
         "kind",
+        "nutrition_days",
+        "healthkit_nutrition_samples",
         "runtime_config",
         "schema_version",
         "selection",
@@ -195,6 +339,25 @@
           }
         },
         "kind": {"const": "weight_nutrition"},
+        "nutrition_days": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["carbohydrates", "day", "energy", "protein", "total_fat"],
+            "properties": {
+              "carbohydrates": {"$ref": "#/$defs/dailyNutritionFeature"},
+              "day": {"type": "string", "format": "date"},
+              "energy": {"$ref": "#/$defs/dailyNutritionFeature"},
+              "protein": {"$ref": "#/$defs/dailyNutritionFeature"},
+              "total_fat": {"$ref": "#/$defs/dailyNutritionFeature"}
+            }
+          }
+        },
+        "healthkit_nutrition_samples": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/healthKitNutritionSample"}
+        },
         "runtime_config": {"$ref": "#/$defs/runtimeConfig"},
         "schema_version": {"const": "3.0"},
         "selection": {

@@ -55,6 +55,36 @@ source = "https://github.com/RMKruse/personal-health-lab/issues/70"
 statement = "HealthLab, human CLI, JSON 3.0, and Streamlit expose the same complete persisted weight projection."
 evidence = ["positive", "parity"]
 
+[[contract]]
+id = "V03-C-NUTRITION-SOURCE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/71"
+statement = "All 39 closed nutrition types and every allowed source unit traverse the real import path, normalize once, and preserve logical, version, original-value, timestamp, source, and device provenance."
+evidence = ["positive", "reproducibility", "boundary"]
+
+[[contract]]
+id = "V03-C-NUTRITION-DAILY-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/71"
+statement = "Energy, protein, carbohydrates, and total fat sum independently on the measurement-local start day; absent samples remain missing and cross-midnight intervals are not split."
+evidence = ["positive", "negative", "boundary"]
+
+[[contract]]
+id = "V03-C-NUTRITION-RULE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/71"
+statement = "Each nutrition type recommends a zero lower bound only through explicit adoption; a negative source value opens one review and daily derivation creates no second plausibility case."
+evidence = ["positive", "boundary", "transition"]
+
+[[contract]]
+id = "V03-C-NUTRITION-REVIEW-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/71"
+statement = "V0.2 corrections and local exclusions update nutrition projections without mutating HealthKit nutrition samples."
+evidence = ["positive", "transition"]
+
+[[contract]]
+id = "V03-C-NUTRITION-ADAPTERS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/71"
+statement = "HealthLab, human CLI, JSON 3.0, and Streamlit expose the same complete HealthKit nutrition samples and daily projections."
+evidence = ["positive", "parity"]
+
 [[fixture]]
 id = "V03-F-IMPORT-CATALOG-V1"
 kind = "parser_contract"
@@ -67,7 +97,16 @@ id = "V03-F-WEIGHT-NUTRITION-EDGES-V1"
 kind = "parser_contract"
 artifact = "tests/fixtures/v03/weight-edges.xml"
 platform = "all"
-sha256 = "fdfb4fd811d329512f43fb678e5ae409ca85189c500f255836c9b1c7ad5ccafb"
+sha256 = "0f8e7833b8d4678c3312a840fdfae2d924876dd83e2792cbb539c8dfea62ff1a"
+
+[[fixture]]
+id = "V03-F-NUTRITION-ALL-UNITS-V1"
+kind = "generated_parser_contract"
+generator = "tests.acceptance.test_v03_weight._nutrition_fixture_bundle"
+seed = 71
+options = { variants = ["baseline", "later-protein-version", "negative-protein", "zero-sugar", "negative-protein-carbohydrates"] }
+platform = "all"
+sha256 = "e341b6a4470745bf30cf5bda744b8121b566b720048e8fe6cf61dccc873f0d02"
 
 [[case]]
 id = "V03-A-IMPORT-DETAILS-V1"
@@ -154,6 +193,62 @@ forbidden_side_effects = "no carry-forward, interpolation, or source-value mutat
 evidence = ["positive", "negative", "boundary", "reproducibility"]
 
 [[case]]
+id = "V03-A-NUTRITION-PROJECTION-V1"
+contracts = ["V03-C-NUTRITION-SOURCE-V1", "V03-C-NUTRITION-DAILY-V1"]
+fixtures = ["V03-F-NUTRITION-ALL-UNITS-V1"]
+runner = "tests/acceptance/test_v03_weight.py::test_nutrition_imports_every_type_and_unit_and_projects_independent_days"
+initial_state = "empty synthetic store"
+operation = "import all closed nutrition type-unit combinations, then a cumulative protein version"
+level = "application"
+platform = "all"
+expected_result = "complete immutable measurements and four independently missing daily features"
+expected_effect = "one immutable snapshot per committed import"
+forbidden_side_effects = "no unit reinterpretation, interval splitting, imputation, or source mutation"
+evidence = ["positive", "negative", "boundary", "reproducibility"]
+
+[[case]]
+id = "V03-A-NUTRITION-RULE-V1"
+contracts = ["V03-C-NUTRITION-RULE-V1"]
+fixtures = ["V03-F-NUTRITION-ALL-UNITS-V1"]
+runner = "tests/acceptance/test_v03_weight.py::test_negative_nutrition_opens_one_source_review_without_derived_recheck"
+initial_state = "nutrition recommendations with no adopted versions"
+operation = "adopt the protein recommendation and import one negative protein source sample"
+level = "application"
+platform = "all"
+expected_result = "one source plausibility case inherited by the daily protein feature"
+expected_effect = "rule version and reviewed snapshot are persisted"
+forbidden_side_effects = "no recommendation-only activation, source mutation, or derived second review"
+evidence = ["positive", "transition"]
+
+[[case]]
+id = "V03-A-NUTRITION-ZERO-V1"
+contracts = ["V03-C-NUTRITION-RULE-V1"]
+fixtures = ["V03-F-NUTRITION-ALL-UNITS-V1"]
+runner = "tests/acceptance/test_v03_weight.py::test_zero_nutrition_value_is_a_valid_observed_boundary"
+initial_state = "an explicitly adopted zero-lower-bound sugar rule"
+operation = "import a zero-valued dietary sugar source sample"
+level = "application"
+platform = "all"
+expected_result = "zero remains an observed effective value without a plausibility review"
+expected_effect = "the source sample is persisted unchanged"
+forbidden_side_effects = "no zero-to-missing coercion or review case"
+evidence = ["positive", "boundary"]
+
+[[case]]
+id = "V03-A-NUTRITION-REVIEW-V1"
+contracts = ["V03-C-NUTRITION-REVIEW-V1"]
+fixtures = ["V03-F-NUTRITION-ALL-UNITS-V1"]
+runner = "tests/acceptance/test_v03_weight.py::test_nutrition_correction_and_exclusion_preserve_source_samples"
+initial_state = "negative protein and carbohydrate samples with open plausibility reviews"
+operation = "correct the protein sample and locally exclude the carbohydrate sample"
+level = "application"
+platform = "all"
+expected_result = "daily features reflect the correction and exclusion"
+expected_effect = "new immutable effective decisions are projected"
+forbidden_side_effects = "no HealthKit nutrition sample mutation"
+evidence = ["positive", "transition"]
+
+[[case]]
 id = "V03-A-WEIGHT-CORRECTION-V1"
 contracts = ["V03-C-WEIGHT-REVIEW-V1"]
 fixtures = ["V03-F-WEIGHT-NUTRITION-EDGES-V1"]
@@ -197,7 +292,7 @@ evidence = ["positive", "transition"]
 
 [[case]]
 id = "V03-A-WEIGHT-CLI-V1"
-contracts = ["V03-C-WEIGHT-ADAPTERS-V1"]
+contracts = ["V03-C-WEIGHT-ADAPTERS-V1", "V03-C-NUTRITION-ADAPTERS-V1"]
 fixtures = ["V03-F-WEIGHT-NUTRITION-EDGES-V1"]
 runner = "tests/adapters/test_cli.py::test_cli_renders_the_complete_weight_projection_as_human_text_and_json_3"
 initial_state = "committed weight edge fixture"
@@ -211,7 +306,7 @@ evidence = ["positive", "parity"]
 
 [[case]]
 id = "V03-A-WEIGHT-STREAMLIT-V1"
-contracts = ["V03-C-WEIGHT-ADAPTERS-V1"]
+contracts = ["V03-C-WEIGHT-ADAPTERS-V1", "V03-C-NUTRITION-ADAPTERS-V1"]
 fixtures = ["V03-F-WEIGHT-NUTRITION-EDGES-V1"]
 runner = "tests/adapters/test_streamlit.py::test_streamlit_renders_the_complete_weight_projection"
 initial_state = "committed weight edge fixture"

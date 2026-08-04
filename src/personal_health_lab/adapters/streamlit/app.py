@@ -22,6 +22,7 @@ from personal_health_lab.application import (
     ConfirmDataReviewBatch,
     CreateMetadataBackup,
     CreatePlausibilityRuleVersion,
+    DailyNutritionFeature,
     DataConfirmation,
     DataCorrection,
     DataReviewBatchActionId,
@@ -231,9 +232,7 @@ def _render_weight_nutrition(config: RuntimeConfig) -> None:
                 end_date=end,
             )
             with HealthLab.open(config) as health_lab:
-                st.session_state["weight_nutrition"] = health_lab.load_weight_nutrition(
-                    selection
-                )
+                st.session_state["weight_nutrition"] = health_lab.load_weight_nutrition(selection)
         except (ValueError, ConfigurationError, HealthLabError):
             st.error("Gewichtsdaten konnten nicht geladen werden.")
     projection = st.session_state.get("weight_nutrition")
@@ -278,6 +277,59 @@ def _render_weight_nutrition(config: RuntimeConfig) -> None:
                 "Prüffälle": [str(value) for value in item.review_case_ids],
             }
             for item in projection.weight_measurements
+        ],
+        width="stretch",
+    )
+    st.subheader("Ernährung")
+
+    def nutrition_feature_columns(label: str, feature: DailyNutritionFeature) -> dict[str, object]:
+        return {
+            f"{label} ({feature.unit.value})": feature.value,
+            f"{label}-Datentyp": feature.data_type.value,
+            f"{label}-Qualität": feature.quality_status.value,
+            f"{label}-Logische Messungen": [
+                str(value) for value in feature.logical_measurement_ids
+            ],
+            f"{label}-Messungsversionen": [str(value) for value in feature.measurement_version_ids],
+            f"{label}-Prüffälle": [str(value) for value in feature.review_case_ids],
+        }
+
+    st.dataframe(
+        [
+            {
+                "Tag": item.day.isoformat(),
+                **nutrition_feature_columns("Energie", item.energy),
+                **nutrition_feature_columns("Protein", item.protein),
+                **nutrition_feature_columns("Kohlenhydrate", item.carbohydrates),
+                **nutrition_feature_columns("Gesamtfett", item.total_fat),
+            }
+            for item in projection.nutrition_days
+        ],
+        width="stretch",
+    )
+    st.dataframe(
+        [
+            {
+                "Datentyp": item.data_type.value,
+                "Logische Messung": str(item.logical_measurement_id),
+                "Messungsversion": str(item.measurement_version_id),
+                "Ausgewählt": item.is_selected,
+                "Disposition": item.disposition,
+                "Kanonischer Wert": item.value,
+                "Effektiver Wert": item.effective_value,
+                "Kanonische Einheit": item.unit.value,
+                "Originalwert": item.original_value,
+                "Originaleinheit": item.original_unit,
+                "Lokaler Tag": item.measurement_local_day.isoformat(),
+                "Quellbeginn": item.source_start.isoformat(),
+                "Quellende": item.source_end.isoformat(),
+                "Quellaktualisierung": item.source_updated_at.isoformat(),
+                "Quelle": item.source_name,
+                "Gerät": item.device,
+                "Quellversion": item.source_version,
+                "Prüffälle": [str(value) for value in item.review_case_ids],
+            }
+            for item in projection.healthkit_nutrition_samples
         ],
         width="stretch",
     )

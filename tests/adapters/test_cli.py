@@ -167,9 +167,7 @@ def test_cli_renders_import_details_as_human_text_and_json_3(
 def test_cli_renders_the_complete_weight_projection_as_human_text_and_json_3(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    xml = (Path(__file__).parents[1] / "fixtures/v03/weight-edges.xml").read_text(
-        encoding="utf-8"
-    )
+    xml = (Path(__file__).parents[1] / "fixtures/v03/weight-edges.xml").read_text(encoding="utf-8")
     package = tmp_path / "weights.zip"
     with ZipFile(package, "w") as archive:
         archive.writestr("apple_health_export/export.xml", xml)
@@ -199,6 +197,12 @@ def test_cli_renders_the_complete_weight_projection_as_human_text_and_json_3(
     assert "2024-01-02 · missing · - kg" in human
     assert "2024-01-05 · ambiguous · - kg" in human
     assert "Original: 100.0 lb" in human
+    assert "2024-01-01 · Energie: 100.0 kcal · Protein: 20.0 g" in human
+    assert "2024-01-02 · Energie: - kcal · Protein: - g · Kohlenhydrate: 30.0 g" in human
+    assert "Ernährungsmerkmal: dietary_energy_consumed · Qualität: reviewed" in human
+    assert "Logische Messungen:" in human
+    assert "Messungsversionen:" in human
+    assert "dietary_biotin · 0.0001 g · Original: 100.0 mcg" in human
 
     assert main([*common, "--json"]) == 0
     output = json.loads(capsys.readouterr().out)
@@ -212,9 +216,23 @@ def test_cli_renders_the_complete_weight_projection_as_human_text_and_json_3(
     assert output["days"][1]["status"] == "missing"
     assert output["days"][4]["status"] == "ambiguous"
     assert len(output["weight_measurements"]) == 7
-    pounds = next(
-        item for item in output["weight_measurements"] if item["original_unit"] == "lb"
+    assert output["nutrition_days"][0]["energy"]["value"] == 100
+    assert output["nutrition_days"][0]["energy"]["quality_status"] == "reviewed"
+    assert output["nutrition_days"][0]["energy"]["logical_measurement_ids"]
+    assert output["nutrition_days"][0]["energy"]["measurement_version_ids"]
+    assert output["nutrition_days"][0]["protein"]["value"] == 20
+    assert output["nutrition_days"][1]["energy"]["value"] is None
+    assert output["nutrition_days"][1]["carbohydrates"]["value"] == 30
+    assert len(output["healthkit_nutrition_samples"]) == 5
+    biotin = next(
+        item
+        for item in output["healthkit_nutrition_samples"]
+        if item["data_type"] == "dietary_biotin"
     )
+    assert biotin["value"] == pytest.approx(0.0001)
+    assert biotin["original_value"] == 100
+    assert biotin["original_unit"] == "mcg"
+    pounds = next(item for item in output["weight_measurements"] if item["original_unit"] == "lb")
     assert pounds["value_kg"] == pytest.approx(45.359237)
     assert pounds["original_value"] == 100
 
@@ -866,7 +884,7 @@ def test_cli_projects_and_creates_plausibility_rule_versions(
     assert main([*common, "rules", "--json"]) == 0
     rules = json.loads(capsys.readouterr().out)
     _assert_json_contract(rules)
-    assert len(rules["rules"]) == 3
+    assert len(rules["rules"]) == 42
     body_mass = next(rule for rule in rules["rules"] if rule["data_type"] == "body_mass")
     assert body_mass["versions"] == []
     assert body_mass["recommendation"]["specification"] == {
@@ -1378,8 +1396,8 @@ def test_cli_maps_store_migration_plan_and_receipt(
     plan = json.loads(capsys.readouterr().out)
     _assert_json_contract(plan)
     assert plan["workspace"]["allowed_writes"] == ["migrate_store"]
-    assert plan["details"]["steps"] == [[2, 3], [3, 4], [4, 5], [5, 6], [6, 7]]
-    assert plan["details"]["backup_file"] == "metadata-v2-to-v7.sqlite3"
+    assert plan["details"]["steps"] == [[2, 3], [3, 4], [4, 5], [5, 6], [6, 7], [7, 8]]
+    assert plan["details"]["backup_file"] == "metadata-v2-to-v8.sqlite3"
     assert plan["details"]["affected_snapshot_refs"] == [snapshot_ref]
     assert plan["details"]["existing_analyses_become_stale"] is True
 
@@ -1387,8 +1405,8 @@ def test_cli_maps_store_migration_plan_and_receipt(
         monkeypatch.setattr("builtins.input", lambda _prompt: "n")
         assert main([*common, "migrate"]) == 0
     human_plan = capsys.readouterr().out
-    assert "Migrationskette: 2 -> 3 -> 4 -> 5 -> 6 -> 7" in human_plan
-    assert "Migrationssicherung: metadata-v2-to-v7.sqlite3" in human_plan
+    assert "Migrationskette: 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8" in human_plan
+    assert "Migrationssicherung: metadata-v2-to-v8.sqlite3" in human_plan
     assert f"Betroffene Snapshots: {snapshot_ref}" in human_plan
     assert "Bestehende Analysen werden veraltet: ja" in human_plan
 
@@ -1408,13 +1426,20 @@ def test_cli_maps_store_migration_plan_and_receipt(
     receipt = json.loads(capsys.readouterr().out)
     _assert_json_contract(receipt)
     assert receipt["result"]["status"] == "completed"
-    assert receipt["result"]["steps"] == [[2, 3], [3, 4], [4, 5], [5, 6], [6, 7]]
+    assert receipt["result"]["steps"] == [
+        [2, 3],
+        [3, 4],
+        [4, 5],
+        [5, 6],
+        [6, 7],
+        [7, 8],
+    ]
 
     assert main([*common, "rollback-migration", "--json"]) == 0
     rollback_plan = json.loads(capsys.readouterr().out)
     _assert_json_contract(rollback_plan)
     assert rollback_plan["details"]["type"] == "rollback_migration"
-    assert rollback_plan["details"]["source_version"] == 7
+    assert rollback_plan["details"]["source_version"] == 8
     assert rollback_plan["details"]["target_version"] == 2
     assert rollback_plan["details"]["restored_snapshot_ref"] == snapshot_ref
 

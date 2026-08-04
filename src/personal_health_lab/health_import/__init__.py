@@ -54,7 +54,7 @@ _BODY_MASS = "HKQuantityTypeIdentifierBodyMass"
 _LOGICAL_IDENTITY_RULE_VERSION = "healthkit-natural/v2"
 _PAYLOAD_IDENTITY_RULE_VERSION = "healthkit-payload/v2"
 _SYNC_IDENTIFIER = "HKMetadataKeySyncIdentifier"
-_MAPPINGS = {
+_MAPPINGS: dict[str, tuple[CanonicalHealthType, CanonicalUnit, dict[str, float]]] = {
     _ACTIVE_ENERGY: (
         CanonicalHealthType.ACTIVE_ENERGY,
         CanonicalUnit.KILOCALORIE,
@@ -82,48 +82,53 @@ _SLEEP_VALUES = {
     "HKCategoryValueSleepAnalysisAsleepREM",
 }
 _DIETARY_TYPES = {
-    f"HKQuantityTypeIdentifierDietary{name}"
-    for name in (
-        "Biotin",
-        "Caffeine",
-        "Calcium",
-        "Carbohydrates",
-        "Chloride",
-        "Cholesterol",
-        "Chromium",
-        "Copper",
-        "EnergyConsumed",
-        "FatMonounsaturated",
-        "FatPolyunsaturated",
-        "FatSaturated",
-        "FatTotal",
-        "Fiber",
-        "Folate",
-        "Iodine",
-        "Iron",
-        "Magnesium",
-        "Manganese",
-        "Molybdenum",
-        "Niacin",
-        "PantothenicAcid",
-        "Phosphorus",
-        "Potassium",
-        "Protein",
-        "Riboflavin",
-        "Selenium",
-        "Sodium",
-        "Sugar",
-        "Thiamin",
-        "VitaminA",
-        "VitaminB12",
-        "VitaminB6",
-        "VitaminC",
-        "VitaminD",
-        "VitaminE",
-        "VitaminK",
-        "Water",
-        "Zinc",
-    )
+    "HKQuantityTypeIdentifierDietaryBiotin": CanonicalHealthType.DIETARY_BIOTIN,
+    "HKQuantityTypeIdentifierDietaryCaffeine": CanonicalHealthType.DIETARY_CAFFEINE,
+    "HKQuantityTypeIdentifierDietaryCalcium": CanonicalHealthType.DIETARY_CALCIUM,
+    "HKQuantityTypeIdentifierDietaryCarbohydrates": CanonicalHealthType.DIETARY_CARBOHYDRATES,
+    "HKQuantityTypeIdentifierDietaryChloride": CanonicalHealthType.DIETARY_CHLORIDE,
+    "HKQuantityTypeIdentifierDietaryCholesterol": CanonicalHealthType.DIETARY_CHOLESTEROL,
+    "HKQuantityTypeIdentifierDietaryChromium": CanonicalHealthType.DIETARY_CHROMIUM,
+    "HKQuantityTypeIdentifierDietaryCopper": CanonicalHealthType.DIETARY_COPPER,
+    "HKQuantityTypeIdentifierDietaryEnergyConsumed": (
+        CanonicalHealthType.DIETARY_ENERGY_CONSUMED
+    ),
+    "HKQuantityTypeIdentifierDietaryFatMonounsaturated": (
+        CanonicalHealthType.DIETARY_FAT_MONOUNSATURATED
+    ),
+    "HKQuantityTypeIdentifierDietaryFatPolyunsaturated": (
+        CanonicalHealthType.DIETARY_FAT_POLYUNSATURATED
+    ),
+    "HKQuantityTypeIdentifierDietaryFatSaturated": CanonicalHealthType.DIETARY_FAT_SATURATED,
+    "HKQuantityTypeIdentifierDietaryFatTotal": CanonicalHealthType.DIETARY_FAT_TOTAL,
+    "HKQuantityTypeIdentifierDietaryFiber": CanonicalHealthType.DIETARY_FIBER,
+    "HKQuantityTypeIdentifierDietaryFolate": CanonicalHealthType.DIETARY_FOLATE,
+    "HKQuantityTypeIdentifierDietaryIodine": CanonicalHealthType.DIETARY_IODINE,
+    "HKQuantityTypeIdentifierDietaryIron": CanonicalHealthType.DIETARY_IRON,
+    "HKQuantityTypeIdentifierDietaryMagnesium": CanonicalHealthType.DIETARY_MAGNESIUM,
+    "HKQuantityTypeIdentifierDietaryManganese": CanonicalHealthType.DIETARY_MANGANESE,
+    "HKQuantityTypeIdentifierDietaryMolybdenum": CanonicalHealthType.DIETARY_MOLYBDENUM,
+    "HKQuantityTypeIdentifierDietaryNiacin": CanonicalHealthType.DIETARY_NIACIN,
+    "HKQuantityTypeIdentifierDietaryPantothenicAcid": (
+        CanonicalHealthType.DIETARY_PANTOTHENIC_ACID
+    ),
+    "HKQuantityTypeIdentifierDietaryPhosphorus": CanonicalHealthType.DIETARY_PHOSPHORUS,
+    "HKQuantityTypeIdentifierDietaryPotassium": CanonicalHealthType.DIETARY_POTASSIUM,
+    "HKQuantityTypeIdentifierDietaryProtein": CanonicalHealthType.DIETARY_PROTEIN,
+    "HKQuantityTypeIdentifierDietaryRiboflavin": CanonicalHealthType.DIETARY_RIBOFLAVIN,
+    "HKQuantityTypeIdentifierDietarySelenium": CanonicalHealthType.DIETARY_SELENIUM,
+    "HKQuantityTypeIdentifierDietarySodium": CanonicalHealthType.DIETARY_SODIUM,
+    "HKQuantityTypeIdentifierDietarySugar": CanonicalHealthType.DIETARY_SUGAR,
+    "HKQuantityTypeIdentifierDietaryThiamin": CanonicalHealthType.DIETARY_THIAMIN,
+    "HKQuantityTypeIdentifierDietaryVitaminA": CanonicalHealthType.DIETARY_VITAMIN_A,
+    "HKQuantityTypeIdentifierDietaryVitaminB12": CanonicalHealthType.DIETARY_VITAMIN_B12,
+    "HKQuantityTypeIdentifierDietaryVitaminB6": CanonicalHealthType.DIETARY_VITAMIN_B6,
+    "HKQuantityTypeIdentifierDietaryVitaminC": CanonicalHealthType.DIETARY_VITAMIN_C,
+    "HKQuantityTypeIdentifierDietaryVitaminD": CanonicalHealthType.DIETARY_VITAMIN_D,
+    "HKQuantityTypeIdentifierDietaryVitaminE": CanonicalHealthType.DIETARY_VITAMIN_E,
+    "HKQuantityTypeIdentifierDietaryVitaminK": CanonicalHealthType.DIETARY_VITAMIN_K,
+    "HKQuantityTypeIdentifierDietaryWater": CanonicalHealthType.DIETARY_WATER,
+    "HKQuantityTypeIdentifierDietaryZinc": CanonicalHealthType.DIETARY_ZINC,
 }
 _V03_UNITS = {
     "HKQuantityTypeIdentifierBodyMass": frozenset({"kg", "g", "lb"}),
@@ -143,6 +148,28 @@ _V03_UNITS = {
         for source_type in _DIETARY_TYPES
     },
 }
+_MAPPINGS.update(
+    {
+        source_type: (
+            data_type,
+            CanonicalUnit.KILOCALORIE,
+            {"kcal": 1.0, "kJ": 1 / 4.184},
+        )
+        if data_type is CanonicalHealthType.DIETARY_ENERGY_CONSUMED
+        else (
+            data_type,
+            CanonicalUnit.MILLILITER,
+            {"mL": 1.0, "L": 1000.0},
+        )
+        if data_type is CanonicalHealthType.DIETARY_WATER
+        else (
+            data_type,
+            CanonicalUnit.GRAM,
+            {"mcg": 0.000001, "mg": 0.001, "g": 1.0},
+        )
+        for source_type, data_type in _DIETARY_TYPES.items()
+    }
+)
 
 
 class HealthImportError(Exception):

@@ -62,9 +62,7 @@ def test_streamlit_loads_import_details_through_the_application_seam(
 def test_streamlit_renders_the_complete_weight_projection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    xml = (Path(__file__).parents[1] / "fixtures/v03/weight-edges.xml").read_text(
-        encoding="utf-8"
-    )
+    xml = (Path(__file__).parents[1] / "fixtures/v03/weight-edges.xml").read_text(encoding="utf-8")
     package = tmp_path / "weights.zip"
     with ZipFile(package, "w") as archive:
         archive.writestr("apple_health_export/export.xml", xml)
@@ -81,12 +79,8 @@ def test_streamlit_renders_the_complete_weight_projection(
 
     app = AppTest.from_file(str(app_path)).run()
     app.radio[0].set_value("Kerndaten").run()
-    next(item for item in app.date_input if item.label == "Gewicht von").set_value(
-        date(2024, 1, 1)
-    )
-    next(item for item in app.date_input if item.label == "Gewicht bis").set_value(
-        date(2024, 1, 6)
-    )
+    next(item for item in app.date_input if item.label == "Gewicht von").set_value(date(2024, 1, 1))
+    next(item for item in app.date_input if item.label == "Gewicht bis").set_value(date(2024, 1, 6))
     next(button for button in app.button if button.label == "Gewicht laden").click().run()
 
     assert not app.exception
@@ -94,6 +88,8 @@ def test_streamlit_renders_the_complete_weight_projection(
     assert any("Status: provisional" in item.value for item in app.caption)
     daily = app.dataframe[0].value
     measurements = app.dataframe[1].value
+    nutrition_days = app.dataframe[2].value
+    nutrition_samples = app.dataframe[3].value
     assert daily["Status"].tolist() == [
         "observed",
         "missing",
@@ -104,6 +100,17 @@ def test_streamlit_renders_the_complete_weight_projection(
     ]
     assert len(measurements) == 7
     assert measurements["Originaleinheit"].tolist()[2] == "lb"
+    assert nutrition_days["Energie (kcal)"].tolist()[0] == 100
+    assert nutrition_days["Energie (kcal)"].isna().tolist()[1]
+    assert nutrition_days["Protein (g)"].tolist()[0] == 20
+    assert nutrition_days["Kohlenhydrate (g)"].tolist()[1] == 30
+    assert nutrition_days["Gesamtfett (g)"].tolist()[2] == 10
+    assert nutrition_days["Energie-Datentyp"].tolist()[0] == "dietary_energy_consumed"
+    assert nutrition_days["Energie-Qualität"].tolist()[0] == "reviewed"
+    assert nutrition_days["Energie-Logische Messungen"].tolist()[0]
+    assert nutrition_days["Energie-Messungsversionen"].tolist()[0]
+    assert len(nutrition_samples) == 5
+    assert "dietary_biotin" in nutrition_samples["Datentyp"].tolist()
 
 
 def test_streamlit_shows_the_same_empty_overview(
@@ -216,7 +223,7 @@ def test_streamlit_focuses_migration_in_restricted_session(
 
     assert not app.exception
     assert any(item.value == "Datenspeichermigration" for item in app.subheader)
-    assert any("Schema: 2 → 7" in item.value for item in app.caption)
+    assert any("Schema: 2 → 8" in item.value for item in app.caption)
     assert any("2 → 3, 3 → 4, 4 → 5, 5 → 6" in item.value for item in app.caption)
     assert any(f"Betroffene Snapshots: {snapshot_ref}" in item.value for item in app.caption)
     assert any("Bestehende Analysen werden stale: true" in item.value for item in app.caption)

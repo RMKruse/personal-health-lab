@@ -12,12 +12,68 @@ class CanonicalHealthType(StrEnum):
     ACTIVE_ENERGY = "active_energy"
     APPLE_RESTING_HEART_RATE = "apple_resting_heart_rate"
     BODY_MASS = "body_mass"
+    DIETARY_BIOTIN = "dietary_biotin"
+    DIETARY_CAFFEINE = "dietary_caffeine"
+    DIETARY_CALCIUM = "dietary_calcium"
+    DIETARY_CARBOHYDRATES = "dietary_carbohydrates"
+    DIETARY_CHLORIDE = "dietary_chloride"
+    DIETARY_CHOLESTEROL = "dietary_cholesterol"
+    DIETARY_CHROMIUM = "dietary_chromium"
+    DIETARY_COPPER = "dietary_copper"
+    DIETARY_ENERGY_CONSUMED = "dietary_energy_consumed"
+    DIETARY_FAT_MONOUNSATURATED = "dietary_fat_monounsaturated"
+    DIETARY_FAT_POLYUNSATURATED = "dietary_fat_polyunsaturated"
+    DIETARY_FAT_SATURATED = "dietary_fat_saturated"
+    DIETARY_FAT_TOTAL = "dietary_fat_total"
+    DIETARY_FIBER = "dietary_fiber"
+    DIETARY_FOLATE = "dietary_folate"
+    DIETARY_IODINE = "dietary_iodine"
+    DIETARY_IRON = "dietary_iron"
+    DIETARY_MAGNESIUM = "dietary_magnesium"
+    DIETARY_MANGANESE = "dietary_manganese"
+    DIETARY_MOLYBDENUM = "dietary_molybdenum"
+    DIETARY_NIACIN = "dietary_niacin"
+    DIETARY_PANTOTHENIC_ACID = "dietary_pantothenic_acid"
+    DIETARY_PHOSPHORUS = "dietary_phosphorus"
+    DIETARY_POTASSIUM = "dietary_potassium"
+    DIETARY_PROTEIN = "dietary_protein"
+    DIETARY_RIBOFLAVIN = "dietary_riboflavin"
+    DIETARY_SELENIUM = "dietary_selenium"
+    DIETARY_SODIUM = "dietary_sodium"
+    DIETARY_SUGAR = "dietary_sugar"
+    DIETARY_THIAMIN = "dietary_thiamin"
+    DIETARY_VITAMIN_A = "dietary_vitamin_a"
+    DIETARY_VITAMIN_B12 = "dietary_vitamin_b12"
+    DIETARY_VITAMIN_B6 = "dietary_vitamin_b6"
+    DIETARY_VITAMIN_C = "dietary_vitamin_c"
+    DIETARY_VITAMIN_D = "dietary_vitamin_d"
+    DIETARY_VITAMIN_E = "dietary_vitamin_e"
+    DIETARY_VITAMIN_K = "dietary_vitamin_k"
+    DIETARY_WATER = "dietary_water"
+    DIETARY_ZINC = "dietary_zinc"
 
 
 class CanonicalUnit(StrEnum):
     KILOCALORIE = "kcal"
     BEATS_PER_MINUTE = "count/min"
     KILOGRAM = "kg"
+    GRAM = "g"
+    MILLILITER = "mL"
+
+
+def canonical_unit_for(data_type: CanonicalHealthType) -> CanonicalUnit:
+    if data_type in {
+        CanonicalHealthType.ACTIVE_ENERGY,
+        CanonicalHealthType.DIETARY_ENERGY_CONSUMED,
+    }:
+        return CanonicalUnit.KILOCALORIE
+    if data_type is CanonicalHealthType.APPLE_RESTING_HEART_RATE:
+        return CanonicalUnit.BEATS_PER_MINUTE
+    if data_type is CanonicalHealthType.BODY_MASS:
+        return CanonicalUnit.KILOGRAM
+    if data_type is CanonicalHealthType.DIETARY_WATER:
+        return CanonicalUnit.MILLILITER
+    return CanonicalUnit.GRAM
 
 
 class AnalysisFreshness(StrEnum):
@@ -124,11 +180,7 @@ class CanonicalHealthRecord:
     legacy_measurement_version_id: MeasurementVersionId | None = None
 
     def __post_init__(self) -> None:
-        expected_unit = {
-            CanonicalHealthType.ACTIVE_ENERGY: CanonicalUnit.KILOCALORIE,
-            CanonicalHealthType.APPLE_RESTING_HEART_RATE: CanonicalUnit.BEATS_PER_MINUTE,
-            CanonicalHealthType.BODY_MASS: CanonicalUnit.KILOGRAM,
-        }[self.data_type]
+        expected_unit = canonical_unit_for(self.data_type)
         if self.unit is not expected_unit or not math.isfinite(self.value):
             raise ValueError("Ungültiger kanonischer Gesundheitswert.")
         if any(
@@ -175,4 +227,5 @@ __all__ = [
     "ModelMaturityCriterionCode",
     "ModelMaturityStatus",
     "ReproducibilityStatus",
+    "canonical_unit_for",
 ]

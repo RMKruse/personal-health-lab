@@ -27,6 +27,7 @@ from personal_health_lab.application import (
     ConfirmDataReviewBatch,
     CreateMetadataBackup,
     CreatePlausibilityRuleVersion,
+    DailyNutritionFeature,
     DataConfirmation,
     DataCorrection,
     DataMode,
@@ -488,14 +489,23 @@ def _weight_nutrition_json(
     selection: SnapshotDateSelection,
     runtime_config: Mapping[str, object],
 ) -> dict[str, object]:
+    def feature_json(feature: DailyNutritionFeature) -> dict[str, object]:
+        return {
+            "data_type": feature.data_type.value,
+            "logical_measurement_ids": [str(value) for value in feature.logical_measurement_ids],
+            "measurement_version_ids": [str(value) for value in feature.measurement_version_ids],
+            "quality_status": feature.quality_status.value,
+            "review_case_ids": [str(value) for value in feature.review_case_ids],
+            "unit": feature.unit.value,
+            "value": feature.value,
+        }
+
     return {
         "days": [
             {
                 "day": item.day.isoformat(),
                 "logical_measurement_ids": [str(value) for value in item.logical_measurement_ids],
-                "measurement_version_ids": [
-                    str(value) for value in item.measurement_version_ids
-                ],
+                "measurement_version_ids": [str(value) for value in item.measurement_version_ids],
                 "quality_status": item.quality_status.value,
                 "review_case_ids": [str(value) for value in item.review_case_ids],
                 "status": item.status.value,
@@ -504,6 +514,39 @@ def _weight_nutrition_json(
             for item in projection.days
         ],
         "kind": "weight_nutrition",
+        "nutrition_days": [
+            {
+                "carbohydrates": feature_json(item.carbohydrates),
+                "day": item.day.isoformat(),
+                "energy": feature_json(item.energy),
+                "protein": feature_json(item.protein),
+                "total_fat": feature_json(item.total_fat),
+            }
+            for item in projection.nutrition_days
+        ],
+        "healthkit_nutrition_samples": [
+            {
+                "data_type": item.data_type.value,
+                "device": item.device,
+                "disposition": item.disposition,
+                "effective_value": item.effective_value,
+                "is_selected": item.is_selected,
+                "logical_measurement_id": str(item.logical_measurement_id),
+                "measurement_local_day": item.measurement_local_day.isoformat(),
+                "measurement_version_id": str(item.measurement_version_id),
+                "original_unit": item.original_unit,
+                "original_value": item.original_value,
+                "review_case_ids": [str(value) for value in item.review_case_ids],
+                "source_end": item.source_end.isoformat(),
+                "source_name": item.source_name,
+                "source_start": item.source_start.isoformat(),
+                "source_updated_at": item.source_updated_at.isoformat(),
+                "source_version": item.source_version,
+                "unit": item.unit.value,
+                "value": item.value,
+            }
+            for item in projection.healthkit_nutrition_samples
+        ],
         "runtime_config": dict(runtime_config),
         "schema_version": _OUTPUT_SCHEMA_VERSION,
         "selection": {
@@ -1449,6 +1492,52 @@ def main(args: Sequence[str] | None = None) -> int:
                 f"Erstellt: {weight_measurement.source_updated_at.isoformat()} · "
                 f"Prüffälle: "
                 f"{', '.join(map(str, weight_measurement.review_case_ids)) or '-'}"
+            )
+        for nutrition_day in weight_nutrition.nutrition_days:
+
+            def feature_text(feature: DailyNutritionFeature) -> str:
+                value = "-" if feature.value is None else str(feature.value)
+                return f"{value} {feature.unit.value}"
+
+            print(
+                f"{nutrition_day.day} · Energie: {feature_text(nutrition_day.energy)} · "
+                f"Protein: {feature_text(nutrition_day.protein)} · "
+                f"Kohlenhydrate: {feature_text(nutrition_day.carbohydrates)} · "
+                f"Gesamtfett: {feature_text(nutrition_day.total_fat)}"
+            )
+            for feature in (
+                nutrition_day.energy,
+                nutrition_day.protein,
+                nutrition_day.carbohydrates,
+                nutrition_day.total_fat,
+            ):
+                print(
+                    f"{nutrition_day.day} · Ernährungsmerkmal: {feature.data_type.value} · "
+                    f"Qualität: {feature.quality_status.value} · Logische Messungen: "
+                    f"{', '.join(map(str, feature.logical_measurement_ids)) or '-'} · "
+                    f"Messungsversionen: "
+                    f"{', '.join(map(str, feature.measurement_version_ids)) or '-'} · "
+                    f"Prüffälle: {', '.join(map(str, feature.review_case_ids)) or '-'}"
+                )
+        for nutrition_sample in weight_nutrition.healthkit_nutrition_samples:
+            print(
+                f"{nutrition_sample.data_type.value} · {nutrition_sample.value:g} "
+                f"{nutrition_sample.unit.value} · Original: "
+                f"{nutrition_sample.original_value} {nutrition_sample.original_unit} · "
+                f"Effektiv: {nutrition_sample.effective_value} "
+                f"{nutrition_sample.unit.value} · "
+                f"Disposition: {nutrition_sample.disposition or '-'} · "
+                f"Ausgewählt: {str(nutrition_sample.is_selected).lower()} · "
+                f"Logische Messung: {nutrition_sample.logical_measurement_id} · "
+                f"Messungsversion: {nutrition_sample.measurement_version_id} · "
+                f"Lokaler Tag: {nutrition_sample.measurement_local_day} · "
+                f"Quelle: {nutrition_sample.source_name} "
+                f"{nutrition_sample.source_version} · Gerät: {nutrition_sample.device} · "
+                f"Start: {nutrition_sample.source_start.isoformat()} · "
+                f"Ende: {nutrition_sample.source_end.isoformat()} · "
+                f"Erstellt: {nutrition_sample.source_updated_at.isoformat()} · "
+                f"Prüffälle: "
+                f"{', '.join(map(str, nutrition_sample.review_case_ids)) or '-'}"
             )
     elif parsed.command == "recovery-status" and parsed.as_json:
         print(

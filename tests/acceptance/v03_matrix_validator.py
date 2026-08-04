@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import re
 from collections import Counter
 from collections.abc import Collection
@@ -88,8 +89,22 @@ def validate_matrix(
             )
         else:
             assert isinstance(generator, str) and generator
-            assert isinstance(fixture.get("seed"), int)
-            assert "options" in fixture
+            seed = fixture.get("seed")
+            options = fixture.get("options")
+            assert isinstance(seed, int)
+            assert isinstance(options, dict)
+            module_name, separator, function_name = generator.rpartition(".")
+            assert separator and module_name and function_name
+            module_path = root.joinpath(*module_name.split(".")).with_suffix(".py")
+            spec = importlib.util.spec_from_file_location(module_name, module_path)
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            generated = getattr(module, function_name)(seed=seed, options=options)
+            assert isinstance(generated, str)
+            assert hashlib.sha256(generated.encode()).hexdigest() == digest, (
+                f"generated fixture hash changed: {fixture_id}"
+            )
 
     required_case_fields = {
         "id",

@@ -43,11 +43,13 @@ from personal_health_lab.health_data import (
 _METADATA_FILE = "metadata.sqlite3"
 _PARQUET_DIRECTORY = "parquet"
 _QUERY_FILE = "query.duckdb"
-_STORE_SCHEMA_VERSION = 7
+_STORE_SCHEMA_VERSION = 8
 _WRITER_LOCK_FILE = ".writer.lock"
 _FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
 _STORE_MIGRATION_METHOD = "cow-migration/v1"
 _SNAPSHOT_SCHEMA_VERSION = 1
+_CANONICAL_HEALTH_TYPES_SQL = ", ".join(f"'{item.value}'" for item in CanonicalHealthType)
+_CANONICAL_UNITS_SQL = ", ".join(f"'{item.value}'" for item in CanonicalUnit)
 _IDENTITY_RULE_VERSION = "healthkit-identity/v3"
 _SUPPORTED_IDENTITY_RULE_VERSIONS = {"healthkit-natural/v2", _IDENTITY_RULE_VERSION}
 _MAPPING_RULE_VERSION = "healthkit-canonical/v2"
@@ -790,11 +792,13 @@ class StoredImportDetails:
 
 
 @dataclass(frozen=True, slots=True)
-class StoredWeightMeasurement:
+class StoredWeightNutritionMeasurement:
     logical_measurement_id: LogicalMeasurementId
     measurement_version_id: MeasurementVersionId
-    value_kg: float
-    effective_value_kg: float | None
+    data_type: CanonicalHealthType
+    unit: CanonicalUnit
+    value: float
+    effective_value: float | None
     disposition: Literal[
         "included_source",
         "included_correction",
@@ -1034,7 +1038,7 @@ def _execute_script(metadata: sqlite3.Connection, script: str) -> None:
 def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
     _execute_script(
         metadata,
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS imports (
             import_id TEXT PRIMARY KEY CHECK (
                 length(import_id) = 32 AND import_id NOT GLOB '*[^0-9a-f]*'
@@ -1178,9 +1182,9 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS plausibility_rule_versions (
             rule_version_id TEXT NOT NULL REFERENCES rule_version_refs(rule_version_id),
             data_type TEXT NOT NULL CHECK (
-                data_type IN ('active_energy', 'apple_resting_heart_rate', 'body_mass')
+                data_type IN ({_CANONICAL_HEALTH_TYPES_SQL})
             ),
-            canonical_unit TEXT NOT NULL CHECK (canonical_unit IN ('kcal', 'count/min', 'kg')),
+            canonical_unit TEXT NOT NULL CHECK (canonical_unit IN ({_CANONICAL_UNITS_SQL})),
             fixed_lower_bound REAL,
             fixed_upper_bound REAL,
             personal_range_enabled INTEGER NOT NULL CHECK (personal_range_enabled IN (0, 1)),
@@ -1633,7 +1637,7 @@ def _upgrade_migration_event_constraints(metadata: sqlite3.Connection) -> None:
         raise sqlite3.IntegrityError("foreign key violation after constraint upgrade")
 
 
-def _upgrade_v03_weight_constraints(metadata: sqlite3.Connection) -> None:
+def _upgrade_v03_constraints(metadata: sqlite3.Connection) -> None:
     upgrades = (
         (
             "plausibility_rule_versions",
@@ -1643,8 +1647,16 @@ def _upgrade_v03_weight_constraints(metadata: sqlite3.Connection) -> None:
                     "'active_energy', 'apple_resting_heart_rate', 'body_mass')",
                 ),
                 (
+                    "'active_energy', 'apple_resting_heart_rate', 'body_mass')",
+                    f"{_CANONICAL_HEALTH_TYPES_SQL})",
+                ),
+                (
                     "canonical_unit IN ('kcal', 'count/min'))",
                     "canonical_unit IN ('kcal', 'count/min', 'kg'))",
+                ),
+                (
+                    "canonical_unit IN ('kcal', 'count/min', 'kg'))",
+                    f"canonical_unit IN ({_CANONICAL_UNITS_SQL}))",
                 ),
             ),
         ),
@@ -1668,13 +1680,21 @@ def _upgrade_v03_weight_constraints(metadata: sqlite3.Connection) -> None:
         if not isinstance(row[0], str):
             raise sqlite3.DatabaseError(f"invalid {table} definition")
         definition = row[0]
-        if all(new in definition for _, new in replacements):
+        if table == "plausibility_rule_versions" and all(
+            value in definition
+            for value in (
+                f"{_CANONICAL_HEALTH_TYPES_SQL})",
+                f"canonical_unit IN ({_CANONICAL_UNITS_SQL}))",
+            )
+        ):
             continue
         for old, new in replacements:
+            if new in definition:
+                continue
             if old not in definition:
                 raise sqlite3.DatabaseError(f"unsupported {table} constraint")
             definition = definition.replace(old, new, 1)
-        temporary = f"{table}__v03_weight_upgrade"
+        temporary = f"{table}__v03_constraint_upgrade"
         upgraded = definition.replace(
             f"CREATE TABLE {table}", f"CREATE TABLE {temporary}", 1
         )
@@ -2271,7 +2291,7 @@ class LocalStore:
         try:
             with self._metadata:
                 _upgrade_migration_event_constraints(self._metadata)
-                _upgrade_v03_weight_constraints(self._metadata)
+                _upgrade_v03_constraints(self._metadata)
                 _ensure_current_tables(self._metadata)
                 self._metadata.execute("ALTER TABLE store_identity RENAME TO legacy_store_identity")
                 self._metadata.execute(_STORE_IDENTITY_DDL)
@@ -3923,13 +3943,15 @@ class LocalStore:
                       OR source_updated_at_utc IS NULL
                       OR source_start_utc > source_end_utc
                       OR measurement_local_date IS NULL
-                      OR canonical_type NOT IN (
-                          'active_energy', 'apple_resting_heart_rate', 'body_mass'
-                      )
-                      OR (canonical_type = 'active_energy' AND canonical_unit != 'kcal')
-                      OR (canonical_type = 'apple_resting_heart_rate'
-                          AND canonical_unit != 'count/min')
-                      OR (canonical_type = 'body_mass' AND canonical_unit != 'kg'))
+                      OR canonical_type NOT IN ({_CANONICAL_HEALTH_TYPES_SQL})
+                      OR canonical_unit != CASE
+                          WHEN canonical_type IN ('active_energy', 'dietary_energy_consumed')
+                              THEN 'kcal'
+                          WHEN canonical_type = 'apple_resting_heart_rate' THEN 'count/min'
+                          WHEN canonical_type = 'body_mass' THEN 'kg'
+                          WHEN canonical_type = 'dietary_water' THEN 'mL'
+                          ELSE 'g'
+                      END)
               + (SELECT count(*) FROM resolved
                    WHERE logical_measurement_id IS NULL
                       OR selected_measurement_version_id IS NULL
@@ -5361,12 +5383,12 @@ class LocalStore:
             for (data_type, unit), values in grouped.items()
         )
 
-    def load_weight_measurements(
+    def load_weight_nutrition_measurements(
         self,
         snapshot_id: SnapshotId | None,
         start_date: date | None,
         end_date: date | None,
-    ) -> tuple[SnapshotId | None, tuple[StoredWeightMeasurement, ...]]:
+    ) -> tuple[SnapshotId | None, tuple[StoredWeightNutritionMeasurement, ...]]:
         self._require_open()
         selected_snapshot = snapshot_id or self.load_active_snapshot_id()
         if selected_snapshot is None:
@@ -5379,7 +5401,10 @@ class LocalStore:
         versions = str(directory / "measurement_versions.parquet").replace("'", "''")
         resolved = str(directory / "resolved_measurements.parquet").replace("'", "''")
         reviews = str(directory / "open_review_cases.parquet").replace("'", "''")
-        clauses = ["versions.canonical_type = 'body_mass'"]
+        clauses = [
+            "(versions.canonical_type = 'body_mass' "
+            "OR versions.canonical_type LIKE 'dietary_%')"
+        ]
         parameters: list[date] = []
         if start_date is not None:
             clauses.append("versions.measurement_local_date >= ?")
@@ -5390,6 +5415,7 @@ class LocalStore:
         rows = self._query.execute(
             f"""
             SELECT versions.identity_candidate_id, versions.measurement_version_id,
+                   versions.canonical_type, versions.canonical_unit,
                    versions.canonical_value, resolved.effective_value, resolved.disposition,
                    resolved.selected_measurement_version_id IS NOT NULL,
                    versions.source_start_utc, versions.source_end_utc,
@@ -5419,14 +5445,16 @@ class LocalStore:
             )
 
         return selected_snapshot, tuple(
-            StoredWeightMeasurement(
+            StoredWeightNutritionMeasurement(
                 logical_measurement_id=LogicalMeasurementId(str(row[0])),
                 measurement_version_id=MeasurementVersionId(str(row[1])),
-                value_kg=float(row[2]),
-                effective_value_kg=None if row[3] is None else float(row[3]),
+                data_type=CanonicalHealthType(str(row[2])),
+                unit=CanonicalUnit(str(row[3])),
+                value=float(row[4]),
+                effective_value=None if row[5] is None else float(row[5]),
                 disposition=(
                     None
-                    if row[4] is None
+                    if row[6] is None
                     else cast(
                         Literal[
                             "included_source",
@@ -5434,20 +5462,20 @@ class LocalStore:
                             "excluded_local",
                             "excluded_source_deletion",
                         ],
-                        row[4],
+                        row[6],
                     )
                 ),
-                is_selected=bool(row[5]),
-                source_start=local_time(str(row[6]), int(row[9])),
-                source_end=local_time(str(row[7]), int(row[10])),
-                source_updated_at=local_time(str(row[8]), int(row[11])),
-                measurement_local_day=row[12],
-                source_name=str(row[13]),
-                source_version=str(row[14]),
-                device=str(row[15]),
-                original_value=float(row[16]),
-                original_unit=str(row[17]),
-                review_case_ids=tuple(ReviewCaseId(str(item)) for item in row[18]),
+                is_selected=bool(row[7]),
+                source_start=local_time(str(row[8]), int(row[11])),
+                source_end=local_time(str(row[9]), int(row[12])),
+                source_updated_at=local_time(str(row[10]), int(row[13])),
+                measurement_local_day=row[14],
+                source_name=str(row[15]),
+                source_version=str(row[16]),
+                device=str(row[17]),
+                original_value=float(row[18]),
+                original_unit=str(row[19]),
+                review_case_ids=tuple(ReviewCaseId(str(item)) for item in row[20]),
             )
             for row in rows
         )

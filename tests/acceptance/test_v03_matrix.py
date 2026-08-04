@@ -60,6 +60,18 @@ def test_v03_matrix_rejects_open_references_and_hashes() -> None:
     changed_fixture["fixture"][0]["sha256"] = "0" * 64
     mutations.append(changed_fixture)
 
+    changed_generated_fixture = copy.deepcopy(matrix)
+    changed_generated_fixture["fixture"][2]["sha256"] = "0" * 64
+    mutations.append(changed_generated_fixture)
+
+    changed_generator_seed = copy.deepcopy(matrix)
+    changed_generator_seed["fixture"][2]["seed"] = 72
+    mutations.append(changed_generator_seed)
+
+    changed_generator_options = copy.deepcopy(matrix)
+    changed_generator_options["fixture"][2]["options"]["variants"].reverse()
+    mutations.append(changed_generator_options)
+
     for invalid in mutations:
         with pytest.raises(AssertionError):
             validate_matrix(invalid, root=_ROOT, collected_node_ids=collected_node_ids)
