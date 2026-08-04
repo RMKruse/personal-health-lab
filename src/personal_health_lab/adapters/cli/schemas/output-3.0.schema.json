@@ -7,6 +7,9 @@
       "$ref": "#/$defs/importDetailsOutput"
     },
     {
+      "$ref": "#/$defs/weightNutritionOutput"
+    },
+    {
       "$ref": "#/$defs/writePlanOutput"
     },
     {
@@ -143,6 +146,137 @@
         }
       }
     },
+    "weightNutritionOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "days",
+        "kind",
+        "runtime_config",
+        "schema_version",
+        "selection",
+        "snapshot_ref",
+        "status",
+        "weight_measurements"
+      ],
+      "properties": {
+        "days": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "day",
+              "logical_measurement_ids",
+              "measurement_version_ids",
+              "quality_status",
+              "review_case_ids",
+              "status",
+              "value_kg"
+            ],
+            "properties": {
+              "day": {"type": "string", "format": "date"},
+              "logical_measurement_ids": {
+                "type": "array",
+                "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+              },
+              "measurement_version_ids": {
+                "type": "array",
+                "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+              },
+              "quality_status": {"enum": ["reviewed", "provisional"]},
+              "review_case_ids": {
+                "type": "array",
+                "items": {"type": "string", "pattern": "^[0-9a-f]{32}$"}
+              },
+              "status": {"enum": ["observed", "missing", "ambiguous"]},
+              "value_kg": {"type": ["number", "null"]}
+            }
+          }
+        },
+        "kind": {"const": "weight_nutrition"},
+        "runtime_config": {"$ref": "#/$defs/runtimeConfig"},
+        "schema_version": {"const": "3.0"},
+        "selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["end_date", "snapshot_ref", "start_date"],
+          "properties": {
+            "end_date": {"type": ["string", "null"], "format": "date"},
+            "snapshot_ref": {
+              "type": ["string", "null"],
+              "pattern": "^[0-9a-f]{32}$"
+            },
+            "start_date": {"type": ["string", "null"], "format": "date"}
+          }
+        },
+        "snapshot_ref": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "status": {"enum": ["reviewed", "provisional"]},
+        "weight_measurements": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "device",
+              "disposition",
+              "effective_value_kg",
+              "is_selected",
+              "logical_measurement_id",
+              "measurement_local_day",
+              "measurement_version_id",
+              "original_unit",
+              "original_value",
+              "review_case_ids",
+              "source_end",
+              "source_name",
+              "source_start",
+              "source_updated_at",
+              "source_version",
+              "value_kg"
+            ],
+            "properties": {
+              "device": {"$ref": "#/$defs/nullableString"},
+              "disposition": {
+                "enum": [
+                  "included_source",
+                  "included_correction",
+                  "excluded_local",
+                  "excluded_source_deletion",
+                  null
+                ]
+              },
+              "effective_value_kg": {"type": ["number", "null"]},
+              "is_selected": {"type": "boolean"},
+              "logical_measurement_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "measurement_local_day": {"type": "string", "format": "date"},
+              "measurement_version_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "original_unit": {"type": "string", "minLength": 1},
+              "original_value": {"type": "number"},
+              "review_case_ids": {
+                "type": "array",
+                "items": {"type": "string", "pattern": "^[0-9a-f]{32}$"}
+              },
+              "source_end": {"type": "string", "minLength": 1},
+              "source_name": {"$ref": "#/$defs/nullableString"},
+              "source_start": {"type": "string", "minLength": 1},
+              "source_updated_at": {"$ref": "#/$defs/nullableString"},
+              "source_version": {"$ref": "#/$defs/nullableString"},
+              "value_kg": {"type": "number"}
+            }
+          }
+        }
+      }
+    },
     "runtimeConfig": {
       "type": "object",
       "additionalProperties": false,
@@ -266,6 +400,7 @@
                     "enum": [
                       "kcal",
                       "count/min",
+                      "kg",
                       null
                     ]
                   },
@@ -336,7 +471,8 @@
                   "continued_override",
                   "rule_definition",
                   "suspected_source_deletion",
-                  "source_conflict"
+                  "source_conflict",
+                  "preferred_daily_weight_conflict"
                 ]
               },
               "logical_measurement_id": {

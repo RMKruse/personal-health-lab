@@ -788,6 +788,26 @@ class StoredImportDetails:
 
 
 @dataclass(frozen=True, slots=True)
+class StoredWeightMeasurement:
+    logical_measurement_id: str
+    measurement_version_id: str
+    value_kg: float
+    effective_value_kg: float | None
+    disposition: str | None
+    is_selected: bool
+    source_start: datetime
+    source_end: datetime
+    source_updated_at: datetime
+    measurement_local_day: date
+    source_name: str
+    source_version: str
+    device: str
+    original_value: float
+    original_unit: str
+    review_case_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class PublishDecisionResult:
     operation_id: OperationId
     decision_id: str
@@ -811,6 +831,7 @@ class OpenDataReviewCase:
         "suspected_source_deletion",
         "source_conflict",
         "rule_definition",
+        "preferred_daily_weight_conflict",
     ]
     logical_measurement_id: LogicalMeasurementId | None
     measurement_version_id: MeasurementVersionId | None
@@ -1150,9 +1171,9 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS plausibility_rule_versions (
             rule_version_id TEXT NOT NULL REFERENCES rule_version_refs(rule_version_id),
             data_type TEXT NOT NULL CHECK (
-                data_type IN ('active_energy', 'apple_resting_heart_rate')
+                data_type IN ('active_energy', 'apple_resting_heart_rate', 'body_mass')
             ),
-            canonical_unit TEXT NOT NULL CHECK (canonical_unit IN ('kcal', 'count/min')),
+            canonical_unit TEXT NOT NULL CHECK (canonical_unit IN ('kcal', 'count/min', 'kg')),
             fixed_lower_bound REAL,
             fixed_upper_bound REAL,
             personal_range_enabled INTEGER NOT NULL CHECK (personal_range_enabled IN (0, 1)),
@@ -1294,7 +1315,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             case_kind TEXT NOT NULL CHECK (
                 case_kind IN (
                     'plausibility', 'continued_override', 'suspected_source_deletion',
-                    'source_conflict', 'direct_correction'
+                    'source_conflict', 'preferred_daily_weight_conflict', 'direct_correction'
                 )
             ),
             logical_measurement_id TEXT NOT NULL,
@@ -3807,10 +3828,13 @@ class LocalStore:
                       OR source_updated_at_utc IS NULL
                       OR source_start_utc > source_end_utc
                       OR measurement_local_date IS NULL
-                      OR canonical_type NOT IN ('active_energy', 'apple_resting_heart_rate')
+                      OR canonical_type NOT IN (
+                          'active_energy', 'apple_resting_heart_rate', 'body_mass'
+                      )
                       OR (canonical_type = 'active_energy' AND canonical_unit != 'kcal')
                       OR (canonical_type = 'apple_resting_heart_rate'
-                          AND canonical_unit != 'count/min'))
+                          AND canonical_unit != 'count/min')
+                      OR (canonical_type = 'body_mass' AND canonical_unit != 'kg'))
               + (SELECT count(*) FROM resolved
                    WHERE logical_measurement_id IS NULL
                       OR selected_measurement_version_id IS NULL
@@ -3871,7 +3895,8 @@ class LocalStore:
                       OR NOT regexp_full_match(evidence_fingerprint, '[0-9a-f]{{64}}')
                       OR case_kind NOT IN (
                           'plausibility', 'continued_override',
-                          'suspected_source_deletion', 'source_conflict', 'rule_definition'
+                          'suspected_source_deletion', 'source_conflict', 'rule_definition',
+                          'preferred_daily_weight_conflict'
                       )
                       OR NOT (
                           (case_kind = 'plausibility'
@@ -3886,6 +3911,11 @@ class LocalStore:
                           (case_kind IN ('suspected_source_deletion', 'source_conflict')
                            AND logical_measurement_id IS NOT NULL
                            AND measurement_version_id IS NULL
+                           AND rule_version_id IS NULL)
+                          OR
+                          (case_kind = 'preferred_daily_weight_conflict'
+                           AND logical_measurement_id IS NOT NULL
+                           AND measurement_version_id IS NOT NULL
                            AND rule_version_id IS NULL)
                           OR
                           (case_kind = 'rule_definition'
@@ -5234,6 +5264,85 @@ class LocalStore:
         return tuple(
             DailyHealthSeries(data_type=data_type, unit=unit, values=tuple(values))
             for (data_type, unit), values in grouped.items()
+        )
+
+    def load_weight_measurements(
+        self,
+        snapshot_id: SnapshotId | None,
+        start_date: date | None,
+        end_date: date | None,
+    ) -> tuple[SnapshotId | None, tuple[StoredWeightMeasurement, ...]]:
+        self._require_open()
+        selected_snapshot = snapshot_id or self.load_active_snapshot_id()
+        if selected_snapshot is None:
+            return None, ()
+        if self._metadata.execute(
+            "SELECT 1 FROM dataset_snapshots WHERE snapshot_id = ?", (str(selected_snapshot),)
+        ).fetchone() is None:
+            raise StoreError("Datensatz-Snapshot ist unbekannt.")
+        directory = self._root / _PARQUET_DIRECTORY / "snapshots" / str(selected_snapshot)
+        versions = str(directory / "measurement_versions.parquet").replace("'", "''")
+        resolved = str(directory / "resolved_measurements.parquet").replace("'", "''")
+        reviews = str(directory / "open_review_cases.parquet").replace("'", "''")
+        clauses = ["versions.canonical_type = 'body_mass'"]
+        parameters: list[date] = []
+        if start_date is not None:
+            clauses.append("versions.measurement_local_date >= ?")
+            parameters.append(start_date)
+        if end_date is not None:
+            clauses.append("versions.measurement_local_date <= ?")
+            parameters.append(end_date)
+        rows = self._query.execute(
+            f"""
+            SELECT versions.identity_candidate_id, versions.measurement_version_id,
+                   versions.canonical_value, resolved.effective_value, resolved.disposition,
+                   resolved.selected_measurement_version_id IS NOT NULL,
+                   versions.source_start_utc, versions.source_end_utc,
+                   versions.source_updated_at_utc, versions.source_start_offset_minutes,
+                   versions.source_end_offset_minutes, versions.source_updated_at_offset_minutes,
+                   versions.measurement_local_date, versions.source_name,
+                   versions.source_version, versions.device, versions.original_value,
+                   versions.original_unit,
+                   coalesce(list(reviews.review_case_id ORDER BY reviews.review_case_id)
+                            FILTER (WHERE reviews.review_case_id IS NOT NULL), [])
+            FROM read_parquet('{versions}') AS versions
+            LEFT JOIN read_parquet('{resolved}') AS resolved
+              ON resolved.selected_measurement_version_id = versions.measurement_version_id
+            LEFT JOIN read_parquet('{reviews}') AS reviews
+              ON reviews.logical_measurement_id = versions.identity_candidate_id
+            WHERE {' AND '.join(clauses)}
+            GROUP BY ALL
+            ORDER BY versions.measurement_local_date, versions.source_start_utc,
+                     versions.measurement_version_id
+            """,
+            parameters,
+        ).fetchall()
+
+        def local_time(value: str, offset: int) -> datetime:
+            return datetime.fromisoformat(value).astimezone(
+                timezone(timedelta(minutes=offset))
+            )
+
+        return selected_snapshot, tuple(
+            StoredWeightMeasurement(
+                logical_measurement_id=str(row[0]),
+                measurement_version_id=str(row[1]),
+                value_kg=float(row[2]),
+                effective_value_kg=None if row[3] is None else float(row[3]),
+                disposition=None if row[4] is None else str(row[4]),
+                is_selected=bool(row[5]),
+                source_start=local_time(str(row[6]), int(row[9])),
+                source_end=local_time(str(row[7]), int(row[10])),
+                source_updated_at=local_time(str(row[8]), int(row[11])),
+                measurement_local_day=row[12],
+                source_name=str(row[13]),
+                source_version=str(row[14]),
+                device=str(row[15]),
+                original_value=float(row[16]),
+                original_unit=str(row[17]),
+                review_case_ids=tuple(str(item) for item in row[18]),
+            )
+            for row in rows
         )
 
     def load_open_data_review_cases(self) -> tuple[OpenDataReviewCase, ...]:

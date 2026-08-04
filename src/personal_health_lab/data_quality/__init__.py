@@ -373,6 +373,7 @@ def resolve_sources(
         ),
         *continued_overrides,
         *plausibility_cases,
+        *_preferred_daily_weight_conflicts(version_by_id, measurements),
         *(_unknown_rule_case(source_type) for source_type in sorted(set(unknown_source_types))),
     )
     previous_case_ids = {item.review_case_id for item in previous_review_cases}
@@ -382,7 +383,7 @@ def resolve_sources(
     cases_by_id = {
         item.review_case_id: item
         for item in previous_review_cases
-        if item.kind != "suspected_source_deletion"
+        if item.kind not in {"suspected_source_deletion", "preferred_daily_weight_conflict"}
         and not (
             item.kind == "continued_override"
             and str(item.logical_measurement_id) in continued_logical_ids
@@ -508,6 +509,63 @@ def _plausibility_cases(
     return tuple(cases)
 
 
+def _preferred_daily_weight_conflicts(
+    version_by_id: dict[str, MeasurementVersionFact],
+    measurements: tuple[ResolvedMeasurement, ...],
+) -> tuple[OpenDataReviewCase, ...]:
+    by_day: dict[date, list[tuple[MeasurementVersionFact, ResolvedMeasurement]]] = defaultdict(
+        list
+    )
+    for measurement in measurements:
+        if measurement.effective_value is None:
+            continue
+        version = version_by_id[measurement.selected_measurement_version_id]
+        if version.canonical_type == "body_mass":
+            by_day[version.measurement_local_date].append((version, measurement))
+    cases = []
+    for day, candidates in sorted(by_day.items()):
+        latest_at = max(
+            datetime.fromisoformat(version.source_start_utc) for version, _ in candidates
+        )
+        latest = tuple(
+            (version, measurement)
+            for version, measurement in candidates
+            if datetime.fromisoformat(version.source_start_utc) == latest_at
+        )
+        if len({measurement.effective_value for _, measurement in latest}) < 2:
+            continue
+        evidence = hashlib.sha256(
+            repr(
+                tuple(
+                    sorted(
+                        (version.measurement_version_id, measurement.effective_value)
+                        for version, measurement in latest
+                    )
+                )
+            ).encode()
+        ).hexdigest()
+        version, _ = min(
+            latest,
+            key=lambda item: (
+                item[1].effective_value,
+                item[0].measurement_version_id,
+            ),
+        )
+        cases.append(
+            OpenDataReviewCase(
+                review_case_id=hashlib.sha256(
+                    f"preferred_daily_weight:{day}:{evidence}".encode()
+                ).hexdigest()[:32],
+                kind="preferred_daily_weight_conflict",
+                logical_measurement_id=LogicalMeasurementId(version.logical_measurement_id),
+                measurement_version_id=MeasurementVersionId(version.measurement_version_id),
+                rule_version_id=None,
+                evidence_fingerprint=evidence,
+            )
+        )
+    return tuple(cases)
+
+
 def evaluate_plausibility_cases(
     versions: tuple[MeasurementVersionFact, ...],
     measurements: tuple[ResolvedMeasurement, ...],
@@ -523,8 +581,19 @@ def evaluate_plausibility_cases(
 
 
 def plausibility_rule_recommendations() -> tuple[PlausibilityRuleRecord, ...]:
-    return tuple(
-        replace(rule, recommendation_id="builtin-plausibility/v1") for rule in _FIXED_RULES
+    return (
+        *(replace(rule, recommendation_id="builtin-plausibility/v1") for rule in _FIXED_RULES),
+        PlausibilityRuleRecord(
+            "fixed-plausibility/v1",
+            "body_mass",
+            "kg",
+            1.0,
+            None,
+            True,
+            None,
+            datetime(1970, 1, 1, tzinfo=UTC),
+            "builtin-plausibility/v1",
+        ),
     )
 
 

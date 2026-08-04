@@ -11,11 +11,13 @@ from enum import StrEnum
 class CanonicalHealthType(StrEnum):
     ACTIVE_ENERGY = "active_energy"
     APPLE_RESTING_HEART_RATE = "apple_resting_heart_rate"
+    BODY_MASS = "body_mass"
 
 
 class CanonicalUnit(StrEnum):
     KILOCALORIE = "kcal"
     BEATS_PER_MINUTE = "count/min"
+    KILOGRAM = "kg"
 
 
 class AnalysisFreshness(StrEnum):
@@ -124,6 +126,7 @@ class CanonicalHealthRecord:
         expected_unit = {
             CanonicalHealthType.ACTIVE_ENERGY: CanonicalUnit.KILOCALORIE,
             CanonicalHealthType.APPLE_RESTING_HEART_RATE: CanonicalUnit.BEATS_PER_MINUTE,
+            CanonicalHealthType.BODY_MASS: CanonicalUnit.KILOGRAM,
         }[self.data_type]
         if self.unit is not expected_unit or not math.isfinite(self.value):
             raise ValueError("Ungültiger kanonischer Gesundheitswert.")

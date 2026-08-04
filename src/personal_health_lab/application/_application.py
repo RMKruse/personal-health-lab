@@ -6,7 +6,7 @@ import logging
 import math
 import shutil
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
@@ -84,6 +84,7 @@ from personal_health_lab.storage import (
     PublishBatchDecisionResult,
     PublishDecisionResult,
     StoreBusyError,
+    StoredWeightMeasurement,
     StoreError,
     StoreId,
     probe_filevault,
@@ -134,6 +135,7 @@ _READY_READS = (
     "data_review_case",
     "plausibility_rules",
     "migration_diagnostics",
+    "weight_nutrition",
 )
 
 
@@ -234,6 +236,68 @@ class ImportDetails:
     import_id: ImportId
     canonical_counts: ImportCanonicalCounts
     unsupported_content: tuple[ImportContentCount, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotDateSelection:
+    snapshot_ref: SnapshotRef | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+
+    def __post_init__(self) -> None:
+        if (self.start_date is None) != (self.end_date is None):
+            raise ConfigurationError("Datumsbereich verlangt Start und Ende.")
+        if (
+            self.start_date is not None
+            and self.end_date is not None
+            and self.start_date > self.end_date
+        ):
+            raise ConfigurationError("Startdatum darf nicht nach dem Enddatum liegen.")
+
+
+class WeightDayStatus(StrEnum):
+    OBSERVED = "observed"
+    MISSING = "missing"
+    AMBIGUOUS = "ambiguous"
+
+
+@dataclass(frozen=True, slots=True)
+class WeightMeasurement:
+    logical_measurement_id: LogicalMeasurementId
+    measurement_version_id: MeasurementVersionId
+    value_kg: float
+    effective_value_kg: float | None
+    disposition: str | None
+    is_selected: bool
+    source_start: datetime
+    source_end: datetime
+    source_updated_at: datetime
+    measurement_local_day: date
+    source_name: str
+    source_version: str
+    device: str
+    original_value: float
+    original_unit: str
+    review_case_ids: tuple[DataReviewCaseId, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PreferredDailyWeight:
+    day: date
+    status: WeightDayStatus
+    value_kg: float | None
+    logical_measurement_ids: tuple[LogicalMeasurementId, ...] = ()
+    measurement_version_ids: tuple[MeasurementVersionId, ...] = ()
+    review_case_ids: tuple[DataReviewCaseId, ...] = ()
+    quality_status: DataQualityStatus = DataQualityStatus.REVIEWED
+
+
+@dataclass(frozen=True, slots=True)
+class WeightNutrition:
+    snapshot_ref: SnapshotRef | None
+    status: DataQualityStatus
+    days: tuple[PreferredDailyWeight, ...]
+    weight_measurements: tuple[WeightMeasurement, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,6 +420,7 @@ class CreatePlausibilityRuleVersion:
         expected_unit = {
             CanonicalHealthType.ACTIVE_ENERGY: CanonicalUnit.KILOCALORIE,
             CanonicalHealthType.APPLE_RESTING_HEART_RATE: CanonicalUnit.BEATS_PER_MINUTE,
+            CanonicalHealthType.BODY_MASS: CanonicalUnit.KILOGRAM,
         }[self.data_type]
         if self.specification.unit is not expected_unit:
             raise ConfigurationError("Plausibilitätsregel verwendet nicht die kanonische Einheit.")
@@ -862,6 +927,7 @@ class DataReviewCaseKind(StrEnum):
     RULE_DEFINITION = "rule_definition"
     SUSPECTED_SOURCE_DELETION = "suspected_source_deletion"
     SOURCE_CONFLICT = "source_conflict"
+    PREFERRED_DAILY_WEIGHT_CONFLICT = "preferred_daily_weight_conflict"
 
 
 class DataReviewAction(StrEnum):
@@ -3370,6 +3436,104 @@ class HealthLab:
             ),
         )
 
+    def load_weight_nutrition(self, selection: SnapshotDateSelection) -> WeightNutrition:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        try:
+            snapshot_ref, stored_measurements = self._store.load_weight_measurements(
+                selection.snapshot_ref, selection.start_date, selection.end_date
+            )
+        except StoreError as error:
+            raise HealthLabError("Gewichtsprojektion ist nicht verfügbar.") from error
+
+        def public_measurement(item: StoredWeightMeasurement) -> WeightMeasurement:
+            return WeightMeasurement(
+                logical_measurement_id=LogicalMeasurementId(item.logical_measurement_id),
+                measurement_version_id=MeasurementVersionId(item.measurement_version_id),
+                value_kg=item.value_kg,
+                effective_value_kg=item.effective_value_kg,
+                disposition=item.disposition,
+                is_selected=item.is_selected,
+                source_start=item.source_start,
+                source_end=item.source_end,
+                source_updated_at=item.source_updated_at,
+                measurement_local_day=item.measurement_local_day,
+                source_name=item.source_name,
+                source_version=item.source_version,
+                device=item.device,
+                original_value=item.original_value,
+                original_unit=item.original_unit,
+                review_case_ids=tuple(DataReviewCaseId(value) for value in item.review_case_ids),
+            )
+
+        measurements = tuple(public_measurement(item) for item in stored_measurements)
+        selected = tuple(
+            item
+            for item in measurements
+            if item.is_selected
+            and item.effective_value_kg is not None
+            and item.disposition in {"included_source", "included_correction"}
+        )
+        start_date: date | None
+        end_date: date | None
+        if selection.start_date is not None and selection.end_date is not None:
+            start_date, end_date = selection.start_date, selection.end_date
+        elif selected:
+            start_date = min(item.measurement_local_day for item in selected)
+            end_date = max(item.measurement_local_day for item in selected)
+        else:
+            start_date = end_date = None
+
+        by_day: dict[date, list[WeightMeasurement]] = {}
+        for item in selected:
+            by_day.setdefault(item.measurement_local_day, []).append(item)
+        days = []
+        current = start_date
+        while current is not None and end_date is not None and current <= end_date:
+            candidates = by_day.get(current, [])
+            if not candidates:
+                days.append(PreferredDailyWeight(current, WeightDayStatus.MISSING, None))
+                current += timedelta(days=1)
+                continue
+            latest_at = max(item.source_start for item in candidates)
+            latest = tuple(item for item in candidates if item.source_start == latest_at)
+            values = {item.effective_value_kg for item in latest}
+            review_case_ids = tuple(
+                sorted(
+                    {case_id for item in latest for case_id in item.review_case_ids},
+                    key=str,
+                )
+            )
+            observed = len(values) == 1
+            days.append(
+                PreferredDailyWeight(
+                    day=current,
+                    status=(WeightDayStatus.OBSERVED if observed else WeightDayStatus.AMBIGUOUS),
+                    value_kg=next(iter(values)) if observed else None,
+                    logical_measurement_ids=tuple(item.logical_measurement_id for item in latest),
+                    measurement_version_ids=tuple(item.measurement_version_id for item in latest),
+                    review_case_ids=review_case_ids,
+                    quality_status=(
+                        DataQualityStatus.PROVISIONAL
+                        if review_case_ids
+                        else DataQualityStatus.REVIEWED
+                    ),
+                )
+            )
+            current += timedelta(days=1)
+        return WeightNutrition(
+            snapshot_ref=snapshot_ref,
+            status=(
+                DataQualityStatus.PROVISIONAL
+                if any(item.review_case_ids for item in selected)
+                else DataQualityStatus.REVIEWED
+            ),
+            days=tuple(days),
+            weight_measurements=measurements,
+        )
+
     def load_data_review(self, selection: DataReviewSelection) -> DataReview:
         self._require_ready()
         self._require_open()
@@ -3400,6 +3564,8 @@ class HealthLab:
                 return (DataReviewAction.CONFIRM, DataReviewAction.REJECT)
             if kind == "source_conflict":
                 return (DataReviewAction.PREFER, DataReviewAction.SPLIT)
+            if kind == "preferred_daily_weight_conflict":
+                return (DataReviewAction.CORRECT, DataReviewAction.EXCLUDE_LOCAL)
             return ()
 
         cases = tuple(
@@ -3584,7 +3750,10 @@ class HealthLab:
                     tuple(versions),
                     recommendations[data_type],
                 )
-                for data_type, versions in sorted(grouped.items(), key=lambda item: item[0].value)
+                for data_type in sorted(
+                    grouped.keys() | recommendations.keys(), key=lambda x: x.value
+                )
+                for versions in (grouped.get(data_type, []),)
             )
         )
 

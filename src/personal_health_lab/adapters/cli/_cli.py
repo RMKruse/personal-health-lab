@@ -74,6 +74,8 @@ from personal_health_lab.application import (
     RunHistoricalReview,
     RunRestingHeartRateAnalysis,
     SingleDecisionTarget,
+    SnapshotDateSelection,
+    SnapshotRef,
     SourceConflictResolution,
     SourceConflictStrategy,
     SourceDeletionResolution,
@@ -81,6 +83,7 @@ from personal_health_lab.application import (
     SourceValueAcceptance,
     StoreMigrationPlan,
     StoreMigrationReceipt,
+    WeightNutrition,
     WorkspaceStatus,
     WriteApprovalStatus,
     WriteBatchDecisionReceipt,
@@ -128,6 +131,11 @@ def _parser() -> argparse.ArgumentParser:
     import_details = commands.add_parser("import-details", help="Importdetails laden")
     import_details.add_argument("import_id", type=ImportId)
     import_details.add_argument("--json", action="store_true", dest="as_json")
+    weight = commands.add_parser("weight-nutrition", help="Gewicht und Ernährung laden")
+    weight.add_argument("--snapshot", type=SnapshotRef)
+    weight.add_argument("--start-date", type=date.fromisoformat)
+    weight.add_argument("--end-date", type=date.fromisoformat)
+    weight.add_argument("--json", action="store_true", dest="as_json")
     analysis = commands.add_parser("analyze", help="Verzögerungsprofil analysieren")
     analysis.add_argument("--definition", default="lag-signal-v2")
     analysis.add_argument("--start-date", type=date.fromisoformat)
@@ -471,6 +479,64 @@ def _import_details_json(
                 "external_identifier": item.external_identifier,
             }
             for item in details.unsupported_content
+        ],
+    }
+
+
+def _weight_nutrition_json(
+    projection: WeightNutrition,
+    selection: SnapshotDateSelection,
+    runtime_config: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        "days": [
+            {
+                "day": item.day.isoformat(),
+                "logical_measurement_ids": [str(value) for value in item.logical_measurement_ids],
+                "measurement_version_ids": [
+                    str(value) for value in item.measurement_version_ids
+                ],
+                "quality_status": item.quality_status.value,
+                "review_case_ids": [str(value) for value in item.review_case_ids],
+                "status": item.status.value,
+                "value_kg": item.value_kg,
+            }
+            for item in projection.days
+        ],
+        "kind": "weight_nutrition",
+        "runtime_config": dict(runtime_config),
+        "schema_version": _OUTPUT_SCHEMA_VERSION,
+        "selection": {
+            "end_date": None if selection.end_date is None else selection.end_date.isoformat(),
+            "snapshot_ref": (
+                None if selection.snapshot_ref is None else str(selection.snapshot_ref)
+            ),
+            "start_date": (
+                None if selection.start_date is None else selection.start_date.isoformat()
+            ),
+        },
+        "snapshot_ref": None if projection.snapshot_ref is None else str(projection.snapshot_ref),
+        "status": projection.status.value,
+        "weight_measurements": [
+            {
+                "device": item.device,
+                "disposition": item.disposition,
+                "effective_value_kg": item.effective_value_kg,
+                "is_selected": item.is_selected,
+                "logical_measurement_id": str(item.logical_measurement_id),
+                "measurement_local_day": item.measurement_local_day.isoformat(),
+                "measurement_version_id": str(item.measurement_version_id),
+                "original_unit": item.original_unit,
+                "original_value": item.original_value,
+                "review_case_ids": [str(value) for value in item.review_case_ids],
+                "source_end": item.source_end.isoformat(),
+                "source_name": item.source_name,
+                "source_start": item.source_start.isoformat(),
+                "source_updated_at": item.source_updated_at.isoformat(),
+                "source_version": item.source_version,
+                "value_kg": item.value_kg,
+            }
+            for item in projection.weight_measurements
         ],
     }
 
@@ -996,6 +1062,11 @@ def main(args: Sequence[str] | None = None) -> int:
                 recovery_status = health_lab.load_recovery_status()
             elif parsed.command == "import-details":
                 import_details = health_lab.load_import_details(parsed.import_id)
+            elif parsed.command == "weight-nutrition":
+                weight_selection = SnapshotDateSelection(
+                    parsed.snapshot, parsed.start_date, parsed.end_date
+                )
+                weight_nutrition = health_lab.load_weight_nutrition(weight_selection)
             elif parsed.command == "restore":
                 restore_request = BeginMetadataRestore(parsed.backup)
                 restore_plan = health_lab.preview_write(restore_request)
@@ -1339,6 +1410,34 @@ def main(args: Sequence[str] | None = None) -> int:
         print(f"Anomalien: {counts.anomaly_count}")
         for content in import_details.unsupported_content:
             print(f"{content.category.value} · {content.external_identifier} · {content.count}")
+    elif parsed.command == "weight-nutrition" and parsed.as_json:
+        print(
+            json.dumps(
+                _weight_nutrition_json(weight_nutrition, weight_selection, runtime_config),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    elif parsed.command == "weight-nutrition":
+        print("Gewicht und Ernährung")
+        print(f"Snapshot: {weight_nutrition.snapshot_ref or '-'}")
+        print(f"Datenstatus: {weight_nutrition.status.value}")
+        for weight_day in weight_nutrition.days:
+            print(
+                f"{weight_day.day} · {weight_day.status.value} · "
+                f"{weight_day.value_kg if weight_day.value_kg is not None else '-'} kg"
+            )
+        for weight_measurement in weight_nutrition.weight_measurements:
+            print(
+                f"Messung {weight_measurement.measurement_version_id} · "
+                f"{weight_measurement.value_kg} kg · Original: "
+                f"{weight_measurement.original_value} {weight_measurement.original_unit} · "
+                f"Quelle: {weight_measurement.source_name} "
+                f"{weight_measurement.source_version} · Gerät: {weight_measurement.device} · "
+                f"Start: {weight_measurement.source_start.isoformat()} · "
+                f"Ende: {weight_measurement.source_end.isoformat()} · "
+                f"Erstellt: {weight_measurement.source_updated_at.isoformat()}"
+            )
     elif parsed.command == "recovery-status" and parsed.as_json:
         print(
             json.dumps(

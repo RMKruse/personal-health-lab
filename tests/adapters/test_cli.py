@@ -158,6 +158,62 @@ def test_cli_renders_import_details_as_human_text_and_json_3(
     assert overview["schema_version"] == "3.0"
 
 
+@pytest.mark.v02_adapter("cli", "WeightDayStatus")
+def test_cli_renders_the_complete_weight_projection_as_human_text_and_json_3(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    xml = (Path(__file__).parents[1] / "fixtures/v03/weight-edges.xml").read_text(
+        encoding="utf-8"
+    )
+    package = tmp_path / "weights.zip"
+    with ZipFile(package, "w") as archive:
+        archive.writestr("apple_health_export/export.xml", xml)
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(package)
+        health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+    common = [
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(config.synthetic_store),
+        "--real-store",
+        str(config.real_store),
+        "weight-nutrition",
+        "--start-date",
+        "2024-01-01",
+        "--end-date",
+        "2024-01-06",
+    ]
+
+    assert main(common) == 0
+    human = capsys.readouterr().out
+    assert "Gewicht und Ernährung" in human
+    assert "2024-01-02 · missing · - kg" in human
+    assert "2024-01-05 · ambiguous · - kg" in human
+    assert "Original: 100.0 lb" in human
+
+    assert main([*common, "--json"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    _assert_json_contract(output)
+    assert output["kind"] == "weight_nutrition"
+    assert output["selection"] == {
+        "end_date": "2024-01-06",
+        "snapshot_ref": None,
+        "start_date": "2024-01-01",
+    }
+    assert output["days"][1]["status"] == "missing"
+    assert output["days"][4]["status"] == "ambiguous"
+    assert len(output["weight_measurements"]) == 7
+    pounds = next(
+        item for item in output["weight_measurements"] if item["original_unit"] == "lb"
+    )
+    assert pounds["value_kg"] == pytest.approx(45.359237)
+    assert pounds["original_value"] == 100
+
+
 @pytest.mark.v02_adapter(
     "cli",
     "CreateMetadataBackup",
@@ -777,7 +833,16 @@ def test_cli_projects_and_creates_plausibility_rule_versions(
     assert main([*common, "rules", "--json"]) == 0
     rules = json.loads(capsys.readouterr().out)
     _assert_json_contract(rules)
-    assert len(rules["rules"]) == 2
+    assert len(rules["rules"]) == 3
+    body_mass = next(rule for rule in rules["rules"] if rule["data_type"] == "body_mass")
+    assert body_mass["versions"] == []
+    assert body_mass["recommendation"]["specification"] == {
+        "active": True,
+        "fixed_lower_bound": 1.0,
+        "fixed_upper_bound": None,
+        "personal_range_enabled": True,
+        "unit": "kg",
+    }
 
     args = [
         *common,

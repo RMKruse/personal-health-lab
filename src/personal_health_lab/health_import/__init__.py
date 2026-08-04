@@ -49,14 +49,24 @@ from personal_health_lab.storage import (
 _EXPORT_MEMBER = "apple_health_export/export.xml"
 _ACTIVE_ENERGY = "HKQuantityTypeIdentifierActiveEnergyBurned"
 _RESTING_HEART_RATE = "HKQuantityTypeIdentifierRestingHeartRate"
+_BODY_MASS = "HKQuantityTypeIdentifierBodyMass"
 _IDENTITY_RULE_VERSION = "healthkit-natural/v2"
 _SYNC_IDENTIFIER = "HKMetadataKeySyncIdentifier"
 _MAPPINGS = {
-    _ACTIVE_ENERGY: (CanonicalHealthType.ACTIVE_ENERGY, CanonicalUnit.KILOCALORIE, "kcal"),
+    _ACTIVE_ENERGY: (
+        CanonicalHealthType.ACTIVE_ENERGY,
+        CanonicalUnit.KILOCALORIE,
+        {"kcal": 1.0},
+    ),
     _RESTING_HEART_RATE: (
         CanonicalHealthType.APPLE_RESTING_HEART_RATE,
         CanonicalUnit.BEATS_PER_MINUTE,
-        "count/min",
+        {"count/min": 1.0},
+    ),
+    _BODY_MASS: (
+        CanonicalHealthType.BODY_MASS,
+        CanonicalUnit.KILOGRAM,
+        {"kg": 1.0, "g": 0.001, "lb": 0.45359237},
     ),
 }
 _SLEEP_TYPE = "HKCategoryTypeIdentifierSleepAnalysis"
@@ -270,9 +280,11 @@ def _records(
                 elif parent == "HealthData" and element.tag == "Record":
                     source_type = element.attrib.get("type", "")
                     mapping = _MAPPINGS.get(source_type)
-                    if mapping is not None and element.attrib.get("unit") == mapping[2]:
-                        data_type, canonical_unit, source_unit = mapping
-                        value = float(element.attrib["value"])
+                    source_unit = element.attrib.get("unit", "")
+                    if mapping is not None and source_unit in mapping[2]:
+                        data_type, canonical_unit, conversions = mapping
+                        original_value = float(element.attrib["value"])
+                        value = original_value * conversions[source_unit]
                         source_start = _source_datetime(element.attrib["startDate"])
                         source_end = _source_datetime(element.attrib["endDate"])
                         source_updated_at = _source_datetime(element.attrib["creationDate"])
@@ -307,8 +319,8 @@ def _records(
                         )
                         payload_sha256 = _id(
                             data_type.value,
-                            canonical_unit.value,
-                            value,
+                            source_unit,
+                            original_value,
                             source_start.isoformat(),
                             source_end.isoformat(),
                             source_name,
@@ -331,7 +343,7 @@ def _records(
                                     source_name=source_name,
                                     source_version=source_version,
                                     device=device,
-                                    original_value=value,
+                                    original_value=original_value,
                                     original_unit=source_unit,
                                     strong_source_id_hash=strong_source_id_hash,
                                 ),

@@ -25,12 +25,49 @@ source = "https://github.com/RMKruse/personal-health-lab/issues/69"
 statement = "The V0.3 delta matrix rejects open identifiers, runners, evidence, platforms, and fixture hashes."
 evidence = ["positive", "negative"]
 
+[[contract]]
+id = "V03-C-WEIGHT-SOURCE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/70"
+statement = "Body-mass imports canonicalize supported units to kilograms while preserving source values, units, timestamps, offsets, devices, and versions."
+evidence = ["positive", "reproducibility", "boundary"]
+
+[[contract]]
+id = "V03-C-WEIGHT-DAILY-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/70"
+statement = "Preferred daily weight uses the latest local-day instant, merges equal simultaneous values, exposes conflicts, and leaves absent days missing."
+evidence = ["positive", "negative", "boundary"]
+
+[[contract]]
+id = "V03-C-WEIGHT-REVIEW-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/70"
+statement = "V0.2 corrections and local exclusions resolve preferred-daily-weight conflicts without mutating source measurements."
+evidence = ["positive", "transition"]
+
+[[contract]]
+id = "V03-C-WEIGHT-RULE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/70"
+statement = "The delivered body-mass rule recommends at least one kilogram, no upper bound, and personal range only after explicit V0.2 adoption."
+evidence = ["positive", "transition"]
+
+[[contract]]
+id = "V03-C-WEIGHT-ADAPTERS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/70"
+statement = "HealthLab, human CLI, JSON 3.0, and Streamlit expose the same complete persisted weight projection."
+evidence = ["positive", "parity"]
+
 [[fixture]]
 id = "V03-F-IMPORT-CATALOG-V1"
 kind = "parser_contract"
 artifact = "tests/fixtures/v03/unsupported-import-content.xml"
 platform = "all"
 sha256 = "5d55e2cb2a0c9c0bf01eec021fca4baf18aed4b2607a23b17a40a127c9fcfa44"
+
+[[fixture]]
+id = "V03-F-WEIGHT-NUTRITION-EDGES-V1"
+kind = "parser_contract"
+artifact = "tests/fixtures/v03/weight-edges.xml"
+platform = "all"
+sha256 = "fdfb4fd811d329512f43fb678e5ae409ca85189c500f255836c9b1c7ad5ccafb"
 
 [[case]]
 id = "V03-A-IMPORT-DETAILS-V1"
@@ -101,3 +138,87 @@ expected_result = "each invalid matrix is rejected"
 expected_effect = "none"
 forbidden_side_effects = "no invalid registry accepted"
 evidence = ["negative"]
+
+[[case]]
+id = "V03-A-WEIGHT-PROJECTION-V1"
+contracts = ["V03-C-WEIGHT-SOURCE-V1", "V03-C-WEIGHT-DAILY-V1"]
+fixtures = ["V03-F-WEIGHT-NUTRITION-EDGES-V1"]
+runner = "tests/acceptance/test_v03_weight.py::test_weight_import_projects_units_versions_missingness_and_daily_preference"
+initial_state = "empty synthetic store"
+operation = "import versioned kilogram, gram, pound, equal, conflicting, and absent-day measurements"
+level = "application"
+platform = "all"
+expected_result = "complete source lineage and explicit observed, missing, and ambiguous daily values"
+expected_effect = "one immutable snapshot per committed import"
+forbidden_side_effects = "no carry-forward, interpolation, or source-value mutation"
+evidence = ["positive", "negative", "boundary", "reproducibility"]
+
+[[case]]
+id = "V03-A-WEIGHT-CORRECTION-V1"
+contracts = ["V03-C-WEIGHT-REVIEW-V1"]
+fixtures = ["V03-F-WEIGHT-NUTRITION-EDGES-V1"]
+runner = "tests/acceptance/test_v03_weight.py::test_weight_correction_resolves_an_ambiguous_preferred_daily_weight"
+initial_state = "weight conflict with an open review case"
+operation = "correct one conflicting latest measurement through the V0.2 review workflow"
+level = "application"
+platform = "all"
+expected_result = "one observed preferred daily weight"
+expected_effect = "correction is projected in a new immutable snapshot"
+forbidden_side_effects = "no source measurement mutation"
+evidence = ["positive", "transition"]
+
+[[case]]
+id = "V03-A-WEIGHT-EXCLUSION-V1"
+contracts = ["V03-C-WEIGHT-REVIEW-V1"]
+fixtures = ["V03-F-WEIGHT-NUTRITION-EDGES-V1"]
+runner = "tests/acceptance/test_v03_weight.py::test_weight_exclusion_resolves_an_ambiguous_preferred_daily_weight"
+initial_state = "weight conflict with an open review case"
+operation = "exclude one conflicting latest measurement through the V0.2 review workflow"
+level = "application"
+platform = "all"
+expected_result = "the remaining measurement becomes the observed preferred daily weight"
+expected_effect = "exclusion is projected in a new immutable snapshot"
+forbidden_side_effects = "no source measurement mutation"
+evidence = ["positive", "transition"]
+
+[[case]]
+id = "V03-A-WEIGHT-RULE-V1"
+contracts = ["V03-C-WEIGHT-RULE-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_weight.py::test_weight_plausibility_recommendation_is_adopted_through_the_v02_workflow"
+initial_state = "body-mass recommendation with no adopted version"
+operation = "adopt the recommendation and import a sub-kilogram measurement"
+level = "application"
+platform = "all"
+expected_result = "an explicitly adopted lower-bound rule opens a plausibility case"
+expected_effect = "rule version and reviewed snapshot are persisted"
+forbidden_side_effects = "no recommendation-only rule is silently activated"
+evidence = ["positive", "transition"]
+
+[[case]]
+id = "V03-A-WEIGHT-CLI-V1"
+contracts = ["V03-C-WEIGHT-ADAPTERS-V1"]
+fixtures = ["V03-F-WEIGHT-NUTRITION-EDGES-V1"]
+runner = "tests/adapters/test_cli.py::test_cli_renders_the_complete_weight_projection_as_human_text_and_json_3"
+initial_state = "committed weight edge fixture"
+operation = "load weight nutrition through human CLI and JSON 3.0"
+level = "adapter"
+platform = "all"
+expected_result = "complete human and schema-valid JSON projections"
+expected_effect = "none"
+forbidden_side_effects = "no adapter-side weight selection logic"
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-WEIGHT-STREAMLIT-V1"
+contracts = ["V03-C-WEIGHT-ADAPTERS-V1"]
+fixtures = ["V03-F-WEIGHT-NUTRITION-EDGES-V1"]
+runner = "tests/adapters/test_streamlit.py::test_streamlit_renders_the_complete_weight_projection"
+initial_state = "committed weight edge fixture"
+operation = "select a date range on the Kerndaten page"
+level = "adapter"
+platform = "all"
+expected_result = "complete daily and source-measurement tables"
+expected_effect = "none"
+forbidden_side_effects = "no persistent state outside application"
+evidence = ["positive", "parity"]

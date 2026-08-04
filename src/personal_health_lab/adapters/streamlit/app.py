@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from urllib.parse import quote
@@ -53,12 +53,15 @@ from personal_health_lab.application import (
     RunRestingHeartRateAnalysis,
     RuntimeConfig,
     SingleDecisionTarget,
+    SnapshotDateSelection,
+    SnapshotRef,
     SourceConflictResolution,
     SourceConflictStrategy,
     SourceDeletionResolution,
     SourceDeletionVerdict,
     SourceValueAcceptance,
     StoreMigrationPlan,
+    WeightNutrition,
     WorkspaceState,
     WriteApprovalStatus,
     WriteNotStarted,
@@ -208,6 +211,73 @@ def _render_import_details(config: RuntimeConfig) -> None:
                 "Anzahl": item.count,
             }
             for item in details.unsupported_content
+        ],
+        width="stretch",
+    )
+
+
+def _render_weight_nutrition(config: RuntimeConfig) -> None:
+    st.subheader("Gewicht")
+    snapshot = st.text_input("Gewichts-Snapshot-ID (optional)")
+    start = st.date_input("Gewicht von", value=None)
+    end = st.date_input("Gewicht bis", value=None)
+    if st.button("Gewicht laden"):
+        try:
+            assert start is None or isinstance(start, date)
+            assert end is None or isinstance(end, date)
+            selection = SnapshotDateSelection(
+                snapshot_ref=SnapshotRef(snapshot) if snapshot else None,
+                start_date=start,
+                end_date=end,
+            )
+            with HealthLab.open(config) as health_lab:
+                st.session_state["weight_nutrition"] = health_lab.load_weight_nutrition(
+                    selection
+                )
+        except (ValueError, ConfigurationError, HealthLabError):
+            st.error("Gewichtsdaten konnten nicht geladen werden.")
+    projection = st.session_state.get("weight_nutrition")
+    if not isinstance(projection, WeightNutrition):
+        return
+    st.caption(f"Snapshot: {projection.snapshot_ref or '-'} · Status: {projection.status.value}")
+    st.dataframe(
+        [
+            {
+                "Tag": item.day.isoformat(),
+                "Status": item.status.value,
+                "Gewicht (kg)": item.value_kg,
+                "Datenstatus": item.quality_status.value,
+                "Logische Messungen": [str(value) for value in item.logical_measurement_ids],
+                "Messungsversionen": [str(value) for value in item.measurement_version_ids],
+                "Prüffälle": [str(value) for value in item.review_case_ids],
+            }
+            for item in projection.days
+        ],
+        width="stretch",
+    )
+    st.dataframe(
+        [
+            {
+                "Logische Messung": str(item.logical_measurement_id),
+                "Messungsversion": str(item.measurement_version_id),
+                "Ausgewählt": item.is_selected,
+                "Disposition": item.disposition,
+                "Gewicht (kg)": item.value_kg,
+                "Effektives Gewicht (kg)": item.effective_value_kg,
+                "Originalwert": item.original_value,
+                "Originaleinheit": item.original_unit,
+                "Lokaler Tag": item.measurement_local_day.isoformat(),
+                "Quellbeginn": item.source_start.isoformat(),
+                "Quellende": item.source_end.isoformat(),
+                "Quellaktualisierung": (
+                    None if item.source_updated_at is None else item.source_updated_at.isoformat()
+                ),
+                "Quelle": item.source_name,
+                "Gerät": item.device,
+                "Quellversion": item.source_version,
+                "Prüffälle": [str(value) for value in item.review_case_ids],
+            }
+            for item in projection.weight_measurements
         ],
         width="stretch",
     )
@@ -389,6 +459,7 @@ if rollback_plan.details.migration_operation_id is not None:
             st.error("Migrationsrollback konnte nicht ausgeführt werden.")
 
 if st.session_state["active_page"] == "Kerndaten":
+    _render_weight_nutrition(config)
     _render_import_details(config)
     st.stop()
 
@@ -862,6 +933,9 @@ if overview.quarantined_import_count:
 
 with st.expander("Plausibilitätsregeln"):
     for rule in plausibility_rules.rules:
+        if not rule.versions:
+            st.caption(f"{rule.data_type.value}: keine übernommene Regelversion")
+            continue
         active = rule.active_version
         st.caption(
             f"{rule.data_type.value}: {active.version_id} · "
@@ -932,11 +1006,12 @@ with st.expander("Plausibilitätsregeln"):
         selected_rule.versions,
         format_func=lambda item: item.version_id,
     )
-    if st.button("Historische Prüfung planen"):
+    if st.button("Historische Prüfung planen", disabled=historical_version is None):
         if historical_start is None or historical_end is None:
             st.error("Historischer Prüfzeitraum fehlt.")
         else:
             try:
+                assert historical_version is not None
                 historical_request = RunHistoricalReview(
                     selected_type,
                     historical_start,
