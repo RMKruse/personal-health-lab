@@ -5,6 +5,7 @@ import sqlite3
 from collections.abc import Callable
 from datetime import date
 from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 from streamlit.testing.v1 import AppTest
@@ -22,6 +23,39 @@ from personal_health_lab.application import (
     RuntimeConfig,
 )
 from personal_health_lab.synthetic_export import GenerationOptions, generate_export
+
+
+def test_streamlit_loads_import_details_through_the_application_seam(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    xml = (Path(__file__).parents[1] / "fixtures/v03/unsupported-import-content.xml").read_text(
+        encoding="utf-8"
+    )
+    package = tmp_path / "unsupported.zip"
+    with ZipFile(package, "w") as archive:
+        archive.writestr("apple_health_export/export.xml", xml)
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "synthetic", tmp_path / "real")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(package)
+        receipt = health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+    monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
+    monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(config.synthetic_store))
+    monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(config.real_store))
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
+
+    app = AppTest.from_file(str(app_path)).run()
+    app.radio[0].set_value("Kerndaten").run()
+    next(item for item in app.text_input if item.label == "Import-ID").set_value(
+        str(receipt.result.import_id)
+    )
+    next(button for button in app.button if button.label == "Importdetails laden").click().run()
+
+    assert not app.exception
+    assert any(item.value == "Importdetails" for item in app.subheader)
+    assert any("Kanonische Records im Paket: 1" in item.value for item in app.caption)
+    assert app.dataframe
 
 
 def test_streamlit_shows_the_same_empty_overview(
@@ -44,9 +78,7 @@ def test_streamlit_shows_the_same_empty_overview(
     assert any(button.label == "Ruhepulsanalyse ausführen" for button in app.button)
     assert any("Gepinnter Snapshot: -" in item.value for item in app.caption)
 
-    execute = next(
-        button for button in app.button if button.label == "Ruhepulsanalyse ausführen"
-    )
+    execute = next(button for button in app.button if button.label == "Ruhepulsanalyse ausführen")
     execute.click().run()
 
     assert any("Analysestatus: insufficient_data" in item.value for item in app.warning)
@@ -94,32 +126,38 @@ def test_streamlit_focuses_migration_in_restricted_session(
     ]
     assert cli_main([*common, "migrate", "--json"]) == 0
     cli_migration_plan = json.loads(capsys.readouterr().out)
-    assert cli_main(
-        [
-            *common,
-            "migrate",
-            "--json",
-            "--execute",
-            "--expect-plan",
-            cli_migration_plan["fingerprint"],
-        ]
-    ) == 0
+    assert (
+        cli_main(
+            [
+                *common,
+                "migrate",
+                "--json",
+                "--execute",
+                "--expect-plan",
+                cli_migration_plan["fingerprint"],
+            ]
+        )
+        == 0
+    )
     capsys.readouterr()
     assert cli_main([*common, "overview", "--json"]) == 0
     cli_overview = json.loads(capsys.readouterr().out)
     assert any(item["freshness"] == "stale" for item in cli_overview["analysis_history"])
     assert cli_main([*common, "rollback-migration", "--json"]) == 0
     cli_rollback_plan = json.loads(capsys.readouterr().out)
-    assert cli_main(
-        [
-            *common,
-            "rollback-migration",
-            "--json",
-            "--execute",
-            "--expect-plan",
-            cli_rollback_plan["fingerprint"],
-        ]
-    ) == 0
+    assert (
+        cli_main(
+            [
+                *common,
+                "rollback-migration",
+                "--json",
+                "--execute",
+                "--expect-plan",
+                cli_rollback_plan["fingerprint"],
+            ]
+        )
+        == 0
+    )
     capsys.readouterr()
     monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
     monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(store))
@@ -144,8 +182,7 @@ def test_streamlit_focuses_migration_in_restricted_session(
     assert any("stale" in item.value for item in app.caption)
     assert any(item.value == "Migrationsrollback" for item in app.subheader)
     assert any(
-        f"Wiederhergestellter Snapshot: {snapshot_ref}" in item.value
-        for item in app.caption
+        f"Wiederhergestellter Snapshot: {snapshot_ref}" in item.value for item in app.caption
     )
     next(button for button in app.button if button.label == "Letzte Migration zurückrollen").click()
     app.run()
@@ -455,7 +492,6 @@ def test_streamlit_shows_imported_daily_series(
 
     assert any(button.label == "Ruhepulsanalyse ausführen" for button in app.button)
 
-
     assert any("Gepinnter Snapshot:" in item.value for item in app.caption)
     assert app.date_input[0].disabled
     assert app.date_input[1].disabled
@@ -470,9 +506,7 @@ def test_streamlit_shows_imported_daily_series(
     assert not app.date_input[1].disabled
     next(button for button in app.button if button.label == "Ruhepulsanalyse prüfen").click().run()
 
-    execute = next(
-        button for button in app.button if button.label == "Ruhepulsanalyse ausführen"
-    )
+    execute = next(button for button in app.button if button.label == "Ruhepulsanalyse ausführen")
     execute.click().run(timeout=10)
 
     assert not app.exception
@@ -496,9 +530,7 @@ def test_streamlit_shows_imported_daily_series(
     assert any("Moving-Block-Bootstrap" in caption.value for caption in app.caption)
 
     next(button for button in app.button if button.label == "Ruhepulsanalyse prüfen").click().run()
-    execute = next(
-        button for button in app.button if button.label == "Ruhepulsanalyse ausführen"
-    )
+    execute = next(button for button in app.button if button.label == "Ruhepulsanalyse ausführen")
     execute.click().run(timeout=10)
 
     assert any("Analysestatus: reused" in message.value for message in app.success)
@@ -506,9 +538,7 @@ def test_streamlit_shows_imported_daily_series(
     app.date_input[0].set_value(date(2024, 1, 1))
     app.date_input[1].set_value(date(2024, 6, 30))
     next(button for button in app.button if button.label == "Ruhepulsanalyse prüfen").click().run()
-    execute = next(
-        button for button in app.button if button.label == "Ruhepulsanalyse ausführen"
-    )
+    execute = next(button for button in app.button if button.label == "Ruhepulsanalyse ausführen")
     execute.click().run(timeout=10)
 
     assert not app.exception
@@ -539,9 +569,7 @@ def test_streamlit_page_change_discards_pending_preview(
     assert all(item.value != "Schreibvorschau" for item in app.subheader)
 
 
-def test_streamlit_maps_unstable_analysis(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_streamlit_maps_unstable_analysis(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fixture = generate_export(
         "null-v1",
         42,
@@ -818,16 +846,19 @@ def test_cli_and_streamlit_project_analysis_status_axes(
     def execute_cli(command: list[str]) -> dict[str, object]:
         assert cli_main([*common, *command, "--json"]) == 0
         plan = json.loads(capsys.readouterr().out)
-        assert cli_main(
-            [
-                *common,
-                *command,
-                "--json",
-                "--execute",
-                "--expect-plan",
-                plan["fingerprint"],
-            ]
-        ) == 0
+        assert (
+            cli_main(
+                [
+                    *common,
+                    *command,
+                    "--json",
+                    "--execute",
+                    "--expect-plan",
+                    plan["fingerprint"],
+                ]
+            )
+            == 0
+        )
         return json.loads(capsys.readouterr().out)
 
     execute_cli(["import", str(first.export_path)])

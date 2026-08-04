@@ -1,0 +1,103 @@
+schema_version = 1
+release = "v0.3-delta"
+
+[[contract]]
+id = "V03-C-IMPORT-DETAILS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/69"
+statement = "Import details expose canonical counts and a typed unsupported-content catalog without parser or storage internals."
+evidence = ["positive", "negative"]
+
+[[contract]]
+id = "V03-C-IMPORT-REIMPORT-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/69"
+statement = "Identical and cumulative reimports persist reproducible unsupported-content counts per import."
+evidence = ["positive", "reproducibility"]
+
+[[contract]]
+id = "V03-C-IMPORT-ADAPTERS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/69"
+statement = "CLI, JSON 3.0, and Streamlit render import details loaded only through HealthLab."
+evidence = ["positive", "parity"]
+
+[[contract]]
+id = "V03-C-MATRIX-VALIDATION-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/69"
+statement = "The V0.3 delta matrix rejects open identifiers, runners, evidence, platforms, and fixture hashes."
+evidence = ["positive", "negative"]
+
+[[fixture]]
+id = "V03-F-IMPORT-CATALOG-V1"
+kind = "parser_contract"
+artifact = "tests/fixtures/v03/unsupported-import-content.xml"
+platform = "all"
+sha256 = "5d55e2cb2a0c9c0bf01eec021fca4baf18aed4b2607a23b17a40a127c9fcfa44"
+
+[[case]]
+id = "V03-A-IMPORT-DETAILS-V1"
+contracts = ["V03-C-IMPORT-DETAILS-V1", "V03-C-IMPORT-REIMPORT-V1"]
+fixtures = ["V03-F-IMPORT-CATALOG-V1"]
+runner = "tests/acceptance/test_v03_import_details.py::test_import_details_catalog_unsupported_content_across_reimports"
+initial_state = "empty synthetic store"
+operation = "import the catalog fixture, then reimport it identically and cumulatively"
+level = "application"
+platform = "all"
+expected_result = "typed canonical counts and ordered unsupported-content entries for every import"
+expected_effect = "catalog rows remain bound to their import identities"
+forbidden_side_effects = "no parser or storage internals enter the public projection"
+evidence = ["positive", "negative", "reproducibility"]
+
+[[case]]
+id = "V03-A-IMPORT-CLI-V1"
+contracts = ["V03-C-IMPORT-ADAPTERS-V1"]
+fixtures = ["V03-F-IMPORT-CATALOG-V1"]
+runner = "tests/adapters/test_cli.py::test_cli_renders_import_details_as_human_text_and_json_3"
+initial_state = "committed catalog fixture"
+operation = "load import details through the human CLI and JSON 3.0"
+level = "adapter"
+platform = "all"
+expected_result = "complete human and schema-valid JSON projections"
+expected_effect = "none"
+forbidden_side_effects = "no adapter-side catalog interpretation"
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-IMPORT-STREAMLIT-V1"
+contracts = ["V03-C-IMPORT-ADAPTERS-V1"]
+fixtures = ["V03-F-IMPORT-CATALOG-V1"]
+runner = "tests/adapters/test_streamlit.py::test_streamlit_loads_import_details_through_the_application_seam"
+initial_state = "committed catalog fixture"
+operation = "select an import identity on the Kerndaten page"
+level = "adapter"
+platform = "all"
+expected_result = "canonical counts and the complete catalog table"
+expected_effect = "none"
+forbidden_side_effects = "no persistent state outside application"
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-MATRIX-VALID-V1"
+contracts = ["V03-C-MATRIX-VALIDATION-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix.py::test_v03_matrix_is_well_formed_and_fully_registered"
+initial_state = "repository V0.3 delta matrix"
+operation = "validate all closed matrix references and fixture hashes"
+level = "meta"
+platform = "all"
+expected_result = "matrix accepted"
+expected_effect = "none"
+forbidden_side_effects = "no domain logic interpreted"
+evidence = ["positive"]
+
+[[case]]
+id = "V03-A-MATRIX-REJECT-V1"
+contracts = ["V03-C-MATRIX-VALIDATION-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix.py::test_v03_matrix_rejects_open_references_and_hashes"
+initial_state = "mutated V0.3 delta matrices"
+operation = "validate duplicate IDs, short runners, missing evidence, unknown platforms, and hash drift"
+level = "meta"
+platform = "all"
+expected_result = "each invalid matrix is rejected"
+expected_effect = "none"
+forbidden_side_effects = "no invalid registry accepted"
+evidence = ["negative"]

@@ -10,7 +10,7 @@ from pathlib import Path
 from zipfile import ZipFile
 
 import pytest
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, ValidationError
 
 from personal_health_lab.adapters.cli import main
 from personal_health_lab.application import (
@@ -68,6 +68,9 @@ def _execute_json_import(
     )
     receipt = json.loads(capsys.readouterr().out)
     _assert_json_contract(receipt)
+    invalid_receipt = {**receipt, "result": {"type": "totally_unknown", "secret": "accepted"}}
+    with pytest.raises(ValidationError):
+        _assert_json_contract(invalid_receipt)
     assert receipt["kind"] == "write_receipt"
     assert receipt["plan_fingerprint"] == plan["fingerprint"]
     return exit_code, receipt
@@ -99,6 +102,62 @@ def _execute_json_analysis(
     return exit_code, receipt
 
 
+def test_cli_renders_import_details_as_human_text_and_json_3(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    xml = (Path(__file__).parents[1] / "fixtures/v03/unsupported-import-content.xml").read_text(
+        encoding="utf-8"
+    )
+    package = tmp_path / "unsupported.zip"
+    with ZipFile(package, "w") as archive:
+        archive.writestr("apple_health_export/export.xml", xml)
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(package)
+        receipt = health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+    import_id = str(receipt.result.import_id)
+    common = [
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(config.synthetic_store),
+        "--real-store",
+        str(config.real_store),
+    ]
+
+    assert main([*common, "import-details", import_id]) == 0
+    human = capsys.readouterr().out
+    assert f"Import-ID: {import_id}" in human
+    assert "Kanonische Records im Paket: 1" in human
+    assert "workout_child · WorkoutEvent · 2" in human
+
+    assert main([*common, "import-details", import_id, "--json"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    _assert_json_contract(output)
+    assert output["schema_version"] == "3.0"
+    assert output["kind"] == "import_details"
+    assert output["canonical_counts"] == {
+        "anomaly_count": 0,
+        "logical_measurement_count": 1,
+        "measurement_version_count": 1,
+        "package_record_count": 1,
+        "record_count": 1,
+        "source_occurrence_count": 1,
+    }
+    assert output["unsupported_content"][-1] == {
+        "category": "workout_child",
+        "count": 2,
+        "external_identifier": "WorkoutEvent",
+    }
+
+    assert main([*common, "overview", "--json"]) == 0
+    overview = json.loads(capsys.readouterr().out)
+    _assert_json_contract(overview)
+    assert overview["schema_version"] == "3.0"
+
+
 @pytest.mark.v02_adapter(
     "cli",
     "CreateMetadataBackup",
@@ -119,9 +178,7 @@ def test_cli_maps_metadata_backup_without_exposing_its_path(
     ]
     target = tmp_path / "private" / "metadata.sqlite3"
     target.parent.mkdir()
-    with HealthLab.open(
-        RuntimeConfig(DataMode.REAL, tmp_path / "synthetic", tmp_path / "real")
-    ):
+    with HealthLab.open(RuntimeConfig(DataMode.REAL, tmp_path / "synthetic", tmp_path / "real")):
         pass
     args = [*common, "backup", str(target), "--json"]
     assert main(args) == 0
@@ -276,17 +333,20 @@ def test_cli_completes_restore_through_the_shared_import_command(
 
     assert main([*common, "restore", str(backup), "--json"]) == 0
     restore_plan = json.loads(capsys.readouterr().out)
-    assert main(
-        [
-            *common,
-            "restore",
-            str(backup),
-            "--json",
-            "--execute",
-            "--expect-plan",
-            restore_plan["fingerprint"],
-        ]
-    ) == 0
+    assert (
+        main(
+            [
+                *common,
+                "restore",
+                str(backup),
+                "--json",
+                "--execute",
+                "--expect-plan",
+                restore_plan["fingerprint"],
+            ]
+        )
+        == 0
+    )
     capsys.readouterr()
 
     exit_code, receipt = _execute_json_import(common, package, capsys)
@@ -526,9 +586,10 @@ def test_cli_maps_correction_inputs(
         "--real-store",
         str(tmp_path / "real"),
     ]
-    assert _execute_json_import(
-        common, personal_range_package(tmp_path / "personal.zip"), capsys
-    )[0] == 0
+    assert (
+        _execute_json_import(common, personal_range_package(tmp_path / "personal.zip"), capsys)[0]
+        == 0
+    )
     assert main([*common, "review", "--json"]) == 0
     case = json.loads(capsys.readouterr().out)["cases"][0]
     args = [
@@ -1017,7 +1078,7 @@ def test_cli_prints_empty_overview_as_versioned_json(
             "snapshot_count": 0,
         },
         "runtime_config": _EXPECTED_RUNTIME_CONFIG,
-        "schema_version": "1.0",
+        "schema_version": "3.0",
         "selection": {"end_date": None, "start_date": None},
         "status": "empty",
     }
@@ -1233,16 +1294,19 @@ def test_cli_maps_store_migration_plan_and_receipt(
     assert f"Betroffene Snapshots: {snapshot_ref}" in human_plan
     assert "Bestehende Analysen werden veraltet: ja" in human_plan
 
-    assert main(
-        [
-            *common,
-            "migrate",
-            "--json",
-            "--execute",
-            "--expect-plan",
-            plan["fingerprint"],
-        ]
-    ) == 0
+    assert (
+        main(
+            [
+                *common,
+                "migrate",
+                "--json",
+                "--execute",
+                "--expect-plan",
+                plan["fingerprint"],
+            ]
+        )
+        == 0
+    )
     receipt = json.loads(capsys.readouterr().out)
     _assert_json_contract(receipt)
     assert receipt["result"]["status"] == "completed"
@@ -1256,16 +1320,19 @@ def test_cli_maps_store_migration_plan_and_receipt(
     assert rollback_plan["details"]["target_version"] == 2
     assert rollback_plan["details"]["restored_snapshot_ref"] == snapshot_ref
 
-    assert main(
-        [
-            *common,
-            "rollback-migration",
-            "--json",
-            "--execute",
-            "--expect-plan",
-            rollback_plan["fingerprint"],
-        ]
-    ) == 0
+    assert (
+        main(
+            [
+                *common,
+                "rollback-migration",
+                "--json",
+                "--execute",
+                "--expect-plan",
+                rollback_plan["fingerprint"],
+            ]
+        )
+        == 0
+    )
     rollback_receipt = json.loads(capsys.readouterr().out)
     _assert_json_contract(rollback_receipt)
     assert rollback_receipt["result"]["status"] == "completed"

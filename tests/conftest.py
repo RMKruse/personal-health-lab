@@ -7,11 +7,13 @@ from typing import Any, get_args, get_type_hints
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
+from acceptance.v03_matrix_validator import validate_matrix as validate_v03_matrix
 
 import personal_health_lab.application as application
 from personal_health_lab.application import HealthLab, WritePlanDetails, WriteRequest, WriteResult
 
 _V02_MATRIX = Path(__file__).parent / "acceptance/v02_matrix.toml"
+_V03_MATRIX = Path(__file__).parent / "acceptance/v03_matrix.toml"
 _PROHIBITED_ACTIVE_MARKERS = {"skip", "skipif", "xfail", "flaky", "rerun", "reruns"}
 _READ_PROJECTION_METHODS = {
     "load_data_review",
@@ -46,6 +48,7 @@ _ADAPTER_VARIANTS |= {
     )
 }
 _ACTIVE_V02_NODES: set[str] = set()
+_ACTIVE_V03_NODES: set[str] = set()
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -61,11 +64,15 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     with _V02_MATRIX.open("rb") as source:
         cases = tomllib.load(source)["case"]
     runners = {case["runner"] for case in cases}
+    with _V03_MATRIX.open("rb") as source:
+        v03_matrix = tomllib.load(source)
+    v03_runners = {case["runner"] for case in v03_matrix["case"]}
     collected: dict[str, set[str]] = {}
     parity = {"cli": set(), "streamlit": set()}
     for item in items:
         runner = getattr(item, "originalname", None) or item.name.split("[", 1)[0]
-        collected.setdefault(runner, set()).add(item.nodeid.split("[", 1)[0])
+        node_id = item.nodeid.split("[", 1)[0]
+        collected.setdefault(runner, set()).add(node_id)
         if runner in runners:
             _ACTIVE_V02_NODES.add(item.nodeid)
             prohibited = _PROHIBITED_ACTIVE_MARKERS & {
@@ -75,6 +82,15 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
                 raise pytest.UsageError(
                     f"active V0.2 runner {runner} uses prohibited markers: {sorted(prohibited)}"
                 )
+        if node_id in v03_runners:
+            _ACTIVE_V03_NODES.add(item.nodeid)
+            prohibited = _PROHIBITED_ACTIVE_MARKERS & {
+                marker.name for marker in item.iter_markers()
+            }
+            if prohibited:
+                raise pytest.UsageError(
+                    f"active V0.3 runner {node_id} uses prohibited markers: {sorted(prohibited)}"
+                )
         for marker in item.iter_markers("v02_adapter"):
             side, *variants = marker.args
             if side not in parity:
@@ -83,14 +99,20 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
     missing = runners - collected.keys()
     duplicate = {
-        runner: nodes
-        for runner, nodes in collected.items()
-        if runner in runners and len(nodes) > 1
+        runner: nodes for runner, nodes in collected.items() if runner in runners and len(nodes) > 1
     }
     if missing or duplicate:
         raise pytest.UsageError(
             f"invalid V0.2 runner registry; missing={sorted(missing)}, duplicate={duplicate}"
         )
+    try:
+        validate_v03_matrix(
+            v03_matrix,
+            root=Path(__file__).parents[1],
+            collected_node_ids=[item.nodeid for item in items],
+        )
+    except AssertionError as error:
+        raise pytest.UsageError(str(error)) from error
     for side, variants in parity.items():
         if variants != _ADAPTER_VARIANTS:
             raise pytest.UsageError(
@@ -101,14 +123,12 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 
 @pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_makereport(
-    item: pytest.Item, call: pytest.CallInfo[Any]
-) -> Any:
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[Any]) -> Any:
     outcome = yield
     report = outcome.get_result()
-    if item.nodeid in _ACTIVE_V02_NODES and report.skipped:
+    if item.nodeid in _ACTIVE_V02_NODES | _ACTIVE_V03_NODES and report.skipped:
         report.outcome = "failed"
-        report.longrepr = f"active V0.2 runner skipped during {report.when}: {item.nodeid}"
+        report.longrepr = f"active matrix runner skipped during {report.when}: {item.nodeid}"
 
 
 @pytest.fixture

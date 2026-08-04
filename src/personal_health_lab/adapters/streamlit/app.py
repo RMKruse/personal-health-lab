@@ -31,7 +31,9 @@ from personal_health_lab.application import (
     DataReviewSelection,
     HealthLab,
     HealthLabError,
+    ImportDetails,
     ImportHealthExport,
+    ImportId,
     ImportReceipt,
     ImportStatus,
     LocalMeasurementExclusion,
@@ -149,6 +151,8 @@ def _render_health_import(config: RuntimeConfig) -> None:
                 )
             import_result = write_receipt.result
             st.session_state["last_import_status"] = import_result.status
+            if isinstance(import_result, ImportReceipt):
+                st.session_state["last_import_id"] = str(import_result.import_id)
             st.session_state["last_import_snapshot"] = (
                 str(import_result.snapshot_ref or "-")
                 if isinstance(import_result, ImportReceipt)
@@ -173,6 +177,42 @@ def _render_health_import(config: RuntimeConfig) -> None:
         st.rerun()
 
 
+def _render_import_details(config: RuntimeConfig) -> None:
+    st.subheader("Importdetails")
+    import_id = st.text_input("Import-ID", value=st.session_state.get("last_import_id", ""))
+    if st.button("Importdetails laden", disabled=not import_id):
+        try:
+            with HealthLab.open(config) as health_lab:
+                st.session_state["import_details"] = health_lab.load_import_details(
+                    ImportId(import_id)
+                )
+        except (ValueError, ConfigurationError, HealthLabError):
+            st.error("Importdetails konnten nicht geladen werden.")
+    details = st.session_state.get("import_details")
+    if not isinstance(details, ImportDetails):
+        return
+    counts = details.canonical_counts
+    st.caption(f"Kanonische Records im Paket: {counts.package_record_count}")
+    st.caption(f"Neu importierte Records: {counts.record_count}")
+    st.caption(
+        f"Logische Messungen: {counts.logical_measurement_count} · "
+        f"Messungsversionen: {counts.measurement_version_count} · "
+        f"Quellvorkommen: {counts.source_occurrence_count} · "
+        f"Anomalien: {counts.anomaly_count}"
+    )
+    st.dataframe(
+        [
+            {
+                "Kategorie": item.category.value,
+                "Externer Bezeichner": item.external_identifier,
+                "Anzahl": item.count,
+            }
+            for item in details.unsupported_content
+        ],
+        width="stretch",
+    )
+
+
 def _discard_pending_previews() -> None:
     import_request = st.session_state.get("import_request")
     if isinstance(import_request, ImportHealthExport):
@@ -190,7 +230,7 @@ except (KeyError, ValueError, ConfigurationError):
 
 st.radio(
     "Seite",
-    ("Übersicht", "Datenprüfung"),
+    ("Übersicht", "Datenprüfung", "Kerndaten"),
     key="active_page",
     horizontal=True,
     on_change=_discard_pending_previews,
@@ -220,8 +260,7 @@ if workspace_status.state is WorkspaceState.MIGRATION_REQUIRED:
         st.stop()
     st.subheader("Datenspeichermigration")
     st.caption(
-        f"Schema: {migration_diagnostics.source_version} → "
-        f"{migration_diagnostics.target_version}"
+        f"Schema: {migration_diagnostics.source_version} → {migration_diagnostics.target_version}"
     )
     st.caption(
         "Schritte: "
@@ -293,10 +332,7 @@ if workspace_status.state is WorkspaceState.RESTORE_PENDING:
     st.caption(
         "Migrationsschritte: "
         + (
-            ", ".join(
-                f"{source} → {target}"
-                for source, target in recovery_status.migration_steps
-            )
+            ", ".join(f"{source} → {target}" for source, target in recovery_status.migration_steps)
             or "-"
         )
     )
@@ -352,6 +388,10 @@ if rollback_plan.details.migration_operation_id is not None:
         except HealthLabError:
             st.error("Migrationsrollback konnte nicht ausgeführt werden.")
 
+if st.session_state["active_page"] == "Kerndaten":
+    _render_import_details(config)
+    st.stop()
+
 _render_health_import(config)
 
 with st.expander("Sicherung & Wiederherstellung"):
@@ -381,8 +421,7 @@ with st.expander("Sicherung & Wiederherstellung"):
             f"Zieldatei: {backup_plan.details.target_file}"
         )
         st.caption(
-            "Bestätigungen: "
-            + (", ".join(item.value for item in backup_plan.confirmations) or "-")
+            "Bestätigungen: " + (", ".join(item.value for item in backup_plan.confirmations) or "-")
         )
         if st.button(
             "Metadatensicherung ausführen",
@@ -584,9 +623,7 @@ if data_review.cases:
     batch_note = st.text_input("Optionale Sammelnotiz")
     if st.button("Sammelbestätigung prüfen"):
         assert batch_kind is not None
-        batch_request = ConfirmDataReviewBatch(
-            DataReviewSelection(batch_kind), batch_note or None
-        )
+        batch_request = ConfirmDataReviewBatch(DataReviewSelection(batch_kind), batch_note or None)
         with HealthLab.open(config) as health_lab:
             st.session_state["review_plan"] = health_lab.preview_write(batch_request)
         st.session_state["review_request"] = batch_request
@@ -686,14 +723,10 @@ if data_review.cases:
                 assert case.measurement_version_id is not None
                 review_request_local = ResolveDataReviewCase(
                     case.case_id,
-                    SourceValueAcceptance(
-                        case.measurement_version_id, decision_note or None
-                    ),
+                    SourceValueAcceptance(case.measurement_version_id, decision_note or None),
                 )
                 with HealthLab.open(config) as health_lab:
-                    st.session_state["review_plan"] = health_lab.preview_write(
-                        review_request_local
-                    )
+                    st.session_state["review_plan"] = health_lab.preview_write(review_request_local)
                 st.session_state["review_request"] = review_request_local
                 st.rerun()
         if case.measurement_version_id is not None and case.kind.value in {

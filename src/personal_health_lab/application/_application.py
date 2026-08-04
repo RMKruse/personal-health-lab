@@ -203,6 +203,39 @@ class ImportStatus(StrEnum):
     STORE_BUSY = "store_busy"
 
 
+class UnsupportedContentCategory(StrEnum):
+    RECORD_TYPE = "record_type"
+    SLEEP_VALUE = "sleep_value"
+    TOP_LEVEL_ELEMENT = "top_level_element"
+    UNIT = "unit"
+    WORKOUT_ACTIVITY_TYPE = "workout_activity_type"
+    WORKOUT_CHILD = "workout_child"
+
+
+@dataclass(frozen=True, slots=True)
+class ImportCanonicalCounts:
+    package_record_count: int
+    record_count: int
+    logical_measurement_count: int
+    measurement_version_count: int
+    source_occurrence_count: int
+    anomaly_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ImportContentCount:
+    category: UnsupportedContentCategory
+    external_identifier: str
+    count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ImportDetails:
+    import_id: ImportId
+    canonical_counts: ImportCanonicalCounts
+    unsupported_content: tuple[ImportContentCount, ...]
+
+
 @dataclass(frozen=True, slots=True)
 class PlanFingerprint:
     _value: str
@@ -678,9 +711,7 @@ def _data_review_batch_match_payload(match: DataReviewBatchMatch) -> dict[str, o
         "case_id": str(match.case_id),
         "kind": match.kind.value,
         "measurement_version_id": (
-            None
-            if match.measurement_version_id is None
-            else str(match.measurement_version_id)
+            None if match.measurement_version_id is None else str(match.measurement_version_id)
         ),
         "rule_version_id": match.rule_version_id,
         "evidence_fingerprint": match.evidence_fingerprint,
@@ -1305,9 +1336,8 @@ class HealthLab:
         plan_diagnostics = diagnostics.diagnostics
         if capacity is not None and capacity.status is not CapacityStatus.READY:
             plan_diagnostics += (
-                "capacity_" + (
-                    capacity.reason.value if capacity.reason is not None else capacity.status.value
-                ),
+                "capacity_"
+                + (capacity.reason.value if capacity.reason is not None else capacity.status.value),
             )
         active_snapshot = self._store.load_active_snapshot_id()
         affected_snapshot_refs = () if active_snapshot is None else (active_snapshot,)
@@ -1373,9 +1403,7 @@ class HealthLab:
         facts = self._store.load_migration_rollback_facts()
         diagnostics = plan_migration_rollback(facts)
         details = RollbackMigrationPlan(
-            migration_operation_id=(
-                None if facts is None else facts.migration_operation_id
-            ),
+            migration_operation_id=(None if facts is None else facts.migration_operation_id),
             source_version=None if facts is None else facts.post_migration_version,
             target_version=None if facts is None else facts.pre_migration_version,
             backup_file=None if facts is None else facts.backup_file,
@@ -1387,9 +1415,7 @@ class HealthLab:
             "backup_file": details.backup_file,
             "backup_sha256": details.backup_sha256,
             "current_snapshot_ref": (
-                None
-                if details.current_snapshot_ref is None
-                else str(details.current_snapshot_ref)
+                None if details.current_snapshot_ref is None else str(details.current_snapshot_ref)
             ),
             "diagnostics": diagnostics,
             "migration_operation_id": (
@@ -1473,8 +1499,7 @@ class HealthLab:
             description = describe_metadata_backup(self._store, request.target_path)
             filevault = filevault_override or probe_filevault(request.target_path.parent)
             capacity = capacity_override or preflight_metadata_backup(
-                self._store,
-                request.target_path
+                self._store, request.target_path
             )
         except StoreError as error:
             raise HealthLabError("Metadatensicherung konnte nicht geplant werden.") from error
@@ -1485,8 +1510,7 @@ class HealthLab:
             ()
             if capacity.status is CapacityStatus.READY
             else (
-                "capacity_"
-                + (capacity.reason.value if capacity.reason else capacity.status.value),
+                "capacity_" + (capacity.reason.value if capacity.reason else capacity.status.value),
             )
         )
         blocked = capacity.status is not CapacityStatus.READY
@@ -1873,10 +1897,7 @@ class HealthLab:
             with request.package_path.open("rb") as package:
                 package_hash = hashlib.file_digest(package, "sha256").hexdigest()
             unavailable = False
-            if (
-                workspace.state is WorkspaceState.RESTORE_PENDING
-                and self._store is not None
-            ):
+            if workspace.state is WorkspaceState.RESTORE_PENDING and self._store is not None:
                 restore = inspect_restore_health_export(
                     request.package_path,
                     store=self._store,
@@ -2311,10 +2332,7 @@ class HealthLab:
                     max_uncompressed_bytes=self._config.max_import_uncompressed_bytes,
                     max_compression_ratio=self._config.max_import_compression_ratio,
                 )
-                if (
-                    restore.sources.state_hash
-                    != authorization_plan.details.restore_state_hash
-                ):
+                if restore.sources.state_hash != authorization_plan.details.restore_state_hash:
                     return self._not_started_with_preflight(
                         authorization_plan,
                         WriteNotStartedStatus.PLAN_CHANGED,
@@ -2447,9 +2465,7 @@ class HealthLab:
                     capacity=final_capacity,
                 )
             assert plan.details.backup_file is not None
-            writer.migrate_store_schema(
-                plan.details.steps, plan.details.backup_file, operation_id
-            )
+            writer.migrate_store_schema(plan.details.steps, plan.details.backup_file, operation_id)
         except StoreError as error:
             diagnostic = str(error)
             if diagnostic not in {"migration_backup_failed", "migration_validation_failed"}:
@@ -2533,9 +2549,7 @@ class HealthLab:
                 else WriteNotStartedStatus.BLOCKED
             )
             diagnostic = (
-                "plan_changed"
-                if status is WriteNotStartedStatus.PLAN_CHANGED
-                else str(error)
+                "plan_changed" if status is WriteNotStartedStatus.PLAN_CHANGED else str(error)
             )
             return self._not_started(plan, status, (diagnostic,), expected_plan)
         finally:
@@ -2602,8 +2616,7 @@ class HealthLab:
             current = describe_metadata_backup(writer, request.target_path)
             if (
                 current.backup_id != plan.details.backup_id
-                or current.canonical_content_sha256
-                != plan.details.canonical_content_sha256
+                or current.canonical_content_sha256 != plan.details.canonical_content_sha256
                 or current.audit_max_position != plan.details.audit_max_position
             ):
                 return self._not_started_with_preflight(
@@ -2993,10 +3006,14 @@ class HealthLab:
                     version = writer.load_measurement_version_fact(
                         resolution.measurement_version_id
                     )
-                    if version is None or (
-                        case is not None
-                        and case.measurement_version_id != resolution.measurement_version_id
-                    ) or resolution.unit.value != version.canonical_unit:
+                    if (
+                        version is None
+                        or (
+                            case is not None
+                            and case.measurement_version_id != resolution.measurement_version_id
+                        )
+                        or resolution.unit.value != version.canonical_unit
+                    ):
                         return self._not_started(
                             plan,
                             WriteNotStartedStatus.BLOCKED,
@@ -3121,10 +3138,7 @@ class HealthLab:
                         writer.load_open_data_review_cases(),
                         key=lambda item: item.review_case_id,
                     )
-                    if (
-                        request.selection.kind is None
-                        or case.kind == request.selection.kind.value
-                    )
+                    if (request.selection.kind is None or case.kind == request.selection.kind.value)
                     and case.kind in {"plausibility", "continued_override"}
                     for detail in (load_review_case_detail(writer, case.review_case_id),)
                     if case.kind == "plausibility" or detail.reasons
@@ -3143,10 +3157,7 @@ class HealthLab:
                         None if request.selection.kind is None else request.selection.kind.value
                     ),
                     materialized_matches=json.dumps(
-                        [
-                            _data_review_batch_match_payload(item)
-                            for item in plan.details.matches
-                        ],
+                        [_data_review_batch_match_payload(item) for item in plan.details.matches],
                         sort_keys=True,
                         separators=(",", ":"),
                     ),
@@ -3279,8 +3290,7 @@ class HealthLab:
                 config_schema_version=request.schema_version,
                 expected_snapshot_id=plan.details.base_snapshot_ref,
                 open_review_case_ids=tuple(
-                    str(case.case_id)
-                    for case in self.load_data_review(DataReviewSelection()).cases
+                    str(case.case_id) for case in self.load_data_review(DataReviewSelection()).cases
                 ),
             )
         except AnalysisInputChanged:
@@ -3329,6 +3339,37 @@ class HealthLab:
         reader = self._require_open()
         return reader.load(selection)
 
+    def load_import_details(self, import_id: ImportId) -> ImportDetails:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        try:
+            stored = self._store.load_import_details(import_id)
+        except StoreError as error:
+            raise HealthLabError("Importdetails sind nicht verfügbar.") from error
+        if stored is None:
+            raise ConfigurationError("Import-ID ist unbekannt.")
+        return ImportDetails(
+            import_id,
+            ImportCanonicalCounts(
+                stored.package_record_count,
+                stored.record_count,
+                stored.logical_measurement_count,
+                stored.measurement_version_count,
+                stored.source_occurrence_count,
+                stored.anomaly_count,
+            ),
+            tuple(
+                ImportContentCount(
+                    UnsupportedContentCategory(item.category),
+                    item.external_identifier,
+                    item.count,
+                )
+                for item in stored.unsupported_content
+            ),
+        )
+
     def load_data_review(self, selection: DataReviewSelection) -> DataReview:
         self._require_ready()
         self._require_open()
@@ -3348,9 +3389,7 @@ class HealthLab:
             if kind == "continued_override":
                 detail = load_review_case_detail(store, case.review_case_id)
                 first = (
-                    DataReviewAction.CONFIRM
-                    if detail.reasons
-                    else DataReviewAction.ACCEPT_SOURCE
+                    DataReviewAction.CONFIRM if detail.reasons else DataReviewAction.ACCEPT_SOURCE
                 )
                 return (
                     first,

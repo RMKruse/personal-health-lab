@@ -44,8 +44,10 @@ from personal_health_lab.application import (
     HealthLab,
     HistoricalReviewPlan,
     HistoricalReviewReceipt,
+    ImportDetails,
     ImportHealthExport,
     ImportHealthExportPlan,
+    ImportId,
     ImportReceipt,
     ImportStatus,
     LocalMeasurementExclusion,
@@ -89,6 +91,8 @@ from personal_health_lab.application import (
     WriteRequest,
 )
 
+_OUTPUT_SCHEMA_VERSION = "3.0"
+
 
 def _provenance_json(provenance: AnalysisProvenance | None) -> dict[str, object] | None:
     if provenance is None:
@@ -121,6 +125,9 @@ def _parser() -> argparse.ArgumentParser:
     import_command.add_argument("--json", action="store_true", dest="as_json")
     import_command.add_argument("--execute", action="store_true")
     import_command.add_argument("--expect-plan", type=PlanFingerprint)
+    import_details = commands.add_parser("import-details", help="Importdetails laden")
+    import_details.add_argument("import_id", type=ImportId)
+    import_details.add_argument("--json", action="store_true", dest="as_json")
     analysis = commands.add_parser("analyze", help="Verzögerungsprofil analysieren")
     analysis.add_argument("--definition", default="lag-signal-v2")
     analysis.add_argument("--start-date", type=date.fromisoformat)
@@ -206,9 +213,7 @@ def _parser() -> argparse.ArgumentParser:
     abort_restore.add_argument("--json", action="store_true", dest="as_json")
     abort_restore.add_argument("--execute", action="store_true")
     abort_restore.add_argument("--expect-plan", type=PlanFingerprint)
-    recovery_status = commands.add_parser(
-        "recovery-status", help="Wiederherstellungsstatus laden"
-    )
+    recovery_status = commands.add_parser("recovery-status", help="Wiederherstellungsstatus laden")
     recovery_status.add_argument("--json", action="store_true", dest="as_json")
     return parser
 
@@ -352,9 +357,7 @@ def _analysis_json(result: RestingHeartRateAnalysisResult | None) -> dict[str, o
     cumulative = result.cumulative_association
     return {
         "analysis_definition_id": str(result.analysis_definition_id),
-        "completed_at": (
-            None if result.completed_at is None else result.completed_at.isoformat()
-        ),
+        "completed_at": (None if result.completed_at is None else result.completed_at.isoformat()),
         "cumulative_association": {
             "direction": cumulative.direction.value,
             "estimate_per_100_kcal": cumulative.estimate_per_100_kcal,
@@ -372,9 +375,7 @@ def _analysis_json(result: RestingHeartRateAnalysisResult | None) -> dict[str, o
             "model_readiness": result.diagnostics.model_readiness,
             "input_completeness": result.diagnostics.input_completeness,
             "outcome_standard_deviation": result.diagnostics.outcome_standard_deviation,
-            "maximum_time_series_gap_days": (
-                result.diagnostics.maximum_time_series_gap_days
-            ),
+            "maximum_time_series_gap_days": (result.diagnostics.maximum_time_series_gap_days),
         },
         "data_status": result.data_status.value,
         "status_facts_recorded": result.status_facts_recorded,
@@ -416,17 +417,13 @@ def _analysis_json(result: RestingHeartRateAnalysisResult | None) -> dict[str, o
             "bootstrap_method": result.methodology.bootstrap_method,
             "interval_level": result.methodology.interval_level,
             "max_feature_dependency": result.methodology.max_feature_dependency,
-            "minimum_bootstrap_success_rate": (
-                result.methodology.minimum_bootstrap_success_rate
-            ),
+            "minimum_bootstrap_success_rate": (result.methodology.minimum_bootstrap_success_rate),
             "minimum_input_completeness": result.methodology.minimum_input_completeness,
             "minimum_observations": result.methodology.minimum_observations,
             "minimum_outcome_standard_deviation": (
                 result.methodology.minimum_outcome_standard_deviation
             ),
-            "maximum_time_series_gap_days": (
-                result.methodology.maximum_time_series_gap_days
-            ),
+            "maximum_time_series_gap_days": (result.methodology.maximum_time_series_gap_days),
             "random_seed": result.methodology.random_seed,
             "resample_count": result.methodology.resample_count,
             "ridge_penalty": result.methodology.ridge_penalty,
@@ -450,6 +447,34 @@ def _workspace_json(status: WorkspaceStatus) -> dict[str, object]:
     }
 
 
+def _import_details_json(
+    details: ImportDetails, runtime_config: Mapping[str, object]
+) -> dict[str, object]:
+    counts = details.canonical_counts
+    return {
+        "canonical_counts": {
+            "anomaly_count": counts.anomaly_count,
+            "logical_measurement_count": counts.logical_measurement_count,
+            "measurement_version_count": counts.measurement_version_count,
+            "package_record_count": counts.package_record_count,
+            "record_count": counts.record_count,
+            "source_occurrence_count": counts.source_occurrence_count,
+        },
+        "import_id": str(details.import_id),
+        "kind": "import_details",
+        "runtime_config": dict(runtime_config),
+        "schema_version": _OUTPUT_SCHEMA_VERSION,
+        "unsupported_content": [
+            {
+                "category": item.category.value,
+                "count": item.count,
+                "external_identifier": item.external_identifier,
+            }
+            for item in details.unsupported_content
+        ],
+    }
+
+
 def _recovery_status_json(
     status: RecoveryStatus,
     runtime_config: Mapping[str, object],
@@ -469,7 +494,7 @@ def _recovery_status_json(
             "working_copy_sha256": status.working_copy_sha256,
         },
         "runtime_config": dict(runtime_config),
-        "schema_version": "2.0",
+        "schema_version": _OUTPUT_SCHEMA_VERSION,
         "workspace": _workspace_json(workspace),
     }
 
@@ -551,9 +576,7 @@ def _write_plan_json(
         request_json = {"type": "abort_metadata_restore"}
     elif isinstance(details, StoreMigrationPlan):
         detail_json = {
-            "affected_snapshot_refs": tuple(
-                str(item) for item in details.affected_snapshot_refs
-            ),
+            "affected_snapshot_refs": tuple(str(item) for item in details.affected_snapshot_refs),
             "backup_file": details.backup_file,
             "existing_analyses_become_stale": details.existing_analyses_become_stale,
             "source_version": details.source_version,
@@ -567,9 +590,7 @@ def _write_plan_json(
             "backup_file": details.backup_file,
             "backup_sha256": details.backup_sha256,
             "current_snapshot_ref": (
-                None
-                if details.current_snapshot_ref is None
-                else str(details.current_snapshot_ref)
+                None if details.current_snapshot_ref is None else str(details.current_snapshot_ref)
             ),
             "migration_operation_id": (
                 None
@@ -684,7 +705,7 @@ def _write_plan_json(
         },
         "request": request_json,
         "runtime_config": dict(runtime_config),
-        "schema_version": "2.0",
+        "schema_version": _OUTPUT_SCHEMA_VERSION,
         "workspace": _workspace_json(workspace),
     }
 
@@ -747,9 +768,7 @@ def _write_receipt_json(
             "diagnostics": result.diagnostics,
             "migration_operation_id": str(result.migration_operation_id),
             "restored_snapshot_ref": (
-                None
-                if result.restored_snapshot_ref is None
-                else str(result.restored_snapshot_ref)
+                None if result.restored_snapshot_ref is None else str(result.restored_snapshot_ref)
             ),
             "source_version": result.source_version,
             "status": result.status.value,
@@ -830,7 +849,7 @@ def _write_receipt_json(
         "plan_fingerprint": str(receipt.plan_fingerprint),
         "result": result_json,
         "runtime_config": dict(runtime_config),
-        "schema_version": "2.0",
+        "schema_version": _OUTPUT_SCHEMA_VERSION,
     }
 
 
@@ -843,9 +862,13 @@ def _print_write_plan(plan: WritePlan, workspace: WorkspaceStatus) -> None:
     print("Bestätigungen: " + (", ".join(plan.confirmations) or "-"))
     if isinstance(plan.details, StoreMigrationPlan):
         migration = plan.details
-        chain = " -> ".join(
-            [str(migration.steps[0][0]), *(str(target) for _, target in migration.steps)]
-        ) if migration.steps else "-"
+        chain = (
+            " -> ".join(
+                [str(migration.steps[0][0]), *(str(target) for _, target in migration.steps)]
+            )
+            if migration.steps
+            else "-"
+        )
         print(f"Migrationskette: {chain}")
         print(f"Migrationssicherung: {migration.backup_file or '-'}")
         print(
@@ -860,9 +883,7 @@ def _print_write_plan(plan: WritePlan, workspace: WorkspaceStatus) -> None:
         rollback = plan.details
         print(f"Zurückzurollende Migration: {rollback.migration_operation_id or '-'}")
         print(f"Migrationssicherung: {rollback.backup_file or '-'}")
-        print(
-            f"Schema: {rollback.source_version or '-'} -> {rollback.target_version or '-'}"
-        )
+        print(f"Schema: {rollback.source_version or '-'} -> {rollback.target_version or '-'}")
         print(f"Wiederhergestellter Snapshot: {rollback.restored_snapshot_ref or '-'}")
         print(f"Unreferenzierter Snapshot: {rollback.current_snapshot_ref or '-'}")
     elif isinstance(plan.details, MetadataRestorePlan):
@@ -876,9 +897,7 @@ def _print_write_plan(plan: WritePlan, workspace: WorkspaceStatus) -> None:
         print(
             "Migrationsschritte: "
             + (
-                ", ".join(
-                    f"{source} -> {target}" for source, target in restore.migration_steps
-                )
+                ", ".join(f"{source} -> {target}" for source, target in restore.migration_steps)
                 or "-"
             )
         )
@@ -951,8 +970,10 @@ def main(args: Sequence[str] | None = None) -> int:
     if parsed.command == "review-resolve" and (
         (parsed.correct is not None and (parsed.unit is None or not parsed.reason))
         or (parsed.exclude_local and (parsed.case_id is None or not parsed.reason))
-        or ((parsed.correct is not None or parsed.exclude_local or parsed.accept_source)
-            and parsed.measurement_version is None)
+        or (
+            (parsed.correct is not None or parsed.exclude_local or parsed.accept_source)
+            and parsed.measurement_version is None
+        )
         or (parsed.case_id is None and parsed.correct is None)
     ):
         parser.error("Messung, Einheit, Prüffall oder Pflichtgrund fehlt.")
@@ -973,6 +994,8 @@ def main(args: Sequence[str] | None = None) -> int:
             workspace_status = health_lab.load_workspace_status()
             if parsed.command == "recovery-status":
                 recovery_status = health_lab.load_recovery_status()
+            elif parsed.command == "import-details":
+                import_details = health_lab.load_import_details(parsed.import_id)
             elif parsed.command == "restore":
                 restore_request = BeginMetadataRestore(parsed.backup)
                 restore_plan = health_lab.preview_write(restore_request)
@@ -984,13 +1007,9 @@ def main(args: Sequence[str] | None = None) -> int:
                     )
                 elif not parsed.as_json:
                     _print_write_plan(restore_plan, workspace_status)
-                    if (
-                        restore_plan.approval.status is not WriteApprovalStatus.BLOCKED
-                        and input("Metadatenwiederherstellung beginnen? [j/N] ")
-                        .strip()
-                        .lower()
-                        in {"j", "ja"}
-                    ):
+                    if restore_plan.approval.status is not WriteApprovalStatus.BLOCKED and input(
+                        "Metadatenwiederherstellung beginnen? [j/N] "
+                    ).strip().lower() in {"j", "ja"}:
                         restore_write_receipt = health_lab.execute_write(
                             restore_request, expected_plan=restore_plan.fingerprint
                         )
@@ -1048,11 +1067,9 @@ def main(args: Sequence[str] | None = None) -> int:
                     )
                 elif not parsed.as_json:
                     _print_write_plan(migration_plan, workspace_status)
-                    if (
-                        migration_plan.approval.status is not WriteApprovalStatus.BLOCKED
-                        and input("Datenspeichermigration ausführen? [j/N] ").strip().lower()
-                        in {"j", "ja"}
-                    ):
+                    if migration_plan.approval.status is not WriteApprovalStatus.BLOCKED and input(
+                        "Datenspeichermigration ausführen? [j/N] "
+                    ).strip().lower() in {"j", "ja"}:
                         migration_write_receipt = health_lab.execute_write(
                             migration_request, expected_plan=migration_plan.fingerprint
                         )
@@ -1067,11 +1084,9 @@ def main(args: Sequence[str] | None = None) -> int:
                     )
                 elif not parsed.as_json:
                     _print_write_plan(rollback_plan, workspace_status)
-                    if (
-                        rollback_plan.approval.status is not WriteApprovalStatus.BLOCKED
-                        and input("Letzte Migration zurückrollen? [j/N] ").strip().lower()
-                        in {"j", "ja"}
-                    ):
+                    if rollback_plan.approval.status is not WriteApprovalStatus.BLOCKED and input(
+                        "Letzte Migration zurückrollen? [j/N] "
+                    ).strip().lower() in {"j", "ja"}:
                         rollback_write_receipt = health_lab.execute_write(
                             rollback_request, expected_plan=rollback_plan.fingerprint
                         )
@@ -1086,11 +1101,9 @@ def main(args: Sequence[str] | None = None) -> int:
                     )
                 elif not parsed.as_json:
                     _print_write_plan(backup_plan, workspace_status)
-                    if (
-                        backup_plan.approval.status is not WriteApprovalStatus.BLOCKED
-                        and input("Metadatensicherung schreiben? [j/N] ").strip().lower()
-                        in {"j", "ja"}
-                    ):
+                    if backup_plan.approval.status is not WriteApprovalStatus.BLOCKED and input(
+                        "Metadatensicherung schreiben? [j/N] "
+                    ).strip().lower() in {"j", "ja"}:
                         backup_write_receipt = health_lab.execute_write(
                             backup_request, expected_plan=backup_plan.fingerprint
                         )
@@ -1178,9 +1191,7 @@ def main(args: Sequence[str] | None = None) -> int:
                                             parsed.conflict_strategy,
                                             None
                                             if parsed.preferred_version is None
-                                            else MeasurementVersionId(
-                                                parsed.preferred_version
-                                            ),
+                                            else MeasurementVersionId(parsed.preferred_version),
                                             parsed.note,
                                         )
                                     )
@@ -1225,13 +1236,9 @@ def main(args: Sequence[str] | None = None) -> int:
                             for item in decision_plan.details.matches
                         )
                     )
-                    if (
-                        decision_plan.approval.status is not WriteApprovalStatus.BLOCKED
-                        and input(
-                            f"{decision_plan.details.count} Datenprüffälle bestätigen? [j/N] "
-                        ).strip().lower()
-                        in {"j", "ja"}
-                    ):
+                    if decision_plan.approval.status is not WriteApprovalStatus.BLOCKED and input(
+                        f"{decision_plan.details.count} Datenprüffälle bestätigen? [j/N] "
+                    ).strip().lower() in {"j", "ja"}:
                         decision_write_receipt = health_lab.execute_write(
                             decision_request, expected_plan=decision_plan.fingerprint
                         )
@@ -1277,11 +1284,9 @@ def main(args: Sequence[str] | None = None) -> int:
                     )
                 elif not parsed.as_json:
                     _print_write_plan(analysis_plan, workspace_status)
-                    if (
-                        analysis_plan.approval.status is not WriteApprovalStatus.BLOCKED
-                        and input("Ruhepulsanalyse ausführen? [j/N] ").strip().lower()
-                        in {"j", "ja"}
-                    ):
+                    if analysis_plan.approval.status is not WriteApprovalStatus.BLOCKED and input(
+                        "Ruhepulsanalyse ausführen? [j/N] "
+                    ).strip().lower() in {"j", "ja"}:
                         analysis_write_receipt = health_lab.execute_write(
                             analysis_request, expected_plan=analysis_plan.fingerprint
                         )
@@ -1315,7 +1320,26 @@ def main(args: Sequence[str] | None = None) -> int:
     }
     if not parsed.as_json:
         print("Konfiguration: " + json.dumps(runtime_config, ensure_ascii=False, sort_keys=True))
-    if parsed.command == "recovery-status" and parsed.as_json:
+    if parsed.command == "import-details" and parsed.as_json:
+        print(
+            json.dumps(
+                _import_details_json(import_details, runtime_config),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    elif parsed.command == "import-details":
+        counts = import_details.canonical_counts
+        print(f"Import-ID: {import_details.import_id}")
+        print(f"Kanonische Records im Paket: {counts.package_record_count}")
+        print(f"Neu importierte Records: {counts.record_count}")
+        print(f"Logische Messungen: {counts.logical_measurement_count}")
+        print(f"Messungsversionen: {counts.measurement_version_count}")
+        print(f"Quellvorkommen: {counts.source_occurrence_count}")
+        print(f"Anomalien: {counts.anomaly_count}")
+        for content in import_details.unsupported_content:
+            print(f"{content.category.value} · {content.external_identifier} · {content.count}")
+    elif parsed.command == "recovery-status" and parsed.as_json:
         print(
             json.dumps(
                 _recovery_status_json(recovery_status, runtime_config, workspace_status),
@@ -1493,11 +1517,15 @@ def main(args: Sequence[str] | None = None) -> int:
             _print_write_plan(historical_plan, workspace_status)
         else:
             print(f"Historische Datenprüfung: {historical_write_receipt.result.status.value}")
-    elif parsed.command in {
-        "review-confirm-batch",
-        "review-resolve",
-        "review-revoke",
-    } and parsed.as_json:
+    elif (
+        parsed.command
+        in {
+            "review-confirm-batch",
+            "review-resolve",
+            "review-revoke",
+        }
+        and parsed.as_json
+    ):
         output = (
             _write_plan_json(decision_plan, runtime_config, workspace_status)
             if decision_write_receipt is None
@@ -1526,7 +1554,7 @@ def main(args: Sequence[str] | None = None) -> int:
                 {
                     **_plausibility_rules_json(plausibility_rules),
                     "runtime_config": runtime_config,
-                    "schema_version": "2.0",
+                    "schema_version": _OUTPUT_SCHEMA_VERSION,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -1545,7 +1573,7 @@ def main(args: Sequence[str] | None = None) -> int:
                 {
                     **_data_review_json(data_review, data_review_details),
                     "runtime_config": runtime_config,
-                    "schema_version": "2.0",
+                    "schema_version": _OUTPUT_SCHEMA_VERSION,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -1600,9 +1628,7 @@ def main(args: Sequence[str] | None = None) -> int:
                     "analysis_history": [
                         _analysis_json(result) for result in overview.analysis_history
                     ],
-                    "last_reviewed_analysis": _analysis_json(
-                        overview.last_reviewed_analysis
-                    ),
+                    "last_reviewed_analysis": _analysis_json(overview.last_reviewed_analysis),
                     "resting_hr_analysis": _analysis_json(overview.resting_hr_analysis),
                     "provenance": {
                         "import_count": overview.import_count,
@@ -1613,7 +1639,7 @@ def main(args: Sequence[str] | None = None) -> int:
                         "snapshot_count": overview.snapshot_count,
                     },
                     "runtime_config": runtime_config,
-                    "schema_version": overview.schema_version,
+                    "schema_version": _OUTPUT_SCHEMA_VERSION,
                     "selection": {
                         "end_date": (
                             overview.selection.end_date.isoformat()
@@ -1656,21 +1682,11 @@ def main(args: Sequence[str] | None = None) -> int:
             return 3 if isinstance(restore_write_receipt.result, WriteNotStarted) else 0
         if parsed.command == "abort-restore":
             if abort_restore_write_receipt is None:
-                return (
-                    3
-                    if abort_restore_plan.approval.status is WriteApprovalStatus.BLOCKED
-                    else 0
-                )
-            return (
-                3 if isinstance(abort_restore_write_receipt.result, WriteNotStarted) else 0
-            )
+                return 3 if abort_restore_plan.approval.status is WriteApprovalStatus.BLOCKED else 0
+            return 3 if isinstance(abort_restore_write_receipt.result, WriteNotStarted) else 0
         if parsed.command == "migrate":
             if migration_write_receipt is None:
-                return (
-                    3
-                    if migration_plan.approval.status is WriteApprovalStatus.BLOCKED
-                    else 0
-                )
+                return 3 if migration_plan.approval.status is WriteApprovalStatus.BLOCKED else 0
             return 3 if isinstance(migration_write_receipt.result, WriteNotStarted) else 0
         if parsed.command == "rollback-migration":
             if rollback_write_receipt is None:

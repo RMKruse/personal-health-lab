@@ -142,8 +142,9 @@ def test_public_application_surface_is_exact_and_closed(tmp_path: Path) -> None:
     assert {name for name in HealthLab.__dict__ if not name.startswith("_")} == {
         "execute_write",
         "load_data_review",
-        "load_data_review_case",
-        "load_migration_diagnostics",
+            "load_data_review_case",
+            "load_import_details",
+            "load_migration_diagnostics",
         "load_overview",
         "load_plausibility_rules",
         "load_recovery_status",

@@ -759,6 +759,34 @@ class PublishImportResult:
     diagnostics: tuple[str, ...] = ()
 
 
+UnsupportedContentCategory = Literal[
+    "record_type",
+    "sleep_value",
+    "top_level_element",
+    "unit",
+    "workout_activity_type",
+    "workout_child",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class UnsupportedImportContent:
+    category: UnsupportedContentCategory
+    external_identifier: str
+    count: int
+
+
+@dataclass(frozen=True, slots=True)
+class StoredImportDetails:
+    package_record_count: int
+    record_count: int
+    logical_measurement_count: int
+    measurement_version_count: int
+    source_occurrence_count: int
+    anomaly_count: int
+    unsupported_content: tuple[UnsupportedImportContent, ...]
+
+
 @dataclass(frozen=True, slots=True)
 class PublishDecisionResult:
     operation_id: OperationId
@@ -1067,6 +1095,25 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                 AND measurement_version_id NOT GLOB '*[^0-9a-f]*'
             ),
             PRIMARY KEY (import_id, measurement_version_id)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS import_canonical_counts (
+            import_id TEXT PRIMARY KEY REFERENCES imports(import_id),
+            logical_measurement_count INTEGER NOT NULL CHECK (logical_measurement_count >= 0),
+            measurement_version_count INTEGER NOT NULL CHECK (measurement_version_count >= 0),
+            source_occurrence_count INTEGER NOT NULL CHECK (source_occurrence_count >= 0),
+            anomaly_count INTEGER NOT NULL CHECK (anomaly_count >= 0)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS unsupported_import_content (
+            import_id TEXT NOT NULL REFERENCES imports(import_id),
+            category TEXT NOT NULL CHECK (
+                category IN (
+                    'record_type', 'sleep_value', 'top_level_element', 'unit',
+                    'workout_activity_type', 'workout_child'
+                )
+            ),
+            external_identifier TEXT NOT NULL CHECK (length(external_identifier) > 0),
+            count INTEGER NOT NULL CHECK (count > 0),
+            PRIMARY KEY (import_id, category, external_identifier)
         ) STRICT;
         CREATE TABLE IF NOT EXISTS exports (
             export_id TEXT PRIMARY KEY CHECK (
@@ -1385,7 +1432,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             diagnostics TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
-        """
+        """,
     )
     metadata.executemany(
         "INSERT OR IGNORE INTO rule_version_refs VALUES (?, ?)",
@@ -1584,9 +1631,7 @@ class LocalStore:
             rows = self._metadata.execute(f'SELECT * FROM "{table}"').fetchall()
             if rows:
                 placeholders = ", ".join("?" for _ in columns)
-                destination.executemany(
-                    f'INSERT INTO "{table}" VALUES ({placeholders})', rows
-                )
+                destination.executemany(f'INSERT INTO "{table}" VALUES ({placeholders})', rows)
 
     def validate_recovery_writer(self) -> StoreIdentity:
         self._require_open()
@@ -1791,9 +1836,7 @@ class LocalStore:
                 pass
         return MigrationRollbackFacts(
             migration_operation_id=OperationId(str(row[0])),
-            latest_state_change_operation_id=(
-                None if row[6] is None else OperationId(str(row[6]))
-            ),
+            latest_state_change_operation_id=(None if row[6] is None else OperationId(str(row[6]))),
             backup_file=backup_file,
             backup_sha256=backup_sha256,
             backup_exists=backup_exists,
@@ -1814,9 +1857,7 @@ class LocalStore:
         backup_path = self._root / "migration-backups" / facts.backup_file
         restored = sqlite3.connect(":memory:")
         try:
-            with sqlite3.connect(
-                f"{backup_path.resolve().as_uri()}?mode=ro", uri=True
-            ) as backup:
+            with sqlite3.connect(f"{backup_path.resolve().as_uri()}?mode=ro", uri=True) as backup:
                 backup.backup(restored)
             restored.execute("PRAGMA foreign_keys = OFF")
             _upgrade_migration_event_constraints(restored)
@@ -1877,8 +1918,7 @@ class LocalStore:
                     str(row[5]),
                 )
                 for row in self._query.execute(
-                    "SELECT * FROM read_parquet"
-                    f"('{paths['open_review_cases.parquet']}')"
+                    f"SELECT * FROM read_parquet('{paths['open_review_cases.parquet']}')"
                 ).fetchall()
             )
             versions = tuple(
@@ -1986,17 +2026,22 @@ class LocalStore:
         imports_table = self._metadata.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'imports'"
         ).fetchone()
-        if imports_table is not None and self._metadata.execute(
-            "SELECT 1 FROM imports "
-            "WHERE status IN ('committed', 'duplicate', 'quarantined') LIMIT 1"
-        ).fetchone() is not None:
+        if (
+            imports_table is not None
+            and self._metadata.execute(
+                "SELECT 1 FROM imports "
+                "WHERE status IN ('committed', 'duplicate', 'quarantined') LIMIT 1"
+            ).fetchone()
+            is not None
+        ):
             return True
         snapshots_table = self._metadata.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'snapshots'"
         ).fetchone()
-        return snapshots_table is not None and self._metadata.execute(
-            "SELECT 1 FROM snapshots LIMIT 1"
-        ).fetchone() is not None
+        return (
+            snapshots_table is not None
+            and self._metadata.execute("SELECT 1 FROM snapshots LIMIT 1").fetchone() is not None
+        )
 
     def preflight_store_migration(self) -> CapacityCheck:
         try:
@@ -2097,9 +2142,7 @@ class LocalStore:
             staging_root = self._root / "migration-staging"
             staging_root.mkdir(exist_ok=True)
             staging = staging_root / str(operation_id)
-            snapshot = (
-                self._root / _PARQUET_DIRECTORY / "snapshots" / str(new_snapshot)
-            )
+            snapshot = self._root / _PARQUET_DIRECTORY / "snapshots" / str(new_snapshot)
             marker.write_text(
                 json.dumps(
                     {"operation_id": str(operation_id), "snapshot_id": str(new_snapshot)},
@@ -2250,7 +2293,7 @@ class LocalStore:
                     encoding="utf-8",
                 )
         marker_root = self._root / "migration-staging"
-        for marker in (() if not marker_root.exists() else marker_root.glob("*.json")):
+        for marker in () if not marker_root.exists() else marker_root.glob("*.json"):
             try:
                 values = json.loads(marker.read_bytes())
                 raw_operation_id = values["operation_id"]
@@ -2282,9 +2325,7 @@ class LocalStore:
             )
         if marker_root.exists():
             for staging in tuple(path for path in marker_root.iterdir() if path.is_dir()):
-                self._quarantine_migration_artifacts(
-                    OperationId(uuid4().hex), staging, None
-                )
+                self._quarantine_migration_artifacts(OperationId(uuid4().hex), staging, None)
         has_snapshot_catalog = self._metadata.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'dataset_snapshots'"
         ).fetchone()
@@ -2298,9 +2339,7 @@ class LocalStore:
         if snapshot_root.exists():
             for snapshot in tuple(path for path in snapshot_root.iterdir() if path.is_dir()):
                 if snapshot.name not in cataloged:
-                    self._quarantine_migration_artifacts(
-                        OperationId(uuid4().hex), None, snapshot
-                    )
+                    self._quarantine_migration_artifacts(OperationId(uuid4().hex), None, snapshot)
 
     @classmethod
     def open(cls, root: Path, mode: DataMode) -> Self:
@@ -2575,6 +2614,7 @@ class LocalStore:
         export_date: datetime | None,
         records: tuple[CanonicalHealthRecord, ...],
         unknown_source_types: tuple[str, ...],
+        unsupported_content: tuple[UnsupportedImportContent, ...],
         governing_export_id: str,
         resolve_sources: SourceResolver,
         restore_overlay: Path | None = None,
@@ -2595,6 +2635,7 @@ class LocalStore:
                 export_date=export_date,
                 records=records,
                 unknown_source_types=unknown_source_types,
+                unsupported_content=unsupported_content,
                 governing_export_id=governing_export_id,
                 resolve_sources=resolve_sources,
                 restore_overlay=restore_overlay,
@@ -2615,6 +2656,7 @@ class LocalStore:
         export_date: datetime | None,
         records: tuple[CanonicalHealthRecord, ...],
         unknown_source_types: tuple[str, ...],
+        unsupported_content: tuple[UnsupportedImportContent, ...],
         governing_export_id: str,
         resolve_sources: SourceResolver,
         restore_overlay: Path | None,
@@ -2655,6 +2697,11 @@ class LocalStore:
                     package_record_count=len(records),
                     record_count=0,
                     records=records,
+                    logical_measurement_count=result.logical_measurement_count,
+                    measurement_version_count=result.measurement_version_count,
+                    source_occurrence_count=result.source_occurrence_count,
+                    anomaly_count=result.anomaly_count,
+                    unsupported_content=unsupported_content,
                 )
             shutil.rmtree(self._root / "staging" / str(import_id), ignore_errors=True)
             return result
@@ -2871,6 +2918,11 @@ class LocalStore:
                 package_record_count=len(records),
                 record_count=new_record_count,
                 records=records,
+                logical_measurement_count=logical_count,
+                measurement_version_count=version_count,
+                source_occurrence_count=self._snapshot_occurrence_count(snapshot_id),
+                anomaly_count=resolution.anomaly_count,
+                unsupported_content=unsupported_content,
             )
             self._metadata.execute(
                 "INSERT INTO dataset_snapshots VALUES (?, ?, ?, ?, ?, ?)",
@@ -2970,7 +3022,7 @@ class LocalStore:
                 if rows:
                     self._metadata.executemany(
                         f'INSERT {"OR IGNORE " if ignore_existing else ""}INTO "{table}" '
-                        f'VALUES ({", ".join("?" for _ in range(columns))})',
+                        f"VALUES ({', '.join('?' for _ in range(columns))})",
                         rows,
                     )
 
@@ -3125,8 +3177,7 @@ class LocalStore:
                 ),
             )
             for item_export_id, item_export_date, _, _ in (
-                restore_exports
-                or ((export_id, export_date, "", records),)
+                restore_exports or ((export_id, export_date, "", records),)
             )
         )
         self._query.executemany("INSERT INTO export_order VALUES (?, ?)", export_rows)
@@ -3899,6 +3950,11 @@ class LocalStore:
         package_record_count: int,
         record_count: int,
         records: tuple[CanonicalHealthRecord, ...],
+        logical_measurement_count: int,
+        measurement_version_count: int,
+        source_occurrence_count: int,
+        anomaly_count: int,
+        unsupported_content: tuple[UnsupportedImportContent, ...],
     ) -> None:
         self._metadata.execute(
             """
@@ -3922,6 +3978,23 @@ class LocalStore:
         self._metadata.executemany(
             "INSERT OR IGNORE INTO import_measurement_versions VALUES (?, ?)",
             {(str(import_id), str(record.measurement_version_id)) for record in records},
+        )
+        self._metadata.execute(
+            "INSERT INTO import_canonical_counts VALUES (?, ?, ?, ?, ?)",
+            (
+                str(import_id),
+                logical_measurement_count,
+                measurement_version_count,
+                source_occurrence_count,
+                anomaly_count,
+            ),
+        )
+        self._metadata.executemany(
+            "INSERT INTO unsupported_import_content VALUES (?, ?, ?, ?)",
+            (
+                (str(import_id), item.category, item.external_identifier, item.count)
+                for item in unsupported_content
+            ),
         )
 
     def _current_import_result(
@@ -4010,11 +4083,7 @@ class LocalStore:
         )
         if review_case_id is not None and (case is None or case.logical_measurement_id is None):
             raise StoreError("Datenprüffall ist nicht mehr offen.")
-        logical_id = (
-            logical_measurement_id
-            if case is None
-            else str(case.logical_measurement_id)
-        )
+        logical_id = logical_measurement_id if case is None else str(case.logical_measurement_id)
         if logical_id is None:
             raise StoreError("Logische Quellmessung fehlt.")
         case_logical_id = None if case is None else case.logical_measurement_id
@@ -4072,9 +4141,7 @@ class LocalStore:
             "reject": "source_deletion",
         }.get(
             action,
-            "source_deletion"
-            if case_kind == "suspected_source_deletion"
-            else "confirmation",
+            "source_deletion" if case_kind == "suspected_source_deletion" else "confirmation",
         )
         completed_at = datetime.now(UTC).isoformat()
         with self._metadata:
@@ -4092,8 +4159,7 @@ class LocalStore:
                 (audit_position, audit_event_id, str(operation_id), completed_at),
             )
             self._metadata.execute(
-                "INSERT INTO data_review_decisions VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO data_review_decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     audit_event_id,
                     decision_id,
@@ -4532,9 +4598,7 @@ class LocalStore:
                         ),
                         logical_measurement_id=LogicalMeasurementId(str(case_row[2])),
                         measurement_version_id=(
-                            None
-                            if case_row[3] is None
-                            else MeasurementVersionId(str(case_row[3]))
+                            None if case_row[3] is None else MeasurementVersionId(str(case_row[3]))
                         ),
                         rule_version_id=None if case_row[4] is None else str(case_row[4]),
                         evidence_fingerprint=str(case_row[5]),
@@ -4689,9 +4753,7 @@ class LocalStore:
                 continue
             restored_identities.add(identity_id)
             version_id = (
-                selected_version_id
-                if identity_id == str(previous_identity[0])
-                else candidate_id
+                selected_version_id if identity_id == str(previous_identity[0]) else candidate_id
             )
             chosen = self._query.execute(
                 "SELECT canonical_value, canonical_unit FROM measurement_versions "
@@ -4727,9 +4789,7 @@ class LocalStore:
         replacement_plausibility_cases: tuple[OpenDataReviewCase, ...] | None = None,
         replaced_measurement_version_ids: tuple[str, ...] = (),
         batch_confirmations: tuple[tuple[OpenDataReviewCase, str], ...] = (),
-        batch_revocations: tuple[
-            tuple[OpenDataReviewCase, str, str, tuple[str, ...]], ...
-        ] = (),
+        batch_revocations: tuple[tuple[OpenDataReviewCase, str, str, tuple[str, ...]], ...] = (),
     ) -> str:
         parent = self._root / _PARQUET_DIRECTORY / "snapshots" / str(parent_snapshot_id)
         staging = self._root / "staging" / str(operation_id)
@@ -5708,6 +5768,45 @@ class LocalStore:
             ).fetchall()
         )
 
+    def load_import_details(self, import_id: ImportId) -> StoredImportDetails | None:
+        self._require_open()
+        try:
+            row = self._metadata.execute(
+                """
+                SELECT imports.package_record_count, imports.record_count,
+                       counts.logical_measurement_count, counts.measurement_version_count,
+                       counts.source_occurrence_count, counts.anomaly_count
+                FROM imports
+                JOIN import_canonical_counts AS counts USING (import_id)
+                WHERE import_id = ?
+                """,
+                (str(import_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            return StoredImportDetails(
+                int(row[0]),
+                int(row[1]),
+                int(row[2]),
+                int(row[3]),
+                int(row[4]),
+                int(row[5]),
+                tuple(
+                    UnsupportedImportContent(category, str(identifier), int(count))
+                    for category, identifier, count in self._metadata.execute(
+                        """
+                        SELECT category, external_identifier, count
+                        FROM unsupported_import_content
+                        WHERE import_id = ?
+                        ORDER BY category, external_identifier
+                        """,
+                        (str(import_id),),
+                    ).fetchall()
+                ),
+            )
+        except sqlite3.Error as error:
+            raise StoreError("Importdetails sind nicht verfügbar.") from error
+
     def load_active_snapshot_id(self) -> SnapshotId | None:
         self._require_open()
         row = self._metadata.execute(
@@ -5985,9 +6084,7 @@ class LocalStore:
                             "minimum_input_completeness": (
                                 result.methodology.minimum_input_completeness
                             ),
-                            "max_feature_dependency": (
-                                result.methodology.max_feature_dependency
-                            ),
+                            "max_feature_dependency": (result.methodology.max_feature_dependency),
                             "minimum_bootstrap_success_rate": (
                                 result.methodology.minimum_bootstrap_success_rate
                             ),
@@ -6153,9 +6250,7 @@ class LocalStore:
                     Literal["simultaneous_band_includes_zero", "simultaneous_band_excludes_zero"],
                     diagnostic_values["association_guardrail"],
                 ),
-                input_completeness=cast(
-                    float | None, diagnostic_values.get("input_completeness")
-                ),
+                input_completeness=cast(float | None, diagnostic_values.get("input_completeness")),
                 outcome_standard_deviation=cast(
                     float | None, diagnostic_values.get("outcome_standard_deviation")
                 ),
