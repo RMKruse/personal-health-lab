@@ -4,11 +4,13 @@ import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 import duckdb
 import pytest
 
+import personal_health_lab.health_import as health_import
 import personal_health_lab.recovery as recovery_module
 from personal_health_lab.application import (
     AbortMetadataRestore,
@@ -236,6 +238,48 @@ def test_restore_sources_match_exactly_and_activate_overlay_once(tmp_path: Path)
         assert metadata.execute(
             "SELECT audit_position FROM audit_events ORDER BY audit_position"
         ).fetchall() == [(1,), (2,)]
+
+
+def test_v2_backup_restores_legacy_measurement_versions_with_current_parser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_version_ids = health_import._measurement_version_ids
+
+    def legacy_version_ids(*args: Any, **kwargs: Any) -> tuple[Any, Any]:
+        _, legacy = original_version_ids(*args, **kwargs)
+        return legacy, legacy
+
+    source = _config(tmp_path / "v2-source")
+    package = _source_package(tmp_path / "v2-source.zip", (("restore-v2", 300),))
+    backup = tmp_path / "v2-backup.sqlite3"
+    monkeypatch.setattr(health_import, "_measurement_version_ids", legacy_version_ids)
+    with HealthLab.open(source) as health_lab:
+        request = ImportHealthExport(package)
+        health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+        backup_request = CreateMetadataBackup(backup)
+        health_lab.execute_write(
+            backup_request,
+            expected_plan=health_lab.preview_write(backup_request).fingerprint,
+        )
+    monkeypatch.setattr(health_import, "_measurement_version_ids", original_version_ids)
+    with sqlite3.connect(backup) as metadata:
+        metadata.execute(
+            "UPDATE backup_manifest SET identity_rule_version_id = 'healthkit-natural/v2'"
+        )
+
+    target = _config(tmp_path / "v2-target")
+    _execute_begin(target, backup)
+    with HealthLab.open(target) as health_lab:
+        request = ImportHealthExport(package)
+        receipt = health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+
+    assert isinstance(receipt.result, ImportReceipt)
+    assert receipt.result.status is ImportStatus.COMMITTED
+    assert receipt.result.measurement_version_count == 1
 
 
 def test_restore_keeps_revoked_correction_tombstoned(tmp_path: Path) -> None:

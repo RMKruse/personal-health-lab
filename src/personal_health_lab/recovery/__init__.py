@@ -7,7 +7,7 @@ import json
 import os
 import shutil
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -811,12 +811,16 @@ def inspect_restore_sources(
             )
         }
     available = {
-        (
-            str(record.logical_measurement_id),
-            str(record.measurement_version_id),
-            _record_payload_sha256(record),
-        )
+        (str(record.logical_measurement_id), str(version_id), _record_payload_sha256(record))
         for record in records
+        for version_id in (
+            record.measurement_version_id,
+            *(
+                ()
+                if record.legacy_measurement_version_id is None
+                else (record.legacy_measurement_version_id,)
+            ),
+        )
     }
     matched = required & available
     state_hash = hashlib.sha256(
@@ -831,6 +835,43 @@ def inspect_restore_sources(
         required_count=len(required),
         matched_count=len(matched),
     )
+
+
+def select_restore_source_versions(
+    store: LocalStore,
+    target_root: Path,
+    records: tuple[CanonicalHealthRecord, ...],
+) -> tuple[CanonicalHealthRecord, ...]:
+    working = load_restore_working_copy(store, target_root)
+    with sqlite3.connect(f"{working.resolve().as_uri()}?mode=ro", uri=True) as backup:
+        required = {
+            (str(row[0]), str(row[1]), str(row[2]))
+            for row in backup.execute(
+                "SELECT logical_measurement_id, measurement_version_id, payload_sha256 "
+                "FROM required_source_refs"
+            )
+        }
+    selected = []
+    for record in records:
+        payload = _record_payload_sha256(record)
+        candidates = (
+            record.measurement_version_id,
+            *(
+                ()
+                if record.legacy_measurement_version_id is None
+                else (record.legacy_measurement_version_id,)
+            ),
+        )
+        version_id = next(
+            (
+                candidate
+                for candidate in candidates
+                if (str(record.logical_measurement_id), str(candidate), payload) in required
+            ),
+            record.measurement_version_id,
+        )
+        selected.append(replace(record, measurement_version_id=version_id))
+    return tuple(selected)
 
 
 def preflight_restore_source_import(
@@ -1369,6 +1410,7 @@ __all__ = [
     "preflight_metadata_restore_start",
     "preflight_restore_source_import",
     "restore_source_resolver",
+    "select_restore_source_versions",
     "stage_metadata_restore_abort",
     "stage_restore_source_package",
     "validate_metadata_restore_abort",

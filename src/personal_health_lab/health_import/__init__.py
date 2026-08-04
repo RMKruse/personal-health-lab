@@ -8,7 +8,7 @@ import json
 import shutil
 import stat
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal, cast
@@ -32,6 +32,7 @@ from personal_health_lab.recovery import (
     load_restore_working_copy,
     preflight_restore_source_import,
     restore_source_resolver,
+    select_restore_source_versions,
     stage_restore_source_package,
 )
 from personal_health_lab.storage import (
@@ -650,6 +651,30 @@ def _import_restore_health_export(
             measurement_version_count=len(records),
             diagnostics=("restore_sources_pending",),
         )
+
+    selected_records = select_restore_source_versions(store, target_root, records)
+    selected_version_ids = {
+        str(original.measurement_version_id): selected.measurement_version_id
+        for original, selected in zip(records, selected_records, strict=True)
+    }
+    records = selected_records
+    restore_exports = tuple(
+        (
+            item_export_id,
+            item_export_date,
+            item_package_hash,
+            tuple(
+                replace(
+                    record,
+                    measurement_version_id=selected_version_ids.get(
+                        str(record.measurement_version_id), record.measurement_version_id
+                    ),
+                )
+                for record in item_records
+            ),
+        )
+        for item_export_id, item_export_date, item_package_hash, item_records in restore_exports
+    )
 
     session = store.load_restore_session()
     if session is None:
