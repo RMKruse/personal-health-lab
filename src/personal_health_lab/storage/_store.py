@@ -43,13 +43,14 @@ from personal_health_lab.health_data import (
 _METADATA_FILE = "metadata.sqlite3"
 _PARQUET_DIRECTORY = "parquet"
 _QUERY_FILE = "query.duckdb"
-_STORE_SCHEMA_VERSION = 6
+_STORE_SCHEMA_VERSION = 7
 _WRITER_LOCK_FILE = ".writer.lock"
 _FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
 _STORE_MIGRATION_METHOD = "cow-migration/v1"
 _SNAPSHOT_SCHEMA_VERSION = 1
 _IDENTITY_RULE_VERSION = "healthkit-natural/v2"
-_MAPPING_RULE_VERSION = "healthkit-canonical/v1"
+_MAPPING_RULE_VERSION = "healthkit-canonical/v2"
+_SUPPORTED_MAPPING_RULE_VERSIONS = {"healthkit-canonical/v1", _MAPPING_RULE_VERSION}
 _FIXED_PLAUSIBILITY_RULE_VERSION = "fixed-plausibility/v1"
 _SNAPSHOT_SCHEMAS = {
     "source_occurrences.parquet": (
@@ -789,11 +790,16 @@ class StoredImportDetails:
 
 @dataclass(frozen=True, slots=True)
 class StoredWeightMeasurement:
-    logical_measurement_id: str
-    measurement_version_id: str
+    logical_measurement_id: LogicalMeasurementId
+    measurement_version_id: MeasurementVersionId
     value_kg: float
     effective_value_kg: float | None
-    disposition: str | None
+    disposition: Literal[
+        "included_source",
+        "included_correction",
+        "excluded_local",
+        "excluded_source_deletion",
+    ] | None
     is_selected: bool
     source_start: datetime
     source_end: datetime
@@ -804,7 +810,7 @@ class StoredWeightMeasurement:
     device: str
     original_value: float
     original_unit: str
-    review_case_ids: tuple[str, ...]
+    review_case_ids: tuple[ReviewCaseId, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1626,6 +1632,58 @@ def _upgrade_migration_event_constraints(metadata: sqlite3.Connection) -> None:
         raise sqlite3.IntegrityError("foreign key violation after constraint upgrade")
 
 
+def _upgrade_v03_weight_constraints(metadata: sqlite3.Connection) -> None:
+    upgrades = (
+        (
+            "plausibility_rule_versions",
+            (
+                (
+                    "'active_energy', 'apple_resting_heart_rate')",
+                    "'active_energy', 'apple_resting_heart_rate', 'body_mass')",
+                ),
+                (
+                    "canonical_unit IN ('kcal', 'count/min'))",
+                    "canonical_unit IN ('kcal', 'count/min', 'kg'))",
+                ),
+            ),
+        ),
+        (
+            "data_review_decisions",
+            (
+                (
+                    "'source_conflict', 'direct_correction'",
+                    "'source_conflict', 'preferred_daily_weight_conflict', "
+                    "'direct_correction'",
+                ),
+            ),
+        ),
+    )
+    for table, replacements in upgrades:
+        row = metadata.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+        if row is None:
+            continue
+        if not isinstance(row[0], str):
+            raise sqlite3.DatabaseError(f"invalid {table} definition")
+        definition = row[0]
+        if all(new in definition for _, new in replacements):
+            continue
+        for old, new in replacements:
+            if old not in definition:
+                raise sqlite3.DatabaseError(f"unsupported {table} constraint")
+            definition = definition.replace(old, new, 1)
+        temporary = f"{table}__v03_weight_upgrade"
+        upgraded = definition.replace(
+            f"CREATE TABLE {table}", f"CREATE TABLE {temporary}", 1
+        )
+        metadata.execute(f"DROP TABLE IF EXISTS {temporary}")
+        metadata.execute(upgraded)
+        metadata.execute(f"INSERT INTO {temporary} SELECT * FROM {table}")
+        metadata.execute(f"DROP TABLE {table}")
+        metadata.execute(f"ALTER TABLE {temporary} RENAME TO {table}")
+
+
 @dataclass(slots=True)
 class LocalStore:
     _root: Path
@@ -2211,6 +2269,7 @@ class LocalStore:
         try:
             with self._metadata:
                 _upgrade_migration_event_constraints(self._metadata)
+                _upgrade_v03_weight_constraints(self._metadata)
                 _ensure_current_tables(self._metadata)
                 self._metadata.execute("ALTER TABLE store_identity RENAME TO legacy_store_identity")
                 self._metadata.execute(_STORE_IDENTITY_DDL)
@@ -3617,7 +3676,8 @@ class LocalStore:
             or not _is_lower_hex(resolution_basis["governing_export_id"], 64)
             or not isinstance(resolution_basis["identity_rule_version_id"], str)
             or not resolution_basis["identity_rule_version_id"]
-            or resolution_basis["mapping_rule_version_id"] != _MAPPING_RULE_VERSION
+            or resolution_basis["mapping_rule_version_id"]
+            not in _SUPPORTED_MAPPING_RULE_VERSIONS
             or not isinstance(validation_counts, dict)
             or set(validation_counts)
             != {
@@ -3753,7 +3813,7 @@ class LocalStore:
         ).fetchone()
         cataloged_rules = {
             (_IDENTITY_RULE_VERSION, "identity"),
-            (_MAPPING_RULE_VERSION, "mapping"),
+            *((version, "mapping") for version in _SUPPORTED_MAPPING_RULE_VERSIONS),
             (_FIXED_PLAUSIBILITY_RULE_VERSION, "plausibility"),
         }
         if has_rule_refs is not None:
@@ -5325,11 +5385,23 @@ class LocalStore:
 
         return selected_snapshot, tuple(
             StoredWeightMeasurement(
-                logical_measurement_id=str(row[0]),
-                measurement_version_id=str(row[1]),
+                logical_measurement_id=LogicalMeasurementId(str(row[0])),
+                measurement_version_id=MeasurementVersionId(str(row[1])),
                 value_kg=float(row[2]),
                 effective_value_kg=None if row[3] is None else float(row[3]),
-                disposition=None if row[4] is None else str(row[4]),
+                disposition=(
+                    None
+                    if row[4] is None
+                    else cast(
+                        Literal[
+                            "included_source",
+                            "included_correction",
+                            "excluded_local",
+                            "excluded_source_deletion",
+                        ],
+                        row[4],
+                    )
+                ),
                 is_selected=bool(row[5]),
                 source_start=local_time(str(row[6]), int(row[9])),
                 source_end=local_time(str(row[7]), int(row[10])),
@@ -5340,7 +5412,7 @@ class LocalStore:
                 device=str(row[15]),
                 original_value=float(row[16]),
                 original_unit=str(row[17]),
-                review_case_ids=tuple(str(item) for item in row[18]),
+                review_case_ids=tuple(ReviewCaseId(str(item)) for item in row[18]),
             )
             for row in rows
         )
@@ -5378,6 +5450,7 @@ class LocalStore:
                         "suspected_source_deletion",
                         "source_conflict",
                         "rule_definition",
+                        "preferred_daily_weight_conflict",
                     ],
                     kind,
                 ),

@@ -216,7 +216,7 @@ def test_streamlit_focuses_migration_in_restricted_session(
 
     assert not app.exception
     assert any(item.value == "Datenspeichermigration" for item in app.subheader)
-    assert any("Schema: 2 → 6" in item.value for item in app.caption)
+    assert any("Schema: 2 → 7" in item.value for item in app.caption)
     assert any("2 → 3, 3 → 4, 4 → 5, 5 → 6" in item.value for item in app.caption)
     assert any(f"Betroffene Snapshots: {snapshot_ref}" in item.value for item in app.caption)
     assert any("Bestehende Analysen werden stale: true" in item.value for item in app.caption)

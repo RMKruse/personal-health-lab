@@ -1425,18 +1425,30 @@ def main(args: Sequence[str] | None = None) -> int:
         for weight_day in weight_nutrition.days:
             print(
                 f"{weight_day.day} · {weight_day.status.value} · "
-                f"{weight_day.value_kg if weight_day.value_kg is not None else '-'} kg"
+                f"{weight_day.value_kg if weight_day.value_kg is not None else '-'} kg · "
+                f"Qualität: {weight_day.quality_status.value} · Logische Messungen: "
+                f"{', '.join(map(str, weight_day.logical_measurement_ids)) or '-'} · "
+                f"Messungsversionen: "
+                f"{', '.join(map(str, weight_day.measurement_version_ids)) or '-'} · "
+                f"Prüffälle: {', '.join(map(str, weight_day.review_case_ids)) or '-'}"
             )
         for weight_measurement in weight_nutrition.weight_measurements:
             print(
-                f"Messung {weight_measurement.measurement_version_id} · "
+                f"Messung {weight_measurement.measurement_version_id} · Logische Messung: "
+                f"{weight_measurement.logical_measurement_id} · "
                 f"{weight_measurement.value_kg} kg · Original: "
                 f"{weight_measurement.original_value} {weight_measurement.original_unit} · "
+                f"Effektiv: {weight_measurement.effective_value_kg} kg · "
+                f"Disposition: {weight_measurement.disposition or '-'} · "
+                f"Ausgewählt: {str(weight_measurement.is_selected).lower()} · "
+                f"Lokaler Tag: {weight_measurement.measurement_local_day} · "
                 f"Quelle: {weight_measurement.source_name} "
                 f"{weight_measurement.source_version} · Gerät: {weight_measurement.device} · "
                 f"Start: {weight_measurement.source_start.isoformat()} · "
                 f"Ende: {weight_measurement.source_end.isoformat()} · "
-                f"Erstellt: {weight_measurement.source_updated_at.isoformat()}"
+                f"Erstellt: {weight_measurement.source_updated_at.isoformat()} · "
+                f"Prüffälle: "
+                f"{', '.join(map(str, weight_measurement.review_case_ids)) or '-'}"
             )
     elif parsed.command == "recovery-status" and parsed.as_json:
         print(

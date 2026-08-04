@@ -14,11 +14,16 @@ from jsonschema import Draft202012Validator, ValidationError
 
 from personal_health_lab.adapters.cli import main
 from personal_health_lab.application import (
+    CanonicalUnit,
     CreateMetadataBackup,
+    DataCorrection,
     DataMode,
+    DataReviewCaseKind,
+    DataReviewSelection,
     FeatureNotAvailableError,
     HealthLab,
     ImportHealthExport,
+    ResolveDataReviewCase,
     RuntimeConfig,
 )
 from personal_health_lab.synthetic_export import GenerationOptions, generate_export
@@ -212,6 +217,34 @@ def test_cli_renders_the_complete_weight_projection_as_human_text_and_json_3(
     )
     assert pounds["value_kg"] == pytest.approx(45.359237)
     assert pounds["original_value"] == 100
+
+    with HealthLab.open(config) as health_lab:
+        conflict = health_lab.load_data_review(
+            DataReviewSelection(DataReviewCaseKind.PREFERRED_DAILY_WEIGHT_CONFLICT)
+        ).cases[0]
+        assert conflict.measurement_version_id is not None
+        correction = ResolveDataReviewCase(
+            conflict.case_id,
+            DataCorrection(
+                conflict.measurement_version_id,
+                82,
+                CanonicalUnit.KILOGRAM,
+                "Waage falsch abgelesen",
+            ),
+        )
+        health_lab.execute_write(
+            correction,
+            expected_plan=health_lab.preview_write(correction).fingerprint,
+        )
+
+    assert main(common) == 0
+    corrected_human = capsys.readouterr().out
+    assert "Effektiv: 82.0 kg · Disposition: included_correction · Ausgewählt: true" in (
+        corrected_human
+    )
+    assert "Logische Messungen:" in corrected_human
+    assert "Messungsversionen:" in corrected_human
+    assert "Prüffälle:" in corrected_human
 
 
 @pytest.mark.v02_adapter(
@@ -1345,8 +1378,8 @@ def test_cli_maps_store_migration_plan_and_receipt(
     plan = json.loads(capsys.readouterr().out)
     _assert_json_contract(plan)
     assert plan["workspace"]["allowed_writes"] == ["migrate_store"]
-    assert plan["details"]["steps"] == [[2, 3], [3, 4], [4, 5], [5, 6]]
-    assert plan["details"]["backup_file"] == "metadata-v2-to-v6.sqlite3"
+    assert plan["details"]["steps"] == [[2, 3], [3, 4], [4, 5], [5, 6], [6, 7]]
+    assert plan["details"]["backup_file"] == "metadata-v2-to-v7.sqlite3"
     assert plan["details"]["affected_snapshot_refs"] == [snapshot_ref]
     assert plan["details"]["existing_analyses_become_stale"] is True
 
@@ -1354,8 +1387,8 @@ def test_cli_maps_store_migration_plan_and_receipt(
         monkeypatch.setattr("builtins.input", lambda _prompt: "n")
         assert main([*common, "migrate"]) == 0
     human_plan = capsys.readouterr().out
-    assert "Migrationskette: 2 -> 3 -> 4 -> 5 -> 6" in human_plan
-    assert "Migrationssicherung: metadata-v2-to-v6.sqlite3" in human_plan
+    assert "Migrationskette: 2 -> 3 -> 4 -> 5 -> 6 -> 7" in human_plan
+    assert "Migrationssicherung: metadata-v2-to-v7.sqlite3" in human_plan
     assert f"Betroffene Snapshots: {snapshot_ref}" in human_plan
     assert "Bestehende Analysen werden veraltet: ja" in human_plan
 
@@ -1375,13 +1408,13 @@ def test_cli_maps_store_migration_plan_and_receipt(
     receipt = json.loads(capsys.readouterr().out)
     _assert_json_contract(receipt)
     assert receipt["result"]["status"] == "completed"
-    assert receipt["result"]["steps"] == [[2, 3], [3, 4], [4, 5], [5, 6]]
+    assert receipt["result"]["steps"] == [[2, 3], [3, 4], [4, 5], [5, 6], [6, 7]]
 
     assert main([*common, "rollback-migration", "--json"]) == 0
     rollback_plan = json.loads(capsys.readouterr().out)
     _assert_json_contract(rollback_plan)
     assert rollback_plan["details"]["type"] == "rollback_migration"
-    assert rollback_plan["details"]["source_version"] == 6
+    assert rollback_plan["details"]["source_version"] == 7
     assert rollback_plan["details"]["target_version"] == 2
     assert rollback_plan["details"]["restored_snapshot_ref"] == snapshot_ref
 

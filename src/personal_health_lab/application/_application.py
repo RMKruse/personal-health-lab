@@ -267,7 +267,12 @@ class WeightMeasurement:
     measurement_version_id: MeasurementVersionId
     value_kg: float
     effective_value_kg: float | None
-    disposition: str | None
+    disposition: Literal[
+        "included_source",
+        "included_correction",
+        "excluded_local",
+        "excluded_source_deletion",
+    ] | None
     is_selected: bool
     source_start: datetime
     source_end: datetime
@@ -3450,8 +3455,8 @@ class HealthLab:
 
         def public_measurement(item: StoredWeightMeasurement) -> WeightMeasurement:
             return WeightMeasurement(
-                logical_measurement_id=LogicalMeasurementId(item.logical_measurement_id),
-                measurement_version_id=MeasurementVersionId(item.measurement_version_id),
+                logical_measurement_id=item.logical_measurement_id,
+                measurement_version_id=item.measurement_version_id,
                 value_kg=item.value_kg,
                 effective_value_kg=item.effective_value_kg,
                 disposition=item.disposition,
@@ -3465,7 +3470,9 @@ class HealthLab:
                 device=item.device,
                 original_value=item.original_value,
                 original_unit=item.original_unit,
-                review_case_ids=tuple(DataReviewCaseId(value) for value in item.review_case_ids),
+                review_case_ids=tuple(
+                    DataReviewCaseId(str(value)) for value in item.review_case_ids
+                ),
             )
 
         measurements = tuple(public_measurement(item) for item in stored_measurements)

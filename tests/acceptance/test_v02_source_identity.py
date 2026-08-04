@@ -223,7 +223,7 @@ def test_strong_and_natural_identity_create_only_payload_versions(tmp_path: Path
     assert natural_changed.logical_measurement_count == 1
     assert natural_changed.measurement_version_count == 2
     assert provenance_only.source_occurrence_count == 3
-    assert provenance_only.measurement_version_count == 2
+    assert provenance_only.measurement_version_count == 3
 
 
 def test_identity_collision_is_visible_in_the_public_data_review_projection(

@@ -323,7 +323,9 @@ def _records(
                             original_value,
                             source_start.isoformat(),
                             source_end.isoformat(),
+                            source_updated_at.isoformat(),
                             source_name,
+                            source_version,
                             device,
                         )
                         records.append(
