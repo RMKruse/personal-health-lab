@@ -11,7 +11,7 @@ import sqlite3
 import subprocess
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta, timezone
 from enum import StrEnum
 from itertools import pairwise
@@ -48,7 +48,8 @@ _WRITER_LOCK_FILE = ".writer.lock"
 _FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
 _STORE_MIGRATION_METHOD = "cow-migration/v1"
 _SNAPSHOT_SCHEMA_VERSION = 1
-_IDENTITY_RULE_VERSION = "healthkit-natural/v2"
+_IDENTITY_RULE_VERSION = "healthkit-identity/v3"
+_SUPPORTED_IDENTITY_RULE_VERSIONS = {"healthkit-natural/v2", _IDENTITY_RULE_VERSION}
 _MAPPING_RULE_VERSION = "healthkit-canonical/v2"
 _SUPPORTED_MAPPING_RULE_VERSIONS = {"healthkit-canonical/v1", _MAPPING_RULE_VERSION}
 _FIXED_PLAUSIBILITY_RULE_VERSION = "fixed-plausibility/v1"
@@ -1988,6 +1989,7 @@ class LocalStore:
                             "suspected_source_deletion",
                             "source_conflict",
                             "rule_definition",
+                            "preferred_daily_weight_conflict",
                         ],
                         str(row[1]),
                     ),
@@ -2746,6 +2748,38 @@ class LocalStore:
         ],
     ) -> PublishImportResult:
         observed_at = datetime.now().astimezone()
+        active = self._metadata.execute(
+            "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
+        ).fetchone()
+        if active is not None:
+            previous_versions = (
+                self._root
+                / _PARQUET_DIRECTORY
+                / "snapshots"
+                / str(active[0])
+                / "measurement_versions.parquet"
+            )
+            escaped_previous_versions = str(previous_versions).replace("'", "''")
+            legacy_versions = {
+                str(row[0]): (str(row[1]), str(row[2]))
+                for row in self._query.execute(
+                    "SELECT measurement_version_id, source_updated_at_utc, source_version "
+                    f"FROM read_parquet('{escaped_previous_versions}')"
+                ).fetchall()
+            }
+            records = tuple(
+                replace(record, measurement_version_id=legacy_id)
+                if (
+                    (legacy_id := record.legacy_measurement_version_id) is not None
+                    and legacy_versions.get(str(legacy_id))
+                    == (
+                        record.source_updated_at.astimezone(UTC).isoformat(),
+                        record.provenance.source_version,
+                    )
+                )
+                else record
+                for record in records
+            )
         duplicate = self._metadata.execute(
             """
             SELECT active_snapshot.snapshot_id
@@ -2786,9 +2820,6 @@ class LocalStore:
             shutil.rmtree(self._root / "staging" / str(import_id), ignore_errors=True)
             return result
 
-        active = self._metadata.execute(
-            "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
-        ).fetchone()
         staging = self._root / "staging" / str(import_id)
         snapshot = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
         self._query.execute(
@@ -2828,8 +2859,12 @@ class LocalStore:
                             "value": record.value,
                             "start": record.source_start.isoformat(),
                             "end": record.source_end.isoformat(),
+                            "updated": record.source_updated_at.isoformat(),
                             "source": record.provenance.source_name,
+                            "source_version": record.provenance.source_version,
                             "device": record.provenance.device,
+                            "original_value": record.provenance.original_value,
+                            "original_unit": record.provenance.original_unit,
                         },
                         sort_keys=True,
                         separators=(",", ":"),
@@ -3674,8 +3709,8 @@ class LocalStore:
             or type(resolution_basis["audit_max_position"]) is not int
             or resolution_basis["audit_max_position"] < 1
             or not _is_lower_hex(resolution_basis["governing_export_id"], 64)
-            or not isinstance(resolution_basis["identity_rule_version_id"], str)
-            or not resolution_basis["identity_rule_version_id"]
+            or resolution_basis["identity_rule_version_id"]
+            not in _SUPPORTED_IDENTITY_RULE_VERSIONS
             or resolution_basis["mapping_rule_version_id"]
             not in _SUPPORTED_MAPPING_RULE_VERSIONS
             or not isinstance(validation_counts, dict)
@@ -3812,7 +3847,7 @@ class LocalStore:
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'rule_version_refs'"
         ).fetchone()
         cataloged_rules = {
-            (_IDENTITY_RULE_VERSION, "identity"),
+            *((version, "identity") for version in _SUPPORTED_IDENTITY_RULE_VERSIONS),
             *((version, "mapping") for version in _SUPPORTED_MAPPING_RULE_VERSIONS),
             (_FIXED_PLAUSIBILITY_RULE_VERSION, "plausibility"),
         }

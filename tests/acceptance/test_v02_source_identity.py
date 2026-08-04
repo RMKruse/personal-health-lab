@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import Any
 from zipfile import ZIP_DEFLATED, ZipFile
 
+import pytest
+
+import personal_health_lab.health_import as health_import
 from personal_health_lab.application import (
     DataMode,
     DataReviewCaseKind,
@@ -224,6 +228,56 @@ def test_strong_and_natural_identity_create_only_payload_versions(tmp_path: Path
     assert natural_changed.measurement_version_count == 2
     assert provenance_only.source_occurrence_count == 3
     assert provenance_only.measurement_version_count == 3
+
+
+def test_pre_payload_v2_snapshot_does_not_gain_a_spurious_unchanged_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_version_ids = health_import._measurement_version_ids
+
+    def legacy_version_ids(*args: Any, **kwargs: Any) -> tuple[Any, Any]:
+        _, legacy = original_version_ids(*args, **kwargs)
+        return legacy, legacy
+
+    start = "2024-01-01 07:00:00 +0100"
+    config = _config(tmp_path, "payload-transition-store")
+    monkeypatch.setattr(health_import, "_measurement_version_ids", legacy_version_ids)
+    with HealthLab.open(config) as health_lab:
+        _execute(
+            health_lab,
+            _package(
+                tmp_path / "legacy-payload.zip",
+                "2024-01-02 12:00:00 +0100",
+                _record(60, start),
+            ),
+        )
+    monkeypatch.setattr(health_import, "_measurement_version_ids", original_version_ids)
+
+    with HealthLab.open(config) as health_lab:
+        unchanged = _execute(
+            health_lab,
+            _package(
+                tmp_path / "current-unchanged.zip",
+                "2024-01-03 12:00:00 +0100",
+                _record(60, start),
+            ),
+        )
+        source_revision = _execute(
+            health_lab,
+            _package(
+                tmp_path / "current-source-revision.zip",
+                "2024-01-04 12:00:00 +0100",
+                _record(
+                    60,
+                    start,
+                    source_version="2",
+                    creation_date="2024-01-02 09:00:00 +0100",
+                ),
+            ),
+        )
+
+    assert unchanged.measurement_version_count == 1
+    assert source_revision.measurement_version_count == 2
 
 
 def test_identity_collision_is_visible_in_the_public_data_review_projection(

@@ -44,7 +44,8 @@ _METHOD_ID = "metadata-backup/v1"
 _RESTORE_START_METHOD_ID = "restore-start/v1"
 _RESTORE_SOURCE_METHOD_ID = "restore-source-import/v1"
 _RESTORE_ACTIVATE_METHOD_ID = "restore-activate/v1"
-_IDENTITY_RULE_VERSION = "healthkit-natural/v2"
+_IDENTITY_RULE_VERSION = "healthkit-identity/v3"
+_SUPPORTED_IDENTITY_RULE_VERSIONS = {"healthkit-natural/v2", _IDENTITY_RULE_VERSION}
 _MAPPING_RULE_VERSION = "healthkit-canonical/v2"
 _SUPPORTED_MAPPING_RULE_VERSIONS = {"healthkit-canonical/v1", _MAPPING_RULE_VERSION}
 _DIRECTORY_OVERHEAD = 64 * 1024
@@ -640,7 +641,7 @@ def _read_restore_backup(path: Path) -> tuple[BackupId, StoreId, str, int, int]:
                 or source_store_schema <= 0
                 or source_store_schema > current_store_schema_version()
                 or not _is_timestamp(str(row[6]))
-                or str(row[7]) != _IDENTITY_RULE_VERSION
+                or str(row[7]) not in _SUPPORTED_IDENTITY_RULE_VERSIONS
                 or str(row[8]) not in _SUPPORTED_MAPPING_RULE_VERSIONS
                 or len(canonical_hash) != 64
                 or not set(canonical_hash) <= set("0123456789abcdef")

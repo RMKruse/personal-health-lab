@@ -121,6 +121,7 @@ class CanonicalHealthRecord:
     source_updated_at: datetime
     measurement_local_day: date
     provenance: HealthProvenance
+    legacy_measurement_version_id: MeasurementVersionId | None = None
 
     def __post_init__(self) -> None:
         expected_unit = {

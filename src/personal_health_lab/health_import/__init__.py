@@ -50,7 +50,8 @@ _EXPORT_MEMBER = "apple_health_export/export.xml"
 _ACTIVE_ENERGY = "HKQuantityTypeIdentifierActiveEnergyBurned"
 _RESTING_HEART_RATE = "HKQuantityTypeIdentifierRestingHeartRate"
 _BODY_MASS = "HKQuantityTypeIdentifierBodyMass"
-_IDENTITY_RULE_VERSION = "healthkit-natural/v2"
+_LOGICAL_IDENTITY_RULE_VERSION = "healthkit-natural/v2"
+_PAYLOAD_IDENTITY_RULE_VERSION = "healthkit-payload/v2"
 _SYNC_IDENTIFIER = "HKMetadataKeySyncIdentifier"
 _MAPPINGS = {
     _ACTIVE_ENERGY: (
@@ -200,6 +201,50 @@ def _id(*parts: object) -> str:
     return hashlib.sha256("\x1f".join(map(str, parts)).encode()).hexdigest()
 
 
+def _measurement_version_ids(
+    logical_id: LogicalMeasurementId,
+    *,
+    data_type: CanonicalHealthType,
+    source_unit: str,
+    original_value: float,
+    source_start: datetime,
+    source_end: datetime,
+    source_updated_at: datetime,
+    source_name: str,
+    source_version: str,
+    device: str,
+) -> tuple[MeasurementVersionId, MeasurementVersionId]:
+    legacy_payload = _id(
+        data_type.value,
+        source_unit,
+        original_value,
+        source_start.isoformat(),
+        source_end.isoformat(),
+        source_name,
+        device,
+    )
+    current_payload = _id(
+        _PAYLOAD_IDENTITY_RULE_VERSION,
+        data_type.value,
+        source_unit,
+        original_value,
+        source_start.isoformat(),
+        source_end.isoformat(),
+        source_updated_at.isoformat(),
+        source_name,
+        source_version,
+        device,
+    )
+    return (
+        MeasurementVersionId(
+            _id(_PAYLOAD_IDENTITY_RULE_VERSION, logical_id, current_payload)
+        ),
+        MeasurementVersionId(
+            _id(_LOGICAL_IDENTITY_RULE_VERSION, logical_id, legacy_payload)
+        ),
+    )
+
+
 def _records(
     package_path: Path,
     *,
@@ -305,10 +350,14 @@ def _records(
                             None if sync_id is None else _id(source_name, sync_id)
                         )
                         logical_id = LogicalMeasurementId(
-                            _id(_IDENTITY_RULE_VERSION, "strong", strong_source_id_hash)
+                            _id(
+                                _LOGICAL_IDENTITY_RULE_VERSION,
+                                "strong",
+                                strong_source_id_hash,
+                            )
                             if strong_source_id_hash is not None
                             else _id(
-                                _IDENTITY_RULE_VERSION,
+                                _LOGICAL_IDENTITY_RULE_VERSION,
                                 "natural",
                                 data_type.value,
                                 source_start.isoformat(),
@@ -317,23 +366,24 @@ def _records(
                                 device,
                             )
                         )
-                        payload_sha256 = _id(
-                            data_type.value,
-                            source_unit,
-                            original_value,
-                            source_start.isoformat(),
-                            source_end.isoformat(),
-                            source_updated_at.isoformat(),
-                            source_name,
-                            source_version,
-                            device,
+                        measurement_version_id, legacy_measurement_version_id = (
+                            _measurement_version_ids(
+                                logical_id,
+                                data_type=data_type,
+                                source_unit=source_unit,
+                                original_value=original_value,
+                                source_start=source_start,
+                                source_end=source_end,
+                                source_updated_at=source_updated_at,
+                                source_name=source_name,
+                                source_version=source_version,
+                                device=device,
+                            )
                         )
                         records.append(
                             CanonicalHealthRecord(
                                 logical_measurement_id=logical_id,
-                                measurement_version_id=MeasurementVersionId(
-                                    _id(_IDENTITY_RULE_VERSION, logical_id, payload_sha256)
-                                ),
+                                measurement_version_id=measurement_version_id,
                                 data_type=data_type,
                                 unit=canonical_unit,
                                 value=value,
@@ -349,6 +399,7 @@ def _records(
                                     original_unit=source_unit,
                                     strong_source_id_hash=strong_source_id_hash,
                                 ),
+                                legacy_measurement_version_id=legacy_measurement_version_id,
                             )
                         )
                     elif source_type:
