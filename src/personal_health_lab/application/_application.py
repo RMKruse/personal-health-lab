@@ -8,6 +8,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from enum import StrEnum
+from itertools import pairwise
 from pathlib import Path
 from types import TracebackType
 from typing import Literal, Self, get_args
@@ -29,6 +30,7 @@ from personal_health_lab.data_quality import (
     run_historical_review,
 )
 from personal_health_lab.health_data import (
+    CanonicalSleepCategory,
     DataQualityStatus,
     ModelMaturityStatus,
     canonical_unit_for,
@@ -140,6 +142,7 @@ _READY_READS = (
     "plausibility_rules",
     "migration_diagnostics",
     "weight_nutrition",
+    "sleep_days",
 )
 
 
@@ -362,6 +365,217 @@ class WeightNutrition:
     weight_measurements: tuple[WeightMeasurement, ...]
     nutrition_days: tuple[DailyNutrition, ...]
     healthkit_nutrition_samples: tuple[HealthKitNutritionSample, ...]
+
+
+class SleepCategory(StrEnum):
+    IN_BED = "in_bed"
+    AWAKE = "awake"
+    ASLEEP_UNSPECIFIED = "asleep_unspecified"
+    ASLEEP_CORE = "asleep_core"
+    ASLEEP_DEEP = "asleep_deep"
+    ASLEEP_REM = "asleep_rem"
+
+
+class SleepSourceClass(StrEnum):
+    WATCH = "watch"
+    IPHONE = "iphone"
+    MANUAL = "manual"
+    OTHER = "other"
+    UNKNOWN = "unknown"
+
+
+class SleepObservationStatus(StrEnum):
+    UNOBSERVED = "unobserved"
+    PARTIAL = "partial"
+    OBSERVED = "observed"
+
+
+@dataclass(frozen=True, slots=True)
+class SleepInterval:
+    logical_measurement_id: LogicalMeasurementId
+    measurement_version_id: MeasurementVersionId
+    original_category: str
+    canonical_category: SleepCategory
+    source_class: SleepSourceClass
+    is_selected: bool
+    source_start: datetime
+    source_end: datetime
+    source_updated_at: datetime
+    source_name: str
+    source_version: str
+    device: str
+
+
+@dataclass(frozen=True, slots=True)
+class SleepEpisode:
+    start: datetime
+    end: datetime
+    first_observed_asleep: datetime | None
+    last_observed_asleep: datetime | None
+    observed_sleep: timedelta
+    observed_awake: timedelta
+    in_bed: timedelta | None
+    asleep_core: timedelta
+    asleep_deep: timedelta
+    asleep_rem: timedelta
+    asleep_unspecified: timedelta
+    stage_ambiguous: timedelta
+    uncovered_gap: timedelta
+    removed_same_state_overlap: timedelta
+    asleep_awake_conflict: timedelta
+    observed_coverage_ratio: float | None
+    detailed_stage_coverage_ratio: float | None
+    interval_ids: tuple[MeasurementVersionId, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SleepSourceCount:
+    source_class: SleepSourceClass
+    accepted_interval_count: int
+    rejected_interval_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class SleepQuality:
+    source_classifier_version: str
+    derivation_version: str
+    accepted_interval_count: int
+    rejected_interval_count: int
+    contributing_watch_source_count: int
+    source_counts: tuple[SleepSourceCount, ...]
+    primary_selection_ambiguous: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SleepDay:
+    day: date
+    status: SleepObservationStatus
+    primary_episode: SleepEpisode | None
+    naps: tuple[SleepEpisode, ...]
+    quality: SleepQuality
+
+
+@dataclass(frozen=True, slots=True)
+class SleepDays:
+    snapshot_ref: SnapshotRef | None
+    days: tuple[SleepDay, ...]
+    accepted_intervals: tuple[SleepInterval, ...]
+    rejected_intervals: tuple[SleepInterval, ...]
+
+
+_SLEEP_SOURCE_CLASSIFIER_VERSION = "sleep-source-classification/v1"
+_SLEEP_DERIVATION_VERSION = "sleep-derivation/v1"
+_SLEEP_CATEGORIES = {item: SleepCategory(item.value) for item in CanonicalSleepCategory}
+_SLEEP_SOURCE_RULES = {
+    ("Apple Watch", "Apple Watch"): SleepSourceClass.WATCH,
+    ("iPhone", "iPhone"): SleepSourceClass.IPHONE,
+    ("Manual entry", ""): SleepSourceClass.MANUAL,
+    ("Pillow", ""): SleepSourceClass.OTHER,
+}
+
+
+def _classify_sleep_source(source_name: str, device: str) -> SleepSourceClass:
+    if (source_class := _SLEEP_SOURCE_RULES.get((source_name, device))) is not None:
+        return source_class
+    return SleepSourceClass.UNKNOWN
+
+
+def _sleep_episode(intervals: tuple[SleepInterval, ...]) -> SleepEpisode:
+    intervals = tuple(item for item in intervals if item.source_end > item.source_start)
+    starts_and_ends = sorted(
+        {timestamp for item in intervals for timestamp in (item.source_start, item.source_end)}
+    )
+    durations = {category: timedelta() for category in SleepCategory}
+    stage_ambiguous = timedelta()
+    asleep_awake_conflict = timedelta()
+    first_asleep: datetime | None = None
+    last_asleep: datetime | None = None
+    asleep_categories = {
+        SleepCategory.ASLEEP_UNSPECIFIED,
+        SleepCategory.ASLEEP_CORE,
+        SleepCategory.ASLEEP_DEEP,
+        SleepCategory.ASLEEP_REM,
+    }
+    for start, end in pairwise(starts_and_ends):
+        active = {
+            item.canonical_category
+            for item in intervals
+            if item.source_start <= start and item.source_end >= end
+        }
+        span = end - start
+        asleep = active & asleep_categories
+        if asleep and SleepCategory.AWAKE in active:
+            asleep_awake_conflict += span
+        elif len(asleep) > 1:
+            stage_ambiguous += span
+            first_asleep = start if first_asleep is None else first_asleep
+            last_asleep = end
+        elif asleep:
+            category = next(iter(asleep))
+            durations[category] += span
+            first_asleep = start if first_asleep is None else first_asleep
+            last_asleep = end
+        elif SleepCategory.AWAKE in active:
+            durations[SleepCategory.AWAKE] += span
+        if SleepCategory.IN_BED in active:
+            durations[SleepCategory.IN_BED] += span
+
+    def union_duration(items: list[SleepInterval]) -> timedelta:
+        covered = timedelta()
+        end: datetime | None = None
+        for item in sorted(items, key=lambda value: (value.source_start, value.source_end)):
+            if end is None or item.source_start >= end:
+                covered += item.source_end - item.source_start
+                end = item.source_end
+            elif item.source_end > end:
+                covered += item.source_end - end
+                end = item.source_end
+        return covered
+
+    removed_same_state_overlap = sum(
+        (
+            sum((item.source_end - item.source_start for item in items), timedelta())
+            - union_duration(items)
+            for category in SleepCategory
+            if (items := [item for item in intervals if item.canonical_category is category])
+        ),
+        timedelta(),
+    )
+    covered_until: datetime | None = None
+    uncovered_gap = timedelta()
+    for item in sorted(intervals, key=lambda value: (value.source_start, value.source_end)):
+        if covered_until is not None and item.source_start > covered_until:
+            uncovered_gap += item.source_start - covered_until
+        if covered_until is None or item.source_end > covered_until:
+            covered_until = item.source_end
+    observed_sleep = sum((durations[category] for category in asleep_categories), stage_ambiguous)
+    known = observed_sleep + durations[SleepCategory.AWAKE]
+    span = max(item.source_end for item in intervals) - min(item.source_start for item in intervals)
+    detailed = (
+        durations[SleepCategory.ASLEEP_CORE]
+        + durations[SleepCategory.ASLEEP_DEEP]
+        + durations[SleepCategory.ASLEEP_REM]
+    )
+    return SleepEpisode(
+        start=min(item.source_start for item in intervals),
+        end=max(item.source_end for item in intervals),
+        first_observed_asleep=first_asleep,
+        last_observed_asleep=last_asleep,
+        observed_sleep=observed_sleep,
+        observed_awake=durations[SleepCategory.AWAKE],
+        in_bed=durations[SleepCategory.IN_BED] or None,
+        asleep_core=durations[SleepCategory.ASLEEP_CORE],
+        asleep_deep=durations[SleepCategory.ASLEEP_DEEP],
+        asleep_rem=durations[SleepCategory.ASLEEP_REM],
+        asleep_unspecified=durations[SleepCategory.ASLEEP_UNSPECIFIED],
+        stage_ambiguous=stage_ambiguous,
+        uncovered_gap=uncovered_gap,
+        removed_same_state_overlap=removed_same_state_overlap,
+        asleep_awake_conflict=asleep_awake_conflict,
+        observed_coverage_ratio=None if not span else known / span,
+        detailed_stage_coverage_ratio=None if not observed_sleep else detailed / observed_sleep,
+        interval_ids=tuple(item.measurement_version_id for item in intervals),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -3699,6 +3913,147 @@ class HealthLab:
             nutrition_days=tuple(nutrition_days),
             healthkit_nutrition_samples=healthkit_nutrition_samples,
         )
+
+    def load_sleep_days(self, selection: SnapshotDateSelection) -> SleepDays:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        try:
+            snapshot_ref, stored = self._store.load_sleep_measurements(selection.snapshot_ref)
+        except StoreError as error:
+            raise HealthLabError("Schlafprojektion ist nicht verfügbar.") from error
+        intervals = tuple(
+            SleepInterval(
+                logical_measurement_id=item.logical_measurement_id,
+                measurement_version_id=item.measurement_version_id,
+                original_category=item.original_category,
+                canonical_category=_SLEEP_CATEGORIES[item.canonical_category],
+                source_class=_classify_sleep_source(item.source_name, item.device),
+                is_selected=item.is_selected,
+                source_start=item.source_start,
+                source_end=item.source_end,
+                source_updated_at=item.source_updated_at,
+                source_name=item.source_name,
+                source_version=item.source_version,
+                device=item.device,
+            )
+            for item in stored
+            if (selection.start_date is None or item.source_end.date() >= selection.start_date)
+            and (selection.end_date is None or item.source_start.date() <= selection.end_date)
+        )
+        accepted = tuple(item for item in intervals if item.source_class is SleepSourceClass.WATCH)
+        rejected = tuple(
+            item for item in intervals if item.source_class is not SleepSourceClass.WATCH
+        )
+        selected = tuple(item for item in accepted if item.is_selected)
+        groups: list[list[SleepInterval]] = []
+        for interval in selected:
+            if interval.source_end <= interval.source_start:
+                continue
+            if not groups or interval.source_start - max(
+                item.source_end for item in groups[-1]
+            ) > timedelta(minutes=90):
+                groups.append([interval])
+            else:
+                groups[-1].append(interval)
+        episodes_by_day: dict[date, list[SleepEpisode]] = {}
+        for group in groups:
+            episode = _sleep_episode(tuple(group))
+            episodes_by_day.setdefault(episode.end.date(), []).append(episode)
+        if selection.start_date is not None and selection.end_date is not None:
+            dates = tuple(
+                selection.start_date + timedelta(days=offset)
+                for offset in range((selection.end_date - selection.start_date).days + 1)
+            )
+        elif episodes_by_day:
+            start, end = min(episodes_by_day), max(episodes_by_day)
+            dates = tuple(
+                start + timedelta(days=offset) for offset in range((end - start).days + 1)
+            )
+        else:
+            dates = ()
+
+        def quality(day: date, ambiguous: bool = False) -> SleepQuality:
+            day_intervals = tuple(item for item in intervals if item.source_end.date() == day)
+            selected_day = tuple(item for item in day_intervals if item.is_selected)
+            return SleepQuality(
+                source_classifier_version=_SLEEP_SOURCE_CLASSIFIER_VERSION,
+                derivation_version=_SLEEP_DERIVATION_VERSION,
+                accepted_interval_count=sum(
+                    item.source_class is SleepSourceClass.WATCH for item in selected_day
+                ),
+                rejected_interval_count=sum(
+                    item.source_class is not SleepSourceClass.WATCH for item in selected_day
+                ),
+                contributing_watch_source_count=len(
+                    {
+                        item.source_name
+                        for item in selected_day
+                        if item.source_class is SleepSourceClass.WATCH
+                    }
+                ),
+                source_counts=tuple(
+                    SleepSourceCount(
+                        source_class,
+                        sum(
+                            item.source_class is source_class
+                            and source_class is SleepSourceClass.WATCH
+                            for item in selected_day
+                        ),
+                        sum(
+                            item.source_class is source_class
+                            and source_class is not SleepSourceClass.WATCH
+                            for item in selected_day
+                        ),
+                    )
+                    for source_class in SleepSourceClass
+                ),
+                primary_selection_ambiguous=ambiguous,
+            )
+
+        days = []
+        for day in dates:
+            candidates = tuple(
+                item for item in episodes_by_day.get(day, ()) if item.observed_sleep > timedelta()
+            )
+            if not candidates:
+                status = (
+                    SleepObservationStatus.PARTIAL
+                    if any(
+                        item.is_selected and item.source_class is SleepSourceClass.WATCH
+                        for item in intervals
+                        if item.source_end.date() == day
+                    )
+                    else SleepObservationStatus.UNOBSERVED
+                )
+                days.append(SleepDay(day, status, None, (), quality(day)))
+                continue
+            largest = max(item.observed_sleep for item in candidates)
+            primary = tuple(item for item in candidates if item.observed_sleep == largest)
+            if len(primary) != 1:
+                days.append(
+                    SleepDay(
+                        day, SleepObservationStatus.PARTIAL, None, candidates, quality(day, True)
+                    )
+                )
+                continue
+            selected_episode = primary[0]
+            complete = not (
+                selected_episode.uncovered_gap
+                or selected_episode.stage_ambiguous
+                or selected_episode.asleep_awake_conflict
+            )
+            days.append(
+                SleepDay(
+                    day,
+                    SleepObservationStatus.OBSERVED if complete else SleepObservationStatus.PARTIAL,
+                    selected_episode,
+                    tuple(item for item in candidates if item is not selected_episode),
+                    quality(day),
+                )
+            )
+        return SleepDays(snapshot_ref, tuple(days), accepted, rejected)
 
     def load_data_review(self, selection: DataReviewSelection) -> DataReview:
         self._require_ready()

@@ -148,6 +148,7 @@ def test_public_application_surface_is_exact_and_closed(tmp_path: Path) -> None:
         "load_overview",
         "load_plausibility_rules",
             "load_recovery_status",
+            "load_sleep_days",
             "load_weight_nutrition",
             "load_workspace_status",
         "open",

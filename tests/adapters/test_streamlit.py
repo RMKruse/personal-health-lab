@@ -58,6 +58,44 @@ def test_streamlit_loads_import_details_through_the_application_seam(
     assert app.dataframe
 
 
+@pytest.mark.v02_adapter("streamlit", "SleepObservationStatus")
+def test_streamlit_loads_sleep_days_through_the_application_seam(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = tmp_path / "sleep.zip"
+    with ZipFile(package, "w") as archive:
+        archive.writestr(
+            "apple_health_export/export.xml",
+            """
+            <HealthData>
+              <ExportDate value="2024-01-03 12:00:00 +0100"/>
+              <Record type="HKCategoryTypeIdentifierSleepAnalysis"
+                value="HKCategoryValueSleepAnalysisAsleepCore" sourceName="Apple Watch"
+                sourceVersion="1" device="Apple Watch" creationDate="2024-01-03 06:00:00 +0100"
+                startDate="2024-01-02 23:00:00 +0100" endDate="2024-01-03 06:00:00 +0100"/>
+            </HealthData>
+            """,
+        )
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "synthetic", tmp_path / "real")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(package)
+        health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+    monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
+    monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(config.synthetic_store))
+    monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(config.real_store))
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
+
+    app = AppTest.from_file(str(app_path)).run()
+    app.radio[0].set_value("Kerndaten").run()
+    next(button for button in app.button if button.label == "Schlaf laden").click().run()
+
+    assert not app.exception
+    assert any(item.value == "Schlaf" for item in app.subheader)
+    assert app.dataframe
+
+
 @pytest.mark.v02_adapter("streamlit", "WeightDayStatus")
 def test_streamlit_renders_the_complete_weight_projection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

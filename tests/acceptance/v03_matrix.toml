@@ -317,3 +317,84 @@ expected_result = "complete daily and source-measurement tables"
 expected_effect = "none"
 forbidden_side_effects = "no persistent state outside application"
 evidence = ["positive", "parity"]
+
+[[contract]]
+id = "V03-C-SLEEP-SOURCE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/72"
+statement = "Supported SleepAnalysis intervals preserve their exact aware endpoints, offsets, original and canonical categories, provenance, identity, and versions while classifying sources through the shipped contract."
+evidence = ["positive", "boundary", "reproducibility"]
+
+[[contract]]
+id = "V03-C-SLEEP-PROJECTION-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/72"
+statement = "Only selected Watch intervals derive sleep episodes; rejected source classes remain visible, and overlap remains evidence with explicit partial quality."
+evidence = ["positive", "boundary"]
+
+[[contract]]
+id = "V03-C-SLEEP-ADAPTERS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/72"
+statement = "CLI JSON and Streamlit forward the same SnapshotDateSelection to HealthLab.load_sleep_days and render the complete sleep projection."
+evidence = ["positive", "parity"]
+
+[[fixture]]
+id = "V03-F-SLEEP-EDGES-V1"
+kind = "parser_contract"
+artifact = "tests/fixtures/v03/sleep-edges.xml"
+platform = "all"
+sha256 = "adef3fbb2344bf4aafbda5584bbb0bf768be169efd0537344c0aac66d6ce2896"
+
+[[case]]
+id = "V03-A-SLEEP-PROJECTION-V1"
+contracts = ["V03-C-SLEEP-SOURCE-V1", "V03-C-SLEEP-PROJECTION-V1"]
+fixtures = ["V03-F-SLEEP-EDGES-V1"]
+runner = "tests/acceptance/test_v03_sleep.py::test_sleep_import_preserves_categories_offsets_overlap_and_source_eligibility"
+initial_state = "empty synthetic store"
+operation = "import versioned Watch, iPhone, and manual sleep intervals including deprecated Asleep and overlap"
+level = "application"
+platform = "all"
+expected_result = "preserved canonical intervals plus a partial Watch sleep night with explicit conflict evidence"
+expected_effect = "one immutable snapshot is published"
+forbidden_side_effects = "no overlap deduplication, source fusion, or category rewrite"
+evidence = ["positive", "boundary", "reproducibility"]
+
+[[case]]
+id = "V03-A-SLEEP-CLI-V1"
+contracts = ["V03-C-SLEEP-ADAPTERS-V1"]
+fixtures = ["V03-F-SLEEP-EDGES-V1"]
+runner = "tests/acceptance/test_v03_sleep.py::test_sleep_days_cli_uses_the_shared_selection"
+initial_state = "committed Watch sleep fixture"
+operation = "load selected sleep days through human CLI and JSON 3.0"
+level = "adapter"
+platform = "all"
+expected_result = "complete selected sleep projection"
+expected_effect = "none"
+forbidden_side_effects = "no CLI source classification or derivation"
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-SLEEP-REIMPORT-V1"
+contracts = ["V03-C-SLEEP-SOURCE-V1", "V03-C-SLEEP-PROJECTION-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_sleep.py::test_sleep_reimport_versions_stages_and_catalogs_invalid_forms"
+initial_state = "one committed Watch sleep interval"
+operation = "reimport the same natural interval with a corrected stage and catalog unsupported sleep forms"
+level = "application"
+platform = "all"
+expected_result = "both versions remain inspectable, only the corrected version is selected, and invalid forms are catalogued"
+expected_effect = "two immutable snapshots are published"
+forbidden_side_effects = "no stage-specific logical identity and no unsupported value coercion"
+evidence = ["positive", "negative", "reproducibility"]
+
+[[case]]
+id = "V03-A-SLEEP-STREAMLIT-V1"
+contracts = ["V03-C-SLEEP-ADAPTERS-V1"]
+fixtures = ["V03-F-SLEEP-EDGES-V1"]
+runner = "tests/adapters/test_streamlit.py::test_streamlit_loads_sleep_days_through_the_application_seam"
+initial_state = "committed Watch sleep fixture"
+operation = "load sleep on the Kerndaten page"
+level = "adapter"
+platform = "all"
+expected_result = "day and canonical interval tables"
+expected_effect = "none"
+forbidden_side_effects = "no persistent UI state outside application"
+evidence = ["positive", "parity"]

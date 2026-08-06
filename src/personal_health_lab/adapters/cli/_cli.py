@@ -6,7 +6,7 @@ import logging
 import pydoc
 import sys
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from personal_health_lab.adapters._config import load_runtime_config
@@ -75,6 +75,9 @@ from personal_health_lab.application import (
     RunHistoricalReview,
     RunRestingHeartRateAnalysis,
     SingleDecisionTarget,
+    SleepDays,
+    SleepEpisode,
+    SleepInterval,
     SnapshotDateSelection,
     SnapshotRef,
     SourceConflictResolution,
@@ -137,6 +140,11 @@ def _parser() -> argparse.ArgumentParser:
     weight.add_argument("--start-date", type=date.fromisoformat)
     weight.add_argument("--end-date", type=date.fromisoformat)
     weight.add_argument("--json", action="store_true", dest="as_json")
+    sleep = commands.add_parser("sleep-days", help="Schlafnächte laden")
+    sleep.add_argument("--snapshot", type=SnapshotRef)
+    sleep.add_argument("--start-date", type=date.fromisoformat)
+    sleep.add_argument("--end-date", type=date.fromisoformat)
+    sleep.add_argument("--json", action="store_true", dest="as_json")
     analysis = commands.add_parser("analyze", help="Verzögerungsprofil analysieren")
     analysis.add_argument("--definition", default="lag-signal-v2")
     analysis.add_argument("--start-date", type=date.fromisoformat)
@@ -581,6 +589,104 @@ def _weight_nutrition_json(
             }
             for item in projection.weight_measurements
         ],
+    }
+
+
+def _sleep_days_json(
+    projection: SleepDays,
+    selection: SnapshotDateSelection,
+    runtime_config: Mapping[str, object],
+) -> dict[str, object]:
+    def duration(value: timedelta | None) -> float | None:
+        return None if value is None else value.total_seconds()
+
+    def episode(item: SleepEpisode) -> dict[str, object]:
+        return {
+            "asleep_awake_conflict_seconds": duration(item.asleep_awake_conflict),
+            "asleep_core_seconds": duration(item.asleep_core),
+            "asleep_deep_seconds": duration(item.asleep_deep),
+            "asleep_rem_seconds": duration(item.asleep_rem),
+            "asleep_unspecified_seconds": duration(item.asleep_unspecified),
+            "detailed_stage_coverage_ratio": item.detailed_stage_coverage_ratio,
+            "end": item.end.isoformat(),
+            "first_observed_asleep": (
+                None
+                if item.first_observed_asleep is None
+                else item.first_observed_asleep.isoformat()
+            ),
+            "in_bed_seconds": duration(item.in_bed),
+            "interval_ids": [str(value) for value in item.interval_ids],
+            "last_observed_asleep": (
+                None if item.last_observed_asleep is None else item.last_observed_asleep.isoformat()
+            ),
+            "observed_awake_seconds": duration(item.observed_awake),
+            "observed_coverage_ratio": item.observed_coverage_ratio,
+            "observed_sleep_seconds": duration(item.observed_sleep),
+            "removed_same_state_overlap_seconds": duration(item.removed_same_state_overlap),
+            "stage_ambiguous_seconds": duration(item.stage_ambiguous),
+            "start": item.start.isoformat(),
+            "uncovered_gap_seconds": duration(item.uncovered_gap),
+        }
+
+    def interval(item: SleepInterval) -> dict[str, object]:
+        return {
+            "canonical_category": item.canonical_category.value,
+            "device": item.device,
+            "is_selected": item.is_selected,
+            "logical_measurement_id": str(item.logical_measurement_id),
+            "measurement_version_id": str(item.measurement_version_id),
+            "original_category": item.original_category,
+            "source_class": item.source_class.value,
+            "source_end": item.source_end.isoformat(),
+            "source_name": item.source_name,
+            "source_start": item.source_start.isoformat(),
+            "source_updated_at": item.source_updated_at.isoformat(),
+            "source_version": item.source_version,
+        }
+
+    return {
+        "accepted_intervals": [interval(item) for item in projection.accepted_intervals],
+        "days": [
+            {
+                "day": item.day.isoformat(),
+                "naps": [episode(value) for value in item.naps],
+                "primary_episode": (
+                    None if item.primary_episode is None else episode(item.primary_episode)
+                ),
+                "quality": {
+                    "accepted_interval_count": item.quality.accepted_interval_count,
+                    "contributing_watch_source_count": item.quality.contributing_watch_source_count,
+                    "derivation_version": item.quality.derivation_version,
+                    "primary_selection_ambiguous": item.quality.primary_selection_ambiguous,
+                    "rejected_interval_count": item.quality.rejected_interval_count,
+                    "source_counts": [
+                        {
+                            "accepted_interval_count": value.accepted_interval_count,
+                            "rejected_interval_count": value.rejected_interval_count,
+                            "source_class": value.source_class.value,
+                        }
+                        for value in item.quality.source_counts
+                    ],
+                    "source_classifier_version": item.quality.source_classifier_version,
+                },
+                "status": item.status.value,
+            }
+            for item in projection.days
+        ],
+        "kind": "sleep_days",
+        "rejected_intervals": [interval(item) for item in projection.rejected_intervals],
+        "runtime_config": dict(runtime_config),
+        "schema_version": _OUTPUT_SCHEMA_VERSION,
+        "selection": {
+            "end_date": None if selection.end_date is None else selection.end_date.isoformat(),
+            "snapshot_ref": (
+                None if selection.snapshot_ref is None else str(selection.snapshot_ref)
+            ),
+            "start_date": (
+                None if selection.start_date is None else selection.start_date.isoformat()
+            ),
+        },
+        "snapshot_ref": None if projection.snapshot_ref is None else str(projection.snapshot_ref),
     }
 
 
@@ -1110,6 +1216,11 @@ def main(args: Sequence[str] | None = None) -> int:
                     parsed.snapshot, parsed.start_date, parsed.end_date
                 )
                 weight_nutrition = health_lab.load_weight_nutrition(weight_selection)
+            elif parsed.command == "sleep-days":
+                sleep_selection = SnapshotDateSelection(
+                    parsed.snapshot, parsed.start_date, parsed.end_date
+                )
+                sleep_days = health_lab.load_sleep_days(sleep_selection)
             elif parsed.command == "restore":
                 restore_request = BeginMetadataRestore(parsed.backup)
                 restore_plan = health_lab.preview_write(restore_request)
@@ -1538,6 +1649,33 @@ def main(args: Sequence[str] | None = None) -> int:
                 f"Erstellt: {nutrition_sample.source_updated_at.isoformat()} · "
                 f"Prüffälle: "
                 f"{', '.join(map(str, nutrition_sample.review_case_ids)) or '-'}"
+            )
+    elif parsed.command == "sleep-days" and parsed.as_json:
+        print(
+            json.dumps(
+                _sleep_days_json(sleep_days, sleep_selection, runtime_config),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    elif parsed.command == "sleep-days":
+        print("Schlafnächte")
+        print(f"Snapshot: {sleep_days.snapshot_ref or '-'}")
+        for day in sleep_days.days:
+            episode = day.primary_episode
+            print(
+                f"{day.day} · {day.status.value} · Schlaf: "
+                f"{'-' if episode is None else episode.observed_sleep} · "
+                f"Akzeptiert: {day.quality.accepted_interval_count} · "
+                f"Abgewiesen: {day.quality.rejected_interval_count}"
+            )
+        for interval in (*sleep_days.accepted_intervals, *sleep_days.rejected_intervals):
+            print(
+                f"{interval.canonical_category.value} · Original: {interval.original_category} · "
+                f"Quelle: {interval.source_class.value} · Ausgewählt: "
+                f"{str(interval.is_selected).lower()} · {interval.source_start.isoformat()} "
+                f"bis {interval.source_end.isoformat()} · {interval.source_name} · "
+                f"{interval.device}"
             )
     elif parsed.command == "recovery-status" and parsed.as_json:
         print(

@@ -27,6 +27,8 @@ from personal_health_lab.health_data import (
     AnalysisFreshness,
     CanonicalHealthRecord,
     CanonicalHealthType,
+    CanonicalSleepCategory,
+    CanonicalSleepInterval,
     CanonicalUnit,
     DailyHealthSeries,
     DailyHealthValue,
@@ -85,6 +87,23 @@ _SNAPSHOT_SCHEMAS = {
         ("original_value", "DOUBLE"),
         ("original_unit", "VARCHAR"),
         ("strong_source_id_hash", "VARCHAR"),
+    ),
+    "sleep_intervals.parquet": (
+        ("measurement_version_id", "VARCHAR"),
+        ("identity_candidate_id", "VARCHAR"),
+        ("original_category", "VARCHAR"),
+        ("canonical_category", "VARCHAR"),
+        ("source_start_utc", "VARCHAR"),
+        ("source_end_utc", "VARCHAR"),
+        ("source_updated_at_utc", "VARCHAR"),
+        ("source_start_offset_minutes", "INTEGER"),
+        ("source_end_offset_minutes", "INTEGER"),
+        ("source_updated_at_offset_minutes", "INTEGER"),
+        ("source_name", "VARCHAR"),
+        ("source_version", "VARCHAR"),
+        ("device", "VARCHAR"),
+        ("strong_source_id_hash", "VARCHAR"),
+        ("is_selected", "BOOLEAN"),
     ),
     "resolved_measurements.parquet": (
         ("logical_measurement_id", "VARCHAR"),
@@ -799,12 +818,15 @@ class StoredWeightNutritionMeasurement:
     unit: CanonicalUnit
     value: float
     effective_value: float | None
-    disposition: Literal[
-        "included_source",
-        "included_correction",
-        "excluded_local",
-        "excluded_source_deletion",
-    ] | None
+    disposition: (
+        Literal[
+            "included_source",
+            "included_correction",
+            "excluded_local",
+            "excluded_source_deletion",
+        ]
+        | None
+    )
     is_selected: bool
     source_start: datetime
     source_end: datetime
@@ -1665,8 +1687,7 @@ def _upgrade_v03_constraints(metadata: sqlite3.Connection) -> None:
             (
                 (
                     "'source_conflict', 'direct_correction'",
-                    "'source_conflict', 'preferred_daily_weight_conflict', "
-                    "'direct_correction'",
+                    "'source_conflict', 'preferred_daily_weight_conflict', 'direct_correction'",
                 ),
             ),
         ),
@@ -1695,9 +1716,7 @@ def _upgrade_v03_constraints(metadata: sqlite3.Connection) -> None:
                 raise sqlite3.DatabaseError(f"unsupported {table} constraint")
             definition = definition.replace(old, new, 1)
         temporary = f"{table}__v03_constraint_upgrade"
-        upgraded = definition.replace(
-            f"CREATE TABLE {table}", f"CREATE TABLE {temporary}", 1
-        )
+        upgraded = definition.replace(f"CREATE TABLE {table}", f"CREATE TABLE {temporary}", 1)
         metadata.execute(f"DROP TABLE IF EXISTS {temporary}")
         metadata.execute(upgraded)
         metadata.execute(f"INSERT INTO {temporary} SELECT * FROM {table}")
@@ -2715,6 +2734,7 @@ class LocalStore:
         export_id: str,
         export_date: datetime | None,
         records: tuple[CanonicalHealthRecord, ...],
+        sleep_intervals: tuple[CanonicalSleepInterval, ...],
         unknown_source_types: tuple[str, ...],
         unsupported_content: tuple[UnsupportedImportContent, ...],
         governing_export_id: str,
@@ -2736,6 +2756,7 @@ class LocalStore:
                 export_id=export_id,
                 export_date=export_date,
                 records=records,
+                sleep_intervals=sleep_intervals,
                 unknown_source_types=unknown_source_types,
                 unsupported_content=unsupported_content,
                 governing_export_id=governing_export_id,
@@ -2757,6 +2778,7 @@ class LocalStore:
         export_id: str,
         export_date: datetime | None,
         records: tuple[CanonicalHealthRecord, ...],
+        sleep_intervals: tuple[CanonicalSleepInterval, ...],
         unknown_source_types: tuple[str, ...],
         unsupported_content: tuple[UnsupportedImportContent, ...],
         governing_export_id: str,
@@ -2828,9 +2850,9 @@ class LocalStore:
                     package_hash=package_hash,
                     snapshot_id=result.snapshot_id,
                     status=result.status,
-                    package_record_count=len(records),
+                    package_record_count=len(records) + len(sleep_intervals),
                     record_count=0,
-                    records=records,
+                    records=(*records, *sleep_intervals),
                     logical_measurement_count=result.logical_measurement_count,
                     measurement_version_count=result.measurement_version_count,
                     source_occurrence_count=result.source_occurrence_count,
@@ -2955,6 +2977,92 @@ class LocalStore:
                 ) = 1
                 """
             )
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE staged_sleep_intervals (
+                measurement_version_id VARCHAR,
+                identity_candidate_id VARCHAR,
+                original_category VARCHAR,
+                canonical_category VARCHAR,
+                source_start_utc VARCHAR,
+                source_end_utc VARCHAR,
+                source_updated_at_utc VARCHAR,
+                source_start_offset_minutes INTEGER,
+                source_end_offset_minutes INTEGER,
+                source_updated_at_offset_minutes INTEGER,
+                source_name VARCHAR,
+                source_version VARCHAR,
+                device VARCHAR,
+                strong_source_id_hash VARCHAR,
+                is_selected BOOLEAN
+            )
+            """
+        )
+        if sleep_intervals:
+            self._query.executemany(
+                "INSERT INTO staged_sleep_intervals "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        str(interval.measurement_version_id),
+                        str(interval.logical_measurement_id),
+                        interval.original_category,
+                        interval.canonical_category.value,
+                        interval.source_start.astimezone(UTC).isoformat(),
+                        interval.source_end.astimezone(UTC).isoformat(),
+                        interval.source_updated_at.astimezone(UTC).isoformat(),
+                        _utc_offset_minutes(interval.source_start),
+                        _utc_offset_minutes(interval.source_end),
+                        _utc_offset_minutes(interval.source_updated_at),
+                        interval.source_name,
+                        interval.source_version,
+                        interval.device,
+                        interval.strong_source_id_hash,
+                        False,
+                    )
+                    for interval in sleep_intervals
+                ],
+            )
+        if active is None:
+            combined_sleep = "SELECT *, 1 AS source_priority FROM staged_sleep_intervals"
+            previous_sleep_count = 0
+        else:
+            previous_sleep = (
+                self._root
+                / _PARQUET_DIRECTORY
+                / "snapshots"
+                / str(active[0])
+                / "sleep_intervals.parquet"
+            )
+            escaped_previous_sleep = str(previous_sleep).replace("'", "''")
+            combined_sleep = (
+                f"SELECT * FROM read_parquet('{escaped_previous_sleep}') "
+                "UNION ALL BY NAME SELECT *, 1 AS source_priority FROM staged_sleep_intervals"
+            )
+            previous_sleep_row = self._query.execute(
+                f"SELECT count(*) FROM read_parquet('{escaped_previous_sleep}')"
+            ).fetchone()
+            assert previous_sleep_row is not None
+            previous_sleep_count = int(previous_sleep_row[0])
+        self._query.execute(
+            f"""
+            CREATE OR REPLACE TEMP TABLE sleep_intervals AS
+            SELECT * EXCLUDE(source_priority, is_selected), row_number() OVER (
+                PARTITION BY identity_candidate_id
+                ORDER BY source_updated_at_utc DESC, source_version DESC,
+                         measurement_version_id DESC
+            ) = 1 AS is_selected
+            FROM ({combined_sleep})
+            QUALIFY row_number() OVER (
+                PARTITION BY measurement_version_id ORDER BY source_priority
+            ) = 1
+            """
+        )
+        sleep_count_row = self._query.execute(
+            "SELECT count(*), count(DISTINCT identity_candidate_id) FROM sleep_intervals"
+        ).fetchone()
+        assert sleep_count_row is not None
+        sleep_version_count, sleep_logical_count = map(int, sleep_count_row)
         count_row = self._query.execute(
             "SELECT count(*), count(DISTINCT identity_candidate_id) FROM combined_samples"
         ).fetchone()
@@ -3044,21 +3152,6 @@ class LocalStore:
                     for item_export_id, item_export_date, item_package_hash, _ in exports_to_record
                 ),
             )
-            self._record_import(
-                operation_id=operation_id,
-                import_id=import_id,
-                package_hash=package_hash,
-                snapshot_id=snapshot_id,
-                status="committed",
-                package_record_count=len(records),
-                record_count=new_record_count,
-                records=records,
-                logical_measurement_count=logical_count,
-                measurement_version_count=version_count,
-                source_occurrence_count=self._snapshot_occurrence_count(snapshot_id),
-                anomaly_count=resolution.anomaly_count,
-                unsupported_content=unsupported_content,
-            )
             self._metadata.execute(
                 "INSERT INTO dataset_snapshots VALUES (?, ?, ?, ?, ?, ?)",
                 (
@@ -3069,6 +3162,25 @@ class LocalStore:
                     None if active is None else str(active[0]),
                     completed_at,
                 ),
+            )
+            all_intervals: tuple[CanonicalHealthRecord | CanonicalSleepInterval, ...] = (
+                *records,
+                *sleep_intervals,
+            )
+            self._record_import(
+                operation_id=operation_id,
+                import_id=import_id,
+                package_hash=package_hash,
+                snapshot_id=snapshot_id,
+                status="committed",
+                package_record_count=len(all_intervals),
+                record_count=new_record_count + sleep_version_count - previous_sleep_count,
+                records=all_intervals,
+                logical_measurement_count=logical_count + sleep_logical_count,
+                measurement_version_count=version_count + sleep_version_count,
+                source_occurrence_count=self._snapshot_occurrence_count(snapshot_id),
+                anomaly_count=resolution.anomaly_count,
+                unsupported_content=unsupported_content,
             )
             self._metadata.executemany(
                 "INSERT OR IGNORE INTO source_type_catalog VALUES (?, ?)",
@@ -3133,9 +3245,9 @@ class LocalStore:
         return PublishImportResult(
             status="committed",
             snapshot_id=snapshot_id,
-            record_count=new_record_count,
-            logical_measurement_count=logical_count,
-            measurement_version_count=version_count,
+            record_count=new_record_count + sleep_version_count - previous_sleep_count,
+            logical_measurement_count=logical_count + sleep_logical_count,
+            measurement_version_count=version_count + sleep_version_count,
             source_occurrence_count=self._snapshot_occurrence_count(snapshot_id),
             anomaly_count=resolution.anomaly_count,
         )
@@ -3729,10 +3841,8 @@ class LocalStore:
             or type(resolution_basis["audit_max_position"]) is not int
             or resolution_basis["audit_max_position"] < 1
             or not _is_lower_hex(resolution_basis["governing_export_id"], 64)
-            or resolution_basis["identity_rule_version_id"]
-            not in _SUPPORTED_IDENTITY_RULE_VERSIONS
-            or resolution_basis["mapping_rule_version_id"]
-            not in _SUPPORTED_MAPPING_RULE_VERSIONS
+            or resolution_basis["identity_rule_version_id"] not in _SUPPORTED_IDENTITY_RULE_VERSIONS
+            or resolution_basis["mapping_rule_version_id"] not in _SUPPORTED_MAPPING_RULE_VERSIONS
             or not isinstance(validation_counts, dict)
             or set(validation_counts)
             != {
@@ -3949,6 +4059,7 @@ class LocalStore:
                               THEN 'kcal'
                           WHEN canonical_type = 'apple_resting_heart_rate' THEN 'count/min'
                           WHEN canonical_type = 'body_mass' THEN 'kg'
+                          WHEN canonical_type LIKE 'sleep_%' THEN 'count'
                           WHEN canonical_type = 'dietary_water' THEN 'mL'
                           ELSE 'g'
                       END)
@@ -4096,7 +4207,7 @@ class LocalStore:
         status: Literal["committed", "duplicate"],
         package_record_count: int,
         record_count: int,
-        records: tuple[CanonicalHealthRecord, ...],
+        records: tuple[CanonicalHealthRecord | CanonicalSleepInterval, ...],
         logical_measurement_count: int,
         measurement_version_count: int,
         source_occurrence_count: int,
@@ -4168,12 +4279,26 @@ class LocalStore:
         ).fetchone()
         assert count_row is not None
         version_count, logical_count = map(int, count_row)
+        sleep_path = (
+            self._root
+            / _PARQUET_DIRECTORY
+            / "snapshots"
+            / str(snapshot_id)
+            / "sleep_intervals.parquet"
+        )
+        escaped_sleep_path = str(sleep_path).replace("'", "''")
+        sleep_count_row = self._query.execute(
+            f"SELECT count(*), count(DISTINCT identity_candidate_id) "
+            f"FROM read_parquet('{escaped_sleep_path}')"
+        ).fetchone()
+        assert sleep_count_row is not None
+        sleep_version_count, sleep_logical_count = map(int, sleep_count_row)
         return PublishImportResult(
             status=status,
             snapshot_id=snapshot_id,
             record_count=record_count,
-            logical_measurement_count=logical_count,
-            measurement_version_count=version_count,
+            logical_measurement_count=logical_count + sleep_logical_count,
+            measurement_version_count=version_count + sleep_version_count,
             source_occurrence_count=self._snapshot_occurrence_count(snapshot_id),
             diagnostics=diagnostics,
         )
@@ -4189,7 +4314,13 @@ class LocalStore:
         escaped = str(path).replace("'", "''")
         row = self._query.execute(f"SELECT count(*) FROM read_parquet('{escaped}')").fetchone()
         assert row is not None
-        return int(row[0])
+        sleep_path = path.with_name("sleep_intervals.parquet")
+        escaped_sleep_path = str(sleep_path).replace("'", "''")
+        sleep_row = self._query.execute(
+            f"SELECT count(*) FROM read_parquet('{escaped_sleep_path}')"
+        ).fetchone()
+        assert sleep_row is not None
+        return int(row[0]) + int(sleep_row[0])
 
     def publish_data_review_resolution(
         self,
@@ -5393,17 +5524,19 @@ class LocalStore:
         selected_snapshot = snapshot_id or self.load_active_snapshot_id()
         if selected_snapshot is None:
             return None, ()
-        if self._metadata.execute(
-            "SELECT 1 FROM dataset_snapshots WHERE snapshot_id = ?", (str(selected_snapshot),)
-        ).fetchone() is None:
+        if (
+            self._metadata.execute(
+                "SELECT 1 FROM dataset_snapshots WHERE snapshot_id = ?", (str(selected_snapshot),)
+            ).fetchone()
+            is None
+        ):
             raise StoreError("Datensatz-Snapshot ist unbekannt.")
         directory = self._root / _PARQUET_DIRECTORY / "snapshots" / str(selected_snapshot)
         versions = str(directory / "measurement_versions.parquet").replace("'", "''")
         resolved = str(directory / "resolved_measurements.parquet").replace("'", "''")
         reviews = str(directory / "open_review_cases.parquet").replace("'", "''")
         clauses = [
-            "(versions.canonical_type = 'body_mass' "
-            "OR versions.canonical_type LIKE 'dietary_%')"
+            "(versions.canonical_type = 'body_mass' OR versions.canonical_type LIKE 'dietary_%')"
         ]
         parameters: list[date] = []
         if start_date is not None:
@@ -5431,7 +5564,7 @@ class LocalStore:
               ON resolved.selected_measurement_version_id = versions.measurement_version_id
             LEFT JOIN read_parquet('{reviews}') AS reviews
               ON reviews.logical_measurement_id = versions.identity_candidate_id
-            WHERE {' AND '.join(clauses)}
+            WHERE {" AND ".join(clauses)}
             GROUP BY ALL
             ORDER BY versions.measurement_local_date, versions.source_start_utc,
                      versions.measurement_version_id
@@ -5440,9 +5573,7 @@ class LocalStore:
         ).fetchall()
 
         def local_time(value: str, offset: int) -> datetime:
-            return datetime.fromisoformat(value).astimezone(
-                timezone(timedelta(minutes=offset))
-            )
+            return datetime.fromisoformat(value).astimezone(timezone(timedelta(minutes=offset)))
 
         return selected_snapshot, tuple(
             StoredWeightNutritionMeasurement(
@@ -5476,6 +5607,56 @@ class LocalStore:
                 original_value=float(row[18]),
                 original_unit=str(row[19]),
                 review_case_ids=tuple(ReviewCaseId(str(item)) for item in row[20]),
+            )
+            for row in rows
+        )
+
+    def load_sleep_measurements(
+        self, snapshot_id: SnapshotId | None
+    ) -> tuple[SnapshotId | None, tuple[CanonicalSleepInterval, ...]]:
+        self._require_open()
+        selected_snapshot = snapshot_id or self.load_active_snapshot_id()
+        if selected_snapshot is None:
+            return None, ()
+        if (
+            self._metadata.execute(
+                "SELECT 1 FROM dataset_snapshots WHERE snapshot_id = ?", (str(selected_snapshot),)
+            ).fetchone()
+            is None
+        ):
+            raise StoreError("Datensatz-Snapshot ist unbekannt.")
+        path = self._root / _PARQUET_DIRECTORY / "snapshots" / str(selected_snapshot)
+        sleep = str(path / "sleep_intervals.parquet").replace("'", "''")
+        rows = self._query.execute(
+            f"""
+            SELECT identity_candidate_id, measurement_version_id, original_category,
+                   canonical_category, source_start_utc, source_end_utc,
+                   source_updated_at_utc, source_start_offset_minutes,
+                   source_end_offset_minutes, source_updated_at_offset_minutes,
+                   source_name, source_version, device, strong_source_id_hash
+                   , is_selected
+            FROM read_parquet('{sleep}')
+            ORDER BY source_start_utc, measurement_version_id
+            """
+        ).fetchall()
+
+        def local_time(value: str, offset: int) -> datetime:
+            return datetime.fromisoformat(value).astimezone(timezone(timedelta(minutes=offset)))
+
+        return selected_snapshot, tuple(
+            CanonicalSleepInterval(
+                logical_measurement_id=LogicalMeasurementId(str(row[0])),
+                measurement_version_id=MeasurementVersionId(str(row[1])),
+                original_category=str(row[2]),
+                canonical_category=CanonicalSleepCategory(str(row[3])),
+                source_start=local_time(str(row[4]), int(row[7])),
+                source_end=local_time(str(row[5]), int(row[8])),
+                source_updated_at=local_time(str(row[6]), int(row[9])),
+                source_name=str(row[10]),
+                source_version=str(row[11]),
+                device=str(row[12]),
+                strong_source_id_hash=None if row[13] is None else str(row[13]),
+                is_selected=bool(row[14]),
             )
             for row in rows
         )

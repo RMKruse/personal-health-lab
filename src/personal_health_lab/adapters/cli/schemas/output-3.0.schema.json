@@ -10,6 +10,9 @@
       "$ref": "#/$defs/weightNutritionOutput"
     },
     {
+      "$ref": "#/$defs/sleepDaysOutput"
+    },
+    {
       "$ref": "#/$defs/writePlanOutput"
     },
     {
@@ -29,6 +32,30 @@
     }
   ],
   "$defs": {
+    "sleepDaysOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accepted_intervals",
+        "days",
+        "kind",
+        "rejected_intervals",
+        "runtime_config",
+        "schema_version",
+        "selection",
+        "snapshot_ref"
+      ],
+      "properties": {
+        "accepted_intervals": { "type": "array", "items": { "type": "object" } },
+        "days": { "type": "array", "items": { "type": "object" } },
+        "kind": { "const": "sleep_days" },
+        "rejected_intervals": { "type": "array", "items": { "type": "object" } },
+        "runtime_config": { "type": "object" },
+        "schema_version": { "const": "3.0" },
+        "selection": { "type": "object" },
+        "snapshot_ref": { "$ref": "#/$defs/nullableString" }
+      }
+    },
     "nullableString": {
       "type": [
         "string",

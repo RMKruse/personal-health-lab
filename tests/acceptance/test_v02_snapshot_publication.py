@@ -24,12 +24,14 @@ PARQUET_FILES = (
     "measurement_versions.parquet",
     "open_review_cases.parquet",
     "resolved_measurements.parquet",
+    "sleep_intervals.parquet",
     "source_occurrences.parquet",
 )
 LAST_COLUMNS = {
     "measurement_versions.parquet": "strong_source_id_hash",
     "open_review_cases.parquet": "evidence_fingerprint",
     "resolved_measurements.parquet": "conflict_resolution_decision_id",
+    "sleep_intervals.parquet": "is_selected",
     "source_occurrences.parquet": "occurrence_fingerprint",
 }
 

@@ -165,6 +165,40 @@ class HealthProvenance:
             raise ValueError("Starke Quellen-ID muss ein SHA-256-Wert sein.")
 
 
+class CanonicalSleepCategory(StrEnum):
+    IN_BED = "in_bed"
+    AWAKE = "awake"
+    ASLEEP_UNSPECIFIED = "asleep_unspecified"
+    ASLEEP_CORE = "asleep_core"
+    ASLEEP_DEEP = "asleep_deep"
+    ASLEEP_REM = "asleep_rem"
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalSleepInterval:
+    logical_measurement_id: LogicalMeasurementId
+    measurement_version_id: MeasurementVersionId
+    original_category: str
+    canonical_category: CanonicalSleepCategory
+    source_start: datetime
+    source_end: datetime
+    source_updated_at: datetime
+    source_name: str
+    source_version: str
+    device: str
+    strong_source_id_hash: str | None = None
+    is_selected: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.original_category or self.source_end < self.source_start:
+            raise ValueError("Ungültiges kanonisches Schlafintervall.")
+        if any(
+            timestamp.tzinfo is None
+            for timestamp in (self.source_start, self.source_end, self.source_updated_at)
+        ):
+            raise ValueError("Quellzeitpunkte müssen eine Zeitzone enthalten.")
+
+
 @dataclass(frozen=True, slots=True)
 class CanonicalHealthRecord:
     logical_measurement_id: LogicalMeasurementId
@@ -215,6 +249,8 @@ __all__ = [
     "AnalysisFreshness",
     "CanonicalHealthRecord",
     "CanonicalHealthType",
+    "CanonicalSleepCategory",
+    "CanonicalSleepInterval",
     "CanonicalUnit",
     "DailyHealthSeries",
     "DailyHealthValue",

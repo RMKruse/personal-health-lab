@@ -20,6 +20,8 @@ from personal_health_lab.data_quality import resolve_sources, select_governing_e
 from personal_health_lab.health_data import (
     CanonicalHealthRecord,
     CanonicalHealthType,
+    CanonicalSleepCategory,
+    CanonicalSleepInterval,
     CanonicalUnit,
     HealthProvenance,
     LogicalMeasurementId,
@@ -81,6 +83,15 @@ _SLEEP_VALUES = {
     "HKCategoryValueSleepAnalysisAsleepDeep",
     "HKCategoryValueSleepAnalysisAsleepREM",
 }
+_SLEEP_CATEGORIES = {
+    "HKCategoryValueSleepAnalysisInBed": CanonicalSleepCategory.IN_BED,
+    "HKCategoryValueSleepAnalysisAwake": CanonicalSleepCategory.AWAKE,
+    "HKCategoryValueSleepAnalysisAsleep": CanonicalSleepCategory.ASLEEP_UNSPECIFIED,
+    "HKCategoryValueSleepAnalysisAsleepUnspecified": CanonicalSleepCategory.ASLEEP_UNSPECIFIED,
+    "HKCategoryValueSleepAnalysisAsleepCore": CanonicalSleepCategory.ASLEEP_CORE,
+    "HKCategoryValueSleepAnalysisAsleepDeep": CanonicalSleepCategory.ASLEEP_DEEP,
+    "HKCategoryValueSleepAnalysisAsleepREM": CanonicalSleepCategory.ASLEEP_REM,
+}
 _DIETARY_TYPES = {
     "HKQuantityTypeIdentifierDietaryBiotin": CanonicalHealthType.DIETARY_BIOTIN,
     "HKQuantityTypeIdentifierDietaryCaffeine": CanonicalHealthType.DIETARY_CAFFEINE,
@@ -90,9 +101,7 @@ _DIETARY_TYPES = {
     "HKQuantityTypeIdentifierDietaryCholesterol": CanonicalHealthType.DIETARY_CHOLESTEROL,
     "HKQuantityTypeIdentifierDietaryChromium": CanonicalHealthType.DIETARY_CHROMIUM,
     "HKQuantityTypeIdentifierDietaryCopper": CanonicalHealthType.DIETARY_COPPER,
-    "HKQuantityTypeIdentifierDietaryEnergyConsumed": (
-        CanonicalHealthType.DIETARY_ENERGY_CONSUMED
-    ),
+    "HKQuantityTypeIdentifierDietaryEnergyConsumed": (CanonicalHealthType.DIETARY_ENERGY_CONSUMED),
     "HKQuantityTypeIdentifierDietaryFatMonounsaturated": (
         CanonicalHealthType.DIETARY_FAT_MONOUNSATURATED
     ),
@@ -214,6 +223,7 @@ class _ParsedExport:
     export_id: str
     export_date: datetime | None
     records: tuple[CanonicalHealthRecord, ...]
+    sleep_intervals: tuple[CanonicalSleepInterval, ...] = ()
     unknown_source_types: tuple[str, ...] = ()
     unsupported_content: tuple[UnsupportedImportContent, ...] = ()
 
@@ -264,12 +274,8 @@ def _measurement_version_ids(
         device,
     )
     return (
-        MeasurementVersionId(
-            _id(_PAYLOAD_IDENTITY_RULE_VERSION, logical_id, current_payload)
-        ),
-        MeasurementVersionId(
-            _id(_LOGICAL_IDENTITY_RULE_VERSION, logical_id, legacy_payload)
-        ),
+        MeasurementVersionId(_id(_PAYLOAD_IDENTITY_RULE_VERSION, logical_id, current_payload)),
+        MeasurementVersionId(_id(_LOGICAL_IDENTITY_RULE_VERSION, logical_id, legacy_payload)),
     )
 
 
@@ -287,6 +293,7 @@ def _records(
     if package_path.stat().st_size > max_package_bytes:
         raise _RejectedPackage("package too large")
     records: list[CanonicalHealthRecord] = []
+    sleep_intervals: list[CanonicalSleepInterval] = []
     unknown_source_types: set[str] = set()
     unsupported: Counter[tuple[str, str]] = Counter()
     with ZipFile(package_path) as archive:
@@ -354,9 +361,82 @@ def _records(
                     source_type = element.attrib.get("type", "")
                     mapping = _MAPPINGS.get(source_type)
                     source_unit = element.attrib.get("unit", "")
-                    if mapping is not None and source_unit in mapping[2]:
+                    if source_type == _SLEEP_TYPE:
+                        original_category = element.attrib.get("value", "")
+                        category = _SLEEP_CATEGORIES.get(original_category)
+                        if category is None:
+                            unsupported["sleep_value", original_category] += 1
+                        elif source_unit:
+                            unsupported[
+                                "unit",
+                                json.dumps([source_type, source_unit], separators=(",", ":")),
+                            ] += 1
+                        else:
+                            source_start = _source_datetime(element.attrib["startDate"])
+                            source_end = _source_datetime(element.attrib["endDate"])
+                            source_updated_at = _source_datetime(element.attrib["creationDate"])
+                            source_name = element.attrib["sourceName"]
+                            source_version = element.attrib.get("sourceVersion", "")
+                            device = element.attrib.get("device", "")
+                            sync_id = next(
+                                (
+                                    child.attrib.get("value")
+                                    for child in element
+                                    if child.tag == "MetadataEntry"
+                                    and child.attrib.get("key") == _SYNC_IDENTIFIER
+                                    and child.attrib.get("value")
+                                ),
+                                None,
+                            )
+                            strong_source_id_hash = (
+                                None if sync_id is None else _id(source_name, sync_id)
+                            )
+                            logical_id = LogicalMeasurementId(
+                                _id(_LOGICAL_IDENTITY_RULE_VERSION, "strong", strong_source_id_hash)
+                                if strong_source_id_hash is not None
+                                else _id(
+                                    _LOGICAL_IDENTITY_RULE_VERSION,
+                                    "natural",
+                                    _SLEEP_TYPE,
+                                    source_start.isoformat(),
+                                    source_end.isoformat(),
+                                    source_name,
+                                    device,
+                                )
+                            )
+                            measurement_version_id = MeasurementVersionId(
+                                _id(
+                                    _PAYLOAD_IDENTITY_RULE_VERSION,
+                                    logical_id,
+                                    original_category,
+                                    source_start.isoformat(),
+                                    source_end.isoformat(),
+                                    source_updated_at.isoformat(),
+                                    source_name,
+                                    source_version,
+                                    device,
+                                )
+                            )
+                            sleep_intervals.append(
+                                CanonicalSleepInterval(
+                                    logical_measurement_id=logical_id,
+                                    measurement_version_id=measurement_version_id,
+                                    original_category=original_category,
+                                    canonical_category=category,
+                                    source_start=source_start,
+                                    source_end=source_end,
+                                    source_updated_at=source_updated_at,
+                                    source_name=source_name,
+                                    source_version=source_version,
+                                    device=device,
+                                    strong_source_id_hash=strong_source_id_hash,
+                                )
+                            )
+                    elif mapping is not None and source_unit in mapping[2]:
                         data_type, canonical_unit, conversions = mapping
-                        original_value = float(element.attrib["value"])
+                        original_value = (
+                            1.0 if source_type == _SLEEP_TYPE else float(element.attrib["value"])
+                        )
                         value = original_value * conversions[source_unit]
                         source_start = _source_datetime(element.attrib["startDate"])
                         source_end = _source_datetime(element.attrib["endDate"])
@@ -387,7 +467,7 @@ def _records(
                             else _id(
                                 _LOGICAL_IDENTITY_RULE_VERSION,
                                 "natural",
-                                data_type.value,
+                                source_type,
                                 source_start.isoformat(),
                                 source_end.isoformat(),
                                 source_name,
@@ -432,11 +512,7 @@ def _records(
                         )
                     elif source_type:
                         unknown_source_types.add(source_type)
-                        if source_type == _SLEEP_TYPE:
-                            value = element.attrib.get("value", "")
-                            if value not in _SLEEP_VALUES:
-                                unsupported["sleep_value", value] += 1
-                        elif source_type in _V03_UNITS:
+                        if source_type in _V03_UNITS:
                             unit = element.attrib.get("unit", "")
                             if unit not in _V03_UNITS[source_type]:
                                 unsupported[
@@ -450,12 +526,13 @@ def _records(
                     unsupported["top_level_element", element.tag] += 1
                     element.clear()
                 tags.pop()
-    if not records and not unknown_source_types and not unsupported:
+    if not records and not sleep_intervals and not unknown_source_types and not unsupported:
         raise ValueError("no supported records")
     return _ParsedExport(
         export_digest.hexdigest(),
         export_date,
         tuple(records),
+        tuple(sleep_intervals),
         tuple(sorted(unknown_source_types)),
         tuple(
             UnsupportedImportContent(cast(UnsupportedContentCategory, category), identifier, count)
@@ -486,7 +563,9 @@ def estimate_health_export(
             max_uncompressed_bytes=max_uncompressed_bytes,
             max_compression_ratio=max_compression_ratio,
         )
-        return HealthExportEstimate(max(input_bytes, package_size), len(parsed.records))
+        return HealthExportEstimate(
+            max(input_bytes, package_size), len(parsed.records) + len(parsed.sleep_intervals)
+        )
     except (
         BadZipFile,
         KeyError,
@@ -511,6 +590,7 @@ def _restore_exports(
 ) -> tuple[
     tuple[_ParsedExport, ...],
     tuple[CanonicalHealthRecord, ...],
+    tuple[CanonicalSleepInterval, ...],
     int,
     tuple[tuple[str, datetime | None, str, tuple[CanonicalHealthRecord, ...]], ...],
 ]:
@@ -557,9 +637,15 @@ def _restore_exports(
         for export in reversed(exports)
         for record in export.records
     }
+    sleep_intervals = {
+        str(interval.measurement_version_id): interval
+        for export in reversed(exports)
+        for interval in export.sleep_intervals
+    }
     return (
         exports,
         tuple(records.values()),
+        tuple(sleep_intervals.values()),
         sum(path.stat().st_size for path in packages.values()),
         tuple(
             (export.export_id, export.export_date, package_hash, export.records)
@@ -579,7 +665,7 @@ def inspect_restore_health_export(
     max_uncompressed_bytes: int,
     max_compression_ratio: float,
 ) -> RestoreHealthExportInspection:
-    _, records, input_bytes, _ = _restore_exports(
+    _, records, sleep_intervals, input_bytes, _ = _restore_exports(
         package_path,
         store=store,
         target_root=target_root,
@@ -590,7 +676,7 @@ def inspect_restore_health_export(
         max_compression_ratio=max_compression_ratio,
     )
     sources = inspect_restore_sources(store, target_root, records)
-    estimate = HealthExportEstimate(max(input_bytes, 1), len(records))
+    estimate = HealthExportEstimate(max(input_bytes, 1), len(records) + len(sleep_intervals))
     return RestoreHealthExportInspection(
         estimate,
         sources,
@@ -630,7 +716,7 @@ def _import_restore_health_export(
             max_uncompressed_bytes=max_uncompressed_bytes,
             max_compression_ratio=max_compression_ratio,
         )
-        exports, records, _, restore_exports = _restore_exports(
+        exports, records, sleep_intervals, _, restore_exports = _restore_exports(
             package_path,
             store=store,
             target_root=target_root,
@@ -671,7 +757,7 @@ def _import_restore_health_export(
             package_hash,
             None,
             0,
-            package_record_count=len(current.records),
+            package_record_count=len(current.records) + len(current.sleep_intervals),
             logical_measurement_count=len(
                 {str(record.logical_measurement_id) for record in records}
             ),
@@ -724,6 +810,7 @@ def _import_restore_health_export(
             export_id=export_id,
             export_date=export_date,
             records=records,
+            sleep_intervals=sleep_intervals,
             unknown_source_types=tuple(
                 sorted(
                     {
@@ -751,7 +838,7 @@ def _import_restore_health_export(
         package_hash,
         published.snapshot_id,
         published.record_count,
-        package_record_count=len(current.records),
+        package_record_count=len(current.records) + len(current.sleep_intervals),
         logical_measurement_count=published.logical_measurement_count,
         measurement_version_count=published.measurement_version_count,
         source_occurrence_count=published.source_occurrence_count,
@@ -850,6 +937,7 @@ def import_health_export(
                 export_id=parsed.export_id,
                 export_date=parsed.export_date,
                 records=parsed.records,
+                sleep_intervals=parsed.sleep_intervals,
                 unknown_source_types=parsed.unknown_source_types,
                 unsupported_content=parsed.unsupported_content,
                 governing_export_id=governing_export_id,
@@ -873,7 +961,7 @@ def import_health_export(
                 package_hash=package_hash,
                 snapshot_id=None,
                 record_count=0,
-                package_record_count=len(parsed.records),
+                package_record_count=len(parsed.records) + len(parsed.sleep_intervals),
                 diagnostics=(diagnostic,),
             )
     except StoreError as error:
@@ -885,7 +973,7 @@ def import_health_export(
         package_hash=package_hash,
         snapshot_id=published.snapshot_id,
         record_count=published.record_count,
-        package_record_count=len(parsed.records),
+        package_record_count=len(parsed.records) + len(parsed.sleep_intervals),
         logical_measurement_count=published.logical_measurement_count,
         measurement_version_count=published.measurement_version_count,
         source_occurrence_count=published.source_occurrence_count,

@@ -335,6 +335,78 @@ def _render_weight_nutrition(config: RuntimeConfig) -> None:
     )
 
 
+def _render_sleep_days(config: RuntimeConfig) -> None:
+    st.subheader("Schlaf")
+    snapshot = st.text_input("Schlaf-Snapshot-ID (optional)")
+    start = st.date_input("Schlaf von", value=None)
+    end = st.date_input("Schlaf bis", value=None)
+    if st.button("Schlaf laden"):
+        try:
+            assert start is None or isinstance(start, date)
+            assert end is None or isinstance(end, date)
+            selection = SnapshotDateSelection(
+                snapshot_ref=SnapshotRef(snapshot) if snapshot else None,
+                start_date=start,
+                end_date=end,
+            )
+            st.session_state["sleep_selection"] = selection
+        except (ValueError, ConfigurationError, HealthLabError):
+            st.error("Schlafdaten konnten nicht geladen werden.")
+    saved_selection = st.session_state.get("sleep_selection")
+    if not isinstance(saved_selection, SnapshotDateSelection):
+        return
+    try:
+        with HealthLab.open(config) as health_lab:
+            projection = health_lab.load_sleep_days(saved_selection)
+    except (ConfigurationError, HealthLabError):
+        st.error("Schlafdaten konnten nicht geladen werden.")
+        return
+    st.caption(f"Snapshot: {projection.snapshot_ref or '-'}")
+    st.dataframe(
+        [
+            {
+                "Tag": item.day.isoformat(),
+                "Status": item.status.value,
+                "Beobachteter Schlaf (s)": (
+                    None
+                    if item.primary_episode is None
+                    else item.primary_episode.observed_sleep.total_seconds()
+                ),
+                "Akzeptierte Intervalle": item.quality.accepted_interval_count,
+                "Abgewiesene Intervalle": item.quality.rejected_interval_count,
+                "Quellenklassen": {
+                    value.source_class.value: {
+                        "akzeptiert": value.accepted_interval_count,
+                        "abgewiesen": value.rejected_interval_count,
+                    }
+                    for value in item.quality.source_counts
+                },
+                "Klassifikator": item.quality.source_classifier_version,
+                "Ableitung": item.quality.derivation_version,
+            }
+            for item in projection.days
+        ],
+        width="stretch",
+    )
+    st.dataframe(
+        [
+            {
+                "Messungsversion": str(item.measurement_version_id),
+                "Originalkategorie": item.original_category,
+                "Kanonische Kategorie": item.canonical_category.value,
+                "Quellenklasse": item.source_class.value,
+                "Ausgewählt": item.is_selected,
+                "Quellbeginn": item.source_start.isoformat(),
+                "Quellende": item.source_end.isoformat(),
+                "Quelle": item.source_name,
+                "Gerät": item.device,
+            }
+            for item in (*projection.accepted_intervals, *projection.rejected_intervals)
+        ],
+        width="stretch",
+    )
+
+
 def _discard_pending_previews() -> None:
     import_request = st.session_state.get("import_request")
     if isinstance(import_request, ImportHealthExport):
@@ -512,6 +584,7 @@ if rollback_plan.details.migration_operation_id is not None:
 
 if st.session_state["active_page"] == "Kerndaten":
     _render_weight_nutrition(config)
+    _render_sleep_days(config)
     _render_import_details(config)
     st.stop()
 
