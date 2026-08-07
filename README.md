@@ -3,6 +3,18 @@ A privacy-first platform for exploring, modeling, and visualizing longitudinal p
 
 **Aktueller Stand: V0.2 – belastbare Import- und Datenqualitätsbasis.**
 
+## Demo des aktuellen Entwicklungsstands
+
+Die lokale Demo erzeugt deterministische synthetische Daten, importiert sie über den echten
+Schreibplan, führt die Ruhepulsanalyse aus und öffnet anschließend Streamlit:
+
+```bash
+./scripts/demo.sh
+```
+
+Die Demo verwendet ausschließlich einen temporären synthetischen Datenspeicher. `Strg-C` beendet
+Streamlit und löscht die Demo-Daten.
+
 ## V0.2 aus einem frischen Checkout nachweisen
 
 Voraussetzung ist Python 3.12 oder neuer sowie [`uv`](https://docs.astral.sh/uv/). Ein frischer
