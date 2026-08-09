@@ -97,6 +97,7 @@ def test_public_application_values_are_immutable_and_storage_neutral() -> None:
         "load_plausibility_rules",
         "load_recovery_status",
         "load_sleep_days",
+        "load_workouts",
         "load_workspace_status",
     )
     request_values = set(get_args(WriteRequest))
