@@ -411,6 +411,7 @@ class AsNeededMedication:
             )
             or len(set(self.preferred_reason_category_ids))
             != len(self.preferred_reason_category_ids)
+            or (self.entry_id is not None and not isinstance(self.entry_id, MedicationPlanEntryId))
         ):
             raise ConfigurationError("Bedarfsmedikation ist ungültig.")
         object.__setattr__(self, "medication_name", name)
@@ -453,6 +454,11 @@ class ReviseMedicationRegime:
             raise ConfigurationError("Regimebeginn muss zeitzonenbewusst sein.")
         if len(set(self.intent.scheduled_doses)) != len(self.intent.scheduled_doses):
             raise ConfigurationError("Identische Planeinträge sind nicht zulässig.")
+        entry_ids = tuple(
+            item.entry_id for item in self.intent.as_needed_medications if item.entry_id is not None
+        )
+        if len(set(entry_ids)) != len(entry_ids):
+            raise ConfigurationError("Bedarfsplaneintrags-IDs müssen eindeutig sein.")
 
 
 @dataclass(frozen=True, slots=True)

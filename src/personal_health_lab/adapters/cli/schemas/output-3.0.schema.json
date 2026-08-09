@@ -54,9 +54,78 @@
         "schema_version": { "const": "3.0" },
         "snapshot_ref": { "$ref": "#/$defs/nullableString" },
         "medication_as_of": { "$ref": "#/$defs/nullableString" },
-        "days": { "type": "array", "items": { "type": "object" } },
-        "regimes": { "type": "array", "items": { "type": "object" } },
-        "intake_reason_categories": { "type": "array", "items": { "type": "object" } },
+        "days": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["as_needed_intakes", "day", "occurrences", "status"],
+            "properties": {
+              "as_needed_intakes": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["amount", "logical_id", "medication_name", "reason_category_name", "taken_at", "unit"],
+                  "properties": {
+                    "amount": { "type": "string" },
+                    "logical_id": { "type": "string" },
+                    "medication_name": { "type": "string" },
+                    "reason_category_name": { "$ref": "#/$defs/nullableString" },
+                    "taken_at": { "type": "string" },
+                    "unit": { "type": "string" }
+                  }
+                }
+              },
+              "day": { "type": "string" },
+              "occurrences": { "type": "array" },
+              "status": { "enum": ["unknown", "empty", "planned"] }
+            }
+          }
+        },
+        "regimes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["as_needed_medications", "logical_id", "revision_id", "scheduled_doses", "starts_at", "timezone"],
+            "properties": {
+              "as_needed_medications": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["amount", "entry_id", "medication_name", "preferred_reason_category_ids", "unit"],
+                  "properties": {
+                    "amount": { "type": "string" },
+                    "entry_id": { "type": "string" },
+                    "medication_name": { "type": "string" },
+                    "preferred_reason_category_ids": { "type": "array", "items": { "type": "string" } },
+                    "unit": { "type": "string" }
+                  }
+                }
+              },
+              "logical_id": { "type": "string" },
+              "revision_id": { "type": "string" },
+              "scheduled_doses": { "type": "array" },
+              "starts_at": { "type": "string" },
+              "timezone": { "type": "string" }
+            }
+          }
+        },
+        "intake_reason_categories": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["logical_id", "name", "revision_id"],
+            "properties": {
+              "logical_id": { "type": "string" },
+              "name": { "type": "string" },
+              "revision_id": { "type": "string" }
+            }
+          }
+        },
         "logical_id": { "type": "string" },
         "revisions": { "type": "array", "items": { "type": "object" } }
       }

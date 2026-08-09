@@ -3,21 +3,27 @@ from decimal import Decimal
 from pathlib import Path
 from zipfile import ZipFile
 
+import pytest
+
 from personal_health_lab.application import (
     AsNeededIntakeCreate,
     AsNeededIntakeRestore,
+    AsNeededIntakeRevise,
     AsNeededIntakeWithdraw,
     AsNeededMedication,
+    ConfigurationError,
     DataMode,
     HealthLab,
     ImportHealthExport,
     IntakeReasonCategoryCreate,
+    IntakeReasonCategoryRestore,
     IntakeReasonCategoryRevise,
     IntakeReasonCategoryWithdraw,
     MedicationActualIntake,
     MedicationDeviationCreate,
     MedicationDeviationRestore,
     MedicationDeviationWithdraw,
+    MedicationPlanEntryId,
     MedicationRegimeCreate,
     MedicationRegimeRevise,
     ReviseAsNeededIntake,
@@ -229,7 +235,7 @@ def test_as_needed_intakes_and_reason_categories_are_snapshot_bound(tmp_path: Pa
                 "Schmerz",
             )
         )
-        health_lab.execute_write(
+        renamed_receipt = health_lab.execute_write(
             renamed, expected_plan=health_lab.preview_write(renamed).fingerprint
         )
         blocked = ReviseIntakeReasonCategory(
@@ -246,6 +252,31 @@ def test_as_needed_intakes_and_reason_categories_are_snapshot_bound(tmp_path: Pa
         new_day = health_lab.load_medication_days(
             SnapshotDateSelection(None, taken_at.date(), taken_at.date())
         ).days[0]
+        revised_intake = ReviseAsNeededIntake(
+            AsNeededIntakeRevise(
+                intake_receipt.result.logical_id,
+                intake_receipt.result.revision_id,
+                taken_at,
+                Decimal("300"),
+                category_receipt.result.logical_id,
+            )
+        )
+        intake_receipt = health_lab.execute_write(
+            revised_intake, expected_plan=health_lab.preview_write(revised_intake).fingerprint
+        )
+        regime_revise = ReviseMedicationRegime(
+            MedicationRegimeRevise(
+                regime_receipt.result.logical_id,
+                regime_receipt.result.revision_id,
+                datetime.fromisoformat("2024-03-01T00:00:00+01:00"),
+                "Europe/Berlin",
+                (),
+                (AsNeededMedication("Ibuprofen", Decimal("400"), "mg", entry_id=entry_id),),
+            )
+        )
+        health_lab.execute_write(
+            regime_revise, expected_plan=health_lab.preview_write(regime_revise).fingerprint
+        )
         withdrawal = ReviseAsNeededIntake(
             AsNeededIntakeWithdraw(
                 intake_receipt.result.logical_id,
@@ -256,12 +287,33 @@ def test_as_needed_intakes_and_reason_categories_are_snapshot_bound(tmp_path: Pa
         withdrawn = health_lab.execute_write(
             withdrawal, expected_plan=health_lab.preview_write(withdrawal).fingerprint
         )
+        category_withdrawal = ReviseIntakeReasonCategory(
+            IntakeReasonCategoryWithdraw(
+                category_receipt.result.logical_id,
+                renamed_receipt.result.revision_id,
+                "Nicht mehr gebraucht",
+            )
+        )
+        withdrawn_category = health_lab.execute_write(
+            category_withdrawal,
+            expected_plan=health_lab.preview_write(category_withdrawal).fingerprint,
+        )
+        category_restore = ReviseIntakeReasonCategory(
+            IntakeReasonCategoryRestore(
+                category_receipt.result.logical_id,
+                withdrawn_category.result.revision_id,
+                "Schmerz",
+            )
+        )
+        health_lab.execute_write(
+            category_restore, expected_plan=health_lab.preview_write(category_restore).fingerprint
+        )
         restore = ReviseAsNeededIntake(
             AsNeededIntakeRestore(
                 intake_receipt.result.logical_id,
                 withdrawn.result.revision_id,
                 taken_at,
-                Decimal("200"),
+                Decimal("300"),
                 category_receipt.result.logical_id,
             )
         )
@@ -276,3 +328,21 @@ def test_as_needed_intakes_and_reason_categories_are_snapshot_bound(tmp_path: Pa
     assert new_day.as_needed_intakes[0].amount == Decimal("200")
     assert blocked_plan.approval.status.value == "blocked"
     assert audit.revisions[-1].state == "active"
+
+
+def test_as_needed_plan_entry_ids_must_be_explicitly_valid_and_unique() -> None:
+    entry_id = MedicationPlanEntryId("a" * 32)
+    with pytest.raises(ConfigurationError):
+        AsNeededMedication("Ibuprofen", Decimal("400"), "mg", entry_id="not-an-id")  # type: ignore[arg-type]
+    with pytest.raises(ConfigurationError):
+        ReviseMedicationRegime(
+            MedicationRegimeCreate(
+                datetime.fromisoformat("2024-03-01T00:00:00+01:00"),
+                "Europe/Berlin",
+                (),
+                (
+                    AsNeededMedication("Ibuprofen", Decimal("400"), "mg", entry_id=entry_id),
+                    AsNeededMedication("Paracetamol", Decimal("500"), "mg", entry_id=entry_id),
+                ),
+            )
+        )
