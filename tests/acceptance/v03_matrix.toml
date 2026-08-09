@@ -14,6 +14,12 @@ statement = "A medication regime is an immutable, snapshot-bound local IANA time
 evidence = ["positive", "boundary", "transition"]
 
 [[contract]]
+id = "V03-C-MEDICATION-DEVIATION-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/81"
+statement = "One immutable deviation binds one scheduled occurrence; omitted, changed-time or changed-dose, and multiple actual intakes share one model, while identical intake is no_change and invalidating regime corrections are blocked."
+evidence = ["positive", "negative", "transition", "boundary"]
+
+[[contract]]
 id = "V03-C-DAILY-STRESS-CUSTOM-CONTEXT-V1"
 source = "https://github.com/RMKruse/personal-health-lab/issues/79"
 statement = "One daily stress revision is active per local day, an observed average remains distinct from the baseline assumption, and normalized custom labels reserve their names while same-label periods cannot overlap."
@@ -153,6 +159,20 @@ expected_result = "the DST gap resolves forward and the old dose plan remains im
 expected_effect = "one revision, audit event, and snapshot per successful regime revision"
 forbidden_side_effects = "no deviation, PRN intake, or adherence score is fabricated"
 evidence = ["positive", "boundary", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-DEVIATION-V1"
+contracts = ["V03-C-MEDICATION-DEVIATION-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_medication.py::test_medication_deviation_binds_one_occurrence_and_keeps_old_snapshot_stable"
+initial_state = "committed synthetic snapshot with one Monday scheduled dose"
+operation = "record a next-day travel-zone intake, preview an identical no_change intake, block an invalidating regime correction, then withdraw the deviation"
+level = "application"
+platform = "all"
+expected_result = "the old snapshot remains deviated while withdrawal restores assumed_as_planned in the active snapshot"
+expected_effect = "one immutable deviation revision, audit event, and snapshot for each successful state change"
+forbidden_side_effects = "no second day occurrence, automatic reassignment, or lock for no_change"
+evidence = ["positive", "negative", "transition", "boundary"]
 
 [[case]]
 id = "V03-A-DAILY-STRESS-CUSTOM-CONTEXT-V1"

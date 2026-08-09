@@ -59,6 +59,8 @@ from personal_health_lab.application import (
     LocalMeasurementExclusion,
     LocalWorkoutExclusion,
     MeasurementVersionId,
+    MedicationAuditRevision,
+    MedicationDeviationAuditRevision,
     MedicationLogicalId,
     MetadataBackupPlan,
     MetadataBackupReceipt,
@@ -108,6 +110,33 @@ from personal_health_lab.application import (
 )
 
 _OUTPUT_SCHEMA_VERSION = "3.0"
+
+
+def _medication_audit_revision_json(
+    item: MedicationAuditRevision | MedicationDeviationAuditRevision,
+) -> dict[str, object]:
+    if isinstance(item, MedicationDeviationAuditRevision):
+        return {
+            "revision_id": str(item.revision_id),
+            "previous_revision_id": None
+            if item.previous_revision_id is None
+            else str(item.previous_revision_id),
+            "state": item.state,
+            "regime_logical_id": str(item.regime_logical_id),
+            "scheduled_at": item.scheduled_at.isoformat(),
+            "actual_intakes": [
+                {"taken_at": intake.taken_at.isoformat(), "amount": str(intake.amount)}
+                for intake in item.actual_intakes
+            ],
+        }
+    return {
+        "revision_id": str(item.revision_id),
+        "previous_revision_id": None
+        if item.previous_revision_id is None
+        else str(item.previous_revision_id),
+        "starts_at": item.starts_at.isoformat(),
+        "timezone": item.timezone,
+    }
 
 
 def _provenance_json(provenance: AnalysisProvenance | None) -> dict[str, object] | None:
@@ -2040,6 +2069,13 @@ def main(args: Sequence[str] | None = None) -> int:
                                     "unit": dose.unit,
                                     "scheduled_at": dose.scheduled_at.isoformat(),
                                     "status": dose.status,
+                                    "actual_intakes": [
+                                        {
+                                            "taken_at": intake.taken_at.isoformat(),
+                                            "amount": str(intake.amount),
+                                        }
+                                        for intake in dose.actual_intakes
+                                    ],
                                 }
                                 for dose in item.occurrences
                             ],
@@ -2092,15 +2128,7 @@ def main(args: Sequence[str] | None = None) -> int:
                     "kind": "medication_audit",
                     "logical_id": str(medication_audit.logical_id),
                     "revisions": [
-                        {
-                            "revision_id": str(item.revision_id),
-                            "previous_revision_id": None
-                            if item.previous_revision_id is None
-                            else str(item.previous_revision_id),
-                            "starts_at": item.starts_at.isoformat(),
-                            "timezone": item.timezone,
-                        }
-                        for item in medication_audit.revisions
+                        _medication_audit_revision_json(item) for item in medication_audit.revisions
                     ],
                     "runtime_config": dict(runtime_config),
                     "schema_version": _OUTPUT_SCHEMA_VERSION,
@@ -2141,9 +2169,16 @@ def main(args: Sequence[str] | None = None) -> int:
             )
     elif parsed.command == "medication" and parsed.medication_command == "audit":
         for medication_revision in medication_audit.revisions:
-            print(
-                f"{medication_revision.revision_id} · {medication_revision.starts_at.isoformat()}"
-            )
+            if isinstance(medication_revision, MedicationDeviationAuditRevision):
+                print(
+                    f"{medication_revision.revision_id} · {medication_revision.state} · "
+                    f"{medication_revision.scheduled_at.isoformat()}"
+                )
+            else:
+                print(
+                    f"{medication_revision.revision_id} · "
+                    f"{medication_revision.starts_at.isoformat()}"
+                )
     elif parsed.command == "workouts":
         print("Trainingseinheiten")
         print(

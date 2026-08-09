@@ -722,6 +722,15 @@ def _render_context(config: RuntimeConfig) -> None:
                     "Status": item.status,
                     "Dosen": ", ".join(
                         f"{dose.medication_name} {dose.amount} {dose.unit}"
+                        + (
+                            " → "
+                            + "; ".join(
+                                f"{intake.taken_at.isoformat()} · {intake.amount}"
+                                for intake in dose.actual_intakes
+                            )
+                            if dose.actual_intakes
+                            else ""
+                        )
                         for dose in item.occurrences
                     ),
                 }

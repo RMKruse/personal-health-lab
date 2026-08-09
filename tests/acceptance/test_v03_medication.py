@@ -7,8 +7,13 @@ from personal_health_lab.application import (
     DataMode,
     HealthLab,
     ImportHealthExport,
+    MedicationActualIntake,
+    MedicationDeviationCreate,
+    MedicationDeviationRestore,
+    MedicationDeviationWithdraw,
     MedicationRegimeCreate,
     MedicationRegimeRevise,
+    ReviseMedicationDeviation,
     ReviseMedicationRegime,
     RuntimeConfig,
     ScheduledDose,
@@ -72,3 +77,96 @@ def test_medication_regime_projects_dst_and_keeps_old_snapshot_stable(tmp_path: 
     assert projected.days[0].occurrences[0].status == "assumed_as_planned"
     assert old_plan.regimes[0].scheduled_doses[0].medication_name == "Levothyroxin"
     assert not new_plan.regimes[0].scheduled_doses
+
+
+def test_medication_deviation_binds_one_occurrence_and_keeps_old_snapshot_stable(
+    tmp_path: Path,
+) -> None:
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    scheduled_at = datetime.fromisoformat("2024-04-01T08:00:00+02:00")
+    with HealthLab.open(config) as health_lab:
+        imported = ImportHealthExport(_package(tmp_path / "export.zip"))
+        health_lab.execute_write(
+            imported, expected_plan=health_lab.preview_write(imported).fingerprint
+        )
+        regime = ReviseMedicationRegime(
+            MedicationRegimeCreate(
+                datetime.fromisoformat("2024-03-01T00:00:00+01:00"),
+                "Europe/Berlin",
+                (
+                    ScheduledDose(
+                        "Levothyroxin", Decimal("75"), "µg", time(8), frozenset({Weekday.MONDAY})
+                    ),
+                ),
+            )
+        )
+        regime_receipt = health_lab.execute_write(
+            regime, expected_plan=health_lab.preview_write(regime).fingerprint
+        )
+        deviation = ReviseMedicationDeviation(
+            MedicationDeviationCreate(
+                regime_receipt.result.logical_id,
+                scheduled_at,
+                (
+                    MedicationActualIntake(
+                        datetime.fromisoformat("2024-04-02T09:00:00+09:00"), Decimal("150")
+                    ),
+                ),
+            )
+        )
+        receipt = health_lab.execute_write(
+            deviation, expected_plan=health_lab.preview_write(deviation).fingerprint
+        )
+        old_snapshot = receipt.result.snapshot_ref
+        unchanged = ReviseMedicationDeviation(
+            MedicationDeviationCreate(
+                regime_receipt.result.logical_id,
+                scheduled_at,
+                (MedicationActualIntake(scheduled_at, Decimal("75")),),
+            )
+        )
+        assert health_lab.preview_write(unchanged).approval.status.value == "no_change"
+        blocked_regime = ReviseMedicationRegime(
+            MedicationRegimeRevise(
+                regime_receipt.result.logical_id,
+                regime_receipt.result.revision_id,
+                datetime.fromisoformat("2024-03-01T00:00:00+01:00"),
+                "Europe/Berlin",
+                (),
+            )
+        )
+        assert health_lab.preview_write(blocked_regime).approval.status.value == "blocked"
+        withdraw = ReviseMedicationDeviation(
+            MedicationDeviationWithdraw(
+                receipt.result.logical_id, receipt.result.revision_id, "Falscher Eintrag"
+            )
+        )
+        withdrawn = health_lab.execute_write(
+            withdraw, expected_plan=health_lab.preview_write(withdraw).fingerprint
+        )
+        day = health_lab.load_medication_days(
+            SnapshotDateSelection(old_snapshot, scheduled_at.date(), scheduled_at.date())
+        ).days[0]
+        current_day = health_lab.load_medication_days(
+            SnapshotDateSelection(None, scheduled_at.date(), scheduled_at.date())
+        ).days[0]
+        restore = ReviseMedicationDeviation(
+            MedicationDeviationRestore(
+                receipt.result.logical_id,
+                withdrawn.result.revision_id,
+                (MedicationActualIntake(scheduled_at, Decimal("150")),),
+            )
+        )
+        health_lab.execute_write(
+            restore, expected_plan=health_lab.preview_write(restore).fingerprint
+        )
+        restored_day = health_lab.load_medication_days(
+            SnapshotDateSelection(None, scheduled_at.date(), scheduled_at.date())
+        ).days[0]
+        audit = health_lab.load_medication_audit(receipt.result.logical_id)
+
+    assert day.occurrences[0].status == "deviated"
+    assert day.occurrences[0].actual_intakes[0].taken_at.isoformat() == "2024-04-02T09:00:00+09:00"
+    assert current_day.occurrences[0].status == "assumed_as_planned"
+    assert restored_day.occurrences[0].status == "deviated"
+    assert audit.revisions[-1].state == "active"
