@@ -16,7 +16,11 @@ from uuid import uuid4
 from xml.etree.ElementTree import ParseError, iterparse
 from zipfile import BadZipFile, ZipFile, is_zipfile
 
-from personal_health_lab.data_quality import resolve_sources, select_governing_export
+from personal_health_lab.data_quality import (
+    resolve_sources,
+    resolve_workouts,
+    select_governing_export,
+)
 from personal_health_lab.health_data import (
     CanonicalHealthRecord,
     CanonicalHealthType,
@@ -975,6 +979,7 @@ def _import_restore_health_export(
             unsupported_content=current.unsupported_content,
             governing_export_id=export_id,
             resolve_sources=restore_source_resolver(working),
+            resolve_workouts=resolve_workouts,
             restore_overlay=working,
             restore_overlay_sha256=session.working_copy_sha256,
             restore_exports=restore_exports,
@@ -1097,6 +1102,7 @@ def import_health_export(
                 unsupported_content=parsed.unsupported_content,
                 governing_export_id=governing_export_id,
                 resolve_sources=resolve_sources,
+                resolve_workouts=resolve_workouts,
             )
         except (OSError, StoreError) as error:
             cause = error.__cause__ if isinstance(error, StoreError) else error

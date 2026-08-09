@@ -54,6 +54,7 @@ from personal_health_lab.application import (
     ImportReceipt,
     ImportStatus,
     LocalMeasurementExclusion,
+    LocalWorkoutExclusion,
     MeasurementVersionId,
     MetadataBackupPlan,
     MetadataBackupReceipt,
@@ -90,6 +91,7 @@ from personal_health_lab.application import (
     StoreMigrationPlan,
     StoreMigrationReceipt,
     WeightNutrition,
+    WorkoutCorrection,
     Workouts,
     WorkspaceStatus,
     WriteApprovalStatus,
@@ -196,8 +198,12 @@ def _parser() -> argparse.ArgumentParser:
     resolve.add_argument("--conflict-strategy", type=SourceConflictStrategy)
     resolve.add_argument("--confirm", action="store_true")
     resolve.add_argument("--correct", type=float)
+    resolve.add_argument("--workout-correction", action="store_true")
+    resolve.add_argument("--distance", type=float)
+    resolve.add_argument("--energy", type=float)
     resolve.add_argument("--unit", type=CanonicalUnit, choices=tuple(CanonicalUnit))
     resolve.add_argument("--exclude-local", action="store_true")
+    resolve.add_argument("--workout-exclusion", action="store_true")
     resolve.add_argument("--accept-source", action="store_true")
     resolve.add_argument("--measurement-version")
     resolve.add_argument("--reason")
@@ -820,6 +826,7 @@ def _workouts_json(
                 "source_start": item.source_start.isoformat(),
                 "source_updated_at": item.source_updated_at.isoformat(),
                 "source_version": item.source_version,
+                "strong_source_id_hash": item.strong_source_id_hash,
                 "workout_version_id": str(item.workout_version_id),
             }
             for item in projection.workouts
@@ -1320,7 +1327,10 @@ def main(args: Sequence[str] | None = None) -> int:
     ):
         parser.error("Genau eine Auflösungsart muss angegeben werden.")
     if parsed.command == "review-resolve" and (
-        (parsed.correct is not None and (parsed.unit is None or not parsed.reason))
+        (
+            parsed.correct is not None
+            and ((not parsed.workout_correction and parsed.unit is None) or not parsed.reason)
+        )
         or (parsed.exclude_local and (parsed.case_id is None or not parsed.reason))
         or (
             (parsed.correct is not None or parsed.exclude_local or parsed.accept_source)
@@ -1533,7 +1543,16 @@ def main(args: Sequence[str] | None = None) -> int:
                         DataConfirmation(parsed.note)
                         if parsed.confirm
                         else (
-                            DataCorrection(
+                            WorkoutCorrection(
+                                MeasurementVersionId(parsed.measurement_version),
+                                parsed.correct,
+                                parsed.distance,
+                                parsed.energy,
+                                parsed.reason,
+                                parsed.note,
+                            )
+                            if parsed.workout_correction
+                            else DataCorrection(
                                 MeasurementVersionId(parsed.measurement_version),
                                 parsed.correct,
                                 parsed.unit,
@@ -1542,7 +1561,13 @@ def main(args: Sequence[str] | None = None) -> int:
                             )
                             if parsed.correct is not None
                             else (
-                                LocalMeasurementExclusion(
+                                LocalWorkoutExclusion(
+                                    MeasurementVersionId(parsed.measurement_version),
+                                    parsed.reason,
+                                    parsed.note,
+                                )
+                                if parsed.workout_exclusion
+                                else LocalMeasurementExclusion(
                                     MeasurementVersionId(parsed.measurement_version),
                                     parsed.reason,
                                     parsed.note,

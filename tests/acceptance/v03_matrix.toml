@@ -423,6 +423,24 @@ source = "https://github.com/RMKruse/personal-health-lab/issues/74"
 statement = "CLI JSON and Streamlit forward the same SnapshotDateSelection to HealthLab.load_activity_days and render the complete activity projection."
 evidence = ["positive", "parity"]
 
+[[contract]]
+id = "V03-C-WORKOUTS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/75"
+statement = "Immutable workouts preserve their original type, local start day, aware times, full source provenance, reported-or-elapsed duration, and optional distance and energy."
+evidence = ["positive", "boundary", "reproducibility"]
+
+[[contract]]
+id = "V03-C-WORKOUT-REVIEW-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/75"
+statement = "Invalid workout totals and positive overlap persist data-review cases; correction and local exclusion update only the effective workout projection."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V03-C-WORKOUT-ADAPTERS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/75"
+statement = "HealthLab, CLI JSON, and Streamlit use the shared workout projection without merging it into activity-day totals."
+evidence = ["positive", "parity"]
+
 [[case]]
 id = "V03-A-ACTIVITY-OVERLAP-V1"
 contracts = ["V03-C-ACTIVITY-REVIEW-V1"]
@@ -491,4 +509,46 @@ platform = "all"
 expected_result = "daily activity and canonical measurement tables"
 expected_effect = "none"
 forbidden_side_effects = "no persistent UI state outside application"
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-WORKOUT-PROJECTION-V1"
+contracts = ["V03-C-WORKOUTS-V1", "V03-C-WORKOUT-REVIEW-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_workouts.py::test_workouts_keep_types_durations_and_overlap_status"
+initial_state = "empty synthetic store"
+operation = "import known and unknown overlapping workouts"
+level = "application"
+platform = "all"
+expected_result = "both workouts remain canonical with their shared persisted overlap review"
+expected_effect = "one immutable snapshot is published"
+forbidden_side_effects = "no activity-day aggregation or overlap deduplication"
+evidence = ["positive", "boundary", "reproducibility", "negative"]
+
+[[case]]
+id = "V03-A-WORKOUT-CORRECTION-V1"
+contracts = ["V03-C-WORKOUT-REVIEW-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_workouts.py::test_workout_correction_persists_through_data_review"
+initial_state = "committed workout plausibility review"
+operation = "correct an impossible reported workout duration"
+level = "application"
+platform = "all"
+expected_result = "the raw workout remains while its effective duration is corrected"
+expected_effect = "one data-review snapshot is published"
+forbidden_side_effects = "no source workout mutation"
+evidence = ["positive", "transition"]
+
+[[case]]
+id = "V03-A-WORKOUT-CLI-V1"
+contracts = ["V03-C-WORKOUT-ADAPTERS-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_workouts.py::test_workouts_cli_serializes_the_shared_projection"
+initial_state = "committed workout"
+operation = "load workouts through CLI JSON"
+level = "adapter"
+platform = "all"
+expected_result = "complete shared workout projection"
+expected_effect = "none"
+forbidden_side_effects = "no adapter-side duration or aggregate derivation"
 evidence = ["positive", "parity"]

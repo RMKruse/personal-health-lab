@@ -38,6 +38,7 @@ from personal_health_lab.application import (
     ImportReceipt,
     ImportStatus,
     LocalMeasurementExclusion,
+    LocalWorkoutExclusion,
     MeasurementVersionId,
     MetadataBackupReceipt,
     MetadataRestorePlan,
@@ -64,6 +65,7 @@ from personal_health_lab.application import (
     SourceValueAcceptance,
     StoreMigrationPlan,
     WeightNutrition,
+    WorkoutCorrection,
     WorkspaceState,
     WriteApprovalStatus,
     WriteNotStarted,
@@ -1111,6 +1113,54 @@ if data_review.cases:
                 st.session_state["review_request"] = review_request_local
                 st.rerun()
         if case.measurement_version_id is not None and case.kind.value in {
+            "workout_plausibility",
+            "workout_overlap",
+        }:
+            duration = st.number_input(
+                "Wirksame Dauer (Minuten)",
+                value=float(detail.effective_value or 0),
+                min_value=0.0,
+                key=f"workout-duration-{case.case_id}",
+            )
+            reason = st.text_input("Korrekturgrund", key=f"workout-reason-{case.case_id}")
+            if st.button("Training korrigieren", key=f"workout-correct-{case.case_id}"):
+                try:
+                    review_request_local = ResolveDataReviewCase(
+                        case.case_id,
+                        WorkoutCorrection(
+                            case.measurement_version_id,
+                            duration,
+                            None,
+                            None,
+                            reason,
+                            decision_note or None,
+                        ),
+                    )
+                    with HealthLab.open(config) as health_lab:
+                        st.session_state["review_plan"] = health_lab.preview_write(
+                            review_request_local
+                        )
+                    st.session_state["review_request"] = review_request_local
+                    st.rerun()
+                except ConfigurationError:
+                    st.error("Korrekturgrund fehlt.")
+            if st.button("Training lokal ausschließen", key=f"workout-exclude-{case.case_id}"):
+                try:
+                    review_request_local = ResolveDataReviewCase(
+                        case.case_id,
+                        LocalWorkoutExclusion(
+                            case.measurement_version_id, reason, decision_note or None
+                        ),
+                    )
+                    with HealthLab.open(config) as health_lab:
+                        st.session_state["review_plan"] = health_lab.preview_write(
+                            review_request_local
+                        )
+                    st.session_state["review_request"] = review_request_local
+                    st.rerun()
+                except ConfigurationError:
+                    st.error("Ausschlussgrund fehlt.")
+        elif case.measurement_version_id is not None and case.kind.value in {
             "plausibility",
             "continued_override",
         }:

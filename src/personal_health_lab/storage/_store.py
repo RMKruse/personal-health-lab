@@ -50,7 +50,7 @@ _STORE_SCHEMA_VERSION = 8
 _WRITER_LOCK_FILE = ".writer.lock"
 _FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
 _STORE_MIGRATION_METHOD = "cow-migration/v1"
-_SNAPSHOT_SCHEMA_VERSION = 2
+_SNAPSHOT_SCHEMA_VERSION = 4
 _CANONICAL_HEALTH_TYPES_SQL = ", ".join(f"'{item.value}'" for item in CanonicalHealthType)
 _CANONICAL_UNITS_SQL = ", ".join(f"'{item.value}'" for item in CanonicalUnit)
 _PRE_ACTIVITY_HEALTH_TYPES_SQL = ", ".join(
@@ -139,10 +139,24 @@ _SNAPSHOT_SCHEMAS = {
         ("source_name", "VARCHAR"),
         ("source_version", "VARCHAR"),
         ("device", "VARCHAR"),
+        ("strong_source_id_hash", "VARCHAR"),
         ("reported_duration_minutes", "DOUBLE"),
         ("distance_kilometers", "DOUBLE"),
         ("active_energy_kilocalories", "DOUBLE"),
         ("is_selected", "BOOLEAN"),
+    ),
+    "resolved_workouts.parquet": (
+        ("logical_workout_id", "VARCHAR"),
+        ("selected_workout_version_id", "VARCHAR"),
+        ("disposition", "VARCHAR"),
+        ("effective_duration_minutes", "DOUBLE"),
+        ("distance_kilometers", "DOUBLE"),
+        ("active_energy_kilocalories", "DOUBLE"),
+        ("effective_decision_id", "VARCHAR"),
+    ),
+    "workout_review_links.parquet": (
+        ("review_case_id", "VARCHAR"),
+        ("workout_version_id", "VARCHAR"),
     ),
     "resolved_measurements.parquet": (
         ("logical_measurement_id", "VARCHAR"),
@@ -166,7 +180,23 @@ _SNAPSHOT_SCHEMAS = {
     ),
 }
 _LEGACY_SNAPSHOT_SCHEMAS = {
-    name: schema for name, schema in _SNAPSHOT_SCHEMAS.items() if name != "workouts.parquet"
+    name: schema
+    for name, schema in _SNAPSHOT_SCHEMAS.items()
+    if name not in {"workouts.parquet", "resolved_workouts.parquet", "workout_review_links.parquet"}
+}
+_V2_SNAPSHOT_SCHEMAS = {
+    name: (
+        tuple(field for field in schema if field[0] != "strong_source_id_hash")
+        if name == "workouts.parquet"
+        else schema
+    )
+    for name, schema in _SNAPSHOT_SCHEMAS.items()
+    if name not in {"resolved_workouts.parquet", "workout_review_links.parquet"}
+}
+_V3_SNAPSHOT_SCHEMAS = {
+    name: schema
+    for name, schema in _SNAPSHOT_SCHEMAS.items()
+    if name not in {"resolved_workouts.parquet", "workout_review_links.parquet"}
 }
 _KIB = 1024
 _MIB = 1024 * _KIB
@@ -894,10 +924,14 @@ class StoredWorkout:
     source_name: str
     source_version: str
     device: str
+    strong_source_id_hash: str | None
     reported_duration_minutes: float | None
     distance_kilometers: float | None
     active_energy_kilocalories: float | None
     is_selected: bool
+    effective_duration_minutes: float | None
+    disposition: str | None
+    review_case_ids: tuple[ReviewCaseId, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -920,6 +954,8 @@ class OpenDataReviewCase:
     review_case_id: str
     kind: Literal[
         "plausibility",
+        "workout_plausibility",
+        "workout_overlap",
         "continued_override",
         "suspected_source_deletion",
         "source_conflict",
@@ -976,6 +1012,37 @@ class ResolvedMeasurement:
     correction_decision_id: str | None
     source_deletion_decision_id: str | None
     conflict_resolution_decision_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkoutVersionFact:
+    workout_version_id: str
+    logical_workout_id: str
+    source_start_utc: str
+    source_end_utc: str
+    source_updated_at_utc: str
+    source_version: str
+    reported_duration_minutes: float | None
+    distance_kilometers: float | None
+    active_energy_kilocalories: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedWorkout:
+    logical_workout_id: str
+    selected_workout_version_id: str
+    disposition: str
+    effective_duration_minutes: float | None
+    distance_kilometers: float | None
+    active_energy_kilocalories: float | None
+    effective_decision_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkoutResolution:
+    workouts: tuple[ResolvedWorkout, ...]
+    review_cases: tuple[OpenDataReviewCase, ...]
+    review_links: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1067,6 +1134,7 @@ class HistoricalReviewPublication:
 
 
 type SourceResolver = Callable[..., SourceResolution]
+type WorkoutResolver = Callable[..., WorkoutResolution]
 
 
 @dataclass(frozen=True, slots=True)
@@ -2112,6 +2180,8 @@ class LocalStore:
                     cast(
                         Literal[
                             "plausibility",
+                            "workout_plausibility",
+                            "workout_overlap",
                             "continued_override",
                             "suspected_source_deletion",
                             "source_conflict",
@@ -2828,6 +2898,7 @@ class LocalStore:
         unsupported_content: tuple[UnsupportedImportContent, ...],
         governing_export_id: str,
         resolve_sources: SourceResolver,
+        resolve_workouts: WorkoutResolver,
         restore_overlay: Path | None = None,
         restore_overlay_sha256: str | None = None,
         restore_exports: tuple[
@@ -2851,6 +2922,7 @@ class LocalStore:
                 unsupported_content=unsupported_content,
                 governing_export_id=governing_export_id,
                 resolve_sources=resolve_sources,
+                resolve_workouts=resolve_workouts,
                 restore_overlay=restore_overlay,
                 restore_overlay_sha256=restore_overlay_sha256,
                 restore_exports=restore_exports,
@@ -2874,6 +2946,7 @@ class LocalStore:
         unsupported_content: tuple[UnsupportedImportContent, ...],
         governing_export_id: str,
         resolve_sources: SourceResolver,
+        resolve_workouts: WorkoutResolver,
         restore_overlay: Path | None,
         restore_overlay_sha256: str | None,
         restore_exports: tuple[
@@ -3170,6 +3243,7 @@ class LocalStore:
                 source_name VARCHAR,
                 source_version VARCHAR,
                 device VARCHAR,
+                strong_source_id_hash VARCHAR,
                 reported_duration_minutes DOUBLE,
                 distance_kilometers DOUBLE,
                 active_energy_kilocalories DOUBLE
@@ -3179,7 +3253,7 @@ class LocalStore:
         if workouts:
             self._query.executemany(
                 "INSERT INTO staged_workouts VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (
                         str(item.workout_version_id),
@@ -3195,6 +3269,7 @@ class LocalStore:
                         item.provenance.source_name,
                         item.provenance.source_version,
                         item.provenance.device,
+                        item.provenance.strong_source_id_hash,
                         item.reported_duration_minutes,
                         item.distance_kilometers,
                         item.active_energy_kilocalories,
@@ -3219,11 +3294,7 @@ class LocalStore:
             self._query.execute(
                 f"""
                 CREATE OR REPLACE TEMP TABLE workouts AS
-                SELECT * EXCLUDE(source_priority, is_selected), row_number() OVER (
-                    PARTITION BY logical_workout_id
-                    ORDER BY source_updated_at_utc DESC, source_version DESC,
-                             workout_version_id DESC
-                ) = 1 AS is_selected
+                SELECT * EXCLUDE(source_priority, is_selected), false AS is_selected
                 FROM (
                     SELECT *, 0 AS source_priority FROM read_parquet('{escaped_previous_workouts}')
                     UNION ALL BY NAME SELECT *, 1 AS source_priority FROM staged_workouts
@@ -3239,7 +3310,7 @@ class LocalStore:
             assert count_row is not None
             previous_workout_count = int(count_row[0])
         if previous_workouts is None or not previous_workouts.exists():
-            self._query.execute("ALTER TABLE workouts ADD COLUMN is_selected BOOLEAN DEFAULT true")
+            self._query.execute("ALTER TABLE workouts ADD COLUMN is_selected BOOLEAN DEFAULT false")
         workout_count_row = self._query.execute(
             "SELECT count(*), count(DISTINCT logical_workout_id) FROM workouts"
         ).fetchone()
@@ -3294,6 +3365,7 @@ class LocalStore:
             unknown_source_types=unknown_source_types,
             audit_position=audit_position,
             resolve_sources=resolve_sources,
+            resolve_workouts=resolve_workouts,
             restore_exports=restore_exports,
             restored_decision_refs=restored_decision_refs,
             restored_rule_refs=restored_rule_refs,
@@ -3518,6 +3590,7 @@ class LocalStore:
         unknown_source_types: tuple[str, ...],
         audit_position: int,
         resolve_sources: SourceResolver,
+        resolve_workouts: WorkoutResolver,
         restore_exports: tuple[
             tuple[str, datetime | None, str, tuple[CanonicalHealthRecord, ...]], ...
         ],
@@ -3625,6 +3698,7 @@ class LocalStore:
         self._query.executemany("INSERT INTO export_order VALUES (?, ?)", export_rows)
         previous_measurements: tuple[ResolvedMeasurement, ...] = ()
         previous_review_cases: tuple[OpenDataReviewCase, ...] = ()
+        previous_workouts: tuple[ResolvedWorkout, ...] = ()
         if parent_snapshot_id is not None:
             previous_directory = (
                 self._root / _PARQUET_DIRECTORY / "snapshots" / str(parent_snapshot_id)
@@ -3667,6 +3741,15 @@ class LocalStore:
                     f"SELECT * FROM read_parquet('{previous_reviews}')"
                 ).fetchall()
             )
+            previous_workout_path = previous_directory / "resolved_workouts.parquet"
+            if previous_workout_path.exists():
+                escaped_previous_workouts = str(previous_workout_path).replace("'", "''")
+                previous_workouts = tuple(
+                    ResolvedWorkout(*row)
+                    for row in self._query.execute(
+                        f"SELECT * FROM read_parquet('{escaped_previous_workouts}')"
+                    ).fetchall()
+                )
 
         occurrence_facts = tuple(
             SourceOccurrenceFact(str(row[0]), int(row[1]), str(row[2]), str(row[3]))
@@ -3736,6 +3819,47 @@ class LocalStore:
             ),
             plausibility_rules=self.load_plausibility_rule_versions(),
         )
+        workout_resolution = resolve_workouts(
+            versions=tuple(
+                WorkoutVersionFact(
+                    str(row[0]),
+                    str(row[1]),
+                    str(row[2]),
+                    str(row[3]),
+                    str(row[4]),
+                    str(row[5]),
+                    None if row[6] is None else float(row[6]),
+                    None if row[7] is None else float(row[7]),
+                    None if row[8] is None else float(row[8]),
+                )
+                for row in self._query.execute(
+                    "SELECT workout_version_id, logical_workout_id, source_start_utc, "
+                    "source_end_utc, source_updated_at_utc, source_version, "
+                    "reported_duration_minutes, distance_kilometers, "
+                    "active_energy_kilocalories FROM workouts"
+                ).fetchall()
+            ),
+            previous_workouts=previous_workouts,
+        )
+        prior_case_ids = {item.review_case_id for item in previous_review_cases}
+        new_workout_case_ids = tuple(
+            ReviewCaseId(item.review_case_id)
+            for item in workout_resolution.review_cases
+            if item.review_case_id not in prior_case_ids
+        )
+        all_cases = {item.review_case_id: item for item in resolution.review_cases}
+        all_cases.update((item.review_case_id, item) for item in workout_resolution.review_cases)
+        resolution = replace(
+            resolution,
+            review_cases=tuple(all_cases[key] for key in sorted(all_cases)),
+            new_review_case_ids=(*resolution.new_review_case_ids, *new_workout_case_ids),
+            cycle_status="open"
+            if resolution.new_review_case_ids or new_workout_case_ids
+            else "closed",
+            cycle_open_case_count=(resolution.cycle_open_case_count + len(new_workout_case_ids)),
+            anomaly_count=resolution.anomaly_count
+            + sum(item.kind == "workout_plausibility" for item in workout_resolution.review_cases),
+        )
         self._query.execute(
             "CREATE OR REPLACE TEMP TABLE resolved_measurements ("
             "logical_measurement_id VARCHAR, selected_measurement_version_id VARCHAR, "
@@ -3763,6 +3887,36 @@ class LocalStore:
             self._query.executemany(
                 "INSERT INTO resolved_measurements VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 resolved_rows,
+            )
+        self._query.execute(
+            "CREATE OR REPLACE TEMP TABLE resolved_workouts ("
+            "logical_workout_id VARCHAR, selected_workout_version_id VARCHAR, disposition VARCHAR, "
+            "effective_duration_minutes DOUBLE, distance_kilometers DOUBLE, "
+            "active_energy_kilocalories DOUBLE, effective_decision_id VARCHAR)"
+        )
+        if workout_resolution.workouts:
+            self._query.executemany(
+                "INSERT INTO resolved_workouts VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        item.logical_workout_id,
+                        item.selected_workout_version_id,
+                        item.disposition,
+                        item.effective_duration_minutes,
+                        item.distance_kilometers,
+                        item.active_energy_kilocalories,
+                        item.effective_decision_id,
+                    )
+                    for item in workout_resolution.workouts
+                ],
+            )
+        self._query.execute(
+            "CREATE OR REPLACE TEMP TABLE workout_review_links "
+            "(review_case_id VARCHAR, workout_version_id VARCHAR)"
+        )
+        if workout_resolution.review_links:
+            self._query.executemany(
+                "INSERT INTO workout_review_links VALUES (?, ?)", workout_resolution.review_links
             )
         self._query.execute(
             "CREATE OR REPLACE TEMP TABLE open_review_cases ("
@@ -3799,7 +3953,9 @@ class LocalStore:
                 ).fetchall()
             )
             if description != _SNAPSHOT_SCHEMAS[filename]:
-                raise StoreError("Staging-Snapshot besitzt ein unerwartetes Schema.")
+                raise StoreError(
+                    f"Staging-Snapshot besitzt für {filename} ein unerwartetes Schema."
+                )
             row = self._query.execute(f"SELECT count(*) FROM read_parquet('{escaped}')").fetchone()
             assert row is not None
             entries.append(
@@ -4015,7 +4171,7 @@ class LocalStore:
                 "files",
                 "validation_counts",
             }
-            or manifest["snapshot_schema_version"] not in {1, _SNAPSHOT_SCHEMA_VERSION}
+            or manifest["snapshot_schema_version"] not in {1, 2, 3, _SNAPSHOT_SCHEMA_VERSION}
             or manifest["snapshot_id"] != snapshot_id
             or not _is_lower_hex(manifest["snapshot_id"], 32)
             or not _is_lower_hex(manifest["store_id"], 32)
@@ -4052,11 +4208,12 @@ class LocalStore:
             or any(type(value) is not int or value < 0 for value in validation_counts.values())
         ):
             raise StoreError("Snapshot-Manifest ist nicht kanonisch oder gültig.")
-        schemas = (
-            _LEGACY_SNAPSHOT_SCHEMAS
-            if manifest["snapshot_schema_version"] == 1
-            else _SNAPSHOT_SCHEMAS
-        )
+        schemas = {
+            1: _LEGACY_SNAPSHOT_SCHEMAS,
+            2: _V2_SNAPSHOT_SCHEMAS,
+            3: _V3_SNAPSHOT_SCHEMAS,
+            _SNAPSHOT_SCHEMA_VERSION: _SNAPSHOT_SCHEMAS,
+        }[manifest["snapshot_schema_version"]]
         files = manifest["files"]
         if (
             not isinstance(files, list)
@@ -4327,7 +4484,8 @@ class LocalStore:
                       OR case_kind NOT IN (
                           'plausibility', 'continued_override',
                           'suspected_source_deletion', 'source_conflict', 'rule_definition',
-                          'preferred_daily_weight_conflict'
+                          'preferred_daily_weight_conflict', 'workout_plausibility',
+                          'workout_overlap'
                       )
                       OR NOT (
                           (case_kind = 'plausibility'
@@ -4349,6 +4507,11 @@ class LocalStore:
                            AND measurement_version_id IS NOT NULL
                            AND rule_version_id IS NULL)
                           OR
+                          (case_kind IN ('workout_plausibility', 'workout_overlap')
+                           AND logical_measurement_id IS NOT NULL
+                           AND measurement_version_id IS NOT NULL
+                           AND rule_version_id IS NULL)
+                          OR
                           (case_kind = 'rule_definition'
                            AND logical_measurement_id IS NULL
                            AND measurement_version_id IS NULL
@@ -4357,11 +4520,14 @@ class LocalStore:
               + (SELECT count(*) FROM reviews r LEFT JOIN versions v
                    ON v.measurement_version_id = r.measurement_version_id
                    WHERE r.measurement_version_id IS NOT NULL
+                     AND r.case_kind NOT IN ('workout_plausibility', 'workout_overlap')
                      AND v.measurement_version_id IS NULL)
               + (SELECT count(*) FROM reviews r LEFT JOIN resolved m
                    ON m.logical_measurement_id = r.logical_measurement_id
                    WHERE r.logical_measurement_id IS NOT NULL
-                     AND r.case_kind != 'rule_definition'
+                     AND r.case_kind NOT IN (
+                         'rule_definition', 'workout_plausibility', 'workout_overlap'
+                     )
                      AND m.logical_measurement_id IS NULL)
             """
         ).fetchone()
@@ -4558,6 +4724,8 @@ class LocalStore:
             "correct",
             "exclude_local",
             "accept_source",
+            "correct_workout",
+            "exclude_workout_local",
         ],
         selected_measurement_version_id: str | None,
         candidate_version_ids: tuple[str, ...],
@@ -4566,6 +4734,8 @@ class LocalStore:
         corrected_value: float | None,
         canonical_unit: str | None,
         cycle_updates: tuple[ReviewCycleUpdate, ...],
+        corrected_distance_kilometers: float | None = None,
+        corrected_active_energy_kilocalories: float | None = None,
     ) -> PublishDecisionResult:
         self._require_open()
         self._require_writer()
@@ -4582,7 +4752,12 @@ class LocalStore:
         )
         if review_case_id is not None and (case is None or case.logical_measurement_id is None):
             raise StoreError("Datenprüffall ist nicht mehr offen.")
-        logical_id = logical_measurement_id if case is None else str(case.logical_measurement_id)
+        logical_id = (
+            logical_measurement_id
+            if case is None
+            or (case is not None and case.kind in {"workout_plausibility", "workout_overlap"})
+            else str(case.logical_measurement_id)
+        )
         if logical_id is None:
             raise StoreError("Logische Quellmessung fehlt.")
         case_logical_id = None if case is None else case.logical_measurement_id
@@ -4608,14 +4783,31 @@ class LocalStore:
                 "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
             ).fetchone()[0]
         )
-        previous_version = self._resolved_version(active, logical_id)
-        resolved = self.load_resolved_measurement(logical_id)
         case_kind = "direct_correction" if case is None else case.kind
+        is_workout_case = case_kind in {"workout_plausibility", "workout_overlap"}
+        recorded_case_kind = "plausibility" if is_workout_case else case_kind
+        recorded_action = {
+            "correct_workout": "correct",
+            "exclude_workout_local": "exclude_local",
+        }.get(action, action)
+        previous_version = (
+            self._resolved_workout_version(active, logical_id)
+            if is_workout_case
+            else self._resolved_version(active, logical_id)
+        )
+        resolved = None if is_workout_case else self.load_resolved_measurement(logical_id)
         superseded_decision_id = (
             None
             if resolved is None
             or (
-                action not in {"correct", "exclude_local", "accept_source"}
+                action
+                not in {
+                    "correct",
+                    "exclude_local",
+                    "accept_source",
+                    "correct_workout",
+                    "exclude_workout_local",
+                }
                 and not (action == "confirm" and case_kind == "continued_override")
             )
             else resolved.effective_decision_id
@@ -4638,6 +4830,8 @@ class LocalStore:
             "prefer": "conflict_resolution",
             "split": "conflict_resolution",
             "reject": "source_deletion",
+            "correct_workout": "correction",
+            "exclude_workout_local": "local_exclusion",
         }.get(
             action,
             "source_deletion" if case_kind == "suspected_source_deletion" else "confirmation",
@@ -4663,7 +4857,7 @@ class LocalStore:
                     audit_event_id,
                     decision_id,
                     review_case_id,
-                    case_kind,
+                    recorded_case_kind,
                     logical_id,
                     (
                         hashlib.sha256(
@@ -4672,7 +4866,7 @@ class LocalStore:
                         if case is None
                         else case.evidence_fingerprint
                     ),
-                    action,
+                    recorded_action,
                     selected_measurement_version_id,
                     previous_version,
                     json.dumps([str(item) for item in candidates], separators=(",", ":")),
@@ -4723,6 +4917,8 @@ class LocalStore:
                 candidate_version_ids=tuple(str(item) for item in candidates),
                 corrected_value=corrected_value,
                 canonical_unit=canonical_unit,
+                corrected_distance_kilometers=corrected_distance_kilometers,
+                corrected_active_energy_kilocalories=corrected_active_energy_kilocalories,
             )
             self._activate_review_snapshot(
                 operation_id, snapshot_id, active, manifest_sha256, completed_at
@@ -5170,6 +5366,21 @@ class LocalStore:
             raise StoreError("Aufgelöste Quellmessung fehlt.")
         return str(row[0])
 
+    def _resolved_workout_version(self, snapshot_id: SnapshotId, logical_id: str) -> str:
+        path = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
+        resolved = path / "resolved_workouts.parquet"
+        if not resolved.exists():
+            raise StoreError("Aufgelöstes Training fehlt.")
+        escaped = str(resolved).replace("'", "''")
+        row = self._query.execute(
+            f"SELECT selected_workout_version_id FROM read_parquet('{escaped}') "
+            "WHERE logical_workout_id = ?",
+            (logical_id,),
+        ).fetchone()
+        if row is None:
+            raise StoreError("Aufgelöstes Training fehlt.")
+        return str(row[0])
+
     def _include_source(self, logical_id: str, version_id: str) -> None:
         version = self._query.execute(
             "SELECT canonical_value, canonical_unit FROM measurement_versions "
@@ -5284,6 +5495,8 @@ class LocalStore:
         candidate_version_ids: tuple[str, ...],
         corrected_value: float | None = None,
         canonical_unit: str | None = None,
+        corrected_distance_kilometers: float | None = None,
+        corrected_active_energy_kilocalories: float | None = None,
         reopened_case: OpenDataReviewCase | None = None,
         replacement_plausibility_cases: tuple[OpenDataReviewCase, ...] | None = None,
         replaced_measurement_version_ids: tuple[str, ...] = (),
@@ -5420,7 +5633,34 @@ class LocalStore:
                     "DELETE FROM open_review_cases WHERE review_case_id = ?",
                     (review_case_id,),
                 )
-            if action == "confirm":
+            if case_kind in {"workout_plausibility", "workout_overlap"}:
+                if action == "correct_workout":
+                    assert selected_measurement_version_id is not None
+                    assert corrected_value is not None
+                    self._query.execute(
+                        "UPDATE resolved_workouts SET disposition = 'included_correction', "
+                        "effective_duration_minutes = ?, distance_kilometers = ?, "
+                        "active_energy_kilocalories = ?, effective_decision_id = ? "
+                        "WHERE logical_workout_id = ? AND selected_workout_version_id = ?",
+                        (
+                            corrected_value,
+                            corrected_distance_kilometers,
+                            corrected_active_energy_kilocalories,
+                            decision_id,
+                            logical_id,
+                            selected_measurement_version_id,
+                        ),
+                    )
+                elif action == "exclude_workout_local":
+                    assert selected_measurement_version_id is not None
+                    self._query.execute(
+                        "UPDATE resolved_workouts SET disposition = 'excluded_local', "
+                        "effective_duration_minutes = NULL, distance_kilometers = NULL, "
+                        "active_energy_kilocalories = NULL, effective_decision_id = ? "
+                        "WHERE logical_workout_id = ? AND selected_workout_version_id = ?",
+                        (decision_id, logical_id, selected_measurement_version_id),
+                    )
+            elif action == "confirm":
                 if case_kind == "suspected_source_deletion":
                     self._query.execute(
                         """
@@ -5941,6 +6181,29 @@ class LocalStore:
             "ORDER BY measurement_local_date, source_start_utc, workout_version_id",
             parameters,
         ).fetchall()
+        resolved_path = path.parent / "resolved_workouts.parquet"
+        resolved: dict[str, ResolvedWorkout] = {}
+        if resolved_path.exists():
+            escaped_resolved = str(resolved_path).replace("'", "''")
+            resolved = {
+                str(row[0]): ResolvedWorkout(*row)
+                for row in self._query.execute(
+                    f"SELECT * FROM read_parquet('{escaped_resolved}')"
+                ).fetchall()
+            }
+        review_cases: dict[str, tuple[ReviewCaseId, ...]] = {}
+        links_path = path.parent / "workout_review_links.parquet"
+        if links_path.exists():
+            escaped_links = str(links_path).replace("'", "''")
+            grouped: dict[str, list[ReviewCaseId]] = {}
+            for case_id, version_id in self._query.execute(
+                f"SELECT review_case_id, workout_version_id FROM read_parquet('{escaped_links}')"
+            ).fetchall():
+                grouped.setdefault(str(version_id), []).append(ReviewCaseId(str(case_id)))
+            review_cases = {
+                version_id: tuple(sorted(case_ids, key=str))
+                for version_id, case_ids in grouped.items()
+            }
 
         def local_time(value: str, offset: int) -> datetime:
             return datetime.fromisoformat(value).astimezone(timezone(timedelta(minutes=offset)))
@@ -5957,13 +6220,72 @@ class LocalStore:
                 str(row[10]),
                 str(row[11]),
                 str(row[12]),
-                None if row[13] is None else float(row[13]),
+                None if row[13] is None else str(row[13]),
                 None if row[14] is None else float(row[14]),
                 None if row[15] is None else float(row[15]),
-                bool(row[16]),
+                None if row[16] is None else float(row[16]),
+                (
+                    resolved[str(row[1])].selected_workout_version_id == str(row[0])
+                    and resolved[str(row[1])].disposition.startswith("included")
+                    if str(row[1]) in resolved
+                    else bool(row[17])
+                ),
+                (
+                    resolved[str(row[1])].effective_duration_minutes
+                    if str(row[1]) in resolved
+                    and resolved[str(row[1])].selected_workout_version_id == str(row[0])
+                    else None
+                ),
+                (
+                    resolved[str(row[1])].disposition
+                    if str(row[1]) in resolved
+                    and resolved[str(row[1])].selected_workout_version_id == str(row[0])
+                    else None
+                ),
+                review_cases.get(str(row[0]), ()),
             )
             for row in rows
         )
+
+    def load_workout_review_case_versions(
+        self, review_case_id: str
+    ) -> tuple[MeasurementVersionId, ...]:
+        self._require_open()
+        snapshot = self.load_active_snapshot_id()
+        if snapshot is None:
+            return ()
+        path = (
+            self._root
+            / _PARQUET_DIRECTORY
+            / "snapshots"
+            / str(snapshot)
+            / "workout_review_links.parquet"
+        )
+        if not path.exists():
+            return ()
+        escaped = str(path).replace("'", "''")
+        return tuple(
+            MeasurementVersionId(str(row[0]))
+            for row in self._query.execute(
+                f"SELECT workout_version_id FROM read_parquet('{escaped}') "
+                "WHERE review_case_id = ? ORDER BY workout_version_id",
+                (review_case_id,),
+            ).fetchall()
+        )
+
+    def load_workout_logical_id(self, workout_version_id: MeasurementVersionId) -> str | None:
+        self._require_open()
+        snapshot = self.load_active_snapshot_id()
+        if snapshot is None:
+            return None
+        path = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot) / "workouts.parquet"
+        escaped = str(path).replace("'", "''")
+        row = self._query.execute(
+            f"SELECT logical_workout_id FROM read_parquet('{escaped}') "
+            "WHERE workout_version_id = ?",
+            (str(workout_version_id),),
+        ).fetchone()
+        return None if row is None else str(row[0])
 
     def load_open_data_review_cases(self) -> tuple[OpenDataReviewCase, ...]:
         self._require_open()

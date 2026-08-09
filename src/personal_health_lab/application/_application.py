@@ -551,6 +551,7 @@ class Workout:
     source_name: str
     source_version: str
     device: str
+    strong_source_id_hash: str | None
     reported_duration_minutes: float | None
     effective_duration_minutes: float
     distance_kilometers: float | None
@@ -958,6 +959,40 @@ class LocalMeasurementExclusion:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkoutCorrection:
+    workout_version_id: MeasurementVersionId
+    effective_duration_minutes: float
+    distance_kilometers: float | None
+    active_energy_kilocalories: float | None
+    reason: str
+    note: str | None = None
+
+    def __post_init__(self) -> None:
+        values = (
+            self.effective_duration_minutes,
+            self.distance_kilometers,
+            self.active_energy_kilocalories,
+        )
+        if any(value is not None and (not math.isfinite(value) or value < 0) for value in values):
+            raise ConfigurationError(
+                "Korrigierte Trainingswerte müssen endlich und nichtnegativ sein."
+            )
+        if not self.reason.strip():
+            raise ConfigurationError("Trainingskorrektur verlangt einen Grund.")
+
+
+@dataclass(frozen=True, slots=True)
+class LocalWorkoutExclusion:
+    workout_version_id: MeasurementVersionId
+    reason: str
+    note: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ConfigurationError("Lokaler Trainingsausschluss verlangt einen Grund.")
+
+
+@dataclass(frozen=True, slots=True)
 class SourceValueAcceptance:
     measurement_version_id: MeasurementVersionId
     note: str | None = None
@@ -967,6 +1002,8 @@ DataReviewResolution = (
     DataConfirmation
     | DataCorrection
     | LocalMeasurementExclusion
+    | WorkoutCorrection
+    | LocalWorkoutExclusion
     | SourceValueAcceptance
     | SourceDeletionResolution
     | SourceConflictResolution
@@ -1325,6 +1362,8 @@ class DataReviewCaseKind(StrEnum):
     SUSPECTED_SOURCE_DELETION = "suspected_source_deletion"
     SOURCE_CONFLICT = "source_conflict"
     PREFERRED_DAILY_WEIGHT_CONFLICT = "preferred_daily_weight_conflict"
+    WORKOUT_PLAUSIBILITY = "workout_plausibility"
+    WORKOUT_OVERLAP = "workout_overlap"
 
 
 class DataReviewAction(StrEnum):
@@ -2234,6 +2273,23 @@ class HealthLab:
                 resolution_payload = {
                     "type": "local_exclusion",
                     "measurement_version_id": str(resolution.measurement_version_id),
+                    "reason": resolution.reason,
+                    "note": resolution.note,
+                }
+            elif isinstance(resolution, WorkoutCorrection):
+                resolution_payload = {
+                    "type": "workout_correction",
+                    "workout_version_id": str(resolution.workout_version_id),
+                    "effective_duration_minutes": resolution.effective_duration_minutes,
+                    "distance_kilometers": resolution.distance_kilometers,
+                    "active_energy_kilocalories": resolution.active_energy_kilocalories,
+                    "reason": resolution.reason,
+                    "note": resolution.note,
+                }
+            elif isinstance(resolution, LocalWorkoutExclusion):
+                resolution_payload = {
+                    "type": "local_workout_exclusion",
+                    "workout_version_id": str(resolution.workout_version_id),
                     "reason": resolution.reason,
                     "note": resolution.note,
                 }
@@ -3432,9 +3488,13 @@ class HealthLab:
                     "correct",
                     "exclude_local",
                     "accept_source",
+                    "correct_workout",
+                    "exclude_workout_local",
                 ]
                 corrected_value: float | None = None
                 canonical_unit: str | None = None
+                corrected_distance_kilometers: float | None = None
+                corrected_active_energy_kilocalories: float | None = None
                 reason: str | None = None
                 direct_logical_id: str | None = None
                 if isinstance(resolution, DataConfirmation):
@@ -3503,6 +3563,71 @@ class HealthLab:
                     selected = str(resolution.measurement_version_id)
                     reason = resolution.reason
                     note = resolution.note
+                elif isinstance(resolution, WorkoutCorrection):
+                    assert case is not None
+                    if (
+                        case.kind
+                        not in {
+                            DataReviewCaseKind.WORKOUT_PLAUSIBILITY,
+                            DataReviewCaseKind.WORKOUT_OVERLAP,
+                        }
+                        or resolution.workout_version_id
+                        not in writer.load_workout_review_case_versions(str(case.case_id))
+                    ):
+                        return self._not_started(
+                            plan,
+                            WriteNotStartedStatus.BLOCKED,
+                            ("resolution_not_allowed",),
+                            expected_plan,
+                        )
+                    action = "correct_workout"
+                    selected = str(resolution.workout_version_id)
+                    corrected_value = resolution.effective_duration_minutes
+                    corrected_distance_kilometers = resolution.distance_kilometers
+                    corrected_active_energy_kilocalories = resolution.active_energy_kilocalories
+                    direct_logical_id = writer.load_workout_logical_id(
+                        resolution.workout_version_id
+                    )
+                    if direct_logical_id is None:
+                        return self._not_started(
+                            plan,
+                            WriteNotStartedStatus.BLOCKED,
+                            ("resolution_not_allowed",),
+                            expected_plan,
+                        )
+                    reason = resolution.reason
+                    note = resolution.note
+                elif isinstance(resolution, LocalWorkoutExclusion):
+                    assert case is not None
+                    if (
+                        case.kind
+                        not in {
+                            DataReviewCaseKind.WORKOUT_PLAUSIBILITY,
+                            DataReviewCaseKind.WORKOUT_OVERLAP,
+                        }
+                        or resolution.workout_version_id
+                        not in writer.load_workout_review_case_versions(str(case.case_id))
+                    ):
+                        return self._not_started(
+                            plan,
+                            WriteNotStartedStatus.BLOCKED,
+                            ("resolution_not_allowed",),
+                            expected_plan,
+                        )
+                    action = "exclude_workout_local"
+                    selected = str(resolution.workout_version_id)
+                    direct_logical_id = writer.load_workout_logical_id(
+                        resolution.workout_version_id
+                    )
+                    if direct_logical_id is None:
+                        return self._not_started(
+                            plan,
+                            WriteNotStartedStatus.BLOCKED,
+                            ("resolution_not_allowed",),
+                            expected_plan,
+                        )
+                    reason = resolution.reason
+                    note = resolution.note
                 elif isinstance(resolution, SourceValueAcceptance):
                     assert case is not None
                     if (
@@ -3553,7 +3678,7 @@ class HealthLab:
                     review_case_id=None if case is None else str(case.case_id),
                     logical_measurement_id=(
                         direct_logical_id
-                        if case is None
+                        if case is None or action in {"correct_workout", "exclude_workout_local"}
                         else (
                             None
                             if case.logical_measurement_id is None
@@ -3571,6 +3696,8 @@ class HealthLab:
                     reason=reason,
                     corrected_value=corrected_value,
                     canonical_unit=canonical_unit,
+                    corrected_distance_kilometers=corrected_distance_kilometers,
+                    corrected_active_energy_kilocalories=corrected_active_energy_kilocalories,
                     cycle_updates=(
                         ()
                         if case is None
@@ -4159,45 +4286,6 @@ class HealthLab:
             )
         except StoreError as error:
             raise HealthLabError("Trainingsprojektion ist nicht verfügbar.") from error
-        overlaps: dict[str, set[DataReviewCaseId]] = {
-            str(item.workout_version_id): set() for item in stored
-        }
-        for item in stored:
-            elapsed_minutes = (item.source_end - item.source_start).total_seconds() / 60
-            invalid_duration = item.reported_duration_minutes is not None and not (
-                0 <= item.reported_duration_minutes <= elapsed_minutes
-            )
-            negative_total = (
-                item.distance_kilometers is not None and item.distance_kilometers < 0
-            ) or (
-                item.active_energy_kilocalories is not None and item.active_energy_kilocalories < 0
-            )
-            if invalid_duration or negative_total:
-                overlaps[str(item.workout_version_id)].add(
-                    DataReviewCaseId(
-                        hashlib.sha256(
-                            f"workout_plausibility:{item.workout_version_id}".encode()
-                        ).hexdigest()[:32]
-                    )
-                )
-        selected = [item for item in stored if item.is_selected]
-        for index, first in enumerate(selected):
-            for second in selected[index + 1 :]:
-                if (
-                    first.logical_workout_id != second.logical_workout_id
-                    and first.source_start < second.source_end
-                    and second.source_start < first.source_end
-                ):
-                    logical_ids = sorted(
-                        (str(first.logical_workout_id), str(second.logical_workout_id))
-                    )
-                    case_id = DataReviewCaseId(
-                        hashlib.sha256(
-                            f"workout_overlap:{':'.join(logical_ids)}".encode()
-                        ).hexdigest()[:32]
-                    )
-                    overlaps[str(first.workout_version_id)].add(case_id)
-                    overlaps[str(second.workout_version_id)].add(case_id)
         workouts = tuple(
             Workout(
                 item.logical_workout_id,
@@ -4210,14 +4298,17 @@ class HealthLab:
                 item.source_name,
                 item.source_version,
                 item.device,
+                item.strong_source_id_hash,
                 item.reported_duration_minutes,
-                (item.source_end - item.source_start).total_seconds() / 60
+                item.effective_duration_minutes
+                if item.effective_duration_minutes is not None
+                else (item.source_end - item.source_start).total_seconds() / 60
                 if item.reported_duration_minutes is None
                 else item.reported_duration_minutes,
                 item.distance_kilometers,
                 item.active_energy_kilocalories,
                 item.is_selected,
-                tuple(sorted(overlaps[str(item.workout_version_id)], key=str)),
+                tuple(DataReviewCaseId(str(case_id)) for case_id in item.review_case_ids),
             )
             for item in stored
         )
@@ -4465,6 +4556,8 @@ class HealthLab:
             if kind == "source_conflict":
                 return (DataReviewAction.PREFER, DataReviewAction.SPLIT)
             if kind == "preferred_daily_weight_conflict":
+                return (DataReviewAction.CORRECT, DataReviewAction.EXCLUDE_LOCAL)
+            if kind in {"workout_plausibility", "workout_overlap"}:
                 return (DataReviewAction.CORRECT, DataReviewAction.EXCLUDE_LOCAL)
             return ()
 

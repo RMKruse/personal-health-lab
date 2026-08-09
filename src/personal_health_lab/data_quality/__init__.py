@@ -26,6 +26,7 @@ from personal_health_lab.storage import (
     OperationId,
     PlausibilityRuleRecord,
     ResolvedMeasurement,
+    ResolvedWorkout,
     ReviewCaseId,
     ReviewCycleRecord,
     ReviewCycleUpdate,
@@ -34,6 +35,8 @@ from personal_health_lab.storage import (
     SourceResolution,
     SourceTypeRuleRequest,
     StoredReviewCycleId,
+    WorkoutResolution,
+    WorkoutVersionFact,
 )
 
 
@@ -263,6 +266,108 @@ def select_governing_export(exports: tuple[ExportFact, ...]) -> str:
             item.export_id,
         ),
     ).export_id
+
+
+def resolve_workouts(
+    *,
+    versions: tuple[WorkoutVersionFact, ...],
+    previous_workouts: tuple[ResolvedWorkout, ...] = (),
+) -> WorkoutResolution:
+    """Resolve source versions and review evidence for immutable workouts."""
+    by_logical: dict[str, list[WorkoutVersionFact]] = defaultdict(list)
+    for version in versions:
+        by_logical[version.logical_workout_id].append(version)
+    previous = {item.logical_workout_id: item for item in previous_workouts}
+    resolved: list[ResolvedWorkout] = []
+    cases: list[OpenDataReviewCase] = []
+    links: list[tuple[str, str]] = []
+    selected: list[WorkoutVersionFact] = []
+    for logical_id, candidates in sorted(by_logical.items()):
+        source = max(
+            candidates,
+            key=lambda item: (
+                item.source_updated_at_utc,
+                item.source_version,
+                item.workout_version_id,
+            ),
+        )
+        prior = previous.get(logical_id)
+        if prior is not None and prior.selected_workout_version_id == source.workout_version_id:
+            resolution = prior
+        else:
+            elapsed = (
+                datetime.fromisoformat(source.source_end_utc)
+                - datetime.fromisoformat(source.source_start_utc)
+            ).total_seconds() / 60
+            resolution = ResolvedWorkout(
+                logical_id,
+                source.workout_version_id,
+                "included_source",
+                source.reported_duration_minutes
+                if source.reported_duration_minutes is not None
+                else elapsed,
+                source.distance_kilometers,
+                source.active_energy_kilocalories,
+                None,
+            )
+        resolved.append(resolution)
+        if resolution.disposition.startswith("included"):
+            selected.append(source)
+        elapsed = (
+            datetime.fromisoformat(source.source_end_utc)
+            - datetime.fromisoformat(source.source_start_utc)
+        ).total_seconds() / 60
+        if (
+            (
+                source.reported_duration_minutes is not None
+                and not 0 <= source.reported_duration_minutes <= elapsed
+            )
+            or (source.distance_kilometers is not None and source.distance_kilometers < 0)
+            or (
+                source.active_energy_kilocalories is not None
+                and source.active_energy_kilocalories < 0
+            )
+        ):
+            key = f"workout_plausibility:{source.workout_version_id}"
+            case = OpenDataReviewCase(
+                hashlib.sha256(key.encode()).hexdigest()[:32],
+                "workout_plausibility",
+                LogicalMeasurementId(source.logical_workout_id),
+                MeasurementVersionId(source.workout_version_id),
+                None,
+                hashlib.sha256(f"{key}:evidence".encode()).hexdigest(),
+            )
+            cases.append(case)
+            links.append((case.review_case_id, source.workout_version_id))
+    for index, first in enumerate(selected):
+        for second in selected[index + 1 :]:
+            if (
+                first.source_start_utc < second.source_end_utc
+                and second.source_start_utc < first.source_end_utc
+            ):
+                ids = sorted((first.logical_workout_id, second.logical_workout_id))
+                key = f"workout_overlap:{':'.join(ids)}"
+                case = OpenDataReviewCase(
+                    hashlib.sha256(key.encode()).hexdigest()[:32],
+                    "workout_overlap",
+                    LogicalMeasurementId(first.logical_workout_id),
+                    MeasurementVersionId(first.workout_version_id),
+                    None,
+                    hashlib.sha256(f"{key}:evidence".encode()).hexdigest(),
+                )
+                cases.append(case)
+                links.extend(
+                    (
+                        (case.review_case_id, first.workout_version_id),
+                        (case.review_case_id, second.workout_version_id),
+                    )
+                )
+    by_id = {item.review_case_id: item for item in cases}
+    return WorkoutResolution(
+        tuple(sorted(resolved, key=lambda item: item.logical_workout_id)),
+        tuple(by_id[key] for key in sorted(by_id)),
+        tuple(sorted(set(links))),
+    )
 
 
 def resolve_sources(
@@ -1087,6 +1192,26 @@ def load_review_case_detail(store: LocalStore, review_case_id: str) -> ReviewCas
             reasons=(),
             canonical_unit=None,
         )
+    if case.kind in {"workout_plausibility", "workout_overlap"}:
+        _, workouts = store.load_workouts(None, None, None)
+        workout = next(
+            (item for item in workouts if item.workout_version_id == case.measurement_version_id),
+            None,
+        )
+        if workout is None:
+            raise ValueError("Trainingsversion des Datenprüffalls fehlt.")
+        return ReviewCaseDetail(
+            source_type="workout",
+            measured_at=workout.source_start,
+            effective_value=workout.effective_duration_minutes,
+            effective_value_source=(
+                None
+                if workout.disposition is None
+                else workout.disposition.removeprefix("included_")
+            ),
+            reasons=(),
+            canonical_unit="min",
+        )
     if case.kind == "continued_override" and case.measurement_version_id is not None:
         version = store.load_measurement_version_fact(case.measurement_version_id)
         if version is None:
@@ -1334,5 +1459,6 @@ __all__ = [
     "load_review_case_detail",
     "load_review_state",
     "resolve_sources",
+    "resolve_workouts",
     "select_governing_export",
 ]
