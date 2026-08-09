@@ -13,6 +13,7 @@ from personal_health_lab.health_data import (
 )
 
 from ._store import (
+    ActivityDerivationRecord,
     AnalysisDefinitionId,
     AnalysisDiagnostics,
     AnalysisMethodology,
@@ -80,6 +81,7 @@ from ._store import (
 )
 
 __all__ = [
+    "ActivityDerivationRecord",
     "AnalysisDataStatusReason",
     "AnalysisDefinitionId",
     "AnalysisDiagnostics",

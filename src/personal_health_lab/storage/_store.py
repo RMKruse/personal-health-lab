@@ -935,6 +935,14 @@ class StoredWorkout:
 
 
 @dataclass(frozen=True, slots=True)
+class ActivityDerivationRecord:
+    version_id: str
+    coverage_gap_minutes: int
+    source_classifier_version: str
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class PublishDecisionResult:
     operation_id: OperationId
     decision_id: str
@@ -1270,6 +1278,28 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(snapshot_id)
         ) STRICT;
+        CREATE TABLE IF NOT EXISTS activity_derivation_versions (
+            version_id TEXT PRIMARY KEY,
+            coverage_gap_minutes INTEGER NOT NULL CHECK (
+                coverage_gap_minutes BETWEEN 1 AND 1440
+            ),
+            source_classifier_version TEXT NOT NULL,
+            created_at_utc TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS activity_derivation_active (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            version_id TEXT NOT NULL REFERENCES activity_derivation_versions(version_id)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS activity_derivation_snapshot_bindings (
+            snapshot_id TEXT PRIMARY KEY REFERENCES dataset_snapshots(snapshot_id),
+            version_id TEXT NOT NULL REFERENCES activity_derivation_versions(version_id)
+        ) STRICT;
+        CREATE TRIGGER IF NOT EXISTS activity_derivation_versions_no_update
+        BEFORE UPDATE ON activity_derivation_versions
+        BEGIN SELECT RAISE(ABORT, 'activity derivation versions are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS activity_derivation_versions_no_delete
+        BEFORE DELETE ON activity_derivation_versions
+        BEGIN SELECT RAISE(ABORT, 'activity derivation versions are append-only'); END;
         CREATE TABLE IF NOT EXISTS import_measurement_versions (
             import_id TEXT NOT NULL REFERENCES imports(import_id),
             measurement_version_id TEXT NOT NULL CHECK (
@@ -1674,6 +1704,18 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                 )
             ),
         ),
+    )
+    metadata.execute(
+        "INSERT OR IGNORE INTO activity_derivation_versions VALUES (?, ?, ?, ?)",
+        (
+            "activity-derivation/v1",
+            240,
+            "activity-source-classification/v1",
+            "1970-01-01T00:00:00+00:00",
+        ),
+    )
+    metadata.execute(
+        "INSERT OR IGNORE INTO activity_derivation_active VALUES (1, 'activity-derivation/v1')"
     )
     import_columns = {
         str(row[1]) for row in metadata.execute("PRAGMA table_info(imports)").fetchall()
@@ -3416,6 +3458,11 @@ class LocalStore:
                     None if active is None else str(active[0]),
                     completed_at,
                 ),
+            )
+            self._metadata.execute(
+                "INSERT INTO activity_derivation_snapshot_bindings VALUES (?, "
+                "(SELECT version_id FROM activity_derivation_active WHERE singleton = 1))",
+                (str(snapshot_id),),
             )
             all_intervals: tuple[
                 CanonicalHealthRecord | CanonicalSleepInterval | CanonicalWorkout, ...
@@ -5879,6 +5926,11 @@ class LocalStore:
         self._metadata.execute(
             "UPDATE active_snapshot SET snapshot_id = ? WHERE singleton = 1", (str(snapshot_id),)
         )
+        self._metadata.execute(
+            "INSERT INTO activity_derivation_snapshot_bindings "
+            "SELECT ?, version_id FROM activity_derivation_snapshot_bindings WHERE snapshot_id = ?",
+            (str(snapshot_id), str(previous_snapshot_id)),
+        )
 
     def load_daily_series(
         self, start_date: date | None, end_date: date | None
@@ -6422,6 +6474,105 @@ class LocalStore:
                 "ORDER BY data_type, effective_from IS NOT NULL, effective_from, created_at"
             ).fetchall()
         )
+
+    def load_activity_derivation_version(
+        self, snapshot_id: SnapshotId | None
+    ) -> ActivityDerivationRecord:
+        self._require_open()
+        selected_snapshot = snapshot_id or self.load_active_snapshot_id()
+        row = None
+        if selected_snapshot is not None:
+            row = self._metadata.execute(
+                "SELECT version_id, coverage_gap_minutes, source_classifier_version, "
+                "created_at_utc "
+                "FROM activity_derivation_snapshot_bindings JOIN activity_derivation_versions "
+                "USING (version_id) WHERE snapshot_id = ?",
+                (str(selected_snapshot),),
+            ).fetchone()
+        if row is None:
+            row = self._metadata.execute(
+                "SELECT version_id, coverage_gap_minutes, source_classifier_version, "
+                "created_at_utc "
+                "FROM activity_derivation_versions WHERE version_id = 'activity-derivation/v1'"
+            ).fetchone()
+        assert row is not None
+        return ActivityDerivationRecord(
+            str(row[0]), int(row[1]), str(row[2]), datetime.fromisoformat(str(row[3]))
+        )
+
+    def create_activity_derivation_version(
+        self,
+        *,
+        operation_id: OperationId,
+        version_id: str,
+        coverage_gap_minutes: int,
+        source_classifier_version: str,
+        expected_snapshot_id: SnapshotId | None,
+    ) -> SnapshotId | None:
+        self._require_open()
+        self._require_writer()
+        active = self.load_active_snapshot_id()
+        if active != expected_snapshot_id:
+            raise StoreError("Aktiver Snapshot hat sich geändert.")
+        created_at = datetime.now(UTC).isoformat()
+        snapshot_id = None if active is None else SnapshotId(uuid4().hex)
+        try:
+            with self._metadata:
+                # Existing stores constrain this ledger to the established rule-version kind.
+                self._metadata.execute(
+                    "INSERT INTO write_operations VALUES (?, "
+                    "'create_plausibility_rule_version', ?, ?, "
+                    "'committed', 1)",
+                    (str(operation_id), created_at, created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO activity_derivation_versions VALUES (?, ?, ?, ?)",
+                    (version_id, coverage_gap_minutes, source_classifier_version, created_at),
+                )
+                self._metadata.execute(
+                    "UPDATE activity_derivation_active SET version_id = ? WHERE singleton = 1",
+                    (version_id,),
+                )
+                if active is not None and snapshot_id is not None:
+                    audit_position = int(
+                        self._metadata.execute(
+                            "SELECT COALESCE(MAX(audit_position), 0) FROM audit_events"
+                        ).fetchone()[0]
+                    )
+                    manifest = self._stage_review_snapshot(
+                        parent_snapshot_id=active,
+                        snapshot_id=snapshot_id,
+                        operation_id=operation_id,
+                        audit_position=audit_position,
+                        review_case_id=None,
+                        decision_id="",
+                        action="activity_derivation_version",
+                        selected_measurement_version_id=None,
+                        candidate_version_ids=(),
+                        replacement_plausibility_cases=(),
+                    )
+                    self._activate_review_snapshot(
+                        operation_id,
+                        snapshot_id,
+                        active,
+                        manifest,
+                        created_at,
+                        activation_kind="rule_version",
+                    )
+                    self._metadata.execute(
+                        "UPDATE activity_derivation_snapshot_bindings SET version_id = ? "
+                        "WHERE snapshot_id = ?",
+                        (version_id, str(snapshot_id)),
+                    )
+        except Exception:
+            shutil.rmtree(self._root / "staging" / str(operation_id), ignore_errors=True)
+            if snapshot_id is not None:
+                shutil.rmtree(
+                    self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id),
+                    ignore_errors=True,
+                )
+            raise
+        return snapshot_id
 
     def load_effective_confirmation_case_ids(self) -> frozenset[str]:
         self._require_open()

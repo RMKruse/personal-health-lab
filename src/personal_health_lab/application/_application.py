@@ -6,7 +6,7 @@ import logging
 import math
 import shutil
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from enum import StrEnum
 from itertools import pairwise
 from pathlib import Path
@@ -509,6 +509,42 @@ class ActivityMeasurement:
     original_value: float
     original_unit: str
     review_case_ids: tuple[DataReviewCaseId, ...]
+    suppression_reason: str | None = None
+
+
+class ActivityCoverageKind(StrEnum):
+    WATCH = "watch"
+    IPHONE_FALLBACK = "iphone_fallback"
+    UNOBSERVED = "unobserved"
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityCoverageSegment:
+    kind: ActivityCoverageKind
+    source_start: datetime
+    source_end: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityDerivationVersion:
+    version_id: str
+    coverage_gap_minutes: int
+    source_classifier_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class ActivitySettings:
+    active_version: ActivityDerivationVersion
+    recommended_version: ActivityDerivationVersion
+
+
+@dataclass(frozen=True, slots=True)
+class CreateActivityDerivationVersion:
+    coverage_gap_minutes: int = 240
+
+    def __post_init__(self) -> None:
+        if type(self.coverage_gap_minutes) is not int or not 1 <= self.coverage_gap_minutes <= 1440:
+            raise ConfigurationError("Abdeckungsschwelle muss eine ganze Zahl von 1 bis 1440 sein.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -520,6 +556,8 @@ class DailyActivityMetric:
     measurement_version_ids: tuple[MeasurementVersionId, ...] = ()
     review_case_ids: tuple[DataReviewCaseId, ...] = ()
     quality_status: DataQualityStatus = DataQualityStatus.REVIEWED
+    watch_value: float | None = None
+    iphone_value: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -529,6 +567,9 @@ class ActivityDay:
     step_count: DailyActivityMetric
     walking_running_distance: DailyActivityMetric
     active_energy: DailyActivityMetric
+    coverage_segments: tuple[ActivityCoverageSegment, ...] = ()
+    is_complete: bool = True
+    incomplete_reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -537,6 +578,9 @@ class ActivityDays:
     status: DataQualityStatus
     days: tuple[ActivityDay, ...]
     measurements: tuple[ActivityMeasurement, ...]
+    source_classifier_version: str = "activity-source-classification/v1"
+    derivation_version: str = "activity-derivation/v1"
+    coverage_gap_minutes: int = 240
 
 
 @dataclass(frozen=True, slots=True)
@@ -580,6 +624,9 @@ class Workouts:
 
 
 _ACTIVITY_TYPES = {CanonicalHealthType(item.value): item for item in ActivityMetric}
+_ACTIVITY_SOURCE_CLASSIFIER_VERSION = "activity-source-classification/v1"
+_ACTIVITY_DERIVATION_VERSION = "activity-derivation/v1"
+_ACTIVITY_COVERAGE_GAP_MINUTES = 240
 
 
 _SLEEP_SOURCE_CLASSIFIER_VERSION = "sleep-source-classification/v1"
@@ -1621,7 +1668,7 @@ class HealthLab:
 
     def preview_write(self, request: WriteRequest) -> WritePlan:
         self._require_open()
-        if not isinstance(request, get_args(WriteRequest)):
+        if not isinstance(request, (*get_args(WriteRequest), CreateActivityDerivationVersion)):
             raise ConfigurationError("Unbekannter Schreibauftrag.")
         if isinstance(request, BeginMetadataRestore):
             return self._build_metadata_restore_plan(request)
@@ -1643,6 +1690,8 @@ class HealthLab:
             return self._build_historical_review_plan(request)
         if isinstance(request, CreatePlausibilityRuleVersion):
             return self._build_plausibility_rule_plan(request)
+        if isinstance(request, CreateActivityDerivationVersion):
+            return self._build_activity_derivation_plan(request)
         if isinstance(
             request, (ResolveDataReviewCase, ConfirmDataReviewBatch, RevokeDataReviewDecision)
         ):
@@ -2156,6 +2205,26 @@ class HealthLab:
                 ),
                 diagnostics=diagnostics,
             ),
+        )
+
+    def _build_activity_derivation_plan(
+        self, request: CreateActivityDerivationVersion
+    ) -> WritePlan:
+        settings = self.load_activity_settings()
+        payload = {
+            "coverage_gap_minutes": request.coverage_gap_minutes,
+            "previous_version_id": settings.active_version.version_id,
+            "source_classifier_version": _ACTIVITY_SOURCE_CLASSIFIER_VERSION,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return WritePlan(
+            PlanFingerprint(hashlib.sha256(b"plan:" + encoded).hexdigest()),
+            PlausibilityRuleVersionPlan(
+                settings.active_version.version_id,
+                hashlib.sha256(b"activity-derivation:" + encoded).hexdigest(),
+                self._store.load_active_snapshot_id() if self._store is not None else None,
+            ),
+            WritePreflight(WriteApproval(WriteApprovalStatus.READY)),
         )
 
     def _build_plausibility_rule_plan(self, request: CreatePlausibilityRuleVersion) -> WritePlan:
@@ -2752,6 +2821,10 @@ class HealthLab:
             return self._execute_metadata_backup(request, authorization_plan, expected_plan)
         if isinstance(request, CreatePlausibilityRuleVersion):
             return self._execute_plausibility_rule_write(request, authorization_plan, expected_plan)
+        if isinstance(request, CreateActivityDerivationVersion):
+            return self._execute_activity_derivation_write(
+                request, authorization_plan, expected_plan
+            )
         if isinstance(request, RunHistoricalReview):
             return self._execute_historical_review_write(request, authorization_plan, expected_plan)
         if isinstance(request, RunRestingHeartRateAnalysis):
@@ -3347,6 +3420,47 @@ class HealthLab:
             MetadataRestoreStatus.ABORTED,
         )
         return WriteReceipt(operation_id, expected_plan, result, plan.preflight)
+
+    def _execute_activity_derivation_write(
+        self,
+        request: CreateActivityDerivationVersion,
+        plan: WritePlan,
+        expected_plan: PlanFingerprint,
+    ) -> WriteReceipt:
+        if not isinstance(plan.details, PlausibilityRuleVersionPlan):
+            return self._not_started(
+                plan,
+                WriteNotStartedStatus.PLAN_CHANGED,
+                ("plan_changed",),
+                expected_plan,
+            )
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        try:
+            operation_id = OperationId(uuid4().hex)
+            snapshot_ref = writer.create_activity_derivation_version(
+                operation_id=operation_id,
+                version_id=plan.details.proposed_version_id,
+                coverage_gap_minutes=request.coverage_gap_minutes,
+                source_classifier_version=_ACTIVITY_SOURCE_CLASSIFIER_VERSION,
+                expected_snapshot_id=plan.details.active_snapshot_ref,
+            )
+        except StoreError as error:
+            raise HealthLabError("Aktivitätsableitung konnte nicht gespeichert werden.") from error
+        finally:
+            writer.close()
+        return WriteReceipt(
+            operation_id,
+            expected_plan,
+            PlausibilityRuleVersionReceipt(
+                operation_id, plan.details.proposed_version_id, snapshot_ref
+            ),
+            plan.preflight,
+        )
 
     def _execute_plausibility_rule_write(
         self,
@@ -4164,6 +4278,22 @@ class HealthLab:
             healthkit_nutrition_samples=healthkit_nutrition_samples,
         )
 
+    def load_activity_settings(self) -> ActivitySettings:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        record = self._store.load_activity_derivation_version(None)
+        active = ActivityDerivationVersion(
+            record.version_id, record.coverage_gap_minutes, record.source_classifier_version
+        )
+        recommendation = ActivityDerivationVersion(
+            _ACTIVITY_DERIVATION_VERSION,
+            _ACTIVITY_COVERAGE_GAP_MINUTES,
+            _ACTIVITY_SOURCE_CLASSIFIER_VERSION,
+        )
+        return ActivitySettings(active, recommendation)
+
     def load_activity_days(self, selection: SnapshotDateSelection) -> ActivityDays:
         self._require_ready()
         self._require_open()
@@ -4175,53 +4305,167 @@ class HealthLab:
             )
         except StoreError as error:
             raise HealthLabError("Aktivitätstagsprojektion ist nicht verfügbar.") from error
-        measurements = tuple(
-            ActivityMeasurement(
-                logical_measurement_id=item.logical_measurement_id,
-                measurement_version_id=item.measurement_version_id,
-                data_type=_ACTIVITY_TYPES[item.data_type],
-                unit=item.unit,
-                value=item.value,
-                effective_value=item.effective_value,
-                disposition=item.disposition,
-                is_selected=item.is_selected,
-                source_class=classify_activity_source(item.source_name, item.device),
-                source_start=item.source_start,
-                source_end=item.source_end,
-                source_updated_at=item.source_updated_at,
-                measurement_local_day=item.measurement_local_day,
-                source_name=item.source_name,
-                source_version=item.source_version,
-                device=item.device,
-                original_value=item.original_value,
-                original_unit=item.original_unit,
-                review_case_ids=tuple(
-                    DataReviewCaseId(str(value)) for value in item.review_case_ids
-                ),
+
+        def public_measurements(
+            values: tuple[StoredMeasurement, ...],
+        ) -> tuple[ActivityMeasurement, ...]:
+            return tuple(
+                ActivityMeasurement(
+                    logical_measurement_id=item.logical_measurement_id,
+                    measurement_version_id=item.measurement_version_id,
+                    data_type=_ACTIVITY_TYPES[item.data_type],
+                    unit=item.unit,
+                    value=item.value,
+                    effective_value=item.effective_value,
+                    disposition=item.disposition,
+                    is_selected=item.is_selected,
+                    source_class=classify_activity_source(item.source_name, item.device),
+                    source_start=item.source_start,
+                    source_end=item.source_end,
+                    source_updated_at=item.source_updated_at,
+                    measurement_local_day=item.measurement_local_day,
+                    source_name=item.source_name,
+                    source_version=item.source_version,
+                    device=item.device,
+                    original_value=item.original_value,
+                    original_unit=item.original_unit,
+                    review_case_ids=tuple(
+                        DataReviewCaseId(str(value)) for value in item.review_case_ids
+                    ),
+                )
+                for item in values
             )
-            for item in stored_measurements
+
+        measurements = public_measurements(stored_measurements)
+        all_snapshot_ref, all_stored_measurements = self._store.load_activity_measurements(
+            snapshot_ref, None, None
+        )
+        assert all_snapshot_ref == snapshot_ref
+        all_measurements = public_measurements(all_stored_measurements)
+        record = self._store.load_activity_derivation_version(snapshot_ref)
+        derivation_version = ActivityDerivationVersion(
+            record.version_id, record.coverage_gap_minutes, record.source_classifier_version
         )
         selected = tuple(
             item
-            for item in measurements
+            for item in all_measurements
             if item.is_selected
             and item.effective_value is not None
             and item.disposition in {"included_source", "included_correction"}
+        )
+        interval_selected = tuple(item for item in selected if item.source_end > item.source_start)
+
+        def union(
+            intervals: tuple[tuple[datetime, datetime], ...],
+        ) -> tuple[tuple[datetime, datetime], ...]:
+            merged: list[tuple[datetime, datetime]] = []
+            for start, end in sorted(intervals):
+                if merged and start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                else:
+                    merged.append((start, end))
+            return tuple(merged)
+
+        def bridge(
+            intervals: tuple[tuple[datetime, datetime], ...],
+        ) -> tuple[tuple[datetime, datetime], ...]:
+            merged: list[tuple[datetime, datetime]] = []
+            for start, end in intervals:
+                if (
+                    merged
+                    and start - merged[-1][1]
+                    < timedelta(minutes=derivation_version.coverage_gap_minutes)
+                    and merged[-1][1].utcoffset() == start.utcoffset()
+                ):
+                    merged[-1] = (merged[-1][0], end)
+                else:
+                    merged.append((start, end))
+            return tuple(merged)
+
+        watch_intervals = [
+            (item.source_start, item.source_end)
+            for item in interval_selected
+            if item.source_class is ActivitySourceClass.WATCH
+        ]
+        _, workouts = self._store.load_workouts(snapshot_ref, None, None)
+        watch_intervals.extend(
+            (item.source_start, item.source_end)
+            for item in workouts
+            if item.is_selected
+            and item.source_end > item.source_start
+            and classify_activity_source(item.source_name, item.device) is ActivitySourceClass.WATCH
+        )
+        _, sleep_intervals = self._store.load_sleep_measurements(snapshot_ref)
+        watch_intervals.extend(
+            (item.source_start, item.source_end)
+            for item in sleep_intervals
+            if item.is_selected
+            and item.source_end > item.source_start
+            and _classify_sleep_source(item.source_name, item.device) is SleepSourceClass.WATCH
+        )
+        watch_coverage = bridge(union(tuple(watch_intervals)))
+        watch_gaps = tuple(
+            (left[1], right[0]) for left, right in pairwise(watch_coverage) if left[1] < right[0]
+        )
+        iphone_fallback_ids = {
+            item.measurement_version_id
+            for item in interval_selected
+            if item.source_class is ActivitySourceClass.IPHONE
+            and any(
+                start <= item.source_start and item.source_end <= end for start, end in watch_gaps
+            )
+        }
+        iphone_coverage: list[tuple[datetime, datetime]] = []
+        for gap_start, gap_end in watch_gaps:
+            iphone_coverage.extend(
+                bridge(
+                    union(
+                        tuple(
+                            (item.source_start, item.source_end)
+                            for item in interval_selected
+                            if item.measurement_version_id in iphone_fallback_ids
+                            and gap_start <= item.source_start
+                            and item.source_end <= gap_end
+                        )
+                    )
+                )
+            )
+
+        def suppression_reason(item: ActivityMeasurement) -> str | None:
+            if item not in selected:
+                return None
+            if (
+                item.source_class is ActivitySourceClass.IPHONE
+                and item.measurement_version_id not in iphone_fallback_ids
+            ):
+                return "iphone_outside_watch_gap"
+            if item.source_class in {ActivitySourceClass.OTHER, ActivitySourceClass.UNKNOWN}:
+                return "ineligible_source"
+            return None
+
+        measurements = tuple(
+            replace(item, suppression_reason=suppression_reason(item)) for item in measurements
+        )
+        eligible = tuple(
+            item
+            for item in selected
+            if item.source_class is ActivitySourceClass.WATCH
+            or item.measurement_version_id in iphone_fallback_ids
         )
         start_date: date | None
         end_date: date | None
         if selection.start_date is not None and selection.end_date is not None:
             start_date, end_date = selection.start_date, selection.end_date
-        elif selected:
-            start_date = min(item.measurement_local_day for item in selected)
-            end_date = max(item.measurement_local_day for item in selected)
+        elif eligible:
+            start_date = min(item.measurement_local_day for item in eligible)
+            end_date = max(item.measurement_local_day for item in eligible)
         else:
             start_date = end_date = None
 
         def feature(metric: ActivityMetric, day: date) -> DailyActivityMetric:
             contributors = tuple(
                 item
-                for item in selected
+                for item in eligible
                 if item.data_type is metric and item.measurement_local_day == day
             )
             review_case_ids = tuple(
@@ -4229,6 +4473,15 @@ class HealthLab:
                     {case_id for item in contributors for case_id in item.review_case_ids}, key=str
                 )
             )
+
+            def source_total(source_class: ActivitySourceClass) -> float | None:
+                values = tuple(
+                    item.effective_value
+                    for item in contributors
+                    if item.source_class is source_class and item.effective_value is not None
+                )
+                return sum(values) if values else None
+
             return DailyActivityMetric(
                 data_type=metric,
                 unit=canonical_unit_for(CanonicalHealthType(metric.value)),
@@ -4247,7 +4500,59 @@ class HealthLab:
                 quality_status=(
                     DataQualityStatus.PROVISIONAL if review_case_ids else DataQualityStatus.REVIEWED
                 ),
+                watch_value=source_total(ActivitySourceClass.WATCH),
+                iphone_value=source_total(ActivitySourceClass.IPHONE),
             )
+
+        coverage_segments: dict[date, list[ActivityCoverageSegment]] = {}
+        coverage_candidates = tuple(
+            item
+            for item in selected
+            if item.source_class in {ActivitySourceClass.WATCH, ActivitySourceClass.IPHONE}
+            and item.source_end > item.source_start
+        )
+        if coverage_candidates:
+            first = min(coverage_candidates, key=lambda item: item.measurement_local_day)
+            last = max(coverage_candidates, key=lambda item: item.measurement_local_day)
+            range_start = datetime.combine(
+                first.measurement_local_day, time.min, first.source_start.tzinfo
+            )
+            range_end = datetime.combine(
+                last.measurement_local_day + timedelta(days=1), time.min, last.source_start.tzinfo
+            )
+            covered = tuple(
+                (start, end, ActivityCoverageKind.WATCH) for start, end in watch_coverage
+            ) + tuple(
+                (start, end, ActivityCoverageKind.IPHONE_FALLBACK) for start, end in iphone_coverage
+            )
+            boundaries = sorted(
+                {
+                    range_start,
+                    range_end,
+                    *(
+                        value
+                        for start, end, _ in covered
+                        for value in (max(start, range_start), min(end, range_end))
+                    ),
+                }
+            )
+            for start, end in pairwise(boundaries):
+                if start == end:
+                    continue
+                kind = next(
+                    (kind for left, right, kind in covered if left <= start and end <= right),
+                    ActivityCoverageKind.UNOBSERVED,
+                )
+                current_start = start
+                while current_start < end:
+                    midnight = datetime.combine(
+                        current_start.date() + timedelta(days=1), time.min, current_start.tzinfo
+                    )
+                    current_end = min(end, midnight)
+                    coverage_segments.setdefault(current_start.date(), []).append(
+                        ActivityCoverageSegment(kind, current_start, current_end)
+                    )
+                    current_start = current_end
 
         days = []
         current = start_date
@@ -4261,6 +4566,19 @@ class HealthLab:
                         ActivityMetric.WALKING_RUNNING_DISTANCE, current
                     ),
                     active_energy=feature(ActivityMetric.ACTIVE_ENERGY, current),
+                    coverage_segments=tuple(coverage_segments.get(current, ())),
+                    is_complete=not any(
+                        segment.kind is ActivityCoverageKind.UNOBSERVED
+                        for segment in coverage_segments.get(current, ())
+                    ),
+                    incomplete_reasons=(
+                        ("unobserved_coverage",)
+                        if any(
+                            segment.kind is ActivityCoverageKind.UNOBSERVED
+                            for segment in coverage_segments.get(current, ())
+                        )
+                        else ()
+                    ),
                 )
             )
             current += timedelta(days=1)
@@ -4268,11 +4586,15 @@ class HealthLab:
             snapshot_ref=snapshot_ref,
             status=(
                 DataQualityStatus.PROVISIONAL
-                if any(item.review_case_ids for item in selected)
+                if any(item.review_case_ids for item in eligible)
+                or any(not item.is_complete for item in days)
                 else DataQualityStatus.REVIEWED
             ),
             days=tuple(days),
             measurements=measurements,
+            source_classifier_version=derivation_version.source_classifier_version,
+            derivation_version=derivation_version.version_id,
+            coverage_gap_minutes=derivation_version.coverage_gap_minutes,
         )
 
     def load_workouts(self, selection: SnapshotDateSelection) -> Workouts:

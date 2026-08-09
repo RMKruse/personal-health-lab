@@ -481,7 +481,10 @@ def _render_activity_days(config: RuntimeConfig) -> None:
     except (ConfigurationError, HealthLabError):
         st.error("Aktivitätsdaten konnten nicht geladen werden.")
         return
-    st.caption(f"Snapshot: {projection.snapshot_ref or '-'} · Status: {projection.status.value}")
+    st.caption(
+        f"Snapshot: {projection.snapshot_ref or '-'} · Status: {projection.status.value} · "
+        f"Abdeckung: {projection.coverage_gap_minutes} min ({projection.derivation_version})"
+    )
     st.dataframe(
         [
             {
@@ -490,6 +493,25 @@ def _render_activity_days(config: RuntimeConfig) -> None:
                 "Schritte": item.step_count.value,
                 "Geh-/Laufdistanz (km)": item.walking_running_distance.value,
                 "Aktive Energie (kcal)": item.active_energy.value,
+                "Watch-Anteil": {
+                    "Trainingszeit": item.exercise_time.watch_value,
+                    "Schritte": item.step_count.watch_value,
+                    "Distanz": item.walking_running_distance.watch_value,
+                    "Energie": item.active_energy.watch_value,
+                },
+                "iPhone-Anteil": {
+                    "Trainingszeit": item.exercise_time.iphone_value,
+                    "Schritte": item.step_count.iphone_value,
+                    "Distanz": item.walking_running_distance.iphone_value,
+                    "Energie": item.active_energy.iphone_value,
+                },
+                "Vollständig": item.is_complete,
+                "Unvollständigkeitsgründe": item.incomplete_reasons,
+                "Abdeckung": [
+                    f"{segment.kind.value}: {segment.source_start.isoformat()} - "
+                    f"{segment.source_end.isoformat()}"
+                    for segment in item.coverage_segments
+                ],
                 "Prüffälle": [
                     str(case_id)
                     for metric in (
@@ -527,6 +549,7 @@ def _render_activity_days(config: RuntimeConfig) -> None:
                 "Gerät": item.device,
                 "Messungsversion": str(item.measurement_version_id),
                 "Prüffälle": [str(case_id) for case_id in item.review_case_ids],
+                "Unterdrückungsgrund": item.suppression_reason,
             }
             for item in projection.measurements
         ],

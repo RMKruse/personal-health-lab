@@ -8,6 +8,7 @@ import pytest
 from personal_health_lab.adapters.cli import main
 from personal_health_lab.application import (
     ActivityMetric,
+    CreateActivityDerivationVersion,
     DataMode,
     DataReviewCaseKind,
     DataReviewSelection,
@@ -72,12 +73,15 @@ def test_activity_import_preserves_typed_samples_and_assigns_cross_midnight_valu
     assert day.exercise_time.value == 2
     assert day.step_count.value == 42
     assert day.walking_running_distance.value == 1.609344
-    assert day.active_energy.value == 10
-    assert next(
-        item.source_class.value
-        for item in activity.measurements
-        if item.data_type is ActivityMetric.ACTIVE_ENERGY
-    ) == "iphone"
+    assert day.active_energy.value is None
+    assert (
+        next(
+            item.source_class.value
+            for item in activity.measurements
+            if item.data_type is ActivityMetric.ACTIVE_ENERGY
+        )
+        == "iphone"
+    )
     assert activity.days[1].exercise_time.value is None
 
 
@@ -119,6 +123,9 @@ def test_activity_days_cli_projects_the_shared_selection(
     assert output["selection"]["start_date"] == "2024-01-02"
     assert output["days"][0]["step_count"]["value"] == 0
     assert output["days"][1]["step_count"]["value"] is None
+    assert output["coverage_gap_minutes"] == 240
+    assert output["days"][0]["is_complete"] is False
+    assert output["measurements"][0]["suppression_reason"] is None
 
 
 def test_same_metric_same_source_class_overlap_opens_a_review_case(tmp_path: Path) -> None:
@@ -219,3 +226,93 @@ def test_negative_activity_value_remains_canonical_and_opens_plausibility_review
     assert len(review.cases) == 1
     assert activity.measurements[0].value == -1
     assert activity.days[0].step_count.value == -1
+
+
+def test_activity_days_use_shared_watch_coverage_and_whole_interval_iphone_fallback(
+    tmp_path: Path,
+) -> None:
+    xml = """
+    <HealthData><ExportDate value="2024-01-03 12:00:00 +0100"/>
+      <Record type="HKQuantityTypeIdentifierStepCount" unit="count" value="1"
+        sourceName="Apple Watch" sourceVersion="1" device="Apple Watch"
+        creationDate="2024-01-02 08:10:00 +0100"
+        startDate="2024-01-02 08:00:00 +0100" endDate="2024-01-02 08:10:00 +0100"/>
+      <Record type="HKQuantityTypeIdentifierActiveEnergyBurned" unit="kcal" value="1"
+        sourceName="Apple Watch" sourceVersion="1" device="Apple Watch"
+        creationDate="2024-01-02 16:10:00 +0100"
+        startDate="2024-01-02 16:00:00 +0100" endDate="2024-01-02 16:10:00 +0100"/>
+      <Record type="HKQuantityTypeIdentifierStepCount" unit="count" value="2"
+        sourceName="iPhone" sourceVersion="1" device="iPhone"
+        creationDate="2024-01-02 10:10:00 +0100"
+        startDate="2024-01-02 10:00:00 +0100" endDate="2024-01-02 10:10:00 +0100"/>
+      <Record type="HKQuantityTypeIdentifierStepCount" unit="count" value="4"
+        sourceName="iPhone" sourceVersion="1" device="iPhone"
+        creationDate="2024-01-02 07:10:00 +0100"
+        startDate="2024-01-02 07:00:00 +0100" endDate="2024-01-02 07:10:00 +0100"/>
+    </HealthData>
+    """
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(_package(tmp_path / "coverage.zip", xml))
+        health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+        activity = health_lab.load_activity_days(SnapshotDateSelection())
+
+    day = activity.days[0]
+    assert day.step_count.watch_value == 1
+    assert day.step_count.iphone_value == 2
+    assert day.step_count.value == 3
+    assert day.is_complete is False
+    assert "unobserved_coverage" in day.incomplete_reasons
+    assert day.coverage_segments[0].source_start.hour == 0
+    assert day.coverage_segments[-1].source_end.hour == 0
+    assert [segment.kind for segment in day.coverage_segments] == [
+        "unobserved",
+        "watch",
+        "unobserved",
+        "iphone_fallback",
+        "unobserved",
+        "watch",
+        "unobserved",
+    ]
+    assert sorted(
+        item.suppression_reason for item in activity.measurements if item.suppression_reason
+    ) == [
+        "iphone_outside_watch_gap",
+    ]
+
+
+def test_activity_derivation_threshold_is_versioned_and_keeps_old_snapshot_readable(
+    tmp_path: Path,
+) -> None:
+    xml = """
+    <HealthData><ExportDate value="2024-01-03 12:00:00 +0100"/>
+      <Record type="HKQuantityTypeIdentifierStepCount" unit="count" value="1"
+        sourceName="Apple Watch" sourceVersion="1" device="Apple Watch"
+        creationDate="2024-01-02 08:10:00 +0100"
+        startDate="2024-01-02 08:00:00 +0100" endDate="2024-01-02 08:10:00 +0100"/>
+      <Record type="HKQuantityTypeIdentifierStepCount" unit="count" value="1"
+        sourceName="Apple Watch" sourceVersion="1" device="Apple Watch"
+        creationDate="2024-01-02 09:10:00 +0100"
+        startDate="2024-01-02 09:00:00 +0100" endDate="2024-01-02 09:10:00 +0100"/>
+    </HealthData>
+    """
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    with HealthLab.open(config) as health_lab:
+        import_request = ImportHealthExport(_package(tmp_path / "settings.zip", xml))
+        imported = health_lab.execute_write(
+            import_request, expected_plan=health_lab.preview_write(import_request).fingerprint
+        )
+        old_snapshot = imported.result.snapshot_ref
+        change = CreateActivityDerivationVersion(coverage_gap_minutes=30)
+        receipt = health_lab.execute_write(
+            change, expected_plan=health_lab.preview_write(change).fingerprint
+        )
+        old = health_lab.load_activity_days(SnapshotDateSelection(snapshot_ref=old_snapshot))
+        current = health_lab.load_activity_days(SnapshotDateSelection())
+
+    assert receipt.result.snapshot_ref != old_snapshot
+    assert old.coverage_gap_minutes == 240
+    assert current.coverage_gap_minutes == 30
+    assert len(old.measurements) == len(current.measurements) == 2

@@ -725,19 +725,33 @@ def _activity_days_json(
             "review_case_ids": [str(value) for value in item.review_case_ids],
             "unit": item.unit.value,
             "value": item.value,
+            "watch_value": item.watch_value,
+            "iphone_value": item.iphone_value,
         }
 
     return {
         "days": [
             {
                 "active_energy": metric(item.active_energy),
+                "coverage_segments": [
+                    {
+                        "kind": segment.kind.value,
+                        "source_start": segment.source_start.isoformat(),
+                        "source_end": segment.source_end.isoformat(),
+                    }
+                    for segment in item.coverage_segments
+                ],
                 "day": item.day.isoformat(),
                 "exercise_time": metric(item.exercise_time),
+                "incomplete_reasons": list(item.incomplete_reasons),
+                "is_complete": item.is_complete,
                 "step_count": metric(item.step_count),
                 "walking_running_distance": metric(item.walking_running_distance),
             }
             for item in projection.days
         ],
+        "coverage_gap_minutes": projection.coverage_gap_minutes,
+        "derivation_version": projection.derivation_version,
         "kind": "activity_days",
         "measurements": [
             {
@@ -758,6 +772,7 @@ def _activity_days_json(
                 "source_start": item.source_start.isoformat(),
                 "source_updated_at": item.source_updated_at.isoformat(),
                 "source_version": item.source_version,
+                "suppression_reason": item.suppression_reason,
                 "unit": item.unit.value,
                 "value": item.value,
             }
@@ -775,6 +790,7 @@ def _activity_days_json(
             ),
         },
         "snapshot_ref": None if projection.snapshot_ref is None else str(projection.snapshot_ref),
+        "source_classifier_version": projection.source_classifier_version,
         "status": projection.status.value,
     }
 
