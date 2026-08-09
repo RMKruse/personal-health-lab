@@ -13,6 +13,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Literal, Self, get_args
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from personal_health_lab import DataMode
 from personal_health_lab.data_quality import (
@@ -92,6 +93,7 @@ from personal_health_lab.storage import (
     PublishBatchDecisionResult,
     PublishDecisionResult,
     StoreBusyError,
+    StoredContextCoverageStart,
     StoredMeasurement,
     StoreError,
     StoreId,
@@ -262,6 +264,129 @@ class SnapshotDateSelection:
             and self.start_date > self.end_date
         ):
             raise ConfigurationError("Startdatum darf nicht nach dem Enddatum liegen.")
+
+
+@dataclass(frozen=True, slots=True)
+class ContextLogicalId:
+    _value: str
+
+    def __post_init__(self) -> None:
+        if len(self._value) != 32 or not set(self._value) <= set("0123456789abcdef"):
+            raise ValueError("Kontext-ID muss ein 32-stelliger Hex-Wert sein.")
+
+    def __str__(self) -> str:
+        return self._value
+
+
+@dataclass(frozen=True, slots=True)
+class ContextRevisionId:
+    _value: str
+
+    def __post_init__(self) -> None:
+        if len(self._value) != 32 or not set(self._value) <= set("0123456789abcdef"):
+            raise ValueError("Kontextrevisions-ID muss ein 32-stelliger Hex-Wert sein.")
+
+    def __str__(self) -> str:
+        return self._value
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCoverageStartCreate:
+    start_date: date
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCoverageStartRevise:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    start_date: date
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCoverageStartWithdraw:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ConfigurationError("Rücknahme verlangt einen Grund.")
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCoverageStartRestore:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    start_date: date
+
+
+ContextCoverageStartIntent = (
+    ContextCoverageStartCreate
+    | ContextCoverageStartRevise
+    | ContextCoverageStartWithdraw
+    | ContextCoverageStartRestore
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseContextCoverageStart:
+    intent: ContextCoverageStartIntent
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.intent, get_args(ContextCoverageStartIntent)):
+            raise ConfigurationError("Unbekannte Kontextabdeckungsabsicht.")
+
+
+class ContextIllnessOrigin(StrEnum):
+    UNKNOWN = "unknown"
+    ASSUMED_NONE = "assumed_none"
+
+
+class ContextStressOrigin(StrEnum):
+    UNKNOWN = "unknown"
+    ASSUMED_AVERAGE = "assumed_average"
+
+
+@dataclass(frozen=True, slots=True)
+class DailyContextDay:
+    day: date
+    illness_origin: ContextIllnessOrigin
+    stress_origin: ContextStressOrigin
+
+
+@dataclass(frozen=True, slots=True)
+class DailyContext:
+    snapshot_ref: SnapshotRef | None
+    context_as_of_date: date | None
+    context_timezone: str
+    days: tuple[DailyContextDay, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCoverageStartRecord:
+    logical_id: ContextLogicalId
+    revision_id: ContextRevisionId
+    start_date: date
+
+
+@dataclass(frozen=True, slots=True)
+class ContextRecords:
+    snapshot_ref: SnapshotRef | None
+    coverage_start: ContextCoverageStartRecord | None
+
+
+@dataclass(frozen=True, slots=True)
+class ContextAuditRevision:
+    revision_id: ContextRevisionId
+    previous_revision_id: ContextRevisionId | None
+    state: Literal["active", "withdrawn"]
+    start_date: date | None
+
+
+@dataclass(frozen=True, slots=True)
+class ContextAudit:
+    logical_id: ContextLogicalId
+    revisions: tuple[ContextAuditRevision, ...]
 
 
 class WeightDayStatus(StrEnum):
@@ -1137,6 +1262,7 @@ WriteRequest = (
     | CreatePlausibilityRuleVersion
     | RunHistoricalReview
     | RunRestingHeartRateAnalysis
+    | ReviseContextCoverageStart
 )
 
 
@@ -1144,6 +1270,7 @@ class WriteApprovalStatus(StrEnum):
     READY = "ready"
     CONFIRMATION_REQUIRED = "confirmation_required"
     BLOCKED = "blocked"
+    NO_CHANGE = "no_change"
 
 
 class WriteConfirmation(StrEnum):
@@ -1282,6 +1409,17 @@ class HistoricalReviewPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class ManualContextRevisionPlan:
+    intent: Literal["create", "revise", "withdraw", "restore"]
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId | None
+    start_date: date | None
+    base_snapshot_ref: SnapshotRef | None
+    snapshot_as_of: datetime
+    context_timezone: str
+
+
+@dataclass(frozen=True, slots=True)
 class RestingHeartRateAnalysisPlan:
     analysis_definition_id: AnalysisDefinitionId
     start_date: date | None
@@ -1303,6 +1441,7 @@ WritePlanDetails = (
     | PlausibilityRuleVersionPlan
     | HistoricalReviewPlan
     | RestingHeartRateAnalysisPlan
+    | ManualContextRevisionPlan
 )
 
 
@@ -1538,6 +1677,10 @@ class WriteNotStartedStatus(StrEnum):
     STORE_BUSY = "store_busy"
 
 
+class NoChangeStatus(StrEnum):
+    NO_CHANGE = "no_change"
+
+
 @dataclass(frozen=True, slots=True)
 class WriteNotStarted:
     status: WriteNotStartedStatus
@@ -1582,6 +1725,22 @@ class HistoricalReviewReceipt:
     diagnostics: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class ManualContextRevisionReceipt:
+    operation_id: OperationId
+    logical_id: ContextLogicalId
+    revision_id: ContextRevisionId
+    snapshot_ref: SnapshotRef
+    status: ImportStatus = ImportStatus.COMMITTED
+    diagnostics: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class WriteNoChange:
+    status: NoChangeStatus = NoChangeStatus.NO_CHANGE
+    diagnostics: tuple[str, ...] = ()
+
+
 class AnalysisStatus(StrEnum):
     COMPLETED = "completed"
     REUSED = "reused"
@@ -1612,7 +1771,9 @@ WriteResult = (
     | WriteBatchDecisionReceipt
     | PlausibilityRuleVersionReceipt
     | HistoricalReviewReceipt
+    | ManualContextRevisionReceipt
     | AnalysisReceipt
+    | WriteNoChange
     | WriteNotStarted
 )
 
@@ -1684,6 +1845,8 @@ class HealthLab:
             return self._build_migration_rollback_plan()
         if isinstance(request, CreateMetadataBackup):
             return self._build_metadata_backup_plan(request)
+        if isinstance(request, ReviseContextCoverageStart):
+            return self._build_context_coverage_start_plan(request)
         if isinstance(request, RunRestingHeartRateAnalysis):
             return self._build_resting_heart_rate_analysis_plan(request)
         if isinstance(request, RunHistoricalReview):
@@ -2225,6 +2388,113 @@ class HealthLab:
                 self._store.load_active_snapshot_id() if self._store is not None else None,
             ),
             WritePreflight(WriteApproval(WriteApprovalStatus.READY)),
+        )
+
+    def _build_context_coverage_start_plan(self, request: ReviseContextCoverageStart) -> WritePlan:
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        snapshot = self._store.load_active_snapshot_id()
+        intent = request.intent
+        kind: Literal["create", "revise", "withdraw", "restore"]
+        start_date: date | None
+        expected_revision_id: ContextRevisionId | None
+        if isinstance(intent, ContextCoverageStartCreate):
+            kind, start_date, expected_revision_id = "create", intent.start_date, None
+            logical_id = ContextLogicalId(
+                hashlib.sha256(b"context_coverage_start").hexdigest()[:32]
+            )
+        elif isinstance(intent, ContextCoverageStartRevise):
+            kind, logical_id, start_date, expected_revision_id = (
+                "revise",
+                intent.logical_id,
+                intent.start_date,
+                intent.expected_revision_id,
+            )
+        elif isinstance(intent, ContextCoverageStartWithdraw):
+            kind, logical_id, start_date, expected_revision_id = (
+                "withdraw",
+                intent.logical_id,
+                None,
+                intent.expected_revision_id,
+            )
+        else:
+            assert isinstance(intent, ContextCoverageStartRestore)
+            kind, logical_id, start_date, expected_revision_id = (
+                "restore",
+                intent.logical_id,
+                intent.start_date,
+                intent.expected_revision_id,
+            )
+        timezone = "Europe/Berlin"
+        snapshot_as_of = datetime.combine(
+            datetime.now(ZoneInfo(timezone)).date(), time.min, ZoneInfo(timezone)
+        )
+        current = None if snapshot is None else self._store.load_context_coverage_start(snapshot)
+        blocked = snapshot is None or (
+            start_date is not None and start_date > snapshot_as_of.date()
+        )
+        diagnostics = (
+            ("context_requires_snapshot",)
+            if snapshot is None
+            else (("context_date_in_future",) if blocked else ())
+        )
+        if not blocked:
+            if kind == "create":
+                blocked = current is not None or bool(
+                    self._store.load_context_coverage_audit(str(logical_id))
+                )
+            elif (
+                (current is None and kind != "restore")
+                or (current is not None and kind == "restore")
+                or (
+                    current is not None
+                    and (
+                        current.logical_id != str(logical_id)
+                        or current.revision_id != str(expected_revision_id)
+                    )
+                )
+            ):
+                blocked = True
+            if blocked and not diagnostics:
+                diagnostics = ("context_revision_changed",)
+        no_change = (
+            not blocked
+            and kind == "revise"
+            and current is not None
+            and current.start_date == start_date
+        )
+        payload = {
+            "intent": kind,
+            "logical_id": str(logical_id),
+            "expected_revision_id": None
+            if expected_revision_id is None
+            else str(expected_revision_id),
+            "start_date": None if start_date is None else start_date.isoformat(),
+            "base_snapshot_ref": None if snapshot is None else str(snapshot),
+            "snapshot_as_of": snapshot_as_of.isoformat(),
+            "context_timezone": timezone,
+        }
+        return WritePlan(
+            PlanFingerprint(
+                hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+            ),
+            ManualContextRevisionPlan(
+                kind,
+                logical_id,
+                expected_revision_id,
+                start_date,
+                snapshot,
+                snapshot_as_of,
+                timezone,
+            ),
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED
+                    if blocked
+                    else (WriteApprovalStatus.NO_CHANGE if no_change else WriteApprovalStatus.READY)
+                ),
+                diagnostics=diagnostics,
+            ),
         )
 
     def _build_plausibility_rule_plan(self, request: CreatePlausibilityRuleVersion) -> WritePlan:
@@ -2823,6 +3093,10 @@ class HealthLab:
             return self._execute_plausibility_rule_write(request, authorization_plan, expected_plan)
         if isinstance(request, CreateActivityDerivationVersion):
             return self._execute_activity_derivation_write(
+                request, authorization_plan, expected_plan
+            )
+        if isinstance(request, ReviseContextCoverageStart):
+            return self._execute_context_coverage_start_write(
                 request, authorization_plan, expected_plan
             )
         if isinstance(request, RunHistoricalReview):
@@ -3458,6 +3732,64 @@ class HealthLab:
             expected_plan,
             PlausibilityRuleVersionReceipt(
                 operation_id, plan.details.proposed_version_id, snapshot_ref
+            ),
+            plan.preflight,
+        )
+
+    def _execute_context_coverage_start_write(
+        self,
+        request: ReviseContextCoverageStart,
+        plan: WritePlan,
+        expected_plan: PlanFingerprint,
+    ) -> WriteReceipt:
+        if not isinstance(plan.details, ManualContextRevisionPlan):
+            return self._not_started(
+                plan, WriteNotStartedStatus.PLAN_CHANGED, ("plan_changed",), expected_plan
+            )
+        if plan.approval.status is WriteApprovalStatus.NO_CHANGE:
+            return WriteReceipt(
+                OperationId(uuid4().hex), expected_plan, WriteNoChange(), plan.preflight
+            )
+        if plan.details.base_snapshot_ref is None:
+            return self._not_started(
+                plan, WriteNotStartedStatus.BLOCKED, plan.diagnostics, expected_plan
+            )
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        try:
+            operation_id = OperationId(uuid4().hex)
+            logical_id, revision_id, snapshot_ref = writer.publish_context_coverage_start(
+                operation_id=operation_id,
+                intent=plan.details.intent,
+                logical_id=str(plan.details.logical_id),
+                expected_revision_id=(
+                    None
+                    if plan.details.expected_revision_id is None
+                    else str(plan.details.expected_revision_id)
+                ),
+                start_date=plan.details.start_date,
+                expected_snapshot_id=plan.details.base_snapshot_ref,
+                context_as_of_date=plan.details.snapshot_as_of.date(),
+                context_timezone=plan.details.context_timezone,
+            )
+        except StoreError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.PLAN_CHANGED, ("plan_changed",), expected_plan
+            )
+        finally:
+            writer.close()
+        return WriteReceipt(
+            operation_id,
+            expected_plan,
+            ManualContextRevisionReceipt(
+                operation_id,
+                ContextLogicalId(logical_id),
+                ContextRevisionId(revision_id),
+                snapshot_ref,
             ),
             plan.preflight,
         )
@@ -4293,6 +4625,98 @@ class HealthLab:
             _ACTIVITY_SOURCE_CLASSIFIER_VERSION,
         )
         return ActivitySettings(active, recommendation)
+
+    @staticmethod
+    def _context_record(
+        value: StoredContextCoverageStart | None,
+    ) -> ContextCoverageStartRecord | None:
+        if value is None or value.start_date is None:
+            return None
+        return ContextCoverageStartRecord(
+            ContextLogicalId(value.logical_id),
+            ContextRevisionId(value.revision_id),
+            value.start_date,
+        )
+
+    def load_daily_context(self, selection: SnapshotDateSelection) -> DailyContext:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        snapshot_ref = (
+            self._store.load_active_snapshot_id()
+            if selection.snapshot_ref is None
+            else selection.snapshot_ref
+        )
+        if snapshot_ref is None:
+            return DailyContext(None, None, "Europe/Berlin", ())
+        coverage = self._store.load_context_coverage_start(snapshot_ref)
+        context_as_of, timezone = self._store.load_context_as_of_date(snapshot_ref)
+        if selection.start_date is None:
+            start = context_as_of if coverage is None else coverage.start_date or context_as_of
+            end = context_as_of
+        else:
+            selected_start = selection.start_date
+            selected_end = selection.end_date
+            assert selected_start is not None
+            assert selected_end is not None
+            start = selected_start
+            end = min(selected_end, context_as_of)
+        if start > end:
+            return DailyContext(snapshot_ref, context_as_of, timezone, ())
+        days = tuple(
+            DailyContextDay(
+                current,
+                (
+                    ContextIllnessOrigin.ASSUMED_NONE
+                    if coverage is not None
+                    and coverage.start_date is not None
+                    and current >= coverage.start_date
+                    else ContextIllnessOrigin.UNKNOWN
+                ),
+                (
+                    ContextStressOrigin.ASSUMED_AVERAGE
+                    if coverage is not None
+                    and coverage.start_date is not None
+                    and current >= coverage.start_date
+                    else ContextStressOrigin.UNKNOWN
+                ),
+            )
+            for current in (
+                start + timedelta(days=index) for index in range((end - start).days + 1)
+            )
+        )
+        return DailyContext(snapshot_ref, context_as_of, timezone, days)
+
+    def load_context_records(self, snapshot_ref: SnapshotRef | None = None) -> ContextRecords:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        selected = self._store.load_active_snapshot_id() if snapshot_ref is None else snapshot_ref
+        return ContextRecords(
+            selected, self._context_record(self._store.load_context_coverage_start(selected))
+        )
+
+    def load_context_audit(self, logical_id: ContextLogicalId) -> ContextAudit:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        return ContextAudit(
+            logical_id,
+            tuple(
+                ContextAuditRevision(
+                    ContextRevisionId(value.revision_id),
+                    None
+                    if value.previous_revision_id is None
+                    else ContextRevisionId(value.previous_revision_id),
+                    value.state,
+                    value.start_date,
+                )
+                for value in self._store.load_context_coverage_audit(str(logical_id))
+            ),
+        )
 
     def load_activity_days(self, selection: SnapshotDateSelection) -> ActivityDays:
         self._require_ready()

@@ -615,6 +615,45 @@ def _render_workouts(config: RuntimeConfig) -> None:
     )
 
 
+def _render_context(config: RuntimeConfig) -> None:
+    st.subheader("Kontext")
+    start = st.date_input("Kontext von", value=None)
+    end = st.date_input("Kontext bis", value=None)
+    if st.button("Kontext laden"):
+        try:
+            assert start is None or isinstance(start, date)
+            assert end is None or isinstance(end, date)
+            selection = SnapshotDateSelection(start_date=start, end_date=end)
+            with HealthLab.open(config) as health_lab:
+                st.session_state["daily_context"] = health_lab.load_daily_context(selection)
+                st.session_state["context_records"] = health_lab.load_context_records()
+        except (ConfigurationError, HealthLabError):
+            st.error("Kontext konnte nicht geladen werden.")
+    projection = st.session_state.get("daily_context")
+    records = st.session_state.get("context_records")
+    if projection is not None:
+        st.dataframe(
+            [
+                {
+                    "Tag": item.day.isoformat(),
+                    "Krankheit": item.illness_origin.value,
+                    "Stress": item.stress_origin.value,
+                }
+                for item in projection.days
+            ],
+            width="stretch",
+        )
+    if records is not None:
+        st.caption(
+            "Abdeckungsbeginn: "
+            + (
+                "-"
+                if records.coverage_start is None
+                else records.coverage_start.start_date.isoformat()
+            )
+        )
+
+
 def _discard_pending_previews() -> None:
     import_request = st.session_state.get("import_request")
     if isinstance(import_request, ImportHealthExport):
@@ -632,7 +671,7 @@ except (KeyError, ValueError, ConfigurationError):
 
 st.radio(
     "Seite",
-    ("Übersicht", "Datenprüfung", "Kerndaten"),
+    ("Übersicht", "Datenprüfung", "Kerndaten", "Kontext & Medikamente"),
     key="active_page",
     horizontal=True,
     on_change=_discard_pending_previews,
@@ -796,6 +835,10 @@ if st.session_state["active_page"] == "Kerndaten":
     _render_activity_days(config)
     _render_workouts(config)
     _render_import_details(config)
+    st.stop()
+
+if st.session_state["active_page"] == "Kontext & Medikamente":
+    _render_context(config)
     st.stop()
 
 _render_health_import(config)

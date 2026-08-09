@@ -2,6 +2,12 @@ schema_version = 1
 release = "v0.3-delta"
 
 [[contract]]
+id = "V03-C-CONTEXT-COVERAGE-START-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/77"
+statement = "A coverage-start revision binds its normalized input, active snapshot, local context day, immutable revision, audit event, and new snapshot; days before it stay unknown while later gaps use only the two context baselines."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
 id = "V03-C-IMPORT-DETAILS-V1"
 source = "https://github.com/RMKruse/personal-health-lab/issues/69"
 statement = "Import details expose canonical counts and a typed unsupported-content catalog without parser or storage internals."
@@ -107,6 +113,20 @@ seed = 71
 options = { variants = ["baseline", "later-protein-version", "negative-protein", "zero-sugar", "negative-protein-carbohydrates"] }
 platform = "all"
 sha256 = "e341b6a4470745bf30cf5bda744b8121b566b720048e8fe6cf61dccc873f0d02"
+
+[[case]]
+id = "V03-A-CONTEXT-COVERAGE-START-V1"
+contracts = ["V03-C-CONTEXT-COVERAGE-START-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_context.py::test_context_coverage_start_publishes_an_immutable_snapshot_and_baseline"
+initial_state = "committed synthetic snapshot without manual context"
+operation = "create the context coverage start through the HealthLab write seam and load the daily, records, and audit projections"
+level = "application"
+platform = "all"
+expected_result = "one immutable context revision and one bound snapshot with unknown pre-coverage days and baseline-only later gaps"
+expected_effect = "one globally ordered audit event and one active snapshot"
+forbidden_side_effects = "no illness, stress, or personal context value is fabricated"
+evidence = ["positive", "negative", "transition"]
 
 [[case]]
 id = "V03-A-IMPORT-DETAILS-V1"

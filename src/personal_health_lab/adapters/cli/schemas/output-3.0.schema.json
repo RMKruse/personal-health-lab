@@ -19,6 +19,9 @@
       "$ref": "#/$defs/workoutsOutput"
     },
     {
+      "$ref": "#/$defs/contextOutput"
+    },
+    {
       "$ref": "#/$defs/writePlanOutput"
     },
     {
@@ -38,6 +41,15 @@
     }
   ],
   "$defs": {
+    "contextOutput": {
+      "type": "object",
+      "required": ["kind", "runtime_config", "schema_version"],
+      "properties": {
+        "kind": { "enum": ["daily_context", "context_records", "context_audit"] },
+        "runtime_config": { "type": "object" },
+        "schema_version": { "const": "3.0" }
+      }
+    },
     "activityDaysOutput": {
       "type": "object",
       "additionalProperties": false,

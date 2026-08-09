@@ -1182,6 +1182,16 @@ class ReviewSnapshotFacts:
     measurements: tuple[ResolvedMeasurement, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class StoredContextCoverageStart:
+    logical_id: str
+    revision_id: str
+    previous_revision_id: str | None
+    state: Literal["active", "withdrawn"]
+    start_date: date | None
+    snapshot_id: SnapshotId | None
+
+
 def _execute_script(metadata: sqlite3.Connection, script: str) -> None:
     statement = ""
     for line in script.splitlines(keepends=True):
@@ -1231,7 +1241,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                                  'revoke_data_review_decision',
                                  'create_plausibility_rule_version',
                                  'run_historical_review', 'migrate_store',
-                                 'rollback_migration')
+                                 'rollback_migration', 'revise_context_coverage_start')
             ),
             started_at_utc TEXT NOT NULL CHECK (
                 length(started_at_utc) >= 20 AND substr(started_at_utc, 11, 1) = 'T'
@@ -1267,7 +1277,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             activation_kind TEXT NOT NULL CHECK (
                 activation_kind IN (
                     'import', 'data_review_decision', 'rule_version', 'historical',
-                    'migration'
+                    'migration', 'manual_context_revision'
                 )
             ),
             activated_at_utc TEXT NOT NULL CHECK (
@@ -1434,7 +1444,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             event_kind TEXT NOT NULL CHECK (
                 event_kind IN (
                     'import_published', 'data_review_decision', 'metadata_tombstone',
-                    'store_migrated'
+                    'store_migrated', 'manual_context_revision'
                 )
             ),
             occurred_at_utc TEXT NOT NULL CHECK (
@@ -1458,6 +1468,43 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS restored_publications (
             audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id)
         ) STRICT;
+        CREATE TABLE IF NOT EXISTS manual_context_revisions (
+            revision_id TEXT PRIMARY KEY CHECK (
+                length(revision_id) = 32 AND revision_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            logical_id TEXT NOT NULL CHECK (
+                length(logical_id) = 32 AND logical_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            object_kind TEXT NOT NULL CHECK (object_kind = 'context_coverage_start'),
+            previous_revision_id TEXT UNIQUE REFERENCES manual_context_revisions(revision_id),
+            state TEXT NOT NULL CHECK (state IN ('active', 'withdrawn')),
+            operation_id TEXT NOT NULL UNIQUE REFERENCES write_operations(operation_id),
+            created_at_utc TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL CHECK (
+                length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'
+            )
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS context_coverage_start_values (
+            revision_id TEXT PRIMARY KEY REFERENCES manual_context_revisions(revision_id),
+            start_date TEXT NOT NULL CHECK (length(start_date) = 10)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS manual_context_snapshot_bindings (
+            snapshot_id TEXT PRIMARY KEY REFERENCES dataset_snapshots(snapshot_id),
+            revision_id TEXT NOT NULL UNIQUE REFERENCES manual_context_revisions(revision_id)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS manual_context_publications (
+            audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
+            revision_id TEXT NOT NULL UNIQUE REFERENCES manual_context_revisions(revision_id),
+            snapshot_id TEXT NOT NULL UNIQUE REFERENCES dataset_snapshots(snapshot_id),
+            context_as_of_date TEXT NOT NULL CHECK (length(context_as_of_date) = 10),
+            context_timezone TEXT NOT NULL
+        ) STRICT;
+        CREATE TRIGGER IF NOT EXISTS manual_context_revisions_no_update
+        BEFORE UPDATE ON manual_context_revisions
+        BEGIN SELECT RAISE(ABORT, 'manual context revisions are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS manual_context_revisions_no_delete
+        BEFORE DELETE ON manual_context_revisions
+        BEGIN SELECT RAISE(ABORT, 'manual context revisions are append-only'); END;
         CREATE TABLE IF NOT EXISTS metadata_restores (
             restore_id TEXT PRIMARY KEY CHECK (
                 length(restore_id) = 32 AND restore_id NOT GLOB '*[^0-9a-f]*'
@@ -3903,7 +3950,7 @@ class LocalStore:
             cycle_status="open"
             if resolution.new_review_case_ids or new_workout_case_ids
             else "closed",
-            cycle_open_case_count=(resolution.cycle_open_case_count + len(new_workout_case_ids)),
+            cycle_open_case_count=(len(resolution.new_review_case_ids) + len(new_workout_case_ids)),
             anomaly_count=resolution.anomaly_count
             + sum(item.kind == "workout_plausibility" for item in workout_resolution.review_cases),
         )
@@ -4125,6 +4172,16 @@ class LocalStore:
                 if "restored_publications" in tables
                 else ""
             )
+            manual_count = (
+                "+ count(manual_context_publications.audit_event_id)"
+                if "manual_context_publications" in tables
+                else ""
+            )
+            manual_join = (
+                "LEFT JOIN manual_context_publications USING (audit_event_id)"
+                if "manual_context_publications" in tables
+                else ""
+            )
             audit = self._metadata.execute(
                 f"""
                 SELECT count(*), COALESCE(MIN(audit_position), 1),
@@ -4134,12 +4191,14 @@ class LocalStore:
                        + count(metadata_tombstones.audit_event_id)
                        {migration_count}
                        {restored_count}
+                       {manual_count}
                 FROM audit_events
                 LEFT JOIN import_publications USING (audit_event_id)
                 LEFT JOIN data_review_decisions USING (audit_event_id)
                 LEFT JOIN metadata_tombstones USING (audit_event_id)
                 {migration_join}
                 {restored_join}
+                {manual_join}
                 """
             ).fetchone()
             assert audit is not None
@@ -5894,9 +5953,9 @@ class LocalStore:
         manifest_sha256: str,
         completed_at: str,
         *,
-        activation_kind: Literal["data_review_decision", "rule_version", "historical"] = (
-            "data_review_decision"
-        ),
+        activation_kind: Literal[
+            "data_review_decision", "rule_version", "historical", "manual_context_revision"
+        ] = ("data_review_decision"),
     ) -> None:
         staging = self._root / "staging" / str(operation_id)
         snapshot = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
@@ -6499,6 +6558,212 @@ class LocalStore:
         return ActivityDerivationRecord(
             str(row[0]), int(row[1]), str(row[2]), datetime.fromisoformat(str(row[3]))
         )
+
+    def load_context_coverage_start(
+        self, snapshot_id: SnapshotId | None
+    ) -> StoredContextCoverageStart | None:
+        self._require_open()
+        selected = self.load_active_snapshot_id() if snapshot_id is None else snapshot_id
+        if selected is None:
+            return None
+        row = self._metadata.execute(
+            """
+            SELECT revision.logical_id, revision.revision_id, revision.previous_revision_id,
+                   revision.state, value.start_date
+            FROM manual_context_snapshot_bindings binding
+            JOIN manual_context_revisions revision USING (revision_id)
+            LEFT JOIN context_coverage_start_values value USING (revision_id)
+            WHERE binding.snapshot_id = ?
+            """,
+            (str(selected),),
+        ).fetchone()
+        if row is None:
+            return None
+        return StoredContextCoverageStart(
+            str(row[0]),
+            str(row[1]),
+            None if row[2] is None else str(row[2]),
+            cast(Literal["active", "withdrawn"], str(row[3])),
+            None if row[4] is None else date.fromisoformat(str(row[4])),
+            selected,
+        )
+
+    def load_context_coverage_audit(
+        self, logical_id: str
+    ) -> tuple[StoredContextCoverageStart, ...]:
+        self._require_open()
+        rows = self._metadata.execute(
+            """
+            SELECT revision.logical_id, revision.revision_id, revision.previous_revision_id,
+                   revision.state, value.start_date
+            FROM manual_context_revisions revision
+            LEFT JOIN context_coverage_start_values value USING (revision_id)
+            WHERE revision.logical_id = ?
+            ORDER BY revision.rowid
+            """,
+            (logical_id,),
+        ).fetchall()
+        return tuple(
+            StoredContextCoverageStart(
+                str(row[0]),
+                str(row[1]),
+                None if row[2] is None else str(row[2]),
+                cast(Literal["active", "withdrawn"], str(row[3])),
+                None if row[4] is None else date.fromisoformat(str(row[4])),
+                None,
+            )
+            for row in rows
+        )
+
+    def load_context_as_of_date(self, snapshot_id: SnapshotId) -> tuple[date, str]:
+        self._require_open()
+        row = self._metadata.execute(
+            "SELECT context_as_of_date, context_timezone FROM manual_context_publications "
+            "WHERE snapshot_id = ?",
+            (str(snapshot_id),),
+        ).fetchone()
+        if row is not None:
+            return date.fromisoformat(str(row[0])), str(row[1])
+        snapshot = self._metadata.execute(
+            "SELECT created_at_utc FROM dataset_snapshots WHERE snapshot_id = ?",
+            (str(snapshot_id),),
+        ).fetchone()
+        if snapshot is None:
+            raise StoreError("Snapshot fehlt.")
+        return datetime.fromisoformat(str(snapshot[0])).date(), "Europe/Berlin"
+
+    def publish_context_coverage_start(
+        self,
+        *,
+        operation_id: OperationId,
+        intent: Literal["create", "revise", "withdraw", "restore"],
+        logical_id: str,
+        expected_revision_id: str | None,
+        start_date: date | None,
+        expected_snapshot_id: SnapshotId,
+        context_as_of_date: date,
+        context_timezone: str,
+    ) -> tuple[str, str, SnapshotId]:
+        self._require_open()
+        self._require_writer()
+        active = self.load_active_snapshot_id()
+        if active != expected_snapshot_id:
+            raise StoreError("Aktiver Snapshot hat sich geändert.")
+        current = self.load_context_coverage_start(active)
+        audit = self.load_context_coverage_audit(logical_id)
+        latest = audit[-1] if audit else None
+        if intent == "create":
+            if current is not None or latest is not None or start_date is None:
+                raise StoreError("Kontextabdeckungsbeginn kann nicht erstellt werden.")
+            previous = None
+            state = "active"
+        elif latest is None or latest.revision_id != expected_revision_id:
+            raise StoreError("Kontextrevision hat sich geändert.")
+        elif intent == "withdraw":
+            if current is None or current.revision_id != expected_revision_id:
+                raise StoreError("Kontextabdeckungsbeginn ist nicht aktiv.")
+            previous, state, start_date = latest.revision_id, "withdrawn", None
+        else:
+            if start_date is None:
+                raise StoreError("Kontextabdeckungsbeginn fehlt.")
+            if intent == "revise" and (
+                current is None or current.revision_id != expected_revision_id
+            ):
+                raise StoreError("Kontextabdeckungsbeginn ist nicht aktiv.")
+            if intent == "restore" and current is not None:
+                raise StoreError("Kontextabdeckungsbeginn ist bereits aktiv.")
+            previous, state = latest.revision_id, "active"
+        revision_id = uuid4().hex
+        snapshot_id = SnapshotId(uuid4().hex)
+        created_at = datetime.now(UTC).isoformat()
+        payload_sha256 = hashlib.sha256(
+            json.dumps(
+                {
+                    "intent": intent,
+                    "logical_id": logical_id,
+                    "start_date": None if start_date is None else start_date.isoformat(),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        try:
+            with self._metadata:
+                self._metadata.execute(
+                    "INSERT INTO write_operations VALUES "
+                    "(?, 'revise_context_coverage_start', ?, ?, 'committed', 1)",
+                    (str(operation_id), created_at, created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO manual_context_revisions VALUES "
+                    "(?, ?, 'context_coverage_start', ?, ?, ?, ?, ?)",
+                    (
+                        revision_id,
+                        logical_id,
+                        previous,
+                        state,
+                        str(operation_id),
+                        created_at,
+                        payload_sha256,
+                    ),
+                )
+                if start_date is not None:
+                    self._metadata.execute(
+                        "INSERT INTO context_coverage_start_values VALUES (?, ?)",
+                        (revision_id, start_date.isoformat()),
+                    )
+                audit_position = int(
+                    self._metadata.execute(
+                        "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+                    ).fetchone()[0]
+                )
+                manifest = self._stage_review_snapshot(
+                    parent_snapshot_id=active,
+                    snapshot_id=snapshot_id,
+                    operation_id=operation_id,
+                    audit_position=audit_position,
+                    review_case_id=None,
+                    decision_id="",
+                    action="manual_context_revision",
+                    selected_measurement_version_id=None,
+                    candidate_version_ids=(),
+                    replacement_plausibility_cases=(),
+                )
+                self._activate_review_snapshot(
+                    operation_id,
+                    snapshot_id,
+                    active,
+                    manifest,
+                    created_at,
+                    activation_kind="manual_context_revision",
+                )
+                if state == "active":
+                    self._metadata.execute(
+                        "INSERT INTO manual_context_snapshot_bindings VALUES (?, ?)",
+                        (str(snapshot_id), revision_id),
+                    )
+                audit_event_id = uuid4().hex
+                self._metadata.execute(
+                    "INSERT INTO audit_events VALUES (?, ?, ?, 'manual_context_revision', ?)",
+                    (audit_position, audit_event_id, str(operation_id), created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO manual_context_publications VALUES (?, ?, ?, ?, ?)",
+                    (
+                        audit_event_id,
+                        revision_id,
+                        str(snapshot_id),
+                        context_as_of_date.isoformat(),
+                        context_timezone,
+                    ),
+                )
+        except Exception:
+            shutil.rmtree(self._root / "staging" / str(operation_id), ignore_errors=True)
+            shutil.rmtree(
+                self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id), ignore_errors=True
+            )
+            raise
+        return logical_id, revision_id, snapshot_id
 
     def create_activity_derivation_version(
         self,

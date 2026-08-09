@@ -26,9 +26,12 @@ from personal_health_lab.application import (
     CapacityCheck,
     ConfigurationError,
     ConfirmDataReviewBatch,
+    ContextLogicalId,
+    ContextRecords,
     CreateMetadataBackup,
     CreatePlausibilityRuleVersion,
     DailyActivityMetric,
+    DailyContext,
     DailyNutritionFeature,
     DataConfirmation,
     DataCorrection,
@@ -160,6 +163,19 @@ def _parser() -> argparse.ArgumentParser:
     workouts.add_argument("--start-date", type=date.fromisoformat)
     workouts.add_argument("--end-date", type=date.fromisoformat)
     workouts.add_argument("--json", action="store_true", dest="as_json")
+    context = commands.add_parser("context", help="Manuellen Kontext laden")
+    context_commands = context.add_subparsers(dest="context_command", required=True)
+    context_days = context_commands.add_parser("days", help="Täglichen Kontext laden")
+    context_days.add_argument("--snapshot", type=SnapshotRef)
+    context_days.add_argument("--start-date", type=date.fromisoformat)
+    context_days.add_argument("--end-date", type=date.fromisoformat)
+    context_days.add_argument("--json", action="store_true", dest="as_json")
+    context_records = context_commands.add_parser("records", help="Wirksame Kontextdaten laden")
+    context_records.add_argument("--snapshot", type=SnapshotRef)
+    context_records.add_argument("--json", action="store_true", dest="as_json")
+    context_audit = context_commands.add_parser("audit", help="Kontextaudit laden")
+    context_audit.add_argument("logical_id", type=ContextLogicalId)
+    context_audit.add_argument("--json", action="store_true", dest="as_json")
     analysis = commands.add_parser("analyze", help="Verzögerungsprofil analysieren")
     analysis.add_argument("--definition", default="lag-signal-v2")
     analysis.add_argument("--start-date", type=date.fromisoformat)
@@ -850,6 +866,54 @@ def _workouts_json(
     }
 
 
+def _daily_context_json(
+    projection: DailyContext, selection: SnapshotDateSelection, runtime_config: Mapping[str, object]
+) -> dict[str, object]:
+    return {
+        "context_as_of_date": None
+        if projection.context_as_of_date is None
+        else projection.context_as_of_date.isoformat(),
+        "context_timezone": projection.context_timezone,
+        "days": [
+            {
+                "day": item.day.isoformat(),
+                "illness_origin": item.illness_origin.value,
+                "stress_origin": item.stress_origin.value,
+            }
+            for item in projection.days
+        ],
+        "kind": "daily_context",
+        "runtime_config": dict(runtime_config),
+        "schema_version": _OUTPUT_SCHEMA_VERSION,
+        "selection": {
+            "end_date": None if selection.end_date is None else selection.end_date.isoformat(),
+            "snapshot_ref": None if selection.snapshot_ref is None else str(selection.snapshot_ref),
+            "start_date": None
+            if selection.start_date is None
+            else selection.start_date.isoformat(),
+        },
+        "snapshot_ref": None if projection.snapshot_ref is None else str(projection.snapshot_ref),
+    }
+
+
+def _context_records_json(
+    projection: ContextRecords, runtime_config: Mapping[str, object]
+) -> dict[str, object]:
+    return {
+        "coverage_start": None
+        if projection.coverage_start is None
+        else {
+            "logical_id": str(projection.coverage_start.logical_id),
+            "revision_id": str(projection.coverage_start.revision_id),
+            "start_date": projection.coverage_start.start_date.isoformat(),
+        },
+        "kind": "context_records",
+        "runtime_config": dict(runtime_config),
+        "schema_version": _OUTPUT_SCHEMA_VERSION,
+        "snapshot_ref": None if projection.snapshot_ref is None else str(projection.snapshot_ref),
+    }
+
+
 def _recovery_status_json(
     status: RecoveryStatus,
     runtime_config: Mapping[str, object],
@@ -1394,6 +1458,15 @@ def main(args: Sequence[str] | None = None) -> int:
                     parsed.snapshot, parsed.start_date, parsed.end_date
                 )
                 workout_projection = health_lab.load_workouts(workout_selection)
+            elif parsed.command == "context" and parsed.context_command == "days":
+                context_selection = SnapshotDateSelection(
+                    parsed.snapshot, parsed.start_date, parsed.end_date
+                )
+                daily_context = health_lab.load_daily_context(context_selection)
+            elif parsed.command == "context" and parsed.context_command == "records":
+                context_records = health_lab.load_context_records(parsed.snapshot)
+            elif parsed.command == "context" and parsed.context_command == "audit":
+                context_audit = health_lab.load_context_audit(parsed.logical_id)
             elif parsed.command == "restore":
                 restore_request = BeginMetadataRestore(parsed.backup)
                 restore_plan = health_lab.preview_write(restore_request)
@@ -1862,6 +1935,55 @@ def main(args: Sequence[str] | None = None) -> int:
                 sort_keys=True,
             )
         )
+    elif parsed.command == "context" and parsed.context_command == "days" and parsed.as_json:
+        print(
+            json.dumps(
+                _daily_context_json(daily_context, context_selection, runtime_config),
+                sort_keys=True,
+            )
+        )
+    elif parsed.command == "context" and parsed.context_command == "records" and parsed.as_json:
+        print(json.dumps(_context_records_json(context_records, runtime_config), sort_keys=True))
+    elif parsed.command == "context" and parsed.context_command == "audit" and parsed.as_json:
+        print(
+            json.dumps(
+                {
+                    "kind": "context_audit",
+                    "logical_id": str(context_audit.logical_id),
+                    "revisions": [
+                        {
+                            "previous_revision_id": None
+                            if item.previous_revision_id is None
+                            else str(item.previous_revision_id),
+                            "revision_id": str(item.revision_id),
+                            "start_date": None
+                            if item.start_date is None
+                            else item.start_date.isoformat(),
+                            "state": item.state,
+                        }
+                        for item in context_audit.revisions
+                    ],
+                    "runtime_config": dict(runtime_config),
+                    "schema_version": _OUTPUT_SCHEMA_VERSION,
+                },
+                sort_keys=True,
+            )
+        )
+    elif parsed.command == "context" and parsed.context_command == "days":
+        print("Täglicher Kontext")
+        for context_day in daily_context.days:
+            print(
+                f"{context_day.day} · Krankheit: {context_day.illness_origin.value} · "
+                f"Stress: {context_day.stress_origin.value}"
+            )
+    elif parsed.command == "context" and parsed.context_command == "records":
+        print("Kontextdaten")
+        if context_records.coverage_start is not None:
+            print(f"Abdeckungsbeginn: {context_records.coverage_start.start_date}")
+    elif parsed.command == "context" and parsed.context_command == "audit":
+        print("Kontextaudit")
+        for revision in context_audit.revisions:
+            print(f"{revision.revision_id} · {revision.state} · {revision.start_date or '-'}")
     elif parsed.command == "workouts":
         print("Trainingseinheiten")
         print(

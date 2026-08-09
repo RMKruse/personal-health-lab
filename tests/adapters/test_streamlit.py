@@ -25,6 +25,17 @@ from personal_health_lab.application import (
 from personal_health_lab.synthetic_export import GenerationOptions, generate_export
 
 
+@pytest.mark.v02_adapter(
+    "streamlit",
+    "ContextAudit",
+    "ContextRecords",
+    "DailyContext",
+    "ManualContextRevisionPlan",
+    "ManualContextRevisionReceipt",
+    "NoChangeStatus",
+    "ReviseContextCoverageStart",
+    "WriteNoChange",
+)
 def test_streamlit_loads_import_details_through_the_application_seam(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

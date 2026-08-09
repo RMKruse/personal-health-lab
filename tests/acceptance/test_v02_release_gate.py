@@ -45,6 +45,10 @@ def test_public_application_surface_is_exact_and_closed(tmp_path: Path) -> None:
             {"DataReviewDecisionPlan", "DataReviewBatchRevokePlan"},
             {"WriteDecisionReceipt", "WriteBatchDecisionReceipt"},
         ),
+        "ReviseContextCoverageStart": (
+            {"ManualContextRevisionPlan"},
+            {"ManualContextRevisionReceipt"},
+        ),
         "RollbackMigration": ({"RollbackMigrationPlan"}, {"RollbackMigrationReceipt"}),
         "RunHistoricalReview": ({"HistoricalReviewPlan"}, {"HistoricalReviewReceipt"}),
         "RunRestingHeartRateAnalysis": (
@@ -58,16 +62,14 @@ def test_public_application_surface_is_exact_and_closed(tmp_path: Path) -> None:
     } == plans
     assert {
         result for _, expected_results in variant_contract.values() for result in expected_results
-    } == results - {"WriteNotStarted"}
+    } == results - {"WriteNotStarted", "WriteNoChange"}
     samples = {
         "AbortMetadataRestore": [application.AbortMetadataRestore()],
         "BeginMetadataRestore": [application.BeginMetadataRestore(tmp_path / "backup.sqlite3")],
         "ConfirmDataReviewBatch": [
             application.ConfirmDataReviewBatch(application.DataReviewSelection())
         ],
-        "CreateMetadataBackup": [
-            application.CreateMetadataBackup(tmp_path / "metadata.sqlite3")
-        ],
+        "CreateMetadataBackup": [application.CreateMetadataBackup(tmp_path / "metadata.sqlite3")],
         "CreatePlausibilityRuleVersion": [
             application.CreatePlausibilityRuleVersion(
                 application.CanonicalHealthType.APPLE_RESTING_HEART_RATE,
@@ -91,6 +93,11 @@ def test_public_application_surface_is_exact_and_closed(tmp_path: Path) -> None:
                 application.BatchDecisionTarget(application.DataReviewBatchActionId("b" * 32)),
                 "erneut prüfen",
             ),
+        ],
+        "ReviseContextCoverageStart": [
+            application.ReviseContextCoverageStart(
+                application.ContextCoverageStartCreate(date(2024, 1, 1))
+            )
         ],
         "RollbackMigration": [application.RollbackMigration()],
         "RunHistoricalReview": [
@@ -126,9 +133,11 @@ def test_public_application_surface_is_exact_and_closed(tmp_path: Path) -> None:
         "DataConfirmation",
         "DataCorrection",
         "LocalMeasurementExclusion",
+        "LocalWorkoutExclusion",
         "SourceConflictResolution",
         "SourceDeletionResolution",
         "SourceValueAcceptance",
+        "WorkoutCorrection",
     }
     assert _names(get_type_hints(RevokeDataReviewDecision)["target"]) == {
         "BatchDecisionTarget",
@@ -140,18 +149,23 @@ def test_public_application_surface_is_exact_and_closed(tmp_path: Path) -> None:
         assert reason.default is inspect.Parameter.empty
     assert "WriteNotStarted" in results
     assert {name for name in HealthLab.__dict__ if not name.startswith("_")} == {
-            "execute_write",
-            "load_activity_days",
-            "load_data_review",
-            "load_data_review_case",
-            "load_import_details",
-            "load_migration_diagnostics",
+        "execute_write",
+        "load_activity_days",
+        "load_activity_settings",
+        "load_context_audit",
+        "load_context_records",
+        "load_daily_context",
+        "load_data_review",
+        "load_data_review_case",
+        "load_import_details",
+        "load_migration_diagnostics",
         "load_overview",
         "load_plausibility_rules",
-            "load_recovery_status",
-            "load_sleep_days",
-            "load_weight_nutrition",
-            "load_workspace_status",
+        "load_recovery_status",
+        "load_sleep_days",
+        "load_weight_nutrition",
+        "load_workouts",
+        "load_workspace_status",
         "open",
         "preview_write",
     }
@@ -182,6 +196,7 @@ def test_adapter_parity_registry_is_exact_and_closed() -> None:
         "MigrateStore",
         "ResolveDataReviewCase",
         "RevokeDataReviewDecision",
+        "ReviseContextCoverageStart",
         "RollbackMigration",
         "RunHistoricalReview",
         "RunRestingHeartRateAnalysis",

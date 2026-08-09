@@ -5,6 +5,7 @@ import sqlite3
 import subprocess
 import sys
 from collections.abc import Callable
+from datetime import date
 from importlib.resources import files
 from pathlib import Path
 from zipfile import ZipFile
@@ -15,6 +16,7 @@ from jsonschema import Draft202012Validator, ValidationError
 from personal_health_lab.adapters.cli import main
 from personal_health_lab.application import (
     CanonicalUnit,
+    ContextCoverageStartCreate,
     CreateMetadataBackup,
     DataCorrection,
     DataMode,
@@ -23,7 +25,9 @@ from personal_health_lab.application import (
     FeatureNotAvailableError,
     HealthLab,
     ImportHealthExport,
+    ManualContextRevisionReceipt,
     ResolveDataReviewCase,
+    ReviseContextCoverageStart,
     RuntimeConfig,
 )
 from personal_health_lab.synthetic_export import GenerationOptions, generate_export
@@ -161,6 +165,70 @@ def test_cli_renders_import_details_as_human_text_and_json_3(
     overview = json.loads(capsys.readouterr().out)
     _assert_json_contract(overview)
     assert overview["schema_version"] == "3.0"
+
+
+@pytest.mark.v02_adapter(
+    "cli",
+    "ContextAudit",
+    "ContextRecords",
+    "DailyContext",
+    "ManualContextRevisionPlan",
+    "ManualContextRevisionReceipt",
+    "NoChangeStatus",
+    "ReviseContextCoverageStart",
+    "WriteNoChange",
+)
+def test_cli_loads_context_projections(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    package = tmp_path / "context.zip"
+    with ZipFile(package, "w") as archive:
+        archive.writestr(
+            "apple_health_export/export.xml",
+            """<HealthData><ExportDate value="2024-01-03 12:00:00 +0100"/>
+            <Record type="HKQuantityTypeIdentifierStepCount" unit="count" value="1"
+            sourceName="Apple Watch" sourceVersion="1" device="Apple Watch"
+            creationDate="2024-01-02 12:00:00 +0100"
+            startDate="2024-01-02 12:00:00 +0100" endDate="2024-01-02 12:01:00 +0100"/>
+            </HealthData>""",
+        )
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    with HealthLab.open(config) as health_lab:
+        imported = ImportHealthExport(package)
+        health_lab.execute_write(
+            imported, expected_plan=health_lab.preview_write(imported).fingerprint
+        )
+        request = ReviseContextCoverageStart(ContextCoverageStartCreate(date(2024, 1, 2)))
+        receipt = health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+    assert isinstance(receipt.result, ManualContextRevisionReceipt)
+    common = [
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(config.synthetic_store),
+        "--real-store",
+        str(config.real_store),
+        "context",
+    ]
+    assert (
+        main(
+            [
+                *common,
+                "days",
+                "--start-date",
+                "2024-01-01",
+                "--end-date",
+                "2024-01-03",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["kind"] == "daily_context"
+    assert main([*common, "records", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["kind"] == "context_records"
+    assert main([*common, "audit", str(receipt.result.logical_id), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["kind"] == "context_audit"
 
 
 @pytest.mark.v02_adapter("cli", "WeightDayStatus")

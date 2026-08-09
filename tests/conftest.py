@@ -18,6 +18,9 @@ _PROHIBITED_ACTIVE_MARKERS = {"skip", "skipif", "xfail", "flaky", "rerun", "reru
 _READ_PROJECTION_METHODS = {
     "load_data_review",
     "load_data_review_case",
+    "load_context_audit",
+    "load_context_records",
+    "load_daily_context",
     "load_migration_diagnostics",
     "load_overview",
     "load_plausibility_rules",
