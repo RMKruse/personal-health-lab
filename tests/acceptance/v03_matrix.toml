@@ -8,6 +8,12 @@ statement = "A coverage-start revision binds its normalized input, active snapsh
 evidence = ["positive", "negative", "transition"]
 
 [[contract]]
+id = "V03-C-DAILY-STRESS-CUSTOM-CONTEXT-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/79"
+statement = "One daily stress revision is active per local day, an observed average remains distinct from the baseline assumption, and normalized custom labels reserve their names while same-label periods cannot overlap."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
 id = "V03-C-IMPORT-DETAILS-V1"
 source = "https://github.com/RMKruse/personal-health-lab/issues/69"
 statement = "Import details expose canonical counts and a typed unsupported-content catalog without parser or storage internals."
@@ -126,6 +132,20 @@ platform = "all"
 expected_result = "one immutable context revision and one bound snapshot with unknown pre-coverage days and baseline-only later gaps"
 expected_effect = "one globally ordered audit event and one active snapshot"
 forbidden_side_effects = "no illness, stress, or personal context value is fabricated"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-DAILY-STRESS-CUSTOM-CONTEXT-V1"
+contracts = ["V03-C-DAILY-STRESS-CUSTOM-CONTEXT-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_context.py::test_daily_stress_and_custom_contexts_share_the_revision_snapshot_contract"
+initial_state = "committed synthetic snapshot with context coverage"
+operation = "record confirmed average stress, create a normalized custom label and open period, then preview an overlapping same-label period"
+level = "application"
+platform = "all"
+expected_result = "the observed stress and open period project through the bound snapshot while the overlap is blocked"
+expected_effect = "one immutable revision and snapshot per successful request"
+forbidden_side_effects = "no duplicate active daily stress, overlapping same-label period, or note in a receipt"
 evidence = ["positive", "negative", "transition"]
 
 [[case]]

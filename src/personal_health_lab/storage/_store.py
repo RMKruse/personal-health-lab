@@ -46,7 +46,7 @@ from personal_health_lab.health_data import (
 _METADATA_FILE = "metadata.sqlite3"
 _PARQUET_DIRECTORY = "parquet"
 _QUERY_FILE = "query.duckdb"
-_STORE_SCHEMA_VERSION = 8
+_STORE_SCHEMA_VERSION = 9
 _WRITER_LOCK_FILE = ".writer.lock"
 _FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
 _STORE_MIGRATION_METHOD = "cow-migration/v1"
@@ -1242,19 +1242,33 @@ class StoredIllnessRevision:
     revision_id: str
     previous_revision_id: str | None
     state: Literal["active", "withdrawn"]
-    object_kind: Literal["illness_category", "illness_period"]
+    object_kind: Literal[
+        "illness_category",
+        "illness_period",
+        "daily_stress",
+        "custom_context_label",
+        "custom_context_period",
+    ]
     name: str | None
     category_logical_id: str | None
     start_date: date | None
     end_date: date | None
     severity: str | None
+    stress_level: str | None
+    note: str | None
 
 
 @dataclass(frozen=True, slots=True)
 class IllnessPublication:
     operation_id: OperationId
     intent: Literal["create", "revise", "withdraw", "restore"]
-    object_kind: Literal["illness_category", "illness_period"]
+    object_kind: Literal[
+        "illness_category",
+        "illness_period",
+        "daily_stress",
+        "custom_context_label",
+        "custom_context_period",
+    ]
     logical_id: ContextLogicalId
     expected_revision_id: ContextRevisionId | None
     name: str | None
@@ -1262,6 +1276,8 @@ class IllnessPublication:
     start_date: date | None
     end_date: date | None
     severity: str | None
+    stress_level: str | None
+    note: str | None
     withdrawal_reason: str | None
     expected_snapshot_id: SnapshotId
     context_as_of_date: date
@@ -1563,7 +1579,8 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                 length(logical_id) = 32 AND logical_id NOT GLOB '*[^0-9a-f]*'
             ),
             object_kind TEXT NOT NULL CHECK (object_kind IN (
-                'context_coverage_start', 'illness_category', 'illness_period'
+                'context_coverage_start', 'illness_category', 'illness_period',
+                'daily_stress', 'custom_context_label', 'custom_context_period'
             )),
             previous_revision_id TEXT UNIQUE REFERENCES manual_context_revisions(revision_id),
             state TEXT NOT NULL CHECK (state IN ('active', 'withdrawn')),
@@ -1616,6 +1633,25 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
         ) STRICT;
         CREATE UNIQUE INDEX IF NOT EXISTS illness_category_name_reserved
         ON illness_category_values(name_key);
+        CREATE TABLE IF NOT EXISTS daily_stress_values (
+            revision_id TEXT PRIMARY KEY REFERENCES manual_context_revisions(revision_id),
+            day TEXT NOT NULL CHECK (length(day) = 10),
+            level TEXT NOT NULL CHECK (level IN ('very_low', 'low', 'average', 'high', 'very_high'))
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS custom_context_label_values (
+            revision_id TEXT PRIMARY KEY REFERENCES manual_context_revisions(revision_id),
+            name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 80),
+            name_key TEXT NOT NULL CHECK (length(name_key) BETWEEN 1 AND 80)
+        ) STRICT;
+        CREATE UNIQUE INDEX IF NOT EXISTS custom_context_label_name_reserved
+        ON custom_context_label_values(name_key);
+        CREATE TABLE IF NOT EXISTS custom_context_period_values (
+            revision_id TEXT PRIMARY KEY REFERENCES manual_context_revisions(revision_id),
+            label_logical_id TEXT NOT NULL,
+            start_date TEXT NOT NULL CHECK (length(start_date) = 10),
+            end_date TEXT CHECK (end_date IS NULL OR length(end_date) = 10),
+            note TEXT CHECK (note IS NULL OR length(note) <= 1000)
+        ) STRICT;
         CREATE TABLE IF NOT EXISTS illness_period_values (
             revision_id TEXT PRIMARY KEY REFERENCES manual_context_revisions(revision_id),
             category_logical_id TEXT NOT NULL CHECK (
@@ -2078,6 +2114,16 @@ def _upgrade_v03_constraints(metadata: sqlite3.Connection) -> None:
                 (
                     "'source_conflict', 'direct_correction'",
                     "'source_conflict', 'preferred_daily_weight_conflict', 'direct_correction'",
+                ),
+            ),
+        ),
+        (
+            "manual_context_revisions",
+            (
+                (
+                    "'context_coverage_start', 'illness_category', 'illness_period'",
+                    "'context_coverage_start', 'illness_category', 'illness_period', "
+                    "'daily_stress', 'custom_context_label', 'custom_context_period'",
                 ),
             ),
         ),
@@ -6779,13 +6825,22 @@ class LocalStore:
         rows = self._metadata.execute(
             """
             SELECT revision.logical_id, revision.revision_id, revision.previous_revision_id,
-                   revision.state, revision.object_kind, category.name,
-                   period.category_logical_id, period.start_date, period.end_date, period.severity
+                   revision.state, revision.object_kind, COALESCE(category.name, label.name),
+                   COALESCE(period.category_logical_id, custom_period.label_logical_id),
+                   COALESCE(period.start_date, custom_period.start_date, stress.day),
+                   COALESCE(period.end_date, custom_period.end_date), period.severity,
+                   stress.level, custom_period.note
             FROM manual_context_revisions revision
             LEFT JOIN illness_category_values category USING (revision_id)
             LEFT JOIN illness_period_values period USING (revision_id)
+            LEFT JOIN daily_stress_values stress USING (revision_id)
+            LEFT JOIN custom_context_label_values label USING (revision_id)
+            LEFT JOIN custom_context_period_values custom_period USING (revision_id)
             WHERE revision.logical_id = ?
-              AND revision.object_kind IN ('illness_category', 'illness_period')
+              AND revision.object_kind IN (
+                  'illness_category', 'illness_period', 'daily_stress',
+                  'custom_context_label', 'custom_context_period'
+              )
             ORDER BY revision.rowid
             """,
             (logical_id,),
@@ -6796,14 +6851,43 @@ class LocalStore:
                 str(row[1]),
                 None if row[2] is None else str(row[2]),
                 cast(Literal["active", "withdrawn"], str(row[3])),
-                cast(Literal["illness_category", "illness_period"], str(row[4])),
+                cast(
+                    Literal[
+                        "illness_category",
+                        "illness_period",
+                        "daily_stress",
+                        "custom_context_label",
+                        "custom_context_period",
+                    ],
+                    str(row[4]),
+                ),
                 None if row[5] is None else str(row[5]),
                 None if row[6] is None else str(row[6]),
                 None if row[7] is None else date.fromisoformat(str(row[7])),
                 None if row[8] is None else date.fromisoformat(str(row[8])),
                 None if row[9] is None else str(row[9]),
+                None if row[10] is None else str(row[10]),
+                None if row[11] is None else str(row[11]),
             )
             for row in rows
+        )
+
+    def is_custom_context_label_name_reserved(
+        self, name: str, *, excluding_logical_id: str | None = None
+    ) -> bool:
+        self._require_open()
+        return (
+            self._metadata.execute(
+                """
+                SELECT 1
+                FROM custom_context_label_values value
+                JOIN manual_context_revisions revision USING (revision_id)
+                WHERE value.name_key = ?
+                  AND (? IS NULL OR revision.logical_id != ?)
+                """,
+                (_normalized_context_name(name), excluding_logical_id, excluding_logical_id),
+            ).fetchone()
+            is not None
         )
 
     def load_active_illness(
@@ -6816,14 +6900,23 @@ class LocalStore:
         rows = self._metadata.execute(
             """
             SELECT revision.logical_id, revision.revision_id, revision.previous_revision_id,
-                   revision.state, revision.object_kind, category.name,
-                   period.category_logical_id, period.start_date, period.end_date, period.severity
+                   revision.state, revision.object_kind, COALESCE(category.name, label.name),
+                   COALESCE(period.category_logical_id, custom_period.label_logical_id),
+                   COALESCE(period.start_date, custom_period.start_date, stress.day),
+                   COALESCE(period.end_date, custom_period.end_date), period.severity,
+                   stress.level, custom_period.note
             FROM manual_context_snapshot_bindings binding
             JOIN manual_context_revisions revision USING (revision_id)
             LEFT JOIN illness_category_values category USING (revision_id)
             LEFT JOIN illness_period_values period USING (revision_id)
+            LEFT JOIN daily_stress_values stress USING (revision_id)
+            LEFT JOIN custom_context_label_values label USING (revision_id)
+            LEFT JOIN custom_context_period_values custom_period USING (revision_id)
             WHERE binding.snapshot_id = ?
-              AND revision.object_kind IN ('illness_category', 'illness_period')
+              AND revision.object_kind IN (
+                  'illness_category', 'illness_period', 'daily_stress',
+                  'custom_context_label', 'custom_context_period'
+              )
             ORDER BY revision.rowid
             """,
             (str(selected),),
@@ -6834,12 +6927,23 @@ class LocalStore:
                 str(row[1]),
                 None if row[2] is None else str(row[2]),
                 cast(Literal["active", "withdrawn"], str(row[3])),
-                cast(Literal["illness_category", "illness_period"], str(row[4])),
+                cast(
+                    Literal[
+                        "illness_category",
+                        "illness_period",
+                        "daily_stress",
+                        "custom_context_label",
+                        "custom_context_period",
+                    ],
+                    str(row[4]),
+                ),
                 None if row[5] is None else str(row[5]),
                 None if row[6] is None else str(row[6]),
                 None if row[7] is None else date.fromisoformat(str(row[7])),
                 None if row[8] is None else date.fromisoformat(str(row[8])),
                 None if row[9] is None else str(row[9]),
+                None if row[10] is None else str(row[10]),
+                None if row[11] is None else str(row[11]),
             )
             for row in rows
         )
@@ -7049,6 +7153,8 @@ class LocalStore:
                     if publication.end_date is None
                     else publication.end_date.isoformat(),
                     "severity": publication.severity,
+                    "stress": publication.stress_level,
+                    "note": publication.note,
                     "reason": publication.withdrawal_reason,
                 },
                 sort_keys=True,
@@ -7105,6 +7211,45 @@ class LocalStore:
                             if publication.end_date is None
                             else publication.end_date.isoformat(),
                             publication.severity,
+                        ),
+                    )
+                if state == "active" and publication.object_kind == "daily_stress":
+                    assert (
+                        publication.start_date is not None and publication.stress_level is not None
+                    )
+                    self._metadata.execute(
+                        "INSERT INTO daily_stress_values VALUES (?, ?, ?)",
+                        (
+                            str(revision_id),
+                            publication.start_date.isoformat(),
+                            publication.stress_level,
+                        ),
+                    )
+                if state == "active" and publication.object_kind == "custom_context_label":
+                    assert publication.name is not None
+                    self._metadata.execute(
+                        "INSERT INTO custom_context_label_values VALUES (?, ?, ?)",
+                        (
+                            str(revision_id),
+                            publication.name,
+                            _normalized_context_name(publication.name),
+                        ),
+                    )
+                if state == "active" and publication.object_kind == "custom_context_period":
+                    assert (
+                        publication.category_logical_id is not None
+                        and publication.start_date is not None
+                    )
+                    self._metadata.execute(
+                        "INSERT INTO custom_context_period_values VALUES (?, ?, ?, ?, ?)",
+                        (
+                            str(revision_id),
+                            str(publication.category_logical_id),
+                            publication.start_date.isoformat(),
+                            None
+                            if publication.end_date is None
+                            else publication.end_date.isoformat(),
+                            publication.note,
                         ),
                     )
                 audit_position = int(

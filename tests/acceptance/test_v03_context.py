@@ -4,6 +4,10 @@ from zipfile import ZipFile
 
 from personal_health_lab.application import (
     ContextCoverageStartCreate,
+    ContextStressOrigin,
+    CustomContextLabelCreate,
+    CustomContextPeriodCreate,
+    DailyStressCreate,
     DataMode,
     HealthLab,
     IllnessCategoryCreate,
@@ -13,10 +17,14 @@ from personal_health_lab.application import (
     ManualContextRevisionPlan,
     ManualContextRevisionReceipt,
     ReviseContextCoverageStart,
+    ReviseCustomContextLabel,
+    ReviseCustomContextPeriod,
+    ReviseDailyStress,
     ReviseIllnessCategory,
     ReviseIllnessPeriod,
     RuntimeConfig,
     SnapshotDateSelection,
+    StressLevel,
 )
 
 
@@ -112,3 +120,59 @@ def test_illness_periods_project_active_categories_and_reject_same_category_over
         IllnessSeverity.MODERATE,
         None,
     ]
+
+
+def test_daily_stress_and_custom_contexts_share_the_revision_snapshot_contract(
+    tmp_path: Path,
+) -> None:
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    with HealthLab.open(config) as health_lab:
+        imported = ImportHealthExport(_package(tmp_path / "export.zip"))
+        health_lab.execute_write(
+            imported, expected_plan=health_lab.preview_write(imported).fingerprint
+        )
+        coverage = ReviseContextCoverageStart(ContextCoverageStartCreate(date(2024, 1, 1)))
+        health_lab.execute_write(
+            coverage, expected_plan=health_lab.preview_write(coverage).fingerprint
+        )
+        stress = ReviseDailyStress(DailyStressCreate(date(2024, 1, 2), StressLevel.AVERAGE))
+        health_lab.execute_write(stress, expected_plan=health_lab.preview_write(stress).fingerprint)
+        label = ReviseCustomContextLabel(CustomContextLabelCreate("  Nachtarbeit  "))
+        label_receipt = health_lab.execute_write(
+            label, expected_plan=health_lab.preview_write(label).fingerprint
+        )
+        period = ReviseCustomContextPeriod(
+            CustomContextPeriodCreate(
+                label_receipt.result.logical_id,
+                date(2024, 1, 1),
+                None,
+                "  nach Bereitschaft  ",
+            )
+        )
+        health_lab.execute_write(period, expected_plan=health_lab.preview_write(period).fingerprint)
+        conflicting = ReviseCustomContextPeriod(
+            CustomContextPeriodCreate(
+                label_receipt.result.logical_id, date(2024, 1, 2), date(2024, 1, 2), None
+            )
+        )
+        daily = health_lab.load_daily_context(
+            SnapshotDateSelection(start_date=date(2024, 1, 1), end_date=date(2024, 1, 3))
+        )
+        conflicting_plan = health_lab.preview_write(conflicting)
+
+    assert [item.stress_origin for item in daily.days] == [
+        ContextStressOrigin.ASSUMED_AVERAGE,
+        ContextStressOrigin.OBSERVED,
+        ContextStressOrigin.ASSUMED_AVERAGE,
+    ]
+    assert [item.stress_level for item in daily.days] == [
+        StressLevel.AVERAGE,
+        StressLevel.AVERAGE,
+        StressLevel.AVERAGE,
+    ]
+    assert [item.custom_context_labels for item in daily.days] == [
+        ("Nachtarbeit",),
+        ("Nachtarbeit",),
+        ("Nachtarbeit",),
+    ]
+    assert conflicting_plan.approval.status.value == "blocked"

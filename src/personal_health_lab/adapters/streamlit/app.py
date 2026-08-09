@@ -650,6 +650,8 @@ def _render_context(config: RuntimeConfig) -> None:
                         else item.highest_illness_severity.value
                     ),
                     "Stress": item.stress_origin.value,
+                    "Stressstufe": "-" if item.stress_level is None else item.stress_level.value,
+                    "Benutzerdefinierter Kontext": ", ".join(item.custom_context_labels) or "-",
                 }
                 for item in projection.days
             ],
@@ -663,6 +665,13 @@ def _render_context(config: RuntimeConfig) -> None:
                 if records.coverage_start is None
                 else records.coverage_start.start_date.isoformat()
             )
+        )
+        st.dataframe(
+            [
+                {"Bezeichnung": item.name, "ID": str(item.logical_id)}
+                for item in records.custom_labels
+            ],
+            width="stretch",
         )
     if audit is not None:
         st.dataframe(

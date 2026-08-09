@@ -11,7 +11,7 @@ from enum import StrEnum
 from itertools import pairwise
 from pathlib import Path
 from types import TracebackType
-from typing import Literal, Self, get_args
+from typing import Literal, Self, cast, get_args
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -432,6 +432,128 @@ class ReviseIllnessPeriod:
     intent: IllnessPeriodIntent
 
 
+class StressLevel(StrEnum):
+    VERY_LOW = "very_low"
+    LOW = "low"
+    AVERAGE = "average"
+    HIGH = "high"
+    VERY_HIGH = "very_high"
+
+
+@dataclass(frozen=True, slots=True)
+class DailyStressCreate:
+    day: date
+    level: StressLevel
+
+
+@dataclass(frozen=True, slots=True)
+class DailyStressRevise:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    day: date
+    level: StressLevel
+
+
+@dataclass(frozen=True, slots=True)
+class DailyStressWithdraw:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class DailyStressRestore(DailyStressRevise):
+    pass
+
+
+DailyStressIntent = DailyStressCreate | DailyStressRevise | DailyStressWithdraw | DailyStressRestore
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseDailyStress:
+    intent: DailyStressIntent
+
+
+@dataclass(frozen=True, slots=True)
+class CustomContextLabelCreate:
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class CustomContextLabelRevise:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class CustomContextLabelWithdraw:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class CustomContextLabelRestore(CustomContextLabelRevise):
+    pass
+
+
+CustomContextLabelIntent = (
+    CustomContextLabelCreate
+    | CustomContextLabelRevise
+    | CustomContextLabelWithdraw
+    | CustomContextLabelRestore
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseCustomContextLabel:
+    intent: CustomContextLabelIntent
+
+
+@dataclass(frozen=True, slots=True)
+class CustomContextPeriodCreate:
+    label_logical_id: ContextLogicalId
+    start_date: date
+    end_date: date | None
+    note: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CustomContextPeriodRevise:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    label_logical_id: ContextLogicalId
+    start_date: date
+    end_date: date | None
+    note: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CustomContextPeriodWithdraw:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class CustomContextPeriodRestore(CustomContextPeriodRevise):
+    pass
+
+
+CustomContextPeriodIntent = (
+    CustomContextPeriodCreate
+    | CustomContextPeriodRevise
+    | CustomContextPeriodWithdraw
+    | CustomContextPeriodRestore
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseCustomContextPeriod:
+    intent: CustomContextPeriodIntent
+
+
 class ContextIllnessOrigin(StrEnum):
     UNKNOWN = "unknown"
     ASSUMED_NONE = "assumed_none"
@@ -441,6 +563,7 @@ class ContextIllnessOrigin(StrEnum):
 class ContextStressOrigin(StrEnum):
     UNKNOWN = "unknown"
     ASSUMED_AVERAGE = "assumed_average"
+    OBSERVED = "observed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -449,6 +572,8 @@ class DailyContextDay:
     illness_origin: ContextIllnessOrigin
     stress_origin: ContextStressOrigin
     highest_illness_severity: IllnessSeverity | None = None
+    stress_level: StressLevel | None = None
+    custom_context_labels: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -467,9 +592,28 @@ class ContextCoverageStartRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class CustomContextLabelRecord:
+    logical_id: ContextLogicalId
+    revision_id: ContextRevisionId
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class CustomContextPeriodRecord:
+    logical_id: ContextLogicalId
+    revision_id: ContextRevisionId
+    label_logical_id: ContextLogicalId
+    start_date: date
+    end_date: date | None
+    note: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class ContextRecords:
     snapshot_ref: SnapshotRef | None
     coverage_start: ContextCoverageStartRecord | None
+    custom_labels: tuple[CustomContextLabelRecord, ...] = ()
+    custom_periods: tuple[CustomContextPeriodRecord, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1362,6 +1506,9 @@ WriteRequest = (
     | ReviseContextCoverageStart
     | ReviseIllnessCategory
     | ReviseIllnessPeriod
+    | ReviseDailyStress
+    | ReviseCustomContextLabel
+    | ReviseCustomContextPeriod
 )
 
 
@@ -1522,7 +1669,13 @@ class ManualContextRevisionPlan:
 @dataclass(frozen=True, slots=True)
 class IllnessRevisionPlan:
     intent: Literal["create", "revise", "withdraw", "restore"]
-    object_kind: Literal["illness_category", "illness_period"]
+    object_kind: Literal[
+        "illness_category",
+        "illness_period",
+        "daily_stress",
+        "custom_context_label",
+        "custom_context_period",
+    ]
     logical_id: ContextLogicalId
     expected_revision_id: ContextRevisionId | None
     name: str | None
@@ -1530,6 +1683,8 @@ class IllnessRevisionPlan:
     start_date: date | None
     end_date: date | None
     severity: IllnessSeverity | None
+    stress_level: StressLevel | None
+    note: str | None
     withdrawal_reason: str | None
     base_snapshot_ref: SnapshotRef | None
     snapshot_as_of: datetime
@@ -1965,7 +2120,16 @@ class HealthLab:
             return self._build_metadata_backup_plan(request)
         if isinstance(request, ReviseContextCoverageStart):
             return self._build_context_coverage_start_plan(request)
-        if isinstance(request, (ReviseIllnessCategory, ReviseIllnessPeriod)):
+        if isinstance(
+            request,
+            (
+                ReviseIllnessCategory,
+                ReviseIllnessPeriod,
+                ReviseDailyStress,
+                ReviseCustomContextLabel,
+                ReviseCustomContextPeriod,
+            ),
+        ):
             return self._build_illness_plan(request)
         if isinstance(request, RunRestingHeartRateAnalysis):
             return self._build_resting_heart_rate_analysis_plan(request)
@@ -2629,14 +2793,26 @@ class HealthLab:
         )
 
     def _build_illness_plan(
-        self, request: ReviseIllnessCategory | ReviseIllnessPeriod
+        self,
+        request: ReviseIllnessCategory
+        | ReviseIllnessPeriod
+        | ReviseDailyStress
+        | ReviseCustomContextLabel
+        | ReviseCustomContextPeriod,
     ) -> WritePlan:
         if self._store is None:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
-        is_category = isinstance(request, ReviseIllnessCategory)
         intent = request.intent
-        object_kind: Literal["illness_category", "illness_period"] = (
-            "illness_category" if is_category else "illness_period"
+        object_kind = (
+            "illness_category"
+            if isinstance(request, ReviseIllnessCategory)
+            else "illness_period"
+            if isinstance(request, ReviseIllnessPeriod)
+            else "daily_stress"
+            if isinstance(request, ReviseDailyStress)
+            else "custom_context_label"
+            if isinstance(request, ReviseCustomContextLabel)
+            else "custom_context_period"
         )
         kind: Literal["create", "revise", "withdraw", "restore"] = (
             "create"
@@ -2649,11 +2825,19 @@ class HealthLab:
         )
         expected_revision_id = getattr(intent, "expected_revision_id", None)
         name = getattr(intent, "name", None)
-        category_logical_id = getattr(intent, "category_logical_id", None)
-        start_date = getattr(intent, "start_date", None)
+        category_logical_id = getattr(
+            intent, "category_logical_id", getattr(intent, "label_logical_id", None)
+        )
+        start_date = getattr(intent, "start_date", getattr(intent, "day", None))
         end_date = getattr(intent, "end_date", None)
         severity = getattr(intent, "severity", None)
+        stress_level = getattr(intent, "level", None)
+        note = getattr(intent, "note", None)
         withdrawal_reason = getattr(intent, "reason", None)
+        if name is not None:
+            name = " ".join(name.split())
+        if note is not None:
+            note = note.strip()
         snapshot = self._store.load_active_snapshot_id()
         timezone = "Europe/Berlin"
         snapshot_as_of = datetime.combine(
@@ -2667,6 +2851,8 @@ class HealthLab:
                 None if start_date is None else start_date.isoformat(),
                 None if end_date is None else end_date.isoformat(),
                 None if severity is None else severity.value,
+                None if stress_level is None else stress_level.value,
+                note,
             ],
             sort_keys=True,
         )
@@ -2678,24 +2864,42 @@ class HealthLab:
         audit = self._store.load_illness_revisions(str(logical_id))
         blocked = snapshot is None
         diagnostics: tuple[str, ...] = ("context_requires_snapshot",) if blocked else ()
-        if name is not None:
-            name = " ".join(name.split())
-            if not name or len(name) > 80 or any(ord(char) < 32 for char in name):
-                blocked, diagnostics = True, ("invalid_illness_category_name",)
+        if name is not None and (
+            not name or len(name) > 80 or any(ord(char) < 32 for char in name)
+        ):
+            blocked, diagnostics = True, ("invalid_context_label_name",)
+        if note is not None and (len(note) > 1000 or any(ord(char) < 32 for char in note)):
+            blocked, diagnostics = True, ("invalid_context_note",)
+        if (
+            object_kind == "custom_context_label"
+            and name is not None
+            and self._store.is_custom_context_label_name_reserved(
+                name,
+                excluding_logical_id=None if kind == "create" else str(logical_id),
+            )
+        ):
+            blocked, diagnostics = True, ("custom_context_label_reserved",)
         if start_date is not None and (
             start_date > snapshot_as_of.date() or (end_date is not None and start_date > end_date)
         ):
             blocked, diagnostics = True, ("invalid_illness_period_dates",)
-        if object_kind == "illness_period" and not blocked:
+        if object_kind in {"illness_period", "custom_context_period"} and not blocked:
             categories = {
-                value.logical_id for value in active if value.object_kind == "illness_category"
+                value.logical_id
+                for value in active
+                if value.object_kind
+                == (
+                    "illness_category"
+                    if object_kind == "illness_period"
+                    else "custom_context_label"
+                )
             }
             if category_logical_id is None or str(category_logical_id) not in categories:
-                blocked, diagnostics = True, ("illness_category_not_active",)
+                blocked, diagnostics = True, ("context_label_not_active",)
             elif start_date is not None:
                 requested_end = snapshot_as_of.date() if end_date is None else end_date
                 for value in active:
-                    if value.object_kind != "illness_period" or value.logical_id == str(logical_id):
+                    if value.object_kind != object_kind or value.logical_id == str(logical_id):
                         continue
                     if (
                         value.category_logical_id == str(category_logical_id)
@@ -2705,8 +2909,18 @@ class HealthLab:
                             snapshot_as_of.date() if value.end_date is None else value.end_date
                         )
                         if value.start_date <= requested_end and start_date <= value_end:
-                            blocked, diagnostics = True, ("illness_period_overlap",)
+                            blocked, diagnostics = True, ("context_period_overlap",)
                             break
+        if object_kind == "daily_stress" and not blocked:
+            if stress_level is None or start_date is None:
+                blocked, diagnostics = True, ("invalid_daily_stress",)
+            elif any(
+                value.object_kind == "daily_stress"
+                and value.start_date == start_date
+                and value.logical_id != str(logical_id)
+                for value in active
+            ):
+                blocked, diagnostics = True, ("daily_stress_exists",)
         if not blocked:
             if kind == "create":
                 blocked = bool(audit)
@@ -2722,13 +2936,23 @@ class HealthLab:
             kind == "revise"
             and current is not None
             and (
-                (object_kind == "illness_category" and current.name == name)
+                (
+                    object_kind in {"illness_category", "custom_context_label"}
+                    and current.name == name
+                )
                 or (
-                    object_kind == "illness_period"
+                    object_kind in {"illness_period", "custom_context_period"}
                     and current.category_logical_id == str(category_logical_id)
                     and current.start_date == start_date
                     and current.end_date == end_date
                     and current.severity == (None if severity is None else severity.value)
+                    and current.note == note
+                )
+                or (
+                    object_kind == "daily_stress"
+                    and current.start_date == start_date
+                    and current.stress_level
+                    == (None if stress_level is None else stress_level.value)
                 )
             )
         )
@@ -2742,6 +2966,8 @@ class HealthLab:
             "start": None if start_date is None else start_date.isoformat(),
             "end": None if end_date is None else end_date.isoformat(),
             "severity": None if severity is None else severity.value,
+            "stress": None if stress_level is None else stress_level.value,
+            "note": note,
             "snapshot": None if snapshot is None else str(snapshot),
         }
         return WritePlan(
@@ -2750,7 +2976,16 @@ class HealthLab:
             ),
             IllnessRevisionPlan(
                 kind,
-                object_kind,
+                cast(
+                    Literal[
+                        "illness_category",
+                        "illness_period",
+                        "daily_stress",
+                        "custom_context_label",
+                        "custom_context_period",
+                    ],
+                    object_kind,
+                ),
                 logical_id,
                 expected_revision_id,
                 name,
@@ -2758,6 +2993,8 @@ class HealthLab:
                 start_date,
                 end_date,
                 severity,
+                stress_level,
+                note,
                 withdrawal_reason,
                 snapshot,
                 snapshot_as_of,
@@ -3375,7 +3612,16 @@ class HealthLab:
             return self._execute_context_coverage_start_write(
                 request, authorization_plan, expected_plan
             )
-        if isinstance(request, (ReviseIllnessCategory, ReviseIllnessPeriod)):
+        if isinstance(
+            request,
+            (
+                ReviseIllnessCategory,
+                ReviseIllnessPeriod,
+                ReviseDailyStress,
+                ReviseCustomContextLabel,
+                ReviseCustomContextPeriod,
+            ),
+        ):
             return self._execute_illness_write(request, authorization_plan, expected_plan)
         if isinstance(request, RunHistoricalReview):
             return self._execute_historical_review_write(request, authorization_plan, expected_plan)
@@ -4077,7 +4323,11 @@ class HealthLab:
 
     def _execute_illness_write(
         self,
-        request: ReviseIllnessCategory | ReviseIllnessPeriod,
+        request: ReviseIllnessCategory
+        | ReviseIllnessPeriod
+        | ReviseDailyStress
+        | ReviseCustomContextLabel
+        | ReviseCustomContextPeriod,
         plan: WritePlan,
         expected_plan: PlanFingerprint,
     ) -> WriteReceipt:
@@ -4119,6 +4369,8 @@ class HealthLab:
                     details.start_date,
                     details.end_date,
                     None if details.severity is None else details.severity.value,
+                    None if details.stress_level is None else details.stress_level.value,
+                    details.note,
                     details.withdrawal_reason,
                     details.base_snapshot_ref,
                     details.snapshot_as_of.date(),
@@ -5013,11 +5265,27 @@ class HealthLab:
             end = min(selected_end, context_as_of)
         if start > end:
             return DailyContext(snapshot_ref, context_as_of, timezone, ())
+        values = self._store.load_active_illness(snapshot_ref)
         periods = tuple(
             value
-            for value in self._store.load_active_illness(snapshot_ref)
+            for value in values
             if value.object_kind == "illness_period" and value.start_date is not None
         )
+        stress_days = {
+            value.start_date: value
+            for value in values
+            if value.object_kind == "daily_stress" and value.start_date is not None
+        }
+        custom_periods = tuple(
+            value
+            for value in values
+            if value.object_kind == "custom_context_period" and value.start_date is not None
+        )
+        labels = {
+            value.logical_id: value.name
+            for value in values
+            if value.object_kind == "custom_context_label" and value.name is not None
+        }
 
         def illness_for(current: date) -> tuple[ContextIllnessOrigin, IllnessSeverity | None]:
             active = tuple(
@@ -5054,13 +5322,34 @@ class HealthLab:
                 current,
                 illness_for(current)[0],
                 (
-                    ContextStressOrigin.ASSUMED_AVERAGE
+                    ContextStressOrigin.OBSERVED
+                    if current in stress_days
+                    else ContextStressOrigin.ASSUMED_AVERAGE
                     if coverage is not None
                     and coverage.start_date is not None
                     and current >= coverage.start_date
                     else ContextStressOrigin.UNKNOWN
                 ),
                 illness_for(current)[1],
+                (
+                    StressLevel(cast(str, stress_days[current].stress_level))
+                    if current in stress_days and stress_days[current].stress_level is not None
+                    else StressLevel.AVERAGE
+                    if coverage is not None
+                    and coverage.start_date is not None
+                    and current >= coverage.start_date
+                    else None
+                ),
+                tuple(
+                    sorted(
+                        labels[value.category_logical_id]
+                        for value in custom_periods
+                        if value.category_logical_id in labels
+                        and value.start_date is not None
+                        and value.start_date <= current
+                        and (value.end_date is None or current <= value.end_date)
+                    )
+                ),
             )
             for current in (
                 start + timedelta(days=index) for index in range((end - start).days + 1)
@@ -5074,8 +5363,33 @@ class HealthLab:
         if self._store is None:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
         selected = self._store.load_active_snapshot_id() if snapshot_ref is None else snapshot_ref
+        values = self._store.load_active_illness(selected)
         return ContextRecords(
-            selected, self._context_record(self._store.load_context_coverage_start(selected))
+            selected,
+            self._context_record(self._store.load_context_coverage_start(selected)),
+            tuple(
+                CustomContextLabelRecord(
+                    ContextLogicalId(value.logical_id),
+                    ContextRevisionId(value.revision_id),
+                    value.name,
+                )
+                for value in values
+                if value.object_kind == "custom_context_label" and value.name is not None
+            ),
+            tuple(
+                CustomContextPeriodRecord(
+                    ContextLogicalId(value.logical_id),
+                    ContextRevisionId(value.revision_id),
+                    ContextLogicalId(value.category_logical_id),
+                    value.start_date,
+                    value.end_date,
+                    value.note,
+                )
+                for value in values
+                if value.object_kind == "custom_context_period"
+                and value.category_logical_id is not None
+                and value.start_date is not None
+            ),
         )
 
     def load_context_audit(self, logical_id: ContextLogicalId) -> ContextAudit:
@@ -5083,6 +5397,12 @@ class HealthLab:
         self._require_open()
         if self._store is None:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        coverage_revisions = self._store.load_context_coverage_audit(str(logical_id))
+        revisions = (
+            coverage_revisions
+            if coverage_revisions
+            else self._store.load_illness_revisions(str(logical_id))
+        )
         return ContextAudit(
             logical_id,
             tuple(
@@ -5094,7 +5414,7 @@ class HealthLab:
                     value.state,
                     value.start_date,
                 )
-                for value in self._store.load_context_coverage_audit(str(logical_id))
+                for value in revisions
             ),
         )
 

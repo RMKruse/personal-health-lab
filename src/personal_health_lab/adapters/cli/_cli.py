@@ -884,6 +884,8 @@ def _daily_context_json(
                     else item.highest_illness_severity.value
                 ),
                 "stress_origin": item.stress_origin.value,
+                "stress_level": None if item.stress_level is None else item.stress_level.value,
+                "custom_context_labels": list(item.custom_context_labels),
             }
             for item in projection.days
         ],
@@ -912,6 +914,25 @@ def _context_records_json(
             "revision_id": str(projection.coverage_start.revision_id),
             "start_date": projection.coverage_start.start_date.isoformat(),
         },
+        "custom_labels": [
+            {
+                "logical_id": str(item.logical_id),
+                "revision_id": str(item.revision_id),
+                "name": item.name,
+            }
+            for item in projection.custom_labels
+        ],
+        "custom_periods": [
+            {
+                "logical_id": str(item.logical_id),
+                "revision_id": str(item.revision_id),
+                "label_logical_id": str(item.label_logical_id),
+                "start_date": item.start_date.isoformat(),
+                "end_date": None if item.end_date is None else item.end_date.isoformat(),
+                "note": item.note,
+            }
+            for item in projection.custom_periods
+        ],
         "kind": "context_records",
         "runtime_config": dict(runtime_config),
         "schema_version": _OUTPUT_SCHEMA_VERSION,
@@ -1980,12 +2001,15 @@ def main(args: Sequence[str] | None = None) -> int:
             print(
                 f"{context_day.day} · Krankheit: {context_day.illness_origin.value} · "
                 f"Schwere: {context_day.highest_illness_severity or '-'} · "
-                f"Stress: {context_day.stress_origin.value}"
+                f"Stress: {context_day.stress_origin.value} ({context_day.stress_level or '-'}) · "
+                f"Kontexte: {', '.join(context_day.custom_context_labels) or '-'}"
             )
     elif parsed.command == "context" and parsed.context_command == "records":
         print("Kontextdaten")
         if context_records.coverage_start is not None:
             print(f"Abdeckungsbeginn: {context_records.coverage_start.start_date}")
+        for label in context_records.custom_labels:
+            print(f"Bezeichnung: {label.name} · {label.logical_id}")
     elif parsed.command == "context" and parsed.context_command == "audit":
         print("Kontextaudit")
         for revision in context_audit.revisions:
