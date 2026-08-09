@@ -88,6 +88,7 @@ from personal_health_lab.storage import (
     FileVaultCheck,
     FileVaultReason,
     FileVaultStatus,
+    IllnessPublication,
     LocalStore,
     OpenDataReviewCase,
     PersonBindingStatus,
@@ -344,9 +345,97 @@ class ReviseContextCoverageStart:
             raise ConfigurationError("Unbekannte Kontextabdeckungsabsicht.")
 
 
+class IllnessSeverity(StrEnum):
+    MILD = "mild"
+    MODERATE = "moderate"
+    SEVERE = "severe"
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessCategoryCreate:
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessCategoryRevise:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessCategoryWithdraw:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessCategoryRestore:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    name: str
+
+
+IllnessCategoryIntent = (
+    IllnessCategoryCreate | IllnessCategoryRevise | IllnessCategoryWithdraw | IllnessCategoryRestore
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseIllnessCategory:
+    intent: IllnessCategoryIntent
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessPeriodCreate:
+    category_logical_id: ContextLogicalId
+    start_date: date
+    end_date: date | None
+    severity: IllnessSeverity
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessPeriodRevise:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    category_logical_id: ContextLogicalId
+    start_date: date
+    end_date: date | None
+    severity: IllnessSeverity
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessPeriodWithdraw:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessPeriodRestore:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    category_logical_id: ContextLogicalId
+    start_date: date
+    end_date: date | None
+    severity: IllnessSeverity
+
+
+IllnessPeriodIntent = (
+    IllnessPeriodCreate | IllnessPeriodRevise | IllnessPeriodWithdraw | IllnessPeriodRestore
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseIllnessPeriod:
+    intent: IllnessPeriodIntent
+
+
 class ContextIllnessOrigin(StrEnum):
     UNKNOWN = "unknown"
     ASSUMED_NONE = "assumed_none"
+    OBSERVED = "observed"
 
 
 class ContextStressOrigin(StrEnum):
@@ -359,6 +448,7 @@ class DailyContextDay:
     day: date
     illness_origin: ContextIllnessOrigin
     stress_origin: ContextStressOrigin
+    highest_illness_severity: IllnessSeverity | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1270,6 +1360,8 @@ WriteRequest = (
     | RunHistoricalReview
     | RunRestingHeartRateAnalysis
     | ReviseContextCoverageStart
+    | ReviseIllnessCategory
+    | ReviseIllnessPeriod
 )
 
 
@@ -1428,6 +1520,23 @@ class ManualContextRevisionPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class IllnessRevisionPlan:
+    intent: Literal["create", "revise", "withdraw", "restore"]
+    object_kind: Literal["illness_category", "illness_period"]
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId | None
+    name: str | None
+    category_logical_id: ContextLogicalId | None
+    start_date: date | None
+    end_date: date | None
+    severity: IllnessSeverity | None
+    withdrawal_reason: str | None
+    base_snapshot_ref: SnapshotRef | None
+    snapshot_as_of: datetime
+    context_timezone: str
+
+
+@dataclass(frozen=True, slots=True)
 class RestingHeartRateAnalysisPlan:
     analysis_definition_id: AnalysisDefinitionId
     start_date: date | None
@@ -1450,6 +1559,7 @@ WritePlanDetails = (
     | HistoricalReviewPlan
     | RestingHeartRateAnalysisPlan
     | ManualContextRevisionPlan
+    | IllnessRevisionPlan
 )
 
 
@@ -1855,6 +1965,8 @@ class HealthLab:
             return self._build_metadata_backup_plan(request)
         if isinstance(request, ReviseContextCoverageStart):
             return self._build_context_coverage_start_plan(request)
+        if isinstance(request, (ReviseIllnessCategory, ReviseIllnessPeriod)):
+            return self._build_illness_plan(request)
         if isinstance(request, RunRestingHeartRateAnalysis):
             return self._build_resting_heart_rate_analysis_plan(request)
         if isinstance(request, RunHistoricalReview):
@@ -2516,6 +2628,151 @@ class HealthLab:
             ),
         )
 
+    def _build_illness_plan(
+        self, request: ReviseIllnessCategory | ReviseIllnessPeriod
+    ) -> WritePlan:
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        is_category = isinstance(request, ReviseIllnessCategory)
+        intent = request.intent
+        object_kind: Literal["illness_category", "illness_period"] = (
+            "illness_category" if is_category else "illness_period"
+        )
+        kind: Literal["create", "revise", "withdraw", "restore"] = (
+            "create"
+            if type(intent).__name__.endswith("Create")
+            else "revise"
+            if type(intent).__name__.endswith("Revise")
+            else "withdraw"
+            if type(intent).__name__.endswith("Withdraw")
+            else "restore"
+        )
+        expected_revision_id = getattr(intent, "expected_revision_id", None)
+        name = getattr(intent, "name", None)
+        category_logical_id = getattr(intent, "category_logical_id", None)
+        start_date = getattr(intent, "start_date", None)
+        end_date = getattr(intent, "end_date", None)
+        severity = getattr(intent, "severity", None)
+        withdrawal_reason = getattr(intent, "reason", None)
+        snapshot = self._store.load_active_snapshot_id()
+        timezone = "Europe/Berlin"
+        snapshot_as_of = datetime.combine(
+            datetime.now(ZoneInfo(timezone)).date(), time.min, ZoneInfo(timezone)
+        )
+        identity = json.dumps(
+            [
+                object_kind,
+                name,
+                None if category_logical_id is None else str(category_logical_id),
+                None if start_date is None else start_date.isoformat(),
+                None if end_date is None else end_date.isoformat(),
+                None if severity is None else severity.value,
+            ],
+            sort_keys=True,
+        )
+        logical_id = getattr(intent, "logical_id", None) or ContextLogicalId(
+            hashlib.sha256(identity.encode()).hexdigest()[:32]
+        )
+        active = self._store.load_active_illness(snapshot)
+        current = next((value for value in active if value.logical_id == str(logical_id)), None)
+        audit = self._store.load_illness_revisions(str(logical_id))
+        blocked = snapshot is None
+        diagnostics: tuple[str, ...] = ("context_requires_snapshot",) if blocked else ()
+        if name is not None:
+            name = " ".join(name.split())
+            if not name or len(name) > 80 or any(ord(char) < 32 for char in name):
+                blocked, diagnostics = True, ("invalid_illness_category_name",)
+        if start_date is not None and (
+            start_date > snapshot_as_of.date() or (end_date is not None and start_date > end_date)
+        ):
+            blocked, diagnostics = True, ("invalid_illness_period_dates",)
+        if object_kind == "illness_period" and not blocked:
+            categories = {
+                value.logical_id for value in active if value.object_kind == "illness_category"
+            }
+            if category_logical_id is None or str(category_logical_id) not in categories:
+                blocked, diagnostics = True, ("illness_category_not_active",)
+            elif start_date is not None:
+                requested_end = snapshot_as_of.date() if end_date is None else end_date
+                for value in active:
+                    if value.object_kind != "illness_period" or value.logical_id == str(logical_id):
+                        continue
+                    if (
+                        value.category_logical_id == str(category_logical_id)
+                        and value.start_date is not None
+                    ):
+                        value_end = (
+                            snapshot_as_of.date() if value.end_date is None else value.end_date
+                        )
+                        if value.start_date <= requested_end and start_date <= value_end:
+                            blocked, diagnostics = True, ("illness_period_overlap",)
+                            break
+        if not blocked:
+            if kind == "create":
+                blocked = bool(audit)
+            elif not audit or audit[-1].revision_id != str(expected_revision_id):
+                blocked = True
+            elif kind == "withdraw" or kind == "revise":
+                blocked = current is None
+            else:
+                blocked = current is not None
+            if blocked and not diagnostics:
+                diagnostics = ("context_revision_changed",)
+        no_change = (
+            kind == "revise"
+            and current is not None
+            and (
+                (object_kind == "illness_category" and current.name == name)
+                or (
+                    object_kind == "illness_period"
+                    and current.category_logical_id == str(category_logical_id)
+                    and current.start_date == start_date
+                    and current.end_date == end_date
+                    and current.severity == (None if severity is None else severity.value)
+                )
+            )
+        )
+        payload = {
+            "kind": object_kind,
+            "intent": kind,
+            "logical_id": str(logical_id),
+            "expected": None if expected_revision_id is None else str(expected_revision_id),
+            "name": name,
+            "category": None if category_logical_id is None else str(category_logical_id),
+            "start": None if start_date is None else start_date.isoformat(),
+            "end": None if end_date is None else end_date.isoformat(),
+            "severity": None if severity is None else severity.value,
+            "snapshot": None if snapshot is None else str(snapshot),
+        }
+        return WritePlan(
+            PlanFingerprint(
+                hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+            ),
+            IllnessRevisionPlan(
+                kind,
+                object_kind,
+                logical_id,
+                expected_revision_id,
+                name,
+                category_logical_id,
+                start_date,
+                end_date,
+                severity,
+                withdrawal_reason,
+                snapshot,
+                snapshot_as_of,
+                timezone,
+            ),
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED
+                    if blocked
+                    else (WriteApprovalStatus.NO_CHANGE if no_change else WriteApprovalStatus.READY)
+                ),
+                diagnostics=diagnostics,
+            ),
+        )
+
     def _build_plausibility_rule_plan(self, request: CreatePlausibilityRuleVersion) -> WritePlan:
         rules = self.load_plausibility_rules()
         versions = next(
@@ -3118,6 +3375,8 @@ class HealthLab:
             return self._execute_context_coverage_start_write(
                 request, authorization_plan, expected_plan
             )
+        if isinstance(request, (ReviseIllnessCategory, ReviseIllnessPeriod)):
+            return self._execute_illness_write(request, authorization_plan, expected_plan)
         if isinstance(request, RunHistoricalReview):
             return self._execute_historical_review_write(request, authorization_plan, expected_plan)
         if isinstance(request, RunRestingHeartRateAnalysis):
@@ -3787,15 +4046,83 @@ class HealthLab:
                     plan.details.intent,
                     StoredContextLogicalId(str(plan.details.logical_id)),
                     (
-                    None
-                    if plan.details.expected_revision_id is None
-                    else StoredContextRevisionId(str(plan.details.expected_revision_id))
+                        None
+                        if plan.details.expected_revision_id is None
+                        else StoredContextRevisionId(str(plan.details.expected_revision_id))
                     ),
                     plan.details.start_date,
                     plan.details.withdrawal_reason,
                     plan.details.base_snapshot_ref,
                     plan.details.snapshot_as_of.date(),
                     plan.details.context_timezone,
+                )
+            )
+        except StoreError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.PLAN_CHANGED, ("plan_changed",), expected_plan
+            )
+        finally:
+            writer.close()
+        return WriteReceipt(
+            operation_id,
+            expected_plan,
+            ManualContextRevisionReceipt(
+                operation_id,
+                ContextLogicalId(str(publication.logical_id)),
+                ContextRevisionId(str(publication.revision_id)),
+                publication.snapshot_id,
+            ),
+            plan.preflight,
+        )
+
+    def _execute_illness_write(
+        self,
+        request: ReviseIllnessCategory | ReviseIllnessPeriod,
+        plan: WritePlan,
+        expected_plan: PlanFingerprint,
+    ) -> WriteReceipt:
+        if not isinstance(plan.details, IllnessRevisionPlan):
+            return self._not_started(
+                plan, WriteNotStartedStatus.PLAN_CHANGED, ("plan_changed",), expected_plan
+            )
+        if plan.approval.status is WriteApprovalStatus.NO_CHANGE:
+            return WriteReceipt(
+                OperationId(uuid4().hex), expected_plan, WriteNoChange(), plan.preflight
+            )
+        if plan.details.base_snapshot_ref is None:
+            return self._not_started(
+                plan, WriteNotStartedStatus.BLOCKED, plan.diagnostics, expected_plan
+            )
+        details = plan.details
+        assert details.base_snapshot_ref is not None
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        try:
+            operation_id = OperationId(uuid4().hex)
+            publication = writer.publish_illness(
+                publication=IllnessPublication(
+                    operation_id,
+                    details.intent,
+                    details.object_kind,
+                    StoredContextLogicalId(str(details.logical_id)),
+                    None
+                    if details.expected_revision_id is None
+                    else StoredContextRevisionId(str(details.expected_revision_id)),
+                    details.name,
+                    None
+                    if details.category_logical_id is None
+                    else StoredContextLogicalId(str(details.category_logical_id)),
+                    details.start_date,
+                    details.end_date,
+                    None if details.severity is None else details.severity.value,
+                    details.withdrawal_reason,
+                    details.base_snapshot_ref,
+                    details.snapshot_as_of.date(),
+                    details.context_timezone,
                 )
             )
         except StoreError:
@@ -4686,16 +5013,46 @@ class HealthLab:
             end = min(selected_end, context_as_of)
         if start > end:
             return DailyContext(snapshot_ref, context_as_of, timezone, ())
+        periods = tuple(
+            value
+            for value in self._store.load_active_illness(snapshot_ref)
+            if value.object_kind == "illness_period" and value.start_date is not None
+        )
+
+        def illness_for(current: date) -> tuple[ContextIllnessOrigin, IllnessSeverity | None]:
+            active = tuple(
+                value
+                for value in periods
+                if value.start_date is not None
+                and value.start_date <= current
+                and (value.end_date is None or current <= value.end_date)
+            )
+            if active:
+                return ContextIllnessOrigin.OBSERVED, max(
+                    (
+                        IllnessSeverity(value.severity)
+                        for value in active
+                        if value.severity is not None
+                    ),
+                    key=(
+                        IllnessSeverity.MILD,
+                        IllnessSeverity.MODERATE,
+                        IllnessSeverity.SEVERE,
+                    ).index,
+                )
+            return (
+                ContextIllnessOrigin.ASSUMED_NONE
+                if coverage is not None
+                and coverage.start_date is not None
+                and current >= coverage.start_date
+                else ContextIllnessOrigin.UNKNOWN,
+                None,
+            )
+
         days = tuple(
             DailyContextDay(
                 current,
-                (
-                    ContextIllnessOrigin.ASSUMED_NONE
-                    if coverage is not None
-                    and coverage.start_date is not None
-                    and current >= coverage.start_date
-                    else ContextIllnessOrigin.UNKNOWN
-                ),
+                illness_for(current)[0],
                 (
                     ContextStressOrigin.ASSUMED_AVERAGE
                     if coverage is not None
@@ -4703,6 +5060,7 @@ class HealthLab:
                     and current >= coverage.start_date
                     else ContextStressOrigin.UNKNOWN
                 ),
+                illness_for(current)[1],
             )
             for current in (
                 start + timedelta(days=index) for index in range((end - start).days + 1)

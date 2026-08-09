@@ -644,6 +644,11 @@ def _render_context(config: RuntimeConfig) -> None:
                 {
                     "Tag": item.day.isoformat(),
                     "Krankheit": item.illness_origin.value,
+                    "Höchste Schwere": (
+                        "-"
+                        if item.highest_illness_severity is None
+                        else item.highest_illness_severity.value
+                    ),
                     "Stress": item.stress_origin.value,
                 }
                 for item in projection.days

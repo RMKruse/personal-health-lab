@@ -6,10 +6,15 @@ from personal_health_lab.application import (
     ContextCoverageStartCreate,
     DataMode,
     HealthLab,
+    IllnessCategoryCreate,
+    IllnessPeriodCreate,
+    IllnessSeverity,
     ImportHealthExport,
     ManualContextRevisionPlan,
     ManualContextRevisionReceipt,
     ReviseContextCoverageStart,
+    ReviseIllnessCategory,
+    ReviseIllnessPeriod,
     RuntimeConfig,
     SnapshotDateSelection,
 )
@@ -68,3 +73,42 @@ def test_context_coverage_start_publishes_an_immutable_snapshot_and_baseline(
     assert records.coverage_start is not None
     assert carried_records.coverage_start == records.coverage_start
     assert len(audit.revisions) == 1
+
+
+def test_illness_periods_project_active_categories_and_reject_same_category_overlap(
+    tmp_path: Path,
+) -> None:
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    with HealthLab.open(config) as health_lab:
+        imported = ImportHealthExport(_package(tmp_path / "export.zip"))
+        health_lab.execute_write(
+            imported, expected_plan=health_lab.preview_write(imported).fingerprint
+        )
+        category_request = ReviseIllnessCategory(IllnessCategoryCreate("Reiseübelkeit"))
+        category = health_lab.execute_write(
+            category_request, expected_plan=health_lab.preview_write(category_request).fingerprint
+        ).result
+        period_request = ReviseIllnessPeriod(
+            IllnessPeriodCreate(
+                category.logical_id, date(2024, 1, 1), date(2024, 1, 2), IllnessSeverity.MODERATE
+            )
+        )
+        period = health_lab.execute_write(
+            period_request, expected_plan=health_lab.preview_write(period_request).fingerprint
+        ).result
+        overlap = ReviseIllnessPeriod(
+            IllnessPeriodCreate(category.logical_id, date(2024, 1, 2), None, IllnessSeverity.MILD)
+        )
+        daily = health_lab.load_daily_context(
+            SnapshotDateSelection(start_date=date(2024, 1, 1), end_date=date(2024, 1, 3))
+        )
+        overlap_plan = health_lab.preview_write(overlap)
+
+    assert period.logical_id
+    assert overlap_plan.approval.status.value == "blocked"
+    assert [item.illness_origin.value for item in daily.days] == ["observed", "observed", "unknown"]
+    assert [item.highest_illness_severity for item in daily.days] == [
+        IllnessSeverity.MODERATE,
+        IllnessSeverity.MODERATE,
+        None,
+    ]

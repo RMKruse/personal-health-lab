@@ -32,8 +32,11 @@ from personal_health_lab.synthetic_export import GenerationOptions, generate_exp
     "DailyContext",
     "ManualContextRevisionPlan",
     "ManualContextRevisionReceipt",
+    "IllnessRevisionPlan",
     "NoChangeStatus",
     "ReviseContextCoverageStart",
+    "ReviseIllnessCategory",
+    "ReviseIllnessPeriod",
     "WriteNoChange",
 )
 def test_streamlit_loads_import_details_through_the_application_seam(

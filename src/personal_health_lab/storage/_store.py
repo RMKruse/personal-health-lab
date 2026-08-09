@@ -1236,6 +1236,45 @@ class ContextCoverageStartPublicationResult:
     snapshot_id: SnapshotId
 
 
+@dataclass(frozen=True, slots=True)
+class StoredIllnessRevision:
+    logical_id: str
+    revision_id: str
+    previous_revision_id: str | None
+    state: Literal["active", "withdrawn"]
+    object_kind: Literal["illness_category", "illness_period"]
+    name: str | None
+    category_logical_id: str | None
+    start_date: date | None
+    end_date: date | None
+    severity: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessPublication:
+    operation_id: OperationId
+    intent: Literal["create", "revise", "withdraw", "restore"]
+    object_kind: Literal["illness_category", "illness_period"]
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId | None
+    name: str | None
+    category_logical_id: ContextLogicalId | None
+    start_date: date | None
+    end_date: date | None
+    severity: str | None
+    withdrawal_reason: str | None
+    expected_snapshot_id: SnapshotId
+    context_as_of_date: date
+    context_timezone: str
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessPublicationResult:
+    logical_id: ContextLogicalId
+    revision_id: ContextRevisionId
+    snapshot_id: SnapshotId
+
+
 def _execute_script(metadata: sqlite3.Connection, script: str) -> None:
     statement = ""
     for line in script.splitlines(keepends=True):
@@ -1245,6 +1284,10 @@ def _execute_script(metadata: sqlite3.Connection, script: str) -> None:
             statement = ""
     if statement.strip():
         raise sqlite3.DatabaseError("incomplete schema statement")
+
+
+def _normalized_context_name(name: str) -> str:
+    return " ".join(name.split()).casefold()
 
 
 def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
@@ -1519,7 +1562,9 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             logical_id TEXT NOT NULL CHECK (
                 length(logical_id) = 32 AND logical_id NOT GLOB '*[^0-9a-f]*'
             ),
-            object_kind TEXT NOT NULL CHECK (object_kind = 'context_coverage_start'),
+            object_kind TEXT NOT NULL CHECK (object_kind IN (
+                'context_coverage_start', 'illness_category', 'illness_period'
+            )),
             previous_revision_id TEXT UNIQUE REFERENCES manual_context_revisions(revision_id),
             state TEXT NOT NULL CHECK (state IN ('active', 'withdrawn')),
             operation_id TEXT NOT NULL UNIQUE REFERENCES write_operations(operation_id),
@@ -1533,8 +1578,9 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             start_date TEXT NOT NULL CHECK (length(start_date) = 10)
         ) STRICT;
         CREATE TABLE IF NOT EXISTS manual_context_snapshot_bindings (
-            snapshot_id TEXT PRIMARY KEY REFERENCES dataset_snapshots(snapshot_id),
+            snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(snapshot_id),
             revision_id TEXT NOT NULL REFERENCES manual_context_revisions(revision_id)
+            , PRIMARY KEY (snapshot_id, revision_id)
         ) STRICT;
         CREATE TABLE IF NOT EXISTS manual_context_publications (
             audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
@@ -1563,6 +1609,35 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
         CREATE TRIGGER IF NOT EXISTS context_coverage_start_values_no_delete
         BEFORE DELETE ON context_coverage_start_values
         BEGIN SELECT RAISE(ABORT, 'manual context values are immutable'); END;
+        CREATE TABLE IF NOT EXISTS illness_category_values (
+            revision_id TEXT PRIMARY KEY REFERENCES manual_context_revisions(revision_id),
+            name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 80),
+            name_key TEXT NOT NULL CHECK (length(name_key) BETWEEN 1 AND 80)
+        ) STRICT;
+        CREATE UNIQUE INDEX IF NOT EXISTS illness_category_name_reserved
+        ON illness_category_values(name_key);
+        CREATE TABLE IF NOT EXISTS illness_period_values (
+            revision_id TEXT PRIMARY KEY REFERENCES manual_context_revisions(revision_id),
+            category_logical_id TEXT NOT NULL CHECK (
+                length(category_logical_id) = 32 AND category_logical_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            start_date TEXT NOT NULL CHECK (length(start_date) = 10),
+            end_date TEXT CHECK (end_date IS NULL OR length(end_date) = 10),
+            severity TEXT NOT NULL CHECK (severity IN ('mild', 'moderate', 'severe')),
+            CHECK (end_date IS NULL OR start_date <= end_date)
+        ) STRICT;
+        CREATE TRIGGER IF NOT EXISTS illness_category_values_no_update
+        BEFORE UPDATE ON illness_category_values
+        BEGIN SELECT RAISE(ABORT, 'illness category values are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS illness_category_values_no_delete
+        BEFORE DELETE ON illness_category_values
+        BEGIN SELECT RAISE(ABORT, 'illness category values are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS illness_period_values_no_update
+        BEFORE UPDATE ON illness_period_values
+        BEGIN SELECT RAISE(ABORT, 'illness period values are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS illness_period_values_no_delete
+        BEFORE DELETE ON illness_period_values
+        BEGIN SELECT RAISE(ABORT, 'illness period values are immutable'); END;
         CREATE TRIGGER IF NOT EXISTS manual_context_snapshot_bindings_no_update
         BEFORE UPDATE ON manual_context_snapshot_bindings
         BEGIN SELECT RAISE(ABORT, 'manual context bindings are immutable'); END;
@@ -6657,7 +6732,7 @@ class LocalStore:
             FROM manual_context_snapshot_bindings binding
             JOIN manual_context_revisions revision USING (revision_id)
             LEFT JOIN context_coverage_start_values value USING (revision_id)
-            WHERE binding.snapshot_id = ?
+            WHERE binding.snapshot_id = ? AND revision.object_kind = 'context_coverage_start'
             """,
             (str(selected),),
         ).fetchone()
@@ -6682,7 +6757,7 @@ class LocalStore:
                    revision.state, value.start_date
             FROM manual_context_revisions revision
             LEFT JOIN context_coverage_start_values value USING (revision_id)
-            WHERE revision.logical_id = ?
+            WHERE revision.logical_id = ? AND revision.object_kind = 'context_coverage_start'
             ORDER BY revision.rowid
             """,
             (logical_id,),
@@ -6695,6 +6770,76 @@ class LocalStore:
                 cast(Literal["active", "withdrawn"], str(row[3])),
                 None if row[4] is None else date.fromisoformat(str(row[4])),
                 None,
+            )
+            for row in rows
+        )
+
+    def load_illness_revisions(self, logical_id: str) -> tuple[StoredIllnessRevision, ...]:
+        self._require_open()
+        rows = self._metadata.execute(
+            """
+            SELECT revision.logical_id, revision.revision_id, revision.previous_revision_id,
+                   revision.state, revision.object_kind, category.name,
+                   period.category_logical_id, period.start_date, period.end_date, period.severity
+            FROM manual_context_revisions revision
+            LEFT JOIN illness_category_values category USING (revision_id)
+            LEFT JOIN illness_period_values period USING (revision_id)
+            WHERE revision.logical_id = ?
+              AND revision.object_kind IN ('illness_category', 'illness_period')
+            ORDER BY revision.rowid
+            """,
+            (logical_id,),
+        ).fetchall()
+        return tuple(
+            StoredIllnessRevision(
+                str(row[0]),
+                str(row[1]),
+                None if row[2] is None else str(row[2]),
+                cast(Literal["active", "withdrawn"], str(row[3])),
+                cast(Literal["illness_category", "illness_period"], str(row[4])),
+                None if row[5] is None else str(row[5]),
+                None if row[6] is None else str(row[6]),
+                None if row[7] is None else date.fromisoformat(str(row[7])),
+                None if row[8] is None else date.fromisoformat(str(row[8])),
+                None if row[9] is None else str(row[9]),
+            )
+            for row in rows
+        )
+
+    def load_active_illness(
+        self, snapshot_id: SnapshotId | None
+    ) -> tuple[StoredIllnessRevision, ...]:
+        self._require_open()
+        selected = self.load_active_snapshot_id() if snapshot_id is None else snapshot_id
+        if selected is None:
+            return ()
+        rows = self._metadata.execute(
+            """
+            SELECT revision.logical_id, revision.revision_id, revision.previous_revision_id,
+                   revision.state, revision.object_kind, category.name,
+                   period.category_logical_id, period.start_date, period.end_date, period.severity
+            FROM manual_context_snapshot_bindings binding
+            JOIN manual_context_revisions revision USING (revision_id)
+            LEFT JOIN illness_category_values category USING (revision_id)
+            LEFT JOIN illness_period_values period USING (revision_id)
+            WHERE binding.snapshot_id = ?
+              AND revision.object_kind IN ('illness_category', 'illness_period')
+            ORDER BY revision.rowid
+            """,
+            (str(selected),),
+        ).fetchall()
+        return tuple(
+            StoredIllnessRevision(
+                str(row[0]),
+                str(row[1]),
+                None if row[2] is None else str(row[2]),
+                cast(Literal["active", "withdrawn"], str(row[3])),
+                cast(Literal["illness_category", "illness_period"], str(row[4])),
+                None if row[5] is None else str(row[5]),
+                None if row[6] is None else str(row[6]),
+                None if row[7] is None else date.fromisoformat(str(row[7])),
+                None if row[8] is None else date.fromisoformat(str(row[8])),
+                None if row[9] is None else str(row[9]),
             )
             for row in rows
         )
@@ -6852,6 +6997,176 @@ class LocalStore:
             )
             raise
         return ContextCoverageStartPublicationResult(logical_id, revision_id, snapshot_id)
+
+    def publish_illness(self, *, publication: IllnessPublication) -> IllnessPublicationResult:
+        self._require_open()
+        self._require_writer()
+        active = self.load_active_snapshot_id()
+        if active != publication.expected_snapshot_id:
+            raise StoreError("Aktiver Snapshot hat sich geändert.")
+        audit = self.load_illness_revisions(str(publication.logical_id))
+        latest = audit[-1] if audit else None
+        current = next(
+            (
+                item
+                for item in self.load_active_illness(active)
+                if item.logical_id == str(publication.logical_id)
+            ),
+            None,
+        )
+        if publication.intent == "create":
+            if latest is not None:
+                raise StoreError("Krankheitsobjekt existiert bereits.")
+            previous, state = None, "active"
+        elif latest is None or latest.revision_id != str(publication.expected_revision_id):
+            raise StoreError("Krankheitsrevision hat sich geändert.")
+        elif publication.intent == "withdraw":
+            if current is None:
+                raise StoreError("Krankheitsobjekt ist nicht aktiv.")
+            previous, state = latest.revision_id, "withdrawn"
+        else:
+            if publication.intent == "revise" and current is None:
+                raise StoreError("Krankheitsobjekt ist nicht aktiv.")
+            if publication.intent == "restore" and current is not None:
+                raise StoreError("Krankheitsobjekt ist bereits aktiv.")
+            previous, state = latest.revision_id, "active"
+        revision_id = ContextRevisionId(uuid4().hex)
+        snapshot_id = SnapshotId(uuid4().hex)
+        created_at = datetime.now(UTC).isoformat()
+        payload_sha256 = hashlib.sha256(
+            json.dumps(
+                {
+                    "intent": publication.intent,
+                    "kind": publication.object_kind,
+                    "name": publication.name,
+                    "category": None
+                    if publication.category_logical_id is None
+                    else str(publication.category_logical_id),
+                    "start": None
+                    if publication.start_date is None
+                    else publication.start_date.isoformat(),
+                    "end": None
+                    if publication.end_date is None
+                    else publication.end_date.isoformat(),
+                    "severity": publication.severity,
+                    "reason": publication.withdrawal_reason,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        try:
+            with self._metadata:
+                self._metadata.execute(
+                    "INSERT INTO write_operations VALUES (?, ?, ?, ?, 'committed', 1)",
+                    (
+                        str(publication.operation_id),
+                        "revise_context_coverage_start",
+                        created_at,
+                        created_at,
+                    ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO manual_context_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        str(revision_id),
+                        str(publication.logical_id),
+                        publication.object_kind,
+                        previous,
+                        state,
+                        str(publication.operation_id),
+                        created_at,
+                        payload_sha256,
+                    ),
+                )
+                if state == "active" and publication.object_kind == "illness_category":
+                    assert publication.name is not None
+                    self._metadata.execute(
+                        "INSERT INTO illness_category_values VALUES (?, ?, ?)",
+                        (
+                            str(revision_id),
+                            publication.name,
+                            _normalized_context_name(publication.name),
+                        ),
+                    )
+                if state == "active" and publication.object_kind == "illness_period":
+                    assert (
+                        publication.category_logical_id is not None
+                        and publication.start_date is not None
+                        and publication.severity is not None
+                    )
+                    self._metadata.execute(
+                        "INSERT INTO illness_period_values VALUES (?, ?, ?, ?, ?)",
+                        (
+                            str(revision_id),
+                            str(publication.category_logical_id),
+                            publication.start_date.isoformat(),
+                            None
+                            if publication.end_date is None
+                            else publication.end_date.isoformat(),
+                            publication.severity,
+                        ),
+                    )
+                audit_position = int(
+                    self._metadata.execute(
+                        "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+                    ).fetchone()[0]
+                )
+                manifest = self._stage_review_snapshot(
+                    parent_snapshot_id=active,
+                    snapshot_id=snapshot_id,
+                    operation_id=publication.operation_id,
+                    audit_position=audit_position,
+                    review_case_id=None,
+                    decision_id="",
+                    action="manual_context_revision",
+                    selected_measurement_version_id=None,
+                    candidate_version_ids=(),
+                    replacement_plausibility_cases=(),
+                )
+                self._activate_review_snapshot(
+                    publication.operation_id,
+                    snapshot_id,
+                    active,
+                    manifest,
+                    created_at,
+                    activation_kind="manual_context_revision",
+                )
+                self._metadata.execute(
+                    "DELETE FROM manual_context_snapshot_bindings WHERE snapshot_id = ? "
+                    "AND revision_id IN "
+                    "(SELECT revision_id FROM manual_context_revisions WHERE logical_id = ?)",
+                    (str(snapshot_id), str(publication.logical_id)),
+                )
+                if state == "active":
+                    self._metadata.execute(
+                        "INSERT INTO manual_context_snapshot_bindings VALUES (?, ?)",
+                        (str(snapshot_id), str(revision_id)),
+                    )
+                audit_event_id = uuid4().hex
+                self._metadata.execute(
+                    "INSERT INTO audit_events VALUES (?, ?, ?, 'manual_context_revision', ?)",
+                    (audit_position, audit_event_id, str(publication.operation_id), created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO manual_context_publications VALUES (?, ?, ?, ?, ?)",
+                    (
+                        audit_event_id,
+                        str(revision_id),
+                        str(snapshot_id),
+                        publication.context_as_of_date.isoformat(),
+                        publication.context_timezone,
+                    ),
+                )
+        except Exception:
+            shutil.rmtree(
+                self._root / "staging" / str(publication.operation_id), ignore_errors=True
+            )
+            shutil.rmtree(
+                self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id), ignore_errors=True
+            )
+            raise
+        return IllnessPublicationResult(publication.logical_id, revision_id, snapshot_id)
 
     def create_activity_derivation_version(
         self,

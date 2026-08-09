@@ -878,6 +878,11 @@ def _daily_context_json(
             {
                 "day": item.day.isoformat(),
                 "illness_origin": item.illness_origin.value,
+                "highest_illness_severity": (
+                    None
+                    if item.highest_illness_severity is None
+                    else item.highest_illness_severity.value
+                ),
                 "stress_origin": item.stress_origin.value,
             }
             for item in projection.days
@@ -1974,6 +1979,7 @@ def main(args: Sequence[str] | None = None) -> int:
         for context_day in daily_context.days:
             print(
                 f"{context_day.day} · Krankheit: {context_day.illness_origin.value} · "
+                f"Schwere: {context_day.highest_illness_severity or '-'} · "
                 f"Stress: {context_day.stress_origin.value}"
             )
     elif parsed.command == "context" and parsed.context_command == "records":
