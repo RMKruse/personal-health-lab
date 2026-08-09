@@ -48,6 +48,11 @@ def test_context_coverage_start_publishes_an_immutable_snapshot_and_baseline(
         )
         records = health_lab.load_context_records()
         audit = health_lab.load_context_audit(receipt.result.logical_id)
+        later_import = ImportHealthExport(_package(tmp_path / "later-export.zip"))
+        health_lab.execute_write(
+            later_import, expected_plan=health_lab.preview_write(later_import).fingerprint
+        )
+        carried_records = health_lab.load_context_records()
 
     assert receipt.result.snapshot_ref != plan.details.base_snapshot_ref
     assert [item.illness_origin.value for item in daily.days] == [
@@ -61,4 +66,5 @@ def test_context_coverage_start_publishes_an_immutable_snapshot_and_baseline(
         "assumed_average",
     ]
     assert records.coverage_start is not None
+    assert carried_records.coverage_start == records.coverage_start
     assert len(audit.revisions) == 1

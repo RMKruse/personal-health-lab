@@ -42,13 +42,47 @@
   ],
   "$defs": {
     "contextOutput": {
-      "type": "object",
-      "required": ["kind", "runtime_config", "schema_version"],
-      "properties": {
-        "kind": { "enum": ["daily_context", "context_records", "context_audit"] },
-        "runtime_config": { "type": "object" },
-        "schema_version": { "const": "3.0" }
-      }
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["context_as_of_date", "context_timezone", "days", "kind", "runtime_config", "schema_version", "selection", "snapshot_ref"],
+          "properties": {
+            "context_as_of_date": { "$ref": "#/$defs/nullableString" },
+            "context_timezone": { "type": "string" },
+            "days": { "type": "array", "items": { "type": "object" } },
+            "kind": { "const": "daily_context" },
+            "runtime_config": { "type": "object" },
+            "schema_version": { "const": "3.0" },
+            "selection": { "type": "object" },
+            "snapshot_ref": { "$ref": "#/$defs/nullableString" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["coverage_start", "kind", "runtime_config", "schema_version", "snapshot_ref"],
+          "properties": {
+            "coverage_start": { "type": ["object", "null"] },
+            "kind": { "const": "context_records" },
+            "runtime_config": { "type": "object" },
+            "schema_version": { "const": "3.0" },
+            "snapshot_ref": { "$ref": "#/$defs/nullableString" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "logical_id", "revisions", "runtime_config", "schema_version"],
+          "properties": {
+            "kind": { "const": "context_audit" },
+            "logical_id": { "type": "string" },
+            "revisions": { "type": "array", "items": { "type": "object" } },
+            "runtime_config": { "type": "object" },
+            "schema_version": { "const": "3.0" }
+          }
+        }
+      ]
     },
     "activityDaysOutput": {
       "type": "object",

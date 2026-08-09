@@ -627,10 +627,17 @@ def _render_context(config: RuntimeConfig) -> None:
             with HealthLab.open(config) as health_lab:
                 st.session_state["daily_context"] = health_lab.load_daily_context(selection)
                 st.session_state["context_records"] = health_lab.load_context_records()
+                records = st.session_state["context_records"]
+                st.session_state["context_audit"] = (
+                    None
+                    if records.coverage_start is None
+                    else health_lab.load_context_audit(records.coverage_start.logical_id)
+                )
         except (ConfigurationError, HealthLabError):
             st.error("Kontext konnte nicht geladen werden.")
     projection = st.session_state.get("daily_context")
     records = st.session_state.get("context_records")
+    audit = st.session_state.get("context_audit")
     if projection is not None:
         st.dataframe(
             [
@@ -651,6 +658,23 @@ def _render_context(config: RuntimeConfig) -> None:
                 if records.coverage_start is None
                 else records.coverage_start.start_date.isoformat()
             )
+        )
+    if audit is not None:
+        st.dataframe(
+            [
+                {
+                    "Revision": str(item.revision_id),
+                    "Vorgänger": ""
+                    if item.previous_revision_id is None
+                    else str(item.previous_revision_id),
+                    "Status": item.state,
+                    "Abdeckungsbeginn": ""
+                    if item.start_date is None
+                    else item.start_date.isoformat(),
+                }
+                for item in audit.revisions
+            ],
+            width="stretch",
         )
 
 

@@ -84,6 +84,7 @@ from personal_health_lab.resting_hr_analysis import (
 from personal_health_lab.storage import (
     CapacityCheck,
     CapacityStatus,
+    ContextCoverageStartPublication,
     FileVaultCheck,
     FileVaultReason,
     FileVaultStatus,
@@ -98,6 +99,12 @@ from personal_health_lab.storage import (
     StoreError,
     StoreId,
     probe_filevault,
+)
+from personal_health_lab.storage import (
+    ContextLogicalId as StoredContextLogicalId,
+)
+from personal_health_lab.storage import (
+    ContextRevisionId as StoredContextRevisionId,
 )
 
 logger = logging.getLogger("personal_health_lab")
@@ -1414,6 +1421,7 @@ class ManualContextRevisionPlan:
     logical_id: ContextLogicalId
     expected_revision_id: ContextRevisionId | None
     start_date: date | None
+    withdrawal_reason: str | None
     base_snapshot_ref: SnapshotRef | None
     snapshot_as_of: datetime
     context_timezone: str
@@ -2398,8 +2406,10 @@ class HealthLab:
         kind: Literal["create", "revise", "withdraw", "restore"]
         start_date: date | None
         expected_revision_id: ContextRevisionId | None
+        withdrawal_reason: str | None
         if isinstance(intent, ContextCoverageStartCreate):
             kind, start_date, expected_revision_id = "create", intent.start_date, None
+            withdrawal_reason = None
             logical_id = ContextLogicalId(
                 hashlib.sha256(b"context_coverage_start").hexdigest()[:32]
             )
@@ -2410,6 +2420,7 @@ class HealthLab:
                 intent.start_date,
                 intent.expected_revision_id,
             )
+            withdrawal_reason = None
         elif isinstance(intent, ContextCoverageStartWithdraw):
             kind, logical_id, start_date, expected_revision_id = (
                 "withdraw",
@@ -2417,6 +2428,7 @@ class HealthLab:
                 None,
                 intent.expected_revision_id,
             )
+            withdrawal_reason = intent.reason.strip()
         else:
             assert isinstance(intent, ContextCoverageStartRestore)
             kind, logical_id, start_date, expected_revision_id = (
@@ -2425,6 +2437,7 @@ class HealthLab:
                 intent.start_date,
                 intent.expected_revision_id,
             )
+            withdrawal_reason = None
         timezone = "Europe/Berlin"
         snapshot_as_of = datetime.combine(
             datetime.now(ZoneInfo(timezone)).date(), time.min, ZoneInfo(timezone)
@@ -2470,9 +2483,14 @@ class HealthLab:
             if expected_revision_id is None
             else str(expected_revision_id),
             "start_date": None if start_date is None else start_date.isoformat(),
+            "withdrawal_reason": withdrawal_reason,
             "base_snapshot_ref": None if snapshot is None else str(snapshot),
             "snapshot_as_of": snapshot_as_of.isoformat(),
             "context_timezone": timezone,
+            "preflight": {
+                "approval": "blocked" if blocked else ("no_change" if no_change else "ready"),
+                "diagnostics": diagnostics,
+            },
         }
         return WritePlan(
             PlanFingerprint(
@@ -2483,6 +2501,7 @@ class HealthLab:
                 logical_id,
                 expected_revision_id,
                 start_date,
+                withdrawal_reason,
                 snapshot,
                 snapshot_as_of,
                 timezone,
@@ -3762,19 +3781,22 @@ class HealthLab:
             )
         try:
             operation_id = OperationId(uuid4().hex)
-            logical_id, revision_id, snapshot_ref = writer.publish_context_coverage_start(
-                operation_id=operation_id,
-                intent=plan.details.intent,
-                logical_id=str(plan.details.logical_id),
-                expected_revision_id=(
+            publication = writer.publish_context_coverage_start(
+                publication=ContextCoverageStartPublication(
+                    operation_id,
+                    plan.details.intent,
+                    StoredContextLogicalId(str(plan.details.logical_id)),
+                    (
                     None
                     if plan.details.expected_revision_id is None
-                    else str(plan.details.expected_revision_id)
-                ),
-                start_date=plan.details.start_date,
-                expected_snapshot_id=plan.details.base_snapshot_ref,
-                context_as_of_date=plan.details.snapshot_as_of.date(),
-                context_timezone=plan.details.context_timezone,
+                    else StoredContextRevisionId(str(plan.details.expected_revision_id))
+                    ),
+                    plan.details.start_date,
+                    plan.details.withdrawal_reason,
+                    plan.details.base_snapshot_ref,
+                    plan.details.snapshot_as_of.date(),
+                    plan.details.context_timezone,
+                )
             )
         except StoreError:
             return self._not_started(
@@ -3787,9 +3809,9 @@ class HealthLab:
             expected_plan,
             ManualContextRevisionReceipt(
                 operation_id,
-                ContextLogicalId(logical_id),
-                ContextRevisionId(revision_id),
-                snapshot_ref,
+                ContextLogicalId(str(publication.logical_id)),
+                ContextRevisionId(str(publication.revision_id)),
+                publication.snapshot_id,
             ),
             plan.preflight,
         )
