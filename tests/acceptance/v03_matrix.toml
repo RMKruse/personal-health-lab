@@ -8,6 +8,12 @@ statement = "A coverage-start revision binds its normalized input, active snapsh
 evidence = ["positive", "negative", "transition"]
 
 [[contract]]
+id = "V03-C-MEDICATION-REGIME-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/80"
+statement = "A medication regime is an immutable, snapshot-bound local IANA timeline with validated scheduled doses; DST gaps move forward, folds use the first occurrence, and a missing deviation is assumed as planned."
+evidence = ["positive", "boundary", "transition"]
+
+[[contract]]
 id = "V03-C-DAILY-STRESS-CUSTOM-CONTEXT-V1"
 source = "https://github.com/RMKruse/personal-health-lab/issues/79"
 statement = "One daily stress revision is active per local day, an observed average remains distinct from the baseline assumption, and normalized custom labels reserve their names while same-label periods cannot overlap."
@@ -133,6 +139,20 @@ expected_result = "one immutable context revision and one bound snapshot with un
 expected_effect = "one globally ordered audit event and one active snapshot"
 forbidden_side_effects = "no illness, stress, or personal context value is fabricated"
 evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-REGIME-V1"
+contracts = ["V03-C-MEDICATION-REGIME-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_medication.py::test_medication_regime_projects_dst_and_keeps_old_snapshot_stable"
+initial_state = "committed synthetic snapshot"
+operation = "create and correct an IANA-zone medication regime, then project its DST dose occurrence through old and current snapshots"
+level = "application"
+platform = "all"
+expected_result = "the DST gap resolves forward and the old dose plan remains immutable after correction"
+expected_effect = "one revision, audit event, and snapshot per successful regime revision"
+forbidden_side_effects = "no deviation, PRN intake, or adherence score is fabricated"
+evidence = ["positive", "boundary", "transition"]
 
 [[case]]
 id = "V03-A-DAILY-STRESS-CUSTOM-CONTEXT-V1"

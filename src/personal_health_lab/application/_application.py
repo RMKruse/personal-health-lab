@@ -6,7 +6,8 @@ import logging
 import math
 import shutil
 from dataclasses import dataclass, replace
-from datetime import date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal
 from enum import StrEnum
 from itertools import pairwise
 from pathlib import Path
@@ -90,6 +91,7 @@ from personal_health_lab.storage import (
     FileVaultStatus,
     IllnessPublication,
     LocalStore,
+    MedicationRegimePublication,
     OpenDataReviewCase,
     PersonBindingStatus,
     PublishBatchDecisionResult,
@@ -106,6 +108,12 @@ from personal_health_lab.storage import (
 )
 from personal_health_lab.storage import (
     ContextRevisionId as StoredContextRevisionId,
+)
+from personal_health_lab.storage import (
+    MedicationLogicalId as StoredMedicationLogicalId,
+)
+from personal_health_lab.storage import (
+    MedicationRevisionId as StoredMedicationRevisionId,
 )
 
 logger = logging.getLogger("personal_health_lab")
@@ -274,6 +282,21 @@ class SnapshotDateSelection:
             raise ConfigurationError("Startdatum darf nicht nach dem Enddatum liegen.")
 
 
+def _resolve_medication_local_datetime(day: date, local_time: time, timezone: str) -> datetime:
+    zone = ZoneInfo(timezone)
+    local = datetime.combine(day, local_time)
+    candidate = local.replace(tzinfo=zone, fold=0)
+    if candidate.astimezone(UTC).astimezone(zone).replace(tzinfo=None) == local:
+        return candidate
+    for minute in range(1, 181):
+        candidate = (local + timedelta(minutes=minute)).replace(tzinfo=zone, fold=0)
+        if candidate.astimezone(UTC).astimezone(zone).replace(tzinfo=None) == local + timedelta(
+            minutes=minute
+        ):
+            return candidate
+    raise ConfigurationError("Lokale Dosiszeit konnte nicht aufgelöst werden.")
+
+
 @dataclass(frozen=True, slots=True)
 class ContextLogicalId:
     _value: str
@@ -296,6 +319,97 @@ class ContextRevisionId:
 
     def __str__(self) -> str:
         return self._value
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationLogicalId:
+    _value: str
+
+    def __post_init__(self) -> None:
+        if len(self._value) != 32 or not set(self._value) <= set("0123456789abcdef"):
+            raise ValueError("Medikamenten-ID muss ein 32-stelliger Hex-Wert sein.")
+
+    def __str__(self) -> str:
+        return self._value
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRevisionId:
+    _value: str
+
+    def __post_init__(self) -> None:
+        if len(self._value) != 32 or not set(self._value) <= set("0123456789abcdef"):
+            raise ValueError("Medikamentenrevisions-ID muss ein 32-stelliger Hex-Wert sein.")
+
+    def __str__(self) -> str:
+        return self._value
+
+
+class Weekday(StrEnum):
+    MONDAY = "monday"
+    TUESDAY = "tuesday"
+    WEDNESDAY = "wednesday"
+    THURSDAY = "thursday"
+    FRIDAY = "friday"
+    SATURDAY = "saturday"
+    SUNDAY = "sunday"
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduledDose:
+    medication_name: str
+    amount: Decimal
+    unit: str
+    local_time: time
+    weekdays: frozenset[Weekday]
+
+    def __post_init__(self) -> None:
+        name = " ".join(self.medication_name.split())
+        unit = " ".join(self.unit.split())
+        if not (1 <= len(name) <= 120 and 1 <= len(unit) <= 32):
+            raise ConfigurationError("Medikamentenname oder Einheit ist ungültig.")
+        if any(ord(char) < 32 for char in name + unit) or self.amount <= 0 or not self.weekdays:
+            raise ConfigurationError("Geplante Dosis ist ungültig.")
+        if not all(isinstance(day, Weekday) for day in self.weekdays):
+            raise ConfigurationError("Wochentage sind ungültig.")
+        object.__setattr__(self, "medication_name", name)
+        object.__setattr__(self, "unit", unit)
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRegimeCreate:
+    starts_at: datetime
+    timezone: str
+    scheduled_doses: tuple[ScheduledDose, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRegimeRevise:
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId
+    starts_at: datetime
+    timezone: str
+    scheduled_doses: tuple[ScheduledDose, ...]
+
+
+MedicationRegimeIntent = MedicationRegimeCreate | MedicationRegimeRevise
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseMedicationRegime:
+    intent: MedicationRegimeIntent
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.intent, get_args(MedicationRegimeIntent)):
+            raise ConfigurationError("Unbekannte Medikamentenregimeabsicht.")
+        try:
+            ZoneInfo(self.intent.timezone)
+        except Exception as error:
+            raise ConfigurationError("Medikamentenzeitzone ist ungültig.") from error
+        if self.intent.starts_at.tzinfo is None:
+            raise ConfigurationError("Regimebeginn muss zeitzonenbewusst sein.")
+        if len(set(self.intent.scheduled_doses)) != len(self.intent.scheduled_doses):
+            raise ConfigurationError("Identische Planeinträge sind nicht zulässig.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -628,6 +742,61 @@ class ContextAuditRevision:
 class ContextAudit:
     logical_id: ContextLogicalId
     revisions: tuple[ContextAuditRevision, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationDoseOccurrence:
+    medication_name: str
+    amount: Decimal
+    unit: str
+    scheduled_at: datetime
+    status: Literal["assumed_as_planned"] = "assumed_as_planned"
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationDay:
+    day: date
+    status: Literal["unknown", "empty", "planned"]
+    occurrences: tuple[MedicationDoseOccurrence, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationDays:
+    snapshot_ref: SnapshotRef | None
+    medication_as_of: datetime | None
+    timezone: str | None
+    days: tuple[MedicationDay, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRegimeRecord:
+    logical_id: MedicationLogicalId
+    revision_id: MedicationRevisionId
+    starts_at: datetime
+    timezone: str
+    scheduled_doses: tuple[ScheduledDose, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationPlan:
+    snapshot_ref: SnapshotRef | None
+    medication_as_of: datetime | None
+    regimes: tuple[MedicationRegimeRecord, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationAuditRevision:
+    revision_id: MedicationRevisionId
+    previous_revision_id: MedicationRevisionId | None
+    starts_at: datetime
+    timezone: str
+    scheduled_doses: tuple[ScheduledDose, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationAudit:
+    logical_id: MedicationLogicalId
+    revisions: tuple[MedicationAuditRevision, ...]
 
 
 class WeightDayStatus(StrEnum):
@@ -1509,6 +1678,7 @@ WriteRequest = (
     | ReviseDailyStress
     | ReviseCustomContextLabel
     | ReviseCustomContextPeriod
+    | ReviseMedicationRegime
 )
 
 
@@ -1667,6 +1837,18 @@ class ManualContextRevisionPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class MedicationRegimePlan:
+    intent: Literal["create", "revise"]
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId | None
+    starts_at: datetime
+    timezone: str
+    scheduled_doses: tuple[ScheduledDose, ...]
+    base_snapshot_ref: SnapshotRef | None
+    medication_as_of: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class IllnessRevisionPlan:
     intent: Literal["create", "revise", "withdraw", "restore"]
     object_kind: Literal[
@@ -1714,6 +1896,7 @@ WritePlanDetails = (
     | HistoricalReviewPlan
     | RestingHeartRateAnalysisPlan
     | ManualContextRevisionPlan
+    | MedicationRegimePlan
     | IllnessRevisionPlan
 )
 
@@ -2009,6 +2192,16 @@ class ManualContextRevisionReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class MedicationRegimeReceipt:
+    operation_id: OperationId
+    logical_id: MedicationLogicalId
+    revision_id: MedicationRevisionId
+    snapshot_ref: SnapshotRef
+    status: ImportStatus = ImportStatus.COMMITTED
+    diagnostics: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class WriteNoChange:
     status: NoChangeStatus = NoChangeStatus.NO_CHANGE
     diagnostics: tuple[str, ...] = ()
@@ -2045,6 +2238,7 @@ WriteResult = (
     | PlausibilityRuleVersionReceipt
     | HistoricalReviewReceipt
     | ManualContextRevisionReceipt
+    | MedicationRegimeReceipt
     | AnalysisReceipt
     | WriteNoChange
     | WriteNotStarted
@@ -2120,6 +2314,8 @@ class HealthLab:
             return self._build_metadata_backup_plan(request)
         if isinstance(request, ReviseContextCoverageStart):
             return self._build_context_coverage_start_plan(request)
+        if isinstance(request, ReviseMedicationRegime):
+            return self._build_medication_regime_plan(request)
         if isinstance(
             request,
             (
@@ -2781,6 +2977,104 @@ class HealthLab:
                 snapshot,
                 snapshot_as_of,
                 timezone,
+            ),
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED
+                    if blocked
+                    else (WriteApprovalStatus.NO_CHANGE if no_change else WriteApprovalStatus.READY)
+                ),
+                diagnostics=diagnostics,
+            ),
+        )
+
+    def _build_medication_regime_plan(self, request: ReviseMedicationRegime) -> WritePlan:
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        snapshot = self._store.load_active_snapshot_id()
+        intent = request.intent
+        if isinstance(intent, MedicationRegimeCreate):
+            kind: Literal["create", "revise"] = "create"
+            expected = None
+            logical_id = MedicationLogicalId(
+                hashlib.sha256(
+                    repr((intent.starts_at, intent.timezone, intent.scheduled_doses)).encode()
+                ).hexdigest()[:32]
+            )
+        else:
+            kind, logical_id, expected = "revise", intent.logical_id, intent.expected_revision_id
+        medication_as_of = self._store.load_medication_as_of(snapshot)
+        current = self._store.load_medication_regime(snapshot, str(logical_id))
+        active_regimes = self._store.load_active_medication_regimes(snapshot)
+        blocked = snapshot is None or intent.starts_at.astimezone(
+            UTC
+        ) > medication_as_of.astimezone(UTC)
+        diagnostics = ("medication_requires_snapshot",) if snapshot is None else ()
+        if not blocked and (
+            (kind == "create" and current is not None)
+            or (kind == "revise" and (current is None or current.revision_id != str(expected)))
+        ):
+            blocked, diagnostics = True, ("medication_revision_changed",)
+        if (
+            not blocked
+            and kind == "create"
+            and any(regime.starts_at == intent.starts_at for regime in active_regimes)
+        ):
+            blocked, diagnostics = True, ("medication_start_exists",)
+        no_change = (
+            not blocked
+            and kind == "revise"
+            and current is not None
+            and current.starts_at == intent.starts_at
+            and current.timezone == intent.timezone
+            and current.scheduled_doses
+            == tuple(
+                (
+                    dose.medication_name,
+                    str(dose.amount),
+                    dose.unit,
+                    dose.local_time,
+                    tuple(sorted(day.value for day in dose.weekdays)),
+                )
+                for dose in intent.scheduled_doses
+            )
+        )
+        payload = {
+            "intent": kind,
+            "logical_id": str(logical_id),
+            "expected_revision_id": None if expected is None else str(expected),
+            "starts_at": intent.starts_at.isoformat(),
+            "timezone": intent.timezone,
+            "doses": [
+                (
+                    dose.medication_name,
+                    str(dose.amount),
+                    dose.unit,
+                    dose.local_time.isoformat(),
+                    sorted(dose.weekdays),
+                )
+                for dose in intent.scheduled_doses
+            ],
+            "base_snapshot_ref": None if snapshot is None else str(snapshot),
+            "medication_as_of": medication_as_of.isoformat(),
+            "diagnostics": diagnostics,
+            "approval": "no_change" if no_change else ("blocked" if blocked else "ready"),
+        }
+        return WritePlan(
+            PlanFingerprint(
+                hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, default=str).encode()
+                ).hexdigest()
+            ),
+            MedicationRegimePlan(
+                kind,
+                logical_id,
+                expected,
+                intent.starts_at,
+                intent.timezone,
+                intent.scheduled_doses,
+                snapshot,
+                medication_as_of,
             ),
             WritePreflight(
                 WriteApproval(
@@ -3612,6 +3906,8 @@ class HealthLab:
             return self._execute_context_coverage_start_write(
                 request, authorization_plan, expected_plan
             )
+        if isinstance(request, ReviseMedicationRegime):
+            return self._execute_medication_regime_write(request, authorization_plan, expected_plan)
         if isinstance(
             request,
             (
@@ -4316,6 +4612,70 @@ class HealthLab:
                 operation_id,
                 ContextLogicalId(str(publication.logical_id)),
                 ContextRevisionId(str(publication.revision_id)),
+                publication.snapshot_id,
+            ),
+            plan.preflight,
+        )
+
+    def _execute_medication_regime_write(
+        self, request: ReviseMedicationRegime, plan: WritePlan, expected_plan: PlanFingerprint
+    ) -> WriteReceipt:
+        if (
+            not isinstance(plan.details, MedicationRegimePlan)
+            or plan.details.base_snapshot_ref is None
+        ):
+            return self._not_started(
+                plan, WriteNotStartedStatus.BLOCKED, plan.diagnostics, expected_plan
+            )
+        if plan.approval.status is WriteApprovalStatus.NO_CHANGE:
+            return WriteReceipt(
+                OperationId(uuid4().hex), expected_plan, WriteNoChange(), plan.preflight
+            )
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        try:
+            operation_id = OperationId(uuid4().hex)
+            publication = writer.publish_medication_regime(
+                MedicationRegimePublication(
+                    operation_id,
+                    plan.details.intent,
+                    StoredMedicationLogicalId(str(plan.details.logical_id)),
+                    None
+                    if plan.details.expected_revision_id is None
+                    else StoredMedicationRevisionId(str(plan.details.expected_revision_id)),
+                    plan.details.starts_at,
+                    plan.details.timezone,
+                    tuple(
+                        (
+                            dose.medication_name,
+                            str(dose.amount),
+                            dose.unit,
+                            dose.local_time,
+                            tuple(sorted(day.value for day in dose.weekdays)),
+                        )
+                        for dose in plan.details.scheduled_doses
+                    ),
+                    plan.details.base_snapshot_ref,
+                    plan.details.medication_as_of,
+                )
+            )
+        except StoreError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.PLAN_CHANGED, ("plan_changed",), expected_plan
+            )
+        finally:
+            writer.close()
+        return WriteReceipt(
+            operation_id,
+            expected_plan,
+            MedicationRegimeReceipt(
+                operation_id,
+                MedicationLogicalId(str(publication.logical_id)),
+                MedicationRevisionId(str(publication.revision_id)),
                 publication.snapshot_id,
             ),
             plan.preflight,
@@ -5415,6 +5775,121 @@ class HealthLab:
                     value.start_date,
                 )
                 for value in revisions
+            ),
+        )
+
+    def load_medication_days(self, selection: SnapshotDateSelection) -> MedicationDays:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        snapshot = (
+            self._store.load_active_snapshot_id()
+            if selection.snapshot_ref is None
+            else selection.snapshot_ref
+        )
+        if snapshot is None:
+            return MedicationDays(None, None, None, ())
+        as_of = self._store.load_medication_as_of(snapshot)
+        regimes = self._store.load_active_medication_regimes(snapshot)
+        timezone = regimes[0].timezone if regimes else None
+        if selection.start_date is None:
+            start = as_of.astimezone(ZoneInfo(timezone or "Europe/Berlin")).date()
+            end = start
+        else:
+            start = selection.start_date
+            end = min(
+                cast(date, selection.end_date),
+                as_of.astimezone(ZoneInfo(timezone or "Europe/Berlin")).date(),
+            )
+        if start > end:
+            return MedicationDays(snapshot, as_of, timezone, ())
+        active = tuple(sorted(regimes, key=lambda regime: regime.starts_at))
+        days: list[MedicationDay] = []
+        for offset in range((end - start).days + 1):
+            current_day = start + timedelta(days=offset)
+            regime = next(
+                (item for item in reversed(active) if item.starts_at.date() <= current_day), None
+            )
+            if regime is None:
+                days.append(MedicationDay(current_day, "unknown", ()))
+                continue
+            next_regime = next((item for item in active if item.starts_at > regime.starts_at), None)
+            occurrences = tuple(
+                MedicationDoseOccurrence(name, Decimal(amount), unit, scheduled)
+                for name, amount, unit, local_time, weekdays in regime.scheduled_doses
+                if Weekday(current_day.strftime("%A").lower()) in {Weekday(day) for day in weekdays}
+                for scheduled in (
+                    _resolve_medication_local_datetime(current_day, local_time, regime.timezone),
+                )
+                if scheduled >= regime.starts_at
+                and scheduled <= as_of
+                and (next_regime is None or scheduled < next_regime.starts_at)
+            )
+            days.append(
+                MedicationDay(current_day, "planned" if occurrences else "empty", occurrences)
+            )
+        return MedicationDays(snapshot, as_of, timezone, tuple(days))
+
+    def load_medication_plan(self, snapshot_ref: SnapshotRef | None = None) -> MedicationPlan:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        selected = self._store.load_active_snapshot_id() if snapshot_ref is None else snapshot_ref
+        if selected is None:
+            return MedicationPlan(None, None, ())
+        return MedicationPlan(
+            selected,
+            self._store.load_medication_as_of(selected),
+            tuple(
+                MedicationRegimeRecord(
+                    MedicationLogicalId(value.logical_id),
+                    MedicationRevisionId(value.revision_id),
+                    value.starts_at,
+                    value.timezone,
+                    tuple(
+                        ScheduledDose(
+                            name,
+                            Decimal(amount),
+                            unit,
+                            local_time,
+                            frozenset(Weekday(day) for day in weekdays),
+                        )
+                        for name, amount, unit, local_time, weekdays in value.scheduled_doses
+                    ),
+                )
+                for value in self._store.load_active_medication_regimes(selected)
+            ),
+        )
+
+    def load_medication_audit(self, logical_id: MedicationLogicalId) -> MedicationAudit:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        return MedicationAudit(
+            logical_id,
+            tuple(
+                MedicationAuditRevision(
+                    MedicationRevisionId(value.revision_id),
+                    None
+                    if value.previous_revision_id is None
+                    else MedicationRevisionId(value.previous_revision_id),
+                    value.starts_at,
+                    value.timezone,
+                    tuple(
+                        ScheduledDose(
+                            name,
+                            Decimal(amount),
+                            unit,
+                            local_time,
+                            frozenset(Weekday(day) for day in weekdays),
+                        )
+                        for name, amount, unit, local_time, weekdays in value.scheduled_doses
+                    ),
+                )
+                for value in self._store.load_medication_regime_audit(str(logical_id))
             ),
         )
 

@@ -59,6 +59,7 @@ from personal_health_lab.application import (
     LocalMeasurementExclusion,
     LocalWorkoutExclusion,
     MeasurementVersionId,
+    MedicationLogicalId,
     MetadataBackupPlan,
     MetadataBackupReceipt,
     MetadataRestorePlan,
@@ -176,6 +177,19 @@ def _parser() -> argparse.ArgumentParser:
     context_audit = context_commands.add_parser("audit", help="Kontextaudit laden")
     context_audit.add_argument("logical_id", type=ContextLogicalId)
     context_audit.add_argument("--json", action="store_true", dest="as_json")
+    medication = commands.add_parser("medication", help="Medikamentenplan laden")
+    medication_commands = medication.add_subparsers(dest="medication_command", required=True)
+    medication_days = medication_commands.add_parser("days", help="Tägliche Dosisvorkommen laden")
+    medication_days.add_argument("--snapshot", type=SnapshotRef)
+    medication_days.add_argument("--start-date", type=date.fromisoformat)
+    medication_days.add_argument("--end-date", type=date.fromisoformat)
+    medication_days.add_argument("--json", action="store_true", dest="as_json")
+    medication_plan = medication_commands.add_parser("plan", help="Regimeplan laden")
+    medication_plan.add_argument("--snapshot", type=SnapshotRef)
+    medication_plan.add_argument("--json", action="store_true", dest="as_json")
+    medication_audit = medication_commands.add_parser("audit", help="Regimeaudit laden")
+    medication_audit.add_argument("logical_id", type=MedicationLogicalId)
+    medication_audit.add_argument("--json", action="store_true", dest="as_json")
     analysis = commands.add_parser("analyze", help="Verzögerungsprofil analysieren")
     analysis.add_argument("--definition", default="lag-signal-v2")
     analysis.add_argument("--start-date", type=date.fromisoformat)
@@ -1493,6 +1507,15 @@ def main(args: Sequence[str] | None = None) -> int:
                 context_records = health_lab.load_context_records(parsed.snapshot)
             elif parsed.command == "context" and parsed.context_command == "audit":
                 context_audit = health_lab.load_context_audit(parsed.logical_id)
+            elif parsed.command == "medication" and parsed.medication_command == "days":
+                medication_selection = SnapshotDateSelection(
+                    parsed.snapshot, parsed.start_date, parsed.end_date
+                )
+                medication_days = health_lab.load_medication_days(medication_selection)
+            elif parsed.command == "medication" and parsed.medication_command == "plan":
+                medication_plan = health_lab.load_medication_plan(parsed.snapshot)
+            elif parsed.command == "medication" and parsed.medication_command == "audit":
+                medication_audit = health_lab.load_medication_audit(parsed.logical_id)
             elif parsed.command == "restore":
                 restore_request = BeginMetadataRestore(parsed.backup)
                 restore_plan = health_lab.preview_write(restore_request)
@@ -1995,6 +2018,96 @@ def main(args: Sequence[str] | None = None) -> int:
                 sort_keys=True,
             )
         )
+    elif parsed.command == "medication" and parsed.medication_command == "days" and parsed.as_json:
+        print(
+            json.dumps(
+                {
+                    "kind": "medication_days",
+                    "snapshot_ref": None
+                    if medication_days.snapshot_ref is None
+                    else str(medication_days.snapshot_ref),
+                    "medication_as_of": None
+                    if medication_days.medication_as_of is None
+                    else medication_days.medication_as_of.isoformat(),
+                    "days": [
+                        {
+                            "day": item.day.isoformat(),
+                            "status": item.status,
+                            "occurrences": [
+                                {
+                                    "medication_name": dose.medication_name,
+                                    "amount": str(dose.amount),
+                                    "unit": dose.unit,
+                                    "scheduled_at": dose.scheduled_at.isoformat(),
+                                    "status": dose.status,
+                                }
+                                for dose in item.occurrences
+                            ],
+                        }
+                        for item in medication_days.days
+                    ],
+                    "runtime_config": dict(runtime_config),
+                    "schema_version": _OUTPUT_SCHEMA_VERSION,
+                },
+                sort_keys=True,
+            )
+        )
+    elif parsed.command == "medication" and parsed.medication_command == "plan" and parsed.as_json:
+        print(
+            json.dumps(
+                {
+                    "kind": "medication_plan",
+                    "snapshot_ref": None
+                    if medication_plan.snapshot_ref is None
+                    else str(medication_plan.snapshot_ref),
+                    "regimes": [
+                        {
+                            "logical_id": str(item.logical_id),
+                            "revision_id": str(item.revision_id),
+                            "starts_at": item.starts_at.isoformat(),
+                            "timezone": item.timezone,
+                            "scheduled_doses": [
+                                {
+                                    "medication_name": dose.medication_name,
+                                    "amount": str(dose.amount),
+                                    "unit": dose.unit,
+                                    "local_time": dose.local_time.isoformat(),
+                                    "weekdays": sorted(day.value for day in dose.weekdays),
+                                }
+                                for dose in item.scheduled_doses
+                            ],
+                        }
+                        for item in medication_plan.regimes
+                    ],
+                    "runtime_config": dict(runtime_config),
+                    "schema_version": _OUTPUT_SCHEMA_VERSION,
+                },
+                sort_keys=True,
+            )
+        )
+    elif parsed.command == "medication" and parsed.medication_command == "audit" and parsed.as_json:
+        print(
+            json.dumps(
+                {
+                    "kind": "medication_audit",
+                    "logical_id": str(medication_audit.logical_id),
+                    "revisions": [
+                        {
+                            "revision_id": str(item.revision_id),
+                            "previous_revision_id": None
+                            if item.previous_revision_id is None
+                            else str(item.previous_revision_id),
+                            "starts_at": item.starts_at.isoformat(),
+                            "timezone": item.timezone,
+                        }
+                        for item in medication_audit.revisions
+                    ],
+                    "runtime_config": dict(runtime_config),
+                    "schema_version": _OUTPUT_SCHEMA_VERSION,
+                },
+                sort_keys=True,
+            )
+        )
     elif parsed.command == "context" and parsed.context_command == "days":
         print("Täglicher Kontext")
         for context_day in daily_context.days:
@@ -2014,6 +2127,23 @@ def main(args: Sequence[str] | None = None) -> int:
         print("Kontextaudit")
         for revision in context_audit.revisions:
             print(f"{revision.revision_id} · {revision.state} · {revision.start_date or '-'}")
+    elif parsed.command == "medication" and parsed.medication_command == "days":
+        for medication_day in medication_days.days:
+            print(
+                f"{medication_day.day} · {medication_day.status} · "
+                f"{len(medication_day.occurrences)} Dosen"
+            )
+    elif parsed.command == "medication" and parsed.medication_command == "plan":
+        for medication_regime in medication_plan.regimes:
+            print(
+                f"{medication_regime.starts_at.isoformat()} · {medication_regime.timezone} · "
+                f"{len(medication_regime.scheduled_doses)} Dosen"
+            )
+    elif parsed.command == "medication" and parsed.medication_command == "audit":
+        for medication_revision in medication_audit.revisions:
+            print(
+                f"{medication_revision.revision_id} · {medication_revision.starts_at.isoformat()}"
+            )
     elif parsed.command == "workouts":
         print("Trainingseinheiten")
         print(

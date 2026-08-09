@@ -690,6 +690,45 @@ def _render_context(config: RuntimeConfig) -> None:
             ],
             width="stretch",
         )
+    st.subheader("Medikamente")
+    if st.button("Medikamentenplan laden"):
+        try:
+            with HealthLab.open(config) as health_lab:
+                st.session_state["medication_plan"] = health_lab.load_medication_plan()
+                st.session_state["medication_days"] = health_lab.load_medication_days(
+                    SnapshotDateSelection()
+                )
+        except (ConfigurationError, HealthLabError):
+            st.error("Medikamentenplan konnte nicht geladen werden.")
+    medication_plan = st.session_state.get("medication_plan")
+    medication_days = st.session_state.get("medication_days")
+    if medication_plan is not None:
+        st.dataframe(
+            [
+                {
+                    "Beginn": regime.starts_at.isoformat(),
+                    "Zeitzone": regime.timezone,
+                    "Geplante Dosen": len(regime.scheduled_doses),
+                }
+                for regime in medication_plan.regimes
+            ],
+            width="stretch",
+        )
+    if medication_days is not None:
+        st.dataframe(
+            [
+                {
+                    "Tag": item.day.isoformat(),
+                    "Status": item.status,
+                    "Dosen": ", ".join(
+                        f"{dose.medication_name} {dose.amount} {dose.unit}"
+                        for dose in item.occurrences
+                    ),
+                }
+                for item in medication_days.days
+            ],
+            width="stretch",
+        )
 
 
 def _discard_pending_previews() -> None:

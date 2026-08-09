@@ -12,7 +12,7 @@ import subprocess
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from datetime import UTC, date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from enum import StrEnum
 from itertools import pairwise
 from pathlib import Path
@@ -1237,6 +1237,60 @@ class ContextCoverageStartPublicationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class MedicationLogicalId:
+    value: str
+
+    def __post_init__(self) -> None:
+        if len(self.value) != 32 or not set(self.value) <= set("0123456789abcdef"):
+            raise ValueError("Medikamenten-ID muss ein 32-stelliger Hex-Wert sein.")
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRevisionId:
+    value: str
+
+    def __post_init__(self) -> None:
+        if len(self.value) != 32 or not set(self.value) <= set("0123456789abcdef"):
+            raise ValueError("Medikamentenrevisions-ID muss ein 32-stelliger Hex-Wert sein.")
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRegimePublication:
+    operation_id: OperationId
+    intent: Literal["create", "revise"]
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId | None
+    starts_at: datetime
+    timezone: str
+    scheduled_doses: tuple[tuple[str, str, str, time, tuple[str, ...]], ...]
+    expected_snapshot_id: SnapshotId
+    medication_as_of: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRegimePublicationResult:
+    logical_id: MedicationLogicalId
+    revision_id: MedicationRevisionId
+    snapshot_id: SnapshotId
+
+
+@dataclass(frozen=True, slots=True)
+class StoredMedicationRegime:
+    logical_id: str
+    revision_id: str
+    previous_revision_id: str | None
+    starts_at: datetime
+    timezone: str
+    scheduled_doses: tuple[tuple[str, str, str, time, tuple[str, ...]], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class StoredIllnessRevision:
     logical_id: str
     revision_id: str
@@ -1344,7 +1398,8 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                                  'revoke_data_review_decision',
                                  'create_plausibility_rule_version',
                                  'run_historical_review', 'migrate_store',
-                                 'rollback_migration', 'revise_context_coverage_start')
+                                 'rollback_migration', 'revise_context_coverage_start',
+                                 'revise_medication_regime')
             ),
             started_at_utc TEXT NOT NULL CHECK (
                 length(started_at_utc) >= 20 AND substr(started_at_utc, 11, 1) = 'T'
@@ -1547,7 +1602,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             event_kind TEXT NOT NULL CHECK (
                 event_kind IN (
                     'import_published', 'data_review_decision', 'metadata_tombstone',
-                    'store_migrated', 'manual_context_revision'
+                    'store_migrated', 'manual_context_revision', 'manual_medication_revision'
                 )
             ),
             occurred_at_utc TEXT NOT NULL CHECK (
@@ -1686,6 +1741,47 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
         CREATE TRIGGER IF NOT EXISTS manual_context_publications_no_delete
         BEFORE DELETE ON manual_context_publications
         BEGIN SELECT RAISE(ABORT, 'manual context publications are immutable'); END;
+        CREATE TABLE IF NOT EXISTS medication_regime_revisions (
+            revision_id TEXT PRIMARY KEY CHECK (
+                length(revision_id) = 32 AND revision_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            logical_id TEXT NOT NULL CHECK (
+                length(logical_id) = 32 AND logical_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            previous_revision_id TEXT UNIQUE REFERENCES medication_regime_revisions(revision_id),
+            operation_id TEXT NOT NULL UNIQUE REFERENCES write_operations(operation_id),
+            created_at_utc TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL CHECK (
+                length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'
+            )
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS medication_regime_values (
+            revision_id TEXT PRIMARY KEY REFERENCES medication_regime_revisions(revision_id),
+            starts_at TEXT NOT NULL,
+            timezone TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS medication_scheduled_doses (
+            dose_id TEXT PRIMARY KEY CHECK (
+                length(dose_id) = 32 AND dose_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            revision_id TEXT NOT NULL REFERENCES medication_regime_revisions(revision_id),
+            medication_name TEXT NOT NULL CHECK (length(medication_name) BETWEEN 1 AND 120),
+            amount TEXT NOT NULL,
+            unit TEXT NOT NULL CHECK (length(unit) BETWEEN 1 AND 32),
+            local_time TEXT NOT NULL CHECK (length(local_time) = 8),
+            weekdays TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS medication_snapshot_bindings (
+            snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(snapshot_id),
+            revision_id TEXT NOT NULL REFERENCES medication_regime_revisions(revision_id),
+            PRIMARY KEY (snapshot_id, revision_id)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS medication_publications (
+            audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
+            revision_id TEXT NOT NULL UNIQUE REFERENCES medication_regime_revisions(revision_id),
+            snapshot_id TEXT NOT NULL UNIQUE REFERENCES dataset_snapshots(snapshot_id),
+            medication_as_of TEXT NOT NULL
+        ) STRICT;
         CREATE TABLE IF NOT EXISTS metadata_restores (
             restore_id TEXT PRIMARY KEY CHECK (
                 length(restore_id) = 32 AND restore_id NOT GLOB '*[^0-9a-f]*'
@@ -3709,6 +3805,11 @@ class LocalStore:
                     "WHERE snapshot_id = ?",
                     (str(snapshot_id), str(active[0])),
                 )
+                self._metadata.execute(
+                    "INSERT INTO medication_snapshot_bindings "
+                    "SELECT ?, revision_id FROM medication_snapshot_bindings WHERE snapshot_id = ?",
+                    (str(snapshot_id), str(active[0])),
+                )
             all_intervals: tuple[
                 CanonicalHealthRecord | CanonicalSleepInterval | CanonicalWorkout, ...
             ] = (
@@ -4380,6 +4481,16 @@ class LocalStore:
                 if "manual_context_publications" in tables
                 else ""
             )
+            medication_count = (
+                "+ count(medication_publications.audit_event_id)"
+                if "medication_publications" in tables
+                else ""
+            )
+            medication_join = (
+                "LEFT JOIN medication_publications USING (audit_event_id)"
+                if "medication_publications" in tables
+                else ""
+            )
             audit = self._metadata.execute(
                 f"""
                 SELECT count(*), COALESCE(MIN(audit_position), 1),
@@ -4390,6 +4501,7 @@ class LocalStore:
                        {migration_count}
                        {restored_count}
                        {manual_count}
+                       {medication_count}
                 FROM audit_events
                 LEFT JOIN import_publications USING (audit_event_id)
                 LEFT JOIN data_review_decisions USING (audit_event_id)
@@ -4397,6 +4509,7 @@ class LocalStore:
                 {migration_join}
                 {restored_join}
                 {manual_join}
+                {medication_join}
                 """
             ).fetchone()
             assert audit is not None
@@ -6195,6 +6308,11 @@ class LocalStore:
                 "SELECT ?, revision_id FROM manual_context_snapshot_bindings WHERE snapshot_id = ?",
                 (str(snapshot_id), str(previous_snapshot_id)),
             )
+        self._metadata.execute(
+            "INSERT INTO medication_snapshot_bindings "
+            "SELECT ?, revision_id FROM medication_snapshot_bindings WHERE snapshot_id = ?",
+            (str(snapshot_id), str(previous_snapshot_id)),
+        )
 
     def load_daily_series(
         self, start_date: date | None, end_date: date | None
@@ -6792,6 +6910,224 @@ class LocalStore:
             None if row[4] is None else date.fromisoformat(str(row[4])),
             selected,
         )
+
+    def load_medication_as_of(self, snapshot_id: SnapshotId | None) -> datetime:
+        self._require_open()
+        selected = self.load_active_snapshot_id() if snapshot_id is None else snapshot_id
+        if selected is None:
+            return datetime.now(UTC)
+        row = self._metadata.execute(
+            "SELECT medication_as_of FROM medication_publications WHERE snapshot_id = ?",
+            (str(selected),),
+        ).fetchone()
+        if row is not None:
+            return datetime.fromisoformat(str(row[0]))
+        row = self._metadata.execute(
+            "SELECT created_at_utc FROM dataset_snapshots WHERE snapshot_id = ?", (str(selected),)
+        ).fetchone()
+        if row is None:
+            raise StoreError("Snapshot fehlt.")
+        return datetime.fromisoformat(str(row[0]))
+
+    def _stored_medication_regimes(
+        self, where: str, args: tuple[object, ...]
+    ) -> tuple[StoredMedicationRegime, ...]:
+        rows = self._metadata.execute(
+            "SELECT revision.logical_id, revision.revision_id, revision.previous_revision_id, "
+            "value.starts_at, value.timezone FROM medication_regime_revisions revision "
+            "JOIN medication_regime_values value USING (revision_id) "
+            + where
+            + " ORDER BY value.starts_at, revision.rowid",
+            args,
+        ).fetchall()
+        values: list[StoredMedicationRegime] = []
+        for row in rows:
+            doses = tuple(
+                (
+                    str(dose[0]),
+                    str(dose[1]),
+                    str(dose[2]),
+                    time.fromisoformat(str(dose[3])),
+                    tuple(json.loads(str(dose[4]))),
+                )
+                for dose in self._metadata.execute(
+                    "SELECT medication_name, amount, unit, local_time, weekdays "
+                    "FROM medication_scheduled_doses WHERE revision_id = ? ORDER BY rowid",
+                    (str(row[1]),),
+                ).fetchall()
+            )
+            values.append(
+                StoredMedicationRegime(
+                    str(row[0]),
+                    str(row[1]),
+                    None if row[2] is None else str(row[2]),
+                    datetime.fromisoformat(str(row[3])),
+                    str(row[4]),
+                    doses,
+                )
+            )
+        return tuple(values)
+
+    def load_active_medication_regimes(
+        self, snapshot_id: SnapshotId | None
+    ) -> tuple[StoredMedicationRegime, ...]:
+        self._require_open()
+        selected = self.load_active_snapshot_id() if snapshot_id is None else snapshot_id
+        if selected is None:
+            return ()
+        return self._stored_medication_regimes(
+            "JOIN medication_snapshot_bindings binding USING (revision_id) "
+            "WHERE binding.snapshot_id = ?",
+            (str(selected),),
+        )
+
+    def load_medication_regime(
+        self, snapshot_id: SnapshotId | None, logical_id: str
+    ) -> StoredMedicationRegime | None:
+        return next(
+            (
+                item
+                for item in self.load_active_medication_regimes(snapshot_id)
+                if item.logical_id == logical_id
+            ),
+            None,
+        )
+
+    def load_medication_regime_audit(self, logical_id: str) -> tuple[StoredMedicationRegime, ...]:
+        self._require_open()
+        return self._stored_medication_regimes("WHERE revision.logical_id = ?", (logical_id,))
+
+    def publish_medication_regime(
+        self, publication: MedicationRegimePublication
+    ) -> MedicationRegimePublicationResult:
+        self._require_open()
+        self._require_writer()
+        active = self.load_active_snapshot_id()
+        if active != publication.expected_snapshot_id:
+            raise StoreError("Aktiver Snapshot hat sich geändert.")
+        audit = self.load_medication_regime_audit(str(publication.logical_id))
+        current = self.load_medication_regime(active, str(publication.logical_id))
+        if publication.intent == "create":
+            if audit or any(
+                regime.starts_at == publication.starts_at
+                for regime in self.load_active_medication_regimes(active)
+            ):
+                raise StoreError("Medikamentenregime existiert bereits.")
+            previous = None
+        else:
+            if (
+                not audit
+                or current is None
+                or current.revision_id != str(publication.expected_revision_id)
+            ):
+                raise StoreError("Medikamentenrevision hat sich geändert.")
+            previous = current.revision_id
+        revision_id, snapshot_id = MedicationRevisionId(uuid4().hex), SnapshotId(uuid4().hex)
+        created_at = datetime.now(UTC).isoformat()
+        payload = {
+            "intent": publication.intent,
+            "starts_at": publication.starts_at.isoformat(),
+            "timezone": publication.timezone,
+            "doses": [
+                (name, amount, unit, local_time.isoformat(), days)
+                for name, amount, unit, local_time, days in publication.scheduled_doses
+            ],
+        }
+        try:
+            with self._metadata:
+                self._metadata.execute(
+                    "INSERT INTO write_operations VALUES "
+                    "(?, 'revise_medication_regime', ?, ?, 'committed', 1)",
+                    (str(publication.operation_id), created_at, created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO medication_regime_revisions VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        str(revision_id),
+                        str(publication.logical_id),
+                        previous,
+                        str(publication.operation_id),
+                        created_at,
+                        hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(),
+                    ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO medication_regime_values VALUES (?, ?, ?)",
+                    (str(revision_id), publication.starts_at.isoformat(), publication.timezone),
+                )
+                self._metadata.executemany(
+                    "INSERT INTO medication_scheduled_doses VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            uuid4().hex,
+                            str(revision_id),
+                            name,
+                            amount,
+                            unit,
+                            local_time.isoformat(),
+                            json.dumps(days),
+                        )
+                        for name, amount, unit, local_time, days in publication.scheduled_doses
+                    ],
+                )
+                position = int(
+                    self._metadata.execute(
+                        "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+                    ).fetchone()[0]
+                )
+                manifest = self._stage_review_snapshot(
+                    parent_snapshot_id=active,
+                    snapshot_id=snapshot_id,
+                    operation_id=publication.operation_id,
+                    audit_position=position,
+                    review_case_id=None,
+                    decision_id="",
+                    action="manual_medication_revision",
+                    selected_measurement_version_id=None,
+                    candidate_version_ids=(),
+                    replacement_plausibility_cases=(),
+                )
+                self._activate_review_snapshot(
+                    publication.operation_id,
+                    snapshot_id,
+                    active,
+                    manifest,
+                    created_at,
+                    activation_kind="manual_context_revision",
+                )
+                self._metadata.execute(
+                    "DELETE FROM medication_snapshot_bindings WHERE snapshot_id = ? "
+                    "AND revision_id IN (SELECT revision_id FROM medication_regime_revisions "
+                    "WHERE logical_id = ?)",
+                    (str(snapshot_id), str(publication.logical_id)),
+                )
+                self._metadata.execute(
+                    "INSERT INTO medication_snapshot_bindings VALUES (?, ?)",
+                    (str(snapshot_id), str(revision_id)),
+                )
+                audit_event_id = uuid4().hex
+                self._metadata.execute(
+                    "INSERT INTO audit_events VALUES (?, ?, ?, 'manual_medication_revision', ?)",
+                    (position, audit_event_id, str(publication.operation_id), created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO medication_publications VALUES (?, ?, ?, ?)",
+                    (
+                        audit_event_id,
+                        str(revision_id),
+                        str(snapshot_id),
+                        publication.medication_as_of.isoformat(),
+                    ),
+                )
+        except Exception:
+            shutil.rmtree(
+                self._root / "staging" / str(publication.operation_id), ignore_errors=True
+            )
+            shutil.rmtree(
+                self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id), ignore_errors=True
+            )
+            raise
+        return MedicationRegimePublicationResult(publication.logical_id, revision_id, snapshot_id)
 
     def load_context_coverage_audit(
         self, logical_id: str
