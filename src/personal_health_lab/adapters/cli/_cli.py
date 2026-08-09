@@ -649,6 +649,8 @@ def _sleep_days_json(
         "days": [
             {
                 "day": item.day.isoformat(),
+                "nap_count": item.nap_count,
+                "nap_observed_sleep_seconds": duration(item.nap_observed_sleep),
                 "naps": [episode(value) for value in item.naps],
                 "primary_episode": (
                     None if item.primary_episode is None else episode(item.primary_episode)
@@ -1666,16 +1668,55 @@ def main(args: Sequence[str] | None = None) -> int:
             print(
                 f"{day.day} · {day.status.value} · Schlaf: "
                 f"{'-' if episode is None else episode.observed_sleep} · "
+                f"Nickerchen: {day.nap_count} ({day.nap_observed_sleep}) · "
                 f"Akzeptiert: {day.quality.accepted_interval_count} · "
                 f"Abgewiesen: {day.quality.rejected_interval_count}"
             )
+            print(
+                f"  Klassifikator: {day.quality.source_classifier_version} · "
+                f"Ableitung: {day.quality.derivation_version} · "
+                f"Watch-Quellen: {day.quality.contributing_watch_source_count} · "
+                "Primärauswahl mehrdeutig: "
+                f"{str(day.quality.primary_selection_ambiguous).lower()} · "
+                "Quellenklassen: "
+                + ", ".join(
+                    f"{count.source_class.value} "
+                    f"(akzeptiert {count.accepted_interval_count}, "
+                    f"abgewiesen {count.rejected_interval_count})"
+                    for count in day.quality.source_counts
+                )
+            )
+            if episode is not None:
+                print(
+                    f"  Episode: {episode.start.isoformat()} bis {episode.end.isoformat()} · "
+                    f"Wach: {episode.observed_awake} · Im Bett: {episode.in_bed} · "
+                    f"Core: {episode.asleep_core} · Tief: {episode.asleep_deep} · "
+                    f"REM: {episode.asleep_rem} · Unspezifiziert: {episode.asleep_unspecified} · "
+                    f"Mehrdeutig: {episode.stage_ambiguous} · Lücke: {episode.uncovered_gap} · "
+                    f"Konflikt: {episode.asleep_awake_conflict} · "
+                    f"Abdeckung: {episode.observed_coverage_ratio} · "
+                    f"Stufenabdeckung: {episode.detailed_stage_coverage_ratio}"
+                )
+            for nap in day.naps:
+                print(
+                    f"  Nickerchen: {nap.start.isoformat()} bis {nap.end.isoformat()} · "
+                    f"Schlaf: {nap.observed_sleep} · Wach: {nap.observed_awake} · "
+                    f"Im Bett: {nap.in_bed} · Core: {nap.asleep_core} · "
+                    f"Tief: {nap.asleep_deep} · REM: {nap.asleep_rem} · "
+                    f"Unspezifiziert: {nap.asleep_unspecified} · "
+                    f"Mehrdeutig: {nap.stage_ambiguous} · Lücke: {nap.uncovered_gap} · "
+                    f"Konflikt: {nap.asleep_awake_conflict} · "
+                    f"Abdeckung: {nap.observed_coverage_ratio} · "
+                    f"Stufenabdeckung: {nap.detailed_stage_coverage_ratio}"
+                )
         for interval in (*sleep_days.accepted_intervals, *sleep_days.rejected_intervals):
             print(
                 f"{interval.canonical_category.value} · Original: {interval.original_category} · "
                 f"Quelle: {interval.source_class.value} · Ausgewählt: "
                 f"{str(interval.is_selected).lower()} · {interval.source_start.isoformat()} "
                 f"bis {interval.source_end.isoformat()} · {interval.source_name} · "
-                f"{interval.device}"
+                f"{interval.source_version} · Aktualisiert: "
+                f"{interval.source_updated_at.isoformat()} · {interval.device}"
             )
     elif parsed.command == "recovery-status" and parsed.as_json:
         print(

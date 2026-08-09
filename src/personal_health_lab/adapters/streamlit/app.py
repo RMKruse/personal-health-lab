@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from urllib.parse import quote
@@ -54,6 +54,7 @@ from personal_health_lab.application import (
     RunRestingHeartRateAnalysis,
     RuntimeConfig,
     SingleDecisionTarget,
+    SleepEpisode,
     SnapshotDateSelection,
     SnapshotRef,
     SourceConflictResolution,
@@ -361,6 +362,36 @@ def _render_sleep_days(config: RuntimeConfig) -> None:
     except (ConfigurationError, HealthLabError):
         st.error("Schlafdaten konnten nicht geladen werden.")
         return
+
+    def episode_fields(episode: SleepEpisode) -> dict[str, object]:
+        def duration(value: timedelta) -> float:
+            return value.total_seconds()
+
+        return {
+            "Beginn": episode.start.isoformat(),
+            "Ende": episode.end.isoformat(),
+            "Erster Schlaf": None
+            if episode.first_observed_asleep is None
+            else episode.first_observed_asleep.isoformat(),
+            "Letzter Schlaf": None
+            if episode.last_observed_asleep is None
+            else episode.last_observed_asleep.isoformat(),
+            "Beobachteter Schlaf (s)": duration(episode.observed_sleep),
+            "Beobachtetes Wach (s)": duration(episode.observed_awake),
+            "Im Bett (s)": None if episode.in_bed is None else duration(episode.in_bed),
+            "Core (s)": duration(episode.asleep_core),
+            "Tief (s)": duration(episode.asleep_deep),
+            "REM (s)": duration(episode.asleep_rem),
+            "Unspezifiziert (s)": duration(episode.asleep_unspecified),
+            "Mehrdeutig (s)": duration(episode.stage_ambiguous),
+            "Unbeobachtete Lücke (s)": duration(episode.uncovered_gap),
+            "Entfernte Überlappung (s)": duration(episode.removed_same_state_overlap),
+            "Schlaf/Wach-Konflikt (s)": duration(episode.asleep_awake_conflict),
+            "Beobachtungsabdeckung": episode.observed_coverage_ratio,
+            "Detaillierte Stufenabdeckung": episode.detailed_stage_coverage_ratio,
+            "Intervallversionen": [str(value) for value in episode.interval_ids],
+        }
+
     st.caption(f"Snapshot: {projection.snapshot_ref or '-'}")
     st.dataframe(
         [
@@ -372,8 +403,11 @@ def _render_sleep_days(config: RuntimeConfig) -> None:
                     if item.primary_episode is None
                     else item.primary_episode.observed_sleep.total_seconds()
                 ),
+                "Nickerchen": item.nap_count,
+                "Nickerchen-Schlaf (s)": item.nap_observed_sleep.total_seconds(),
                 "Akzeptierte Intervalle": item.quality.accepted_interval_count,
                 "Abgewiesene Intervalle": item.quality.rejected_interval_count,
+                "Beitragende Watch-Quellen": item.quality.contributing_watch_source_count,
                 "Quellenklassen": {
                     value.source_class.value: {
                         "akzeptiert": value.accepted_interval_count,
@@ -383,8 +417,18 @@ def _render_sleep_days(config: RuntimeConfig) -> None:
                 },
                 "Klassifikator": item.quality.source_classifier_version,
                 "Ableitung": item.quality.derivation_version,
+                "Primärauswahl mehrdeutig": item.quality.primary_selection_ambiguous,
+                **({} if item.primary_episode is None else episode_fields(item.primary_episode)),
             }
             for item in projection.days
+        ],
+        width="stretch",
+    )
+    st.dataframe(
+        [
+            {"Tag": day.day.isoformat(), **episode_fields(nap)}
+            for day in projection.days
+            for nap in day.naps
         ],
         width="stretch",
     )
@@ -399,6 +443,8 @@ def _render_sleep_days(config: RuntimeConfig) -> None:
                 "Quellbeginn": item.source_start.isoformat(),
                 "Quellende": item.source_end.isoformat(),
                 "Quelle": item.source_name,
+                "Quellversion": item.source_version,
+                "Quellaktualisierung": item.source_updated_at.isoformat(),
                 "Gerät": item.device,
             }
             for item in (*projection.accepted_intervals, *projection.rejected_intervals)

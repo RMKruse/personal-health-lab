@@ -5,7 +5,7 @@ import json
 import logging
 import math
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from enum import StrEnum
 from itertools import pairwise
@@ -454,6 +454,14 @@ class SleepDay:
     naps: tuple[SleepEpisode, ...]
     quality: SleepQuality
 
+    @property
+    def nap_count(self) -> int:
+        return len(self.naps)
+
+    @property
+    def nap_observed_sleep(self) -> timedelta:
+        return sum((item.observed_sleep for item in self.naps), timedelta())
+
 
 @dataclass(frozen=True, slots=True)
 class SleepDays:
@@ -541,24 +549,29 @@ def _sleep_episode(intervals: tuple[SleepInterval, ...]) -> SleepEpisode:
         ),
         timedelta(),
     )
+    known_intervals = tuple(
+        item for item in intervals if item.canonical_category is not SleepCategory.IN_BED
+    )
     covered_until: datetime | None = None
     uncovered_gap = timedelta()
-    for item in sorted(intervals, key=lambda value: (value.source_start, value.source_end)):
+    for item in sorted(known_intervals, key=lambda value: (value.source_start, value.source_end)):
         if covered_until is not None and item.source_start > covered_until:
             uncovered_gap += item.source_start - covered_until
         if covered_until is None or item.source_end > covered_until:
             covered_until = item.source_end
     observed_sleep = sum((durations[category] for category in asleep_categories), stage_ambiguous)
     known = observed_sleep + durations[SleepCategory.AWAKE]
-    span = max(item.source_end for item in intervals) - min(item.source_start for item in intervals)
+    span = max(item.source_end for item in known_intervals) - min(
+        item.source_start for item in known_intervals
+    )
     detailed = (
         durations[SleepCategory.ASLEEP_CORE]
         + durations[SleepCategory.ASLEEP_DEEP]
         + durations[SleepCategory.ASLEEP_REM]
     )
     return SleepEpisode(
-        start=min(item.source_start for item in intervals),
-        end=max(item.source_end for item in intervals),
+        start=min(item.source_start for item in known_intervals),
+        end=max(item.source_end for item in known_intervals),
         first_observed_asleep=first_asleep,
         last_observed_asleep=last_asleep,
         observed_sleep=observed_sleep,
@@ -3949,6 +3962,8 @@ class HealthLab:
         selected = tuple(item for item in accepted if item.is_selected)
         groups: list[list[SleepInterval]] = []
         for interval in selected:
+            if interval.canonical_category is SleepCategory.IN_BED:
+                continue
             if interval.source_end <= interval.source_start:
                 continue
             if not groups or interval.source_start - max(
@@ -3959,17 +3974,32 @@ class HealthLab:
                 groups[-1].append(interval)
         episodes_by_day: dict[date, list[SleepEpisode]] = {}
         for group in groups:
-            episode = _sleep_episode(tuple(group))
+            start = min(item.source_start for item in group)
+            end = max(item.source_end for item in group)
+            in_bed = tuple(
+                replace(
+                    item,
+                    source_start=max(item.source_start, start),
+                    source_end=min(item.source_end, end),
+                )
+                for item in selected
+                if item.canonical_category is SleepCategory.IN_BED
+                and item.source_start < end
+                and item.source_end > start
+            )
+            episode = _sleep_episode(tuple(group) + in_bed)
             episodes_by_day.setdefault(episode.end.date(), []).append(episode)
         if selection.start_date is not None and selection.end_date is not None:
             dates = tuple(
                 selection.start_date + timedelta(days=offset)
                 for offset in range((selection.end_date - selection.start_date).days + 1)
             )
-        elif episodes_by_day:
-            start, end = min(episodes_by_day), max(episodes_by_day)
+        elif selected:
+            first_day = min(item.source_end.date() for item in selected)
+            last_day = max(item.source_end.date() for item in selected)
             dates = tuple(
-                start + timedelta(days=offset) for offset in range((end - start).days + 1)
+                first_day + timedelta(days=offset)
+                for offset in range((last_day - first_day).days + 1)
             )
         else:
             dates = ()

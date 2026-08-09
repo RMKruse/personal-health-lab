@@ -124,6 +124,107 @@ def test_sleep_days_cli_uses_the_shared_selection(tmp_path: Path, capsys) -> Non
     assert output["kind"] == "sleep_days"
     assert output["selection"]["start_date"] == "2024-01-03"
     assert output["days"][0]["primary_episode"]["observed_sleep_seconds"] == 25200
+    assert output["days"][0]["nap_count"] == 0
+    assert output["days"][0]["nap_observed_sleep_seconds"] == 0
+
+
+def test_sleep_days_keep_in_bed_parallel_and_expose_naps(tmp_path: Path) -> None:
+    xml = "".join(
+        (
+            '<HealthData><ExportDate value="2024-01-04 12:00:00 +0100"/>',
+            _record(
+                "HKCategoryValueSleepAnalysisAsleepCore",
+                "2024-01-02 23:00:00 +0100",
+                "2024-01-03 00:00:00 +0100",
+            ),
+            _record(
+                "HKCategoryValueSleepAnalysisInBed",
+                "2024-01-03 00:00:00 +0100",
+                "2024-01-03 02:00:00 +0100",
+            ),
+            _record(
+                "HKCategoryValueSleepAnalysisAsleepREM",
+                "2024-01-03 02:00:00 +0100",
+                "2024-01-03 03:00:00 +0100",
+            ),
+            _record(
+                "HKCategoryValueSleepAnalysisAwake",
+                "2024-01-03 22:00:00 +0100",
+                "2024-01-03 23:00:00 +0100",
+            ),
+            _record(
+                "HKCategoryValueSleepAnalysisInBed",
+                "2024-01-03 22:00:00 +0100",
+                "2024-01-04 06:00:00 +0100",
+            ),
+            _record(
+                "HKCategoryValueSleepAnalysisAsleepCore",
+                "2024-01-04 22:00:00 +0100",
+                "2024-01-04 23:00:00 +0100",
+            ),
+            _record(
+                "HKCategoryValueSleepAnalysisAsleepREM",
+                "2024-01-05 00:30:00 +0100",
+                "2024-01-05 01:30:00 +0100",
+            ),
+            "</HealthData>",
+        )
+    )
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(_package(tmp_path / "sleep.zip", xml))
+        health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+        sleep = health_lab.load_sleep_days(
+            SnapshotDateSelection(start_date=date(2024, 1, 3), end_date=date(2024, 1, 5))
+        )
+
+    tied_day, evidence_only_day, boundary_day = sleep.days
+    assert tied_day.status is SleepObservationStatus.PARTIAL
+    assert tied_day.primary_episode is None
+    assert tied_day.nap_count == 2
+    assert tied_day.nap_observed_sleep == timedelta(hours=2)
+    assert evidence_only_day.status is SleepObservationStatus.PARTIAL
+    assert evidence_only_day.primary_episode is None
+    assert boundary_day.status is SleepObservationStatus.PARTIAL
+    assert boundary_day.primary_episode is not None
+    assert boundary_day.primary_episode.uncovered_gap == timedelta(minutes=90)
+
+
+def test_sleep_days_treat_legacy_snapshots_without_intervals_as_empty(tmp_path: Path) -> None:
+    xml = "".join(
+        (
+            '<HealthData><ExportDate value="2024-01-03 12:00:00 +0100"/>',
+            _record(
+                "HKCategoryValueSleepAnalysisAsleepCore",
+                "2024-01-02 23:00:00 +0100",
+                "2024-01-03 06:00:00 +0100",
+            ),
+            "</HealthData>",
+        )
+    )
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    with HealthLab.open(config) as health_lab:
+        first = health_lab.execute_write(
+            request := ImportHealthExport(_package(tmp_path / "first.zip", xml)),
+            expected_plan=health_lab.preview_write(request).fingerprint,
+        )
+        assert first.result.snapshot_ref is not None
+        legacy_sleep = (
+            config.synthetic_store
+            / "parquet"
+            / "snapshots"
+            / str(first.result.snapshot_ref)
+            / "sleep_intervals.parquet"
+        )
+        legacy_sleep.unlink()
+
+        historical = health_lab.load_sleep_days(
+            SnapshotDateSelection(snapshot_ref=first.result.snapshot_ref)
+        )
+
+    assert historical.accepted_intervals == ()
 
 
 def test_sleep_reimport_versions_stages_and_catalogs_invalid_forms(tmp_path: Path) -> None:
@@ -142,7 +243,7 @@ def test_sleep_reimport_versions_stages_and_catalogs_invalid_forms(tmp_path: Pat
     corrected = original.replace(
         "HKCategoryValueSleepAnalysisAsleep",
         "HKCategoryValueSleepAnalysisAsleepCore",
-    ).replace("2024-01-03 06:00:00 +0100\" start", "2024-01-03 07:00:00 +0100\" start")
+    ).replace('2024-01-03 06:00:00 +0100" start', '2024-01-03 07:00:00 +0100" start')
     invalid = "".join(
         (
             '<HealthData><Record type="HKCategoryTypeIdentifierSleepAnalysis" '

@@ -5626,7 +5626,10 @@ class LocalStore:
         ):
             raise StoreError("Datensatz-Snapshot ist unbekannt.")
         path = self._root / _PARQUET_DIRECTORY / "snapshots" / str(selected_snapshot)
-        sleep = str(path / "sleep_intervals.parquet").replace("'", "''")
+        sleep_path = path / "sleep_intervals.parquet"
+        if not sleep_path.exists():
+            return selected_snapshot, ()
+        sleep = str(sleep_path).replace("'", "''")
         rows = self._query.execute(
             f"""
             SELECT identity_candidate_id, measurement_version_id, original_category,
