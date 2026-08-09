@@ -30,6 +30,7 @@ from personal_health_lab.health_data import (
     CanonicalSleepCategory,
     CanonicalSleepInterval,
     CanonicalUnit,
+    CanonicalWorkout,
     DailyHealthSeries,
     DailyHealthValue,
     DataQualityStatus,
@@ -49,7 +50,7 @@ _STORE_SCHEMA_VERSION = 8
 _WRITER_LOCK_FILE = ".writer.lock"
 _FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
 _STORE_MIGRATION_METHOD = "cow-migration/v1"
-_SNAPSHOT_SCHEMA_VERSION = 1
+_SNAPSHOT_SCHEMA_VERSION = 2
 _CANONICAL_HEALTH_TYPES_SQL = ", ".join(f"'{item.value}'" for item in CanonicalHealthType)
 _CANONICAL_UNITS_SQL = ", ".join(f"'{item.value}'" for item in CanonicalUnit)
 _PRE_ACTIVITY_HEALTH_TYPES_SQL = ", ".join(
@@ -124,6 +125,25 @@ _SNAPSHOT_SCHEMAS = {
         ("strong_source_id_hash", "VARCHAR"),
         ("is_selected", "BOOLEAN"),
     ),
+    "workouts.parquet": (
+        ("workout_version_id", "VARCHAR"),
+        ("logical_workout_id", "VARCHAR"),
+        ("original_activity_type", "VARCHAR"),
+        ("source_start_utc", "VARCHAR"),
+        ("source_end_utc", "VARCHAR"),
+        ("source_updated_at_utc", "VARCHAR"),
+        ("source_start_offset_minutes", "INTEGER"),
+        ("source_end_offset_minutes", "INTEGER"),
+        ("source_updated_at_offset_minutes", "INTEGER"),
+        ("measurement_local_date", "DATE"),
+        ("source_name", "VARCHAR"),
+        ("source_version", "VARCHAR"),
+        ("device", "VARCHAR"),
+        ("reported_duration_minutes", "DOUBLE"),
+        ("distance_kilometers", "DOUBLE"),
+        ("active_energy_kilocalories", "DOUBLE"),
+        ("is_selected", "BOOLEAN"),
+    ),
     "resolved_measurements.parquet": (
         ("logical_measurement_id", "VARCHAR"),
         ("selected_measurement_version_id", "VARCHAR"),
@@ -144,6 +164,9 @@ _SNAPSHOT_SCHEMAS = {
         ("rule_version_id", "VARCHAR"),
         ("evidence_fingerprint", "VARCHAR"),
     ),
+}
+_LEGACY_SNAPSHOT_SCHEMAS = {
+    name: schema for name, schema in _SNAPSHOT_SCHEMAS.items() if name != "workouts.parquet"
 }
 _KIB = 1024
 _MIB = 1024 * _KIB
@@ -857,6 +880,24 @@ class StoredMeasurement:
     original_value: float
     original_unit: str
     review_case_ids: tuple[ReviewCaseId, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StoredWorkout:
+    logical_workout_id: LogicalMeasurementId
+    workout_version_id: MeasurementVersionId
+    original_activity_type: str
+    source_start: datetime
+    source_end: datetime
+    source_updated_at: datetime
+    measurement_local_day: date
+    source_name: str
+    source_version: str
+    device: str
+    reported_duration_minutes: float | None
+    distance_kilometers: float | None
+    active_energy_kilocalories: float | None
+    is_selected: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -2782,6 +2823,7 @@ class LocalStore:
         export_date: datetime | None,
         records: tuple[CanonicalHealthRecord, ...],
         sleep_intervals: tuple[CanonicalSleepInterval, ...],
+        workouts: tuple[CanonicalWorkout, ...],
         unknown_source_types: tuple[str, ...],
         unsupported_content: tuple[UnsupportedImportContent, ...],
         governing_export_id: str,
@@ -2804,6 +2846,7 @@ class LocalStore:
                 export_date=export_date,
                 records=records,
                 sleep_intervals=sleep_intervals,
+                workouts=workouts,
                 unknown_source_types=unknown_source_types,
                 unsupported_content=unsupported_content,
                 governing_export_id=governing_export_id,
@@ -2826,6 +2869,7 @@ class LocalStore:
         export_date: datetime | None,
         records: tuple[CanonicalHealthRecord, ...],
         sleep_intervals: tuple[CanonicalSleepInterval, ...],
+        workouts: tuple[CanonicalWorkout, ...],
         unknown_source_types: tuple[str, ...],
         unsupported_content: tuple[UnsupportedImportContent, ...],
         governing_export_id: str,
@@ -2897,9 +2941,9 @@ class LocalStore:
                     package_hash=package_hash,
                     snapshot_id=result.snapshot_id,
                     status=result.status,
-                    package_record_count=len(records) + len(sleep_intervals),
+                    package_record_count=len(records) + len(sleep_intervals) + len(workouts),
                     record_count=0,
-                    records=(*records, *sleep_intervals),
+                    records=(*records, *sleep_intervals, *workouts),
                     logical_measurement_count=result.logical_measurement_count,
                     measurement_version_count=result.measurement_version_count,
                     source_occurrence_count=result.source_occurrence_count,
@@ -3110,6 +3154,97 @@ class LocalStore:
         ).fetchone()
         assert sleep_count_row is not None
         sleep_version_count, sleep_logical_count = map(int, sleep_count_row)
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE staged_workouts (
+                workout_version_id VARCHAR,
+                logical_workout_id VARCHAR,
+                original_activity_type VARCHAR,
+                source_start_utc VARCHAR,
+                source_end_utc VARCHAR,
+                source_updated_at_utc VARCHAR,
+                source_start_offset_minutes INTEGER,
+                source_end_offset_minutes INTEGER,
+                source_updated_at_offset_minutes INTEGER,
+                measurement_local_date DATE,
+                source_name VARCHAR,
+                source_version VARCHAR,
+                device VARCHAR,
+                reported_duration_minutes DOUBLE,
+                distance_kilometers DOUBLE,
+                active_energy_kilocalories DOUBLE
+            )
+            """
+        )
+        if workouts:
+            self._query.executemany(
+                "INSERT INTO staged_workouts VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        str(item.workout_version_id),
+                        str(item.logical_workout_id),
+                        item.original_activity_type,
+                        item.source_start.astimezone(UTC).isoformat(),
+                        item.source_end.astimezone(UTC).isoformat(),
+                        item.source_updated_at.astimezone(UTC).isoformat(),
+                        _utc_offset_minutes(item.source_start),
+                        _utc_offset_minutes(item.source_end),
+                        _utc_offset_minutes(item.source_updated_at),
+                        item.measurement_local_day,
+                        item.provenance.source_name,
+                        item.provenance.source_version,
+                        item.provenance.device,
+                        item.reported_duration_minutes,
+                        item.distance_kilometers,
+                        item.active_energy_kilocalories,
+                    )
+                    for item in workouts
+                ],
+            )
+        previous_workouts = (
+            None
+            if active is None
+            else (
+                self._root / _PARQUET_DIRECTORY / "snapshots" / str(active[0]) / "workouts.parquet"
+            )
+        )
+        if previous_workouts is None or not previous_workouts.exists():
+            self._query.execute(
+                "CREATE OR REPLACE TEMP TABLE workouts AS SELECT * FROM staged_workouts"
+            )
+            previous_workout_count = 0
+        else:
+            escaped_previous_workouts = str(previous_workouts).replace("'", "''")
+            self._query.execute(
+                f"""
+                CREATE OR REPLACE TEMP TABLE workouts AS
+                SELECT * EXCLUDE(source_priority, is_selected), row_number() OVER (
+                    PARTITION BY logical_workout_id
+                    ORDER BY source_updated_at_utc DESC, source_version DESC,
+                             workout_version_id DESC
+                ) = 1 AS is_selected
+                FROM (
+                    SELECT *, 0 AS source_priority FROM read_parquet('{escaped_previous_workouts}')
+                    UNION ALL BY NAME SELECT *, 1 AS source_priority FROM staged_workouts
+                )
+                QUALIFY row_number() OVER (
+                    PARTITION BY workout_version_id ORDER BY source_priority
+                ) = 1
+                """
+            )
+            count_row = self._query.execute(
+                f"SELECT count(*) FROM read_parquet('{escaped_previous_workouts}')"
+            ).fetchone()
+            assert count_row is not None
+            previous_workout_count = int(count_row[0])
+        if previous_workouts is None or not previous_workouts.exists():
+            self._query.execute("ALTER TABLE workouts ADD COLUMN is_selected BOOLEAN DEFAULT true")
+        workout_count_row = self._query.execute(
+            "SELECT count(*), count(DISTINCT logical_workout_id) FROM workouts"
+        ).fetchone()
+        assert workout_count_row is not None
+        workout_version_count, workout_logical_count = map(int, workout_count_row)
         count_row = self._query.execute(
             "SELECT count(*), count(DISTINCT identity_candidate_id) FROM combined_samples"
         ).fetchone()
@@ -3210,9 +3345,12 @@ class LocalStore:
                     completed_at,
                 ),
             )
-            all_intervals: tuple[CanonicalHealthRecord | CanonicalSleepInterval, ...] = (
+            all_intervals: tuple[
+                CanonicalHealthRecord | CanonicalSleepInterval | CanonicalWorkout, ...
+            ] = (
                 *records,
                 *sleep_intervals,
+                *workouts,
             )
             self._record_import(
                 operation_id=operation_id,
@@ -3221,10 +3359,20 @@ class LocalStore:
                 snapshot_id=snapshot_id,
                 status="committed",
                 package_record_count=len(all_intervals),
-                record_count=new_record_count + sleep_version_count - previous_sleep_count,
+                record_count=(
+                    new_record_count
+                    + sleep_version_count
+                    - previous_sleep_count
+                    + workout_version_count
+                    - previous_workout_count
+                ),
                 records=all_intervals,
-                logical_measurement_count=logical_count + sleep_logical_count,
-                measurement_version_count=version_count + sleep_version_count,
+                logical_measurement_count=logical_count
+                + sleep_logical_count
+                + workout_logical_count,
+                measurement_version_count=version_count
+                + sleep_version_count
+                + workout_version_count,
                 source_occurrence_count=self._snapshot_occurrence_count(snapshot_id),
                 anomaly_count=resolution.anomaly_count,
                 unsupported_content=unsupported_content,
@@ -3867,7 +4015,7 @@ class LocalStore:
                 "files",
                 "validation_counts",
             }
-            or manifest["snapshot_schema_version"] != _SNAPSHOT_SCHEMA_VERSION
+            or manifest["snapshot_schema_version"] not in {1, _SNAPSHOT_SCHEMA_VERSION}
             or manifest["snapshot_id"] != snapshot_id
             or not _is_lower_hex(manifest["snapshot_id"], 32)
             or not _is_lower_hex(manifest["store_id"], 32)
@@ -3904,11 +4052,16 @@ class LocalStore:
             or any(type(value) is not int or value < 0 for value in validation_counts.values())
         ):
             raise StoreError("Snapshot-Manifest ist nicht kanonisch oder gültig.")
+        schemas = (
+            _LEGACY_SNAPSHOT_SCHEMAS
+            if manifest["snapshot_schema_version"] == 1
+            else _SNAPSHOT_SCHEMAS
+        )
         files = manifest["files"]
         if (
             not isinstance(files, list)
             or any(not isinstance(entry, dict) for entry in files)
-            or tuple(entry.get("name") for entry in files) != tuple(sorted(_SNAPSHOT_SCHEMAS))
+            or tuple(entry.get("name") for entry in files) != tuple(sorted(schemas))
         ):
             raise StoreError("Snapshot enthält nicht genau vier geschlossene Dateien.")
         for entry in files:
@@ -3953,7 +4106,7 @@ class LocalStore:
                 json.dumps(description, separators=(",", ":")).encode()
             ).hexdigest()
             if (
-                description != _SNAPSHOT_SCHEMAS[filename]
+                description != schemas[filename]
                 or row is None
                 or int(row[0]) != entry["row_count"]
                 or allocated_bytes != entry["allocated_bytes"]
@@ -3963,7 +4116,7 @@ class LocalStore:
                 raise StoreError("Snapshot-Dateivalidierung fehlgeschlagen.")
         if {path.name for path in directory.iterdir()} != {
             "manifest.json",
-            *_SNAPSHOT_SCHEMAS,
+            *schemas,
         }:
             raise StoreError("Snapshot enthält unerlaubte Artefakte.")
         paths = {
@@ -4257,7 +4410,7 @@ class LocalStore:
         status: Literal["committed", "duplicate"],
         package_record_count: int,
         record_count: int,
-        records: tuple[CanonicalHealthRecord | CanonicalSleepInterval, ...],
+        records: tuple[CanonicalHealthRecord | CanonicalSleepInterval | CanonicalWorkout, ...],
         logical_measurement_count: int,
         measurement_version_count: int,
         source_occurrence_count: int,
@@ -4285,7 +4438,17 @@ class LocalStore:
         )
         self._metadata.executemany(
             "INSERT OR IGNORE INTO import_measurement_versions VALUES (?, ?)",
-            {(str(import_id), str(record.measurement_version_id)) for record in records},
+            {
+                (
+                    str(import_id),
+                    str(
+                        record.workout_version_id
+                        if isinstance(record, CanonicalWorkout)
+                        else record.measurement_version_id
+                    ),
+                )
+                for record in records
+            },
         )
         self._metadata.execute(
             "INSERT INTO import_canonical_counts VALUES (?, ?, ?, ?, ?)",
@@ -4370,7 +4533,15 @@ class LocalStore:
             f"SELECT count(*) FROM read_parquet('{escaped_sleep_path}')"
         ).fetchone()
         assert sleep_row is not None
-        return int(row[0]) + int(sleep_row[0])
+        workouts_path = path.with_name("workouts.parquet")
+        if not workouts_path.exists():
+            return int(row[0]) + int(sleep_row[0])
+        escaped_workouts_path = str(workouts_path).replace("'", "''")
+        workout_row = self._query.execute(
+            f"SELECT count(*) FROM read_parquet('{escaped_workouts_path}')"
+        ).fetchone()
+        assert workout_row is not None
+        return int(row[0]) + int(sleep_row[0]) + int(workout_row[0])
 
     def publish_data_review_resolution(
         self,
@@ -5736,6 +5907,60 @@ class LocalStore:
                 device=str(row[12]),
                 strong_source_id_hash=None if row[13] is None else str(row[13]),
                 is_selected=bool(row[14]),
+            )
+            for row in rows
+        )
+
+    def load_workouts(
+        self, snapshot_id: SnapshotId | None, start_date: date | None, end_date: date | None
+    ) -> tuple[SnapshotId | None, tuple[StoredWorkout, ...]]:
+        self._require_open()
+        selected_snapshot = snapshot_id or self.load_active_snapshot_id()
+        if selected_snapshot is None:
+            return None, ()
+        path = (
+            self._root
+            / _PARQUET_DIRECTORY
+            / "snapshots"
+            / str(selected_snapshot)
+            / "workouts.parquet"
+        )
+        if not path.exists():
+            return selected_snapshot, ()
+        clauses, parameters = [], []
+        if start_date is not None:
+            clauses.append("measurement_local_date >= ?")
+            parameters.append(start_date)
+        if end_date is not None:
+            clauses.append("measurement_local_date <= ?")
+            parameters.append(end_date)
+        escaped = str(path).replace("'", "''")
+        where = "" if not clauses else " WHERE " + " AND ".join(clauses)
+        rows = self._query.execute(
+            f"SELECT * FROM read_parquet('{escaped}'){where} "
+            "ORDER BY measurement_local_date, source_start_utc, workout_version_id",
+            parameters,
+        ).fetchall()
+
+        def local_time(value: str, offset: int) -> datetime:
+            return datetime.fromisoformat(value).astimezone(timezone(timedelta(minutes=offset)))
+
+        return selected_snapshot, tuple(
+            StoredWorkout(
+                LogicalMeasurementId(str(row[1])),
+                MeasurementVersionId(str(row[0])),
+                str(row[2]),
+                local_time(str(row[3]), int(row[6])),
+                local_time(str(row[4]), int(row[7])),
+                local_time(str(row[5]), int(row[8])),
+                row[9],
+                str(row[10]),
+                str(row[11]),
+                str(row[12]),
+                None if row[13] is None else float(row[13]),
+                None if row[14] is None else float(row[14]),
+                None if row[15] is None else float(row[15]),
+                bool(row[16]),
             )
             for row in rows
         )

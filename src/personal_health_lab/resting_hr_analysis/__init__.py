@@ -330,8 +330,7 @@ def _fit(
     selected_resting_days = {
         day
         for day in resting
-        if (start_date is None or day >= start_date)
-        and (end_date is None or day <= end_date)
+        if (start_date is None or day >= start_date) and (end_date is None or day <= end_date)
     }
     input_completeness = len(rows) / len(selected_resting_days)
     bootstrap_success_rate = len(bootstrap) / definition.bootstrap_resamples
@@ -432,9 +431,7 @@ def _fit(
             minimum_input_completeness=definition.minimum_input_completeness,
             max_feature_dependency=definition.max_feature_dependency,
             minimum_bootstrap_success_rate=definition.minimum_bootstrap_success_rate,
-            minimum_outcome_standard_deviation=(
-                definition.minimum_outcome_standard_deviation
-            ),
+            minimum_outcome_standard_deviation=(definition.minimum_outcome_standard_deviation),
             maximum_time_series_gap_days=definition.maximum_time_series_gap_days,
         ),
     )
@@ -522,24 +519,20 @@ def _freeze_status_facts(
         ),
         ModelMaturityCriterion(
             ModelMaturityCriterionCode.OUTCOME_VARIATION,
-            diagnostics.outcome_standard_deviation
-            > methodology.minimum_outcome_standard_deviation,
+            diagnostics.outcome_standard_deviation > methodology.minimum_outcome_standard_deviation,
             diagnostics.outcome_standard_deviation,
             methodology.minimum_outcome_standard_deviation,
         ),
         ModelMaturityCriterion(
             ModelMaturityCriterionCode.TIME_SERIES_CONTINUITY,
-            diagnostics.maximum_time_series_gap_days
-            <= methodology.maximum_time_series_gap_days,
+            diagnostics.maximum_time_series_gap_days <= methodology.maximum_time_series_gap_days,
             float(diagnostics.maximum_time_series_gap_days),
             float(methodology.maximum_time_series_gap_days),
         ),
     )
     return replace(
         result,
-        data_status=(
-            DataQualityStatus.PROVISIONAL if reasons else DataQualityStatus.REVIEWED
-        ),
+        data_status=(DataQualityStatus.PROVISIONAL if reasons else DataQualityStatus.REVIEWED),
         data_status_reasons=tuple(reasons),
         maturity_criteria=criteria,
         reproducibility=(

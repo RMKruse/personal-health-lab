@@ -23,6 +23,7 @@ from personal_health_lab.health_data import (
     CanonicalSleepCategory,
     CanonicalSleepInterval,
     CanonicalUnit,
+    CanonicalWorkout,
     HealthProvenance,
     LogicalMeasurementId,
     MeasurementVersionId,
@@ -238,6 +239,7 @@ class _ParsedExport:
     export_date: datetime | None
     records: tuple[CanonicalHealthRecord, ...]
     sleep_intervals: tuple[CanonicalSleepInterval, ...] = ()
+    workouts: tuple[CanonicalWorkout, ...] = ()
     unknown_source_types: tuple[str, ...] = ()
     unsupported_content: tuple[UnsupportedImportContent, ...] = ()
 
@@ -308,6 +310,7 @@ def _records(
         raise _RejectedPackage("package too large")
     records: list[CanonicalHealthRecord] = []
     sleep_intervals: list[CanonicalSleepInterval] = []
+    workouts: list[CanonicalWorkout] = []
     unknown_source_types: set[str] = set()
     unsupported: Counter[tuple[str, str]] = Counter()
     with ZipFile(package_path) as archive:
@@ -369,7 +372,122 @@ def _records(
                 elif parent == "Workout" and element.tag != "MetadataEntry":
                     unsupported["workout_child", element.tag] += 1
                 elif parent == "HealthData" and element.tag == "Workout":
-                    unsupported["workout_activity_type", element.attrib["workoutActivityType"]] += 1
+                    attrs = element.attrib
+                    if (
+                        not {
+                            "workoutActivityType",
+                            "startDate",
+                            "endDate",
+                            "creationDate",
+                            "sourceName",
+                        }
+                        <= attrs.keys()
+                    ):
+                        unsupported[
+                            "workout_activity_type", attrs.get("workoutActivityType", "")
+                        ] += 1
+                        element.clear()
+                        tags.pop()
+                        continue
+                    source_start = _source_datetime(element.attrib["startDate"])
+                    source_end = _source_datetime(element.attrib["endDate"])
+                    source_updated_at = _source_datetime(element.attrib["creationDate"])
+                    source_name = element.attrib["sourceName"]
+                    source_version = element.attrib.get("sourceVersion", "")
+                    device = element.attrib.get("device", "")
+                    activity_type = element.attrib.get("workoutActivityType", "")
+                    if not activity_type:
+                        unsupported["workout_activity_type", ""] += 1
+                        element.clear()
+                        tags.pop()
+                        continue
+                    sync_id = next(
+                        (
+                            child.attrib.get("value")
+                            for child in element
+                            if child.tag == "MetadataEntry"
+                            and child.attrib.get("key") == _SYNC_IDENTIFIER
+                            and child.attrib.get("value")
+                        ),
+                        None,
+                    )
+                    strong_source_id_hash = None if sync_id is None else _id(source_name, sync_id)
+                    logical_id = LogicalMeasurementId(
+                        _id(_LOGICAL_IDENTITY_RULE_VERSION, "strong", strong_source_id_hash)
+                        if strong_source_id_hash is not None
+                        else _id(
+                            _LOGICAL_IDENTITY_RULE_VERSION,
+                            "natural",
+                            "Workout",
+                            source_start.isoformat(),
+                            source_end.isoformat(),
+                            source_name,
+                            device,
+                        )
+                    )
+
+                    def optional_value(
+                        attributes: dict[str, str],
+                        name: str,
+                        unit_name: str,
+                        units: dict[str, float],
+                    ) -> float | None:
+                        raw = attributes.get(name)
+                        if raw is None:
+                            return None
+                        unit = attributes.get(unit_name, "")
+                        if unit not in units:
+                            unsupported[
+                                "unit", json.dumps(["Workout", unit], separators=(",", ":"))
+                            ] += 1
+                            return None
+                        return float(raw) * units[unit]
+
+                    duration = optional_value(
+                        attrs, "duration", "durationUnit", {"min": 1.0, "s": 1 / 60}
+                    )
+                    distance = optional_value(
+                        attrs,
+                        "totalDistance",
+                        "totalDistanceUnit",
+                        {"m": 0.001, "km": 1.0, "mi": 1.609344},
+                    )
+                    energy = optional_value(
+                        attrs, "totalEnergyBurned", "totalEnergyBurnedUnit", {"kcal": 1.0}
+                    )
+                    version_id = MeasurementVersionId(
+                        _id(
+                            _PAYLOAD_IDENTITY_RULE_VERSION,
+                            logical_id,
+                            activity_type,
+                            duration,
+                            distance,
+                            energy,
+                            source_start.isoformat(),
+                            source_end.isoformat(),
+                            source_updated_at.isoformat(),
+                            source_name,
+                            source_version,
+                            device,
+                        )
+                    )
+                    workouts.append(
+                        CanonicalWorkout(
+                            logical_workout_id=logical_id,
+                            workout_version_id=version_id,
+                            original_activity_type=activity_type,
+                            source_start=source_start,
+                            source_end=source_end,
+                            source_updated_at=source_updated_at,
+                            measurement_local_day=source_start.date(),
+                            provenance=HealthProvenance(
+                                source_name, source_version, device, 0.0, "", strong_source_id_hash
+                            ),
+                            reported_duration_minutes=duration,
+                            distance_kilometers=distance,
+                            active_energy_kilocalories=energy,
+                        )
+                    )
                     element.clear()
                 elif parent == "HealthData" and element.tag == "Record":
                     source_type = element.attrib.get("type", "")
@@ -540,13 +658,20 @@ def _records(
                     unsupported["top_level_element", element.tag] += 1
                     element.clear()
                 tags.pop()
-    if not records and not sleep_intervals and not unknown_source_types and not unsupported:
+    if (
+        not records
+        and not sleep_intervals
+        and not workouts
+        and not unknown_source_types
+        and not unsupported
+    ):
         raise ValueError("no supported records")
     return _ParsedExport(
         export_digest.hexdigest(),
         export_date,
         tuple(records),
         tuple(sleep_intervals),
+        tuple(workouts),
         tuple(sorted(unknown_source_types)),
         tuple(
             UnsupportedImportContent(cast(UnsupportedContentCategory, category), identifier, count)
@@ -578,7 +703,8 @@ def estimate_health_export(
             max_compression_ratio=max_compression_ratio,
         )
         return HealthExportEstimate(
-            max(input_bytes, package_size), len(parsed.records) + len(parsed.sleep_intervals)
+            max(input_bytes, package_size),
+            len(parsed.records) + len(parsed.sleep_intervals) + len(parsed.workouts),
         )
     except (
         BadZipFile,
@@ -605,6 +731,7 @@ def _restore_exports(
     tuple[_ParsedExport, ...],
     tuple[CanonicalHealthRecord, ...],
     tuple[CanonicalSleepInterval, ...],
+    tuple[CanonicalWorkout, ...],
     int,
     tuple[tuple[str, datetime | None, str, tuple[CanonicalHealthRecord, ...]], ...],
 ]:
@@ -656,10 +783,16 @@ def _restore_exports(
         for export in reversed(exports)
         for interval in export.sleep_intervals
     }
+    workouts = {
+        str(workout.workout_version_id): workout
+        for export in reversed(exports)
+        for workout in export.workouts
+    }
     return (
         exports,
         tuple(records.values()),
         tuple(sleep_intervals.values()),
+        tuple(workouts.values()),
         sum(path.stat().st_size for path in packages.values()),
         tuple(
             (export.export_id, export.export_date, package_hash, export.records)
@@ -679,7 +812,7 @@ def inspect_restore_health_export(
     max_uncompressed_bytes: int,
     max_compression_ratio: float,
 ) -> RestoreHealthExportInspection:
-    _, records, sleep_intervals, input_bytes, _ = _restore_exports(
+    _, records, sleep_intervals, workouts, input_bytes, _ = _restore_exports(
         package_path,
         store=store,
         target_root=target_root,
@@ -690,7 +823,9 @@ def inspect_restore_health_export(
         max_compression_ratio=max_compression_ratio,
     )
     sources = inspect_restore_sources(store, target_root, records)
-    estimate = HealthExportEstimate(max(input_bytes, 1), len(records) + len(sleep_intervals))
+    estimate = HealthExportEstimate(
+        max(input_bytes, 1), len(records) + len(sleep_intervals) + len(workouts)
+    )
     return RestoreHealthExportInspection(
         estimate,
         sources,
@@ -730,7 +865,7 @@ def _import_restore_health_export(
             max_uncompressed_bytes=max_uncompressed_bytes,
             max_compression_ratio=max_compression_ratio,
         )
-        exports, records, sleep_intervals, _, restore_exports = _restore_exports(
+        exports, records, sleep_intervals, workouts, _, restore_exports = _restore_exports(
             package_path,
             store=store,
             target_root=target_root,
@@ -771,7 +906,9 @@ def _import_restore_health_export(
             package_hash,
             None,
             0,
-            package_record_count=len(current.records) + len(current.sleep_intervals),
+            package_record_count=len(current.records)
+            + len(current.sleep_intervals)
+            + len(current.workouts),
             logical_measurement_count=len(
                 {str(record.logical_measurement_id) for record in records}
             ),
@@ -825,6 +962,7 @@ def _import_restore_health_export(
             export_date=export_date,
             records=records,
             sleep_intervals=sleep_intervals,
+            workouts=workouts,
             unknown_source_types=tuple(
                 sorted(
                     {
@@ -852,7 +990,9 @@ def _import_restore_health_export(
         package_hash,
         published.snapshot_id,
         published.record_count,
-        package_record_count=len(current.records) + len(current.sleep_intervals),
+        package_record_count=len(current.records)
+        + len(current.sleep_intervals)
+        + len(current.workouts),
         logical_measurement_count=published.logical_measurement_count,
         measurement_version_count=published.measurement_version_count,
         source_occurrence_count=published.source_occurrence_count,
@@ -952,6 +1092,7 @@ def import_health_export(
                 export_date=parsed.export_date,
                 records=parsed.records,
                 sleep_intervals=parsed.sleep_intervals,
+                workouts=parsed.workouts,
                 unknown_source_types=parsed.unknown_source_types,
                 unsupported_content=parsed.unsupported_content,
                 governing_export_id=governing_export_id,
@@ -975,7 +1116,9 @@ def import_health_export(
                 package_hash=package_hash,
                 snapshot_id=None,
                 record_count=0,
-                package_record_count=len(parsed.records) + len(parsed.sleep_intervals),
+                package_record_count=len(parsed.records)
+                + len(parsed.sleep_intervals)
+                + len(parsed.workouts),
                 diagnostics=(diagnostic,),
             )
     except StoreError as error:
@@ -987,7 +1130,9 @@ def import_health_export(
         package_hash=package_hash,
         snapshot_id=published.snapshot_id,
         record_count=published.record_count,
-        package_record_count=len(parsed.records) + len(parsed.sleep_intervals),
+        package_record_count=len(parsed.records)
+        + len(parsed.sleep_intervals)
+        + len(parsed.workouts),
         logical_measurement_count=published.logical_measurement_count,
         measurement_version_count=published.measurement_version_count,
         source_occurrence_count=published.source_occurrence_count,

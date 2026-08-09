@@ -16,6 +16,9 @@
       "$ref": "#/$defs/activityDaysOutput"
     },
     {
+      "$ref": "#/$defs/workoutsOutput"
+    },
+    {
       "$ref": "#/$defs/writePlanOutput"
     },
     {
@@ -81,6 +84,21 @@
         "schema_version": { "const": "3.0" },
         "selection": { "type": "object" },
         "snapshot_ref": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "workoutsOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["aggregates", "kind", "runtime_config", "schema_version", "selection", "snapshot_ref", "status", "workouts"],
+      "properties": {
+        "aggregates": { "type": "array", "items": { "type": "object" } },
+        "kind": { "const": "workouts" },
+        "runtime_config": { "type": "object" },
+        "schema_version": { "const": "3.0" },
+        "selection": { "type": "object" },
+        "snapshot_ref": { "$ref": "#/$defs/nullableString" },
+        "status": { "type": "string" },
+        "workouts": { "type": "array", "items": { "type": "object" } }
       }
     },
     "nullableString": {

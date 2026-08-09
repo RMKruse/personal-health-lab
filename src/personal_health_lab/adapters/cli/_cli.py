@@ -90,6 +90,7 @@ from personal_health_lab.application import (
     StoreMigrationPlan,
     StoreMigrationReceipt,
     WeightNutrition,
+    Workouts,
     WorkspaceStatus,
     WriteApprovalStatus,
     WriteBatchDecisionReceipt,
@@ -152,6 +153,11 @@ def _parser() -> argparse.ArgumentParser:
     activity.add_argument("--start-date", type=date.fromisoformat)
     activity.add_argument("--end-date", type=date.fromisoformat)
     activity.add_argument("--json", action="store_true", dest="as_json")
+    workouts = commands.add_parser("workouts", help="Trainingseinheiten laden")
+    workouts.add_argument("--snapshot", type=SnapshotRef)
+    workouts.add_argument("--start-date", type=date.fromisoformat)
+    workouts.add_argument("--end-date", type=date.fromisoformat)
+    workouts.add_argument("--json", action="store_true", dest="as_json")
     analysis = commands.add_parser("analyze", help="Verzögerungsprofil analysieren")
     analysis.add_argument("--definition", default="lag-signal-v2")
     analysis.add_argument("--start-date", type=date.fromisoformat)
@@ -767,6 +773,60 @@ def _activity_days_json(
     }
 
 
+def _workouts_json(
+    projection: Workouts,
+    selection: SnapshotDateSelection,
+    runtime_config: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        "aggregates": [
+            {
+                "active_energy_kilocalories": item.active_energy_kilocalories,
+                "day": item.day.isoformat(),
+                "distance_kilometers": item.distance_kilometers,
+                "duration_minutes": item.duration_minutes,
+                "original_activity_type": item.original_activity_type,
+                "review_case_ids": [str(value) for value in item.review_case_ids],
+                "workout_count": item.workout_count,
+            }
+            for item in projection.aggregates
+        ],
+        "kind": "workouts",
+        "runtime_config": dict(runtime_config),
+        "schema_version": _OUTPUT_SCHEMA_VERSION,
+        "selection": {
+            "end_date": None if selection.end_date is None else selection.end_date.isoformat(),
+            "snapshot_ref": None if selection.snapshot_ref is None else str(selection.snapshot_ref),
+            "start_date": None
+            if selection.start_date is None
+            else selection.start_date.isoformat(),
+        },
+        "snapshot_ref": None if projection.snapshot_ref is None else str(projection.snapshot_ref),
+        "status": projection.status.value,
+        "workouts": [
+            {
+                "active_energy_kilocalories": item.active_energy_kilocalories,
+                "device": item.device,
+                "distance_kilometers": item.distance_kilometers,
+                "effective_duration_minutes": item.effective_duration_minutes,
+                "is_selected": item.is_selected,
+                "logical_workout_id": str(item.logical_workout_id),
+                "measurement_local_day": item.measurement_local_day.isoformat(),
+                "original_activity_type": item.original_activity_type,
+                "reported_duration_minutes": item.reported_duration_minutes,
+                "review_case_ids": [str(value) for value in item.review_case_ids],
+                "source_end": item.source_end.isoformat(),
+                "source_name": item.source_name,
+                "source_start": item.source_start.isoformat(),
+                "source_updated_at": item.source_updated_at.isoformat(),
+                "source_version": item.source_version,
+                "workout_version_id": str(item.workout_version_id),
+            }
+            for item in projection.workouts
+        ],
+    }
+
+
 def _recovery_status_json(
     status: RecoveryStatus,
     runtime_config: Mapping[str, object],
@@ -1303,6 +1363,11 @@ def main(args: Sequence[str] | None = None) -> int:
                     parsed.snapshot, parsed.start_date, parsed.end_date
                 )
                 activity_days = health_lab.load_activity_days(activity_selection)
+            elif parsed.command == "workouts":
+                workout_selection = SnapshotDateSelection(
+                    parsed.snapshot, parsed.start_date, parsed.end_date
+                )
+                workout_projection = health_lab.load_workouts(workout_selection)
             elif parsed.command == "restore":
                 restore_request = BeginMetadataRestore(parsed.backup)
                 restore_plan = health_lab.preview_write(restore_request)
@@ -1748,11 +1813,30 @@ def main(args: Sequence[str] | None = None) -> int:
                 sort_keys=True,
             )
         )
+    elif parsed.command == "workouts" and parsed.as_json:
+        print(
+            json.dumps(
+                _workouts_json(workout_projection, workout_selection, runtime_config),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    elif parsed.command == "workouts":
+        print("Trainingseinheiten")
+        print(
+            f"Snapshot: {workout_projection.snapshot_ref or '-'} · "
+            f"Status: {workout_projection.status.value}"
+        )
+        for workout in workout_projection.workouts:
+            print(
+                f"{workout.original_activity_type} · {workout.effective_duration_minutes} min · "
+                f"Start: {workout.source_start.isoformat()} · "
+                f"Ende: {workout.source_end.isoformat()}"
+            )
     elif parsed.command == "activity-days":
         print("Aktivitätstage")
         print(
-            f"Snapshot: {activity_days.snapshot_ref or '-'} · "
-            f"Status: {activity_days.status.value}"
+            f"Snapshot: {activity_days.snapshot_ref or '-'} · Status: {activity_days.status.value}"
         )
 
         def value_or_dash(value: float | None) -> float | str:

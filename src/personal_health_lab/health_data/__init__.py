@@ -229,6 +229,42 @@ class CanonicalSleepInterval:
 
 
 @dataclass(frozen=True, slots=True)
+class CanonicalWorkout:
+    logical_workout_id: LogicalMeasurementId
+    workout_version_id: MeasurementVersionId
+    original_activity_type: str
+    source_start: datetime
+    source_end: datetime
+    source_updated_at: datetime
+    measurement_local_day: date
+    provenance: HealthProvenance
+    reported_duration_minutes: float | None = None
+    distance_kilometers: float | None = None
+    active_energy_kilocalories: float | None = None
+
+    def __post_init__(self) -> None:
+        if not self.original_activity_type or self.source_end < self.source_start:
+            raise ValueError("Ungültige kanonische Trainingseinheit.")
+        if (
+            any(
+                timestamp.tzinfo is None
+                for timestamp in (self.source_start, self.source_end, self.source_updated_at)
+            )
+            or self.measurement_local_day != self.source_start.date()
+        ):
+            raise ValueError("Ungültige Trainingszeitpunkte.")
+        if any(
+            value is not None and not math.isfinite(value)
+            for value in (
+                self.reported_duration_minutes,
+                self.distance_kilometers,
+                self.active_energy_kilocalories,
+            )
+        ):
+            raise ValueError("Ungültige Trainingswerte.")
+
+
+@dataclass(frozen=True, slots=True)
 class CanonicalHealthRecord:
     logical_measurement_id: LogicalMeasurementId
     measurement_version_id: MeasurementVersionId
@@ -282,6 +318,7 @@ __all__ = [
     "CanonicalSleepCategory",
     "CanonicalSleepInterval",
     "CanonicalUnit",
+    "CanonicalWorkout",
     "DailyHealthSeries",
     "DailyHealthValue",
     "DataQualityStatus",

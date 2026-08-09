@@ -532,6 +532,64 @@ def _render_activity_days(config: RuntimeConfig) -> None:
     )
 
 
+def _render_workouts(config: RuntimeConfig) -> None:
+    st.subheader("Trainingseinheiten")
+    snapshot = st.text_input("Trainings-Snapshot-ID (optional)")
+    start = st.date_input("Training von", value=None)
+    end = st.date_input("Training bis", value=None)
+    if st.button("Training laden"):
+        try:
+            assert start is None or isinstance(start, date)
+            assert end is None or isinstance(end, date)
+            st.session_state["workout_selection"] = SnapshotDateSelection(
+                SnapshotRef(snapshot) if snapshot else None, start, end
+            )
+        except (ValueError, ConfigurationError, HealthLabError):
+            st.error("Trainingseinheiten konnten nicht geladen werden.")
+    selection = st.session_state.get("workout_selection")
+    if not isinstance(selection, SnapshotDateSelection):
+        return
+    try:
+        with HealthLab.open(config) as health_lab:
+            projection = health_lab.load_workouts(selection)
+    except (ConfigurationError, HealthLabError):
+        st.error("Trainingseinheiten konnten nicht geladen werden.")
+        return
+    st.caption(f"Snapshot: {projection.snapshot_ref or '-'} · Status: {projection.status.value}")
+    st.dataframe(
+        [
+            {
+                "Aktivitätstyp": item.original_activity_type,
+                "Beginn": item.source_start.isoformat(),
+                "Ende": item.source_end.isoformat(),
+                "Gemeldete Dauer (min)": item.reported_duration_minutes,
+                "Effektive Dauer (min)": item.effective_duration_minutes,
+                "Distanz (km)": item.distance_kilometers,
+                "Aktive Energie (kcal)": item.active_energy_kilocalories,
+                "Ausgewählt": item.is_selected,
+                "Prüffälle": [str(value) for value in item.review_case_ids],
+            }
+            for item in projection.workouts
+        ],
+        width="stretch",
+    )
+    st.dataframe(
+        [
+            {
+                "Tag": item.day.isoformat(),
+                "Aktivitätstyp": item.original_activity_type,
+                "Anzahl": item.workout_count,
+                "Dauer (min)": item.duration_minutes,
+                "Distanz (km)": item.distance_kilometers,
+                "Aktive Energie (kcal)": item.active_energy_kilocalories,
+                "Prüffälle": [str(value) for value in item.review_case_ids],
+            }
+            for item in projection.aggregates
+        ],
+        width="stretch",
+    )
+
+
 def _discard_pending_previews() -> None:
     import_request = st.session_state.get("import_request")
     if isinstance(import_request, ImportHealthExport):
@@ -711,6 +769,7 @@ if st.session_state["active_page"] == "Kerndaten":
     _render_weight_nutrition(config)
     _render_sleep_days(config)
     _render_activity_days(config)
+    _render_workouts(config)
     _render_import_details(config)
     st.stop()
 

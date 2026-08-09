@@ -243,18 +243,14 @@ def _canonical_hash(
         for row in connection.execute(
             f"SELECT {order} FROM {_quoted(table)} ORDER BY {order}"
         ).fetchall():
-            digest.update(
-                json.dumps(row, separators=(",", ":"), ensure_ascii=False).encode()
-            )
+            digest.update(json.dumps(row, separators=(",", ":"), ensure_ascii=False).encode())
     return digest.hexdigest()
 
 
 def _audit_is_valid(connection: sqlite3.Connection, audit_max: int) -> bool:
     tables = {
         str(row[0])
-        for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-        )
+        for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
     restored_count = (
         "+ count(restored_publications.audit_event_id) "
@@ -272,14 +268,11 @@ def _audit_is_valid(connection: sqlite3.Connection, audit_max: int) -> bool:
         "count(import_publications.audit_event_id) "
         "+ count(data_review_decisions.audit_event_id) "
         "+ count(metadata_tombstones.audit_event_id) "
-        "+ count(migration_publications.audit_event_id) "
-        + restored_count
-        + "FROM audit_events "
+        "+ count(migration_publications.audit_event_id) " + restored_count + "FROM audit_events "
         "LEFT JOIN import_publications USING (audit_event_id) "
         "LEFT JOIN data_review_decisions USING (audit_event_id) "
         "LEFT JOIN metadata_tombstones USING (audit_event_id) "
-        "LEFT JOIN migration_publications USING (audit_event_id) "
-        + restored_join
+        "LEFT JOIN migration_publications USING (audit_event_id) " + restored_join
     )
     audit = connection.execute(audit_query).fetchone()
     if audit is None or tuple(map(int, audit)) != (audit_max, 1, audit_max, audit_max):
@@ -353,11 +346,7 @@ def _source(store: LocalStore) -> sqlite3.Connection:
                     str(fact.snapshot_id),
                     fact.schema_version,
                     str(fact.created_by_operation_id),
-                    (
-                        None
-                        if fact.parent_snapshot_id is None
-                        else str(fact.parent_snapshot_id)
-                    ),
+                    (None if fact.parent_snapshot_id is None else str(fact.parent_snapshot_id)),
                     fact.created_at_utc.isoformat(),
                 )
                 for fact in store.load_backup_snapshot_facts()
@@ -403,11 +392,7 @@ def _source(store: LocalStore) -> sqlite3.Connection:
                     fact.rule_version_id,
                     fact.evidence_fingerprint,
                     fact.source_type,
-                    (
-                        None
-                        if fact.measured_at_utc is None
-                        else fact.measured_at_utc.isoformat()
-                    ),
+                    (None if fact.measured_at_utc is None else fact.measured_at_utc.isoformat()),
                     fact.effective_value,
                     fact.effective_value_source,
                     fact.canonical_unit,
@@ -633,9 +618,7 @@ def _read_restore_backup(path: Path) -> tuple[BackupId, StoreId, str, int, int]:
                 )
             }
             content_tables = (
-                _CONTENT_TABLES
-                if set(_CONTENT_TABLES) <= tables
-                else _LEGACY_CONTENT_TABLES
+                _CONTENT_TABLES if set(_CONTENT_TABLES) <= tables else _LEGACY_CONTENT_TABLES
             )
             expected_tables = {*content_tables, "backup_manifest"}
             if schema_version >= 2:
@@ -896,9 +879,7 @@ def preflight_restore_source_import(
                 None
                 if snapshot.estimate_bytes is None
                 else _round_up(
-                    snapshot.estimate_bytes
-                    + overlay_allocation
-                    + _DIRECTORY_OVERHEAD,
+                    snapshot.estimate_bytes + overlay_allocation + _DIRECTORY_OVERHEAD,
                     fragment_size,
                 )
             )
@@ -982,6 +963,7 @@ def restore_source_resolver(path: Path) -> SourceResolver:
             )
             for row in backup.execute("SELECT * FROM open_review_overlay_facts").fetchall()
         )
+
     def resolve_restored_sources(
         *,
         occurrences: tuple[SourceOccurrenceFact, ...],
@@ -1081,8 +1063,7 @@ def _migrate_restore_working_copy(path: Path, inspection: MetadataRestoreInspect
                     )
                 migrated_hash = _canonical_hash(working)
                 working.execute(
-                    "UPDATE backup_manifest SET canonical_content_sha256 = ? "
-                    "WHERE singleton = 1",
+                    "UPDATE backup_manifest SET canonical_content_sha256 = ? WHERE singleton = 1",
                     (migrated_hash,),
                 )
                 working.execute(

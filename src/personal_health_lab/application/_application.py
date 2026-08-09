@@ -539,6 +539,45 @@ class ActivityDays:
     measurements: tuple[ActivityMeasurement, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class Workout:
+    logical_workout_id: LogicalMeasurementId
+    workout_version_id: MeasurementVersionId
+    original_activity_type: str
+    source_start: datetime
+    source_end: datetime
+    source_updated_at: datetime
+    measurement_local_day: date
+    source_name: str
+    source_version: str
+    device: str
+    reported_duration_minutes: float | None
+    effective_duration_minutes: float
+    distance_kilometers: float | None
+    active_energy_kilocalories: float | None
+    is_selected: bool
+    review_case_ids: tuple[DataReviewCaseId, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkoutAggregate:
+    day: date
+    original_activity_type: str
+    workout_count: int
+    duration_minutes: float
+    distance_kilometers: float | None
+    active_energy_kilocalories: float | None
+    review_case_ids: tuple[DataReviewCaseId, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Workouts:
+    snapshot_ref: SnapshotRef | None
+    status: DataQualityStatus
+    workouts: tuple[Workout, ...]
+    aggregates: tuple[WorkoutAggregate, ...]
+
+
 _ACTIVITY_TYPES = {CanonicalHealthType(item.value): item for item in ActivityMetric}
 
 
@@ -4107,6 +4146,134 @@ class HealthLab:
             ),
             days=tuple(days),
             measurements=measurements,
+        )
+
+    def load_workouts(self, selection: SnapshotDateSelection) -> Workouts:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        try:
+            snapshot_ref, stored = self._store.load_workouts(
+                selection.snapshot_ref, selection.start_date, selection.end_date
+            )
+        except StoreError as error:
+            raise HealthLabError("Trainingsprojektion ist nicht verfügbar.") from error
+        overlaps: dict[str, set[DataReviewCaseId]] = {
+            str(item.workout_version_id): set() for item in stored
+        }
+        for item in stored:
+            elapsed_minutes = (item.source_end - item.source_start).total_seconds() / 60
+            invalid_duration = item.reported_duration_minutes is not None and not (
+                0 <= item.reported_duration_minutes <= elapsed_minutes
+            )
+            negative_total = (
+                item.distance_kilometers is not None and item.distance_kilometers < 0
+            ) or (
+                item.active_energy_kilocalories is not None and item.active_energy_kilocalories < 0
+            )
+            if invalid_duration or negative_total:
+                overlaps[str(item.workout_version_id)].add(
+                    DataReviewCaseId(
+                        hashlib.sha256(
+                            f"workout_plausibility:{item.workout_version_id}".encode()
+                        ).hexdigest()[:32]
+                    )
+                )
+        selected = [item for item in stored if item.is_selected]
+        for index, first in enumerate(selected):
+            for second in selected[index + 1 :]:
+                if (
+                    first.logical_workout_id != second.logical_workout_id
+                    and first.source_start < second.source_end
+                    and second.source_start < first.source_end
+                ):
+                    logical_ids = sorted(
+                        (str(first.logical_workout_id), str(second.logical_workout_id))
+                    )
+                    case_id = DataReviewCaseId(
+                        hashlib.sha256(
+                            f"workout_overlap:{':'.join(logical_ids)}".encode()
+                        ).hexdigest()[:32]
+                    )
+                    overlaps[str(first.workout_version_id)].add(case_id)
+                    overlaps[str(second.workout_version_id)].add(case_id)
+        workouts = tuple(
+            Workout(
+                item.logical_workout_id,
+                item.workout_version_id,
+                item.original_activity_type,
+                item.source_start,
+                item.source_end,
+                item.source_updated_at,
+                item.measurement_local_day,
+                item.source_name,
+                item.source_version,
+                item.device,
+                item.reported_duration_minutes,
+                (item.source_end - item.source_start).total_seconds() / 60
+                if item.reported_duration_minutes is None
+                else item.reported_duration_minutes,
+                item.distance_kilometers,
+                item.active_energy_kilocalories,
+                item.is_selected,
+                tuple(sorted(overlaps[str(item.workout_version_id)], key=str)),
+            )
+            for item in stored
+        )
+        aggregates = []
+        for day, activity_type in sorted(
+            {(item.measurement_local_day, item.original_activity_type) for item in workouts}
+        ):
+            contributors = tuple(
+                item
+                for item in workouts
+                if item.is_selected
+                and (item.measurement_local_day, item.original_activity_type)
+                == (day, activity_type)
+            )
+            if contributors:
+                aggregates.append(
+                    WorkoutAggregate(
+                        day,
+                        activity_type,
+                        len(contributors),
+                        sum(item.effective_duration_minutes for item in contributors),
+                        (
+                            sum(
+                                item.distance_kilometers
+                                for item in contributors
+                                if item.distance_kilometers is not None
+                            )
+                            if any(item.distance_kilometers is not None for item in contributors)
+                            else None
+                        ),
+                        (
+                            sum(
+                                item.active_energy_kilocalories
+                                for item in contributors
+                                if item.active_energy_kilocalories is not None
+                            )
+                            if any(
+                                item.active_energy_kilocalories is not None for item in contributors
+                            )
+                            else None
+                        ),
+                        tuple(
+                            sorted(
+                                {case for item in contributors for case in item.review_case_ids},
+                                key=str,
+                            )
+                        ),
+                    )
+                )
+        return Workouts(
+            snapshot_ref,
+            DataQualityStatus.PROVISIONAL
+            if any(item.review_case_ids for item in workouts)
+            else DataQualityStatus.REVIEWED,
+            workouts,
+            tuple(aggregates),
         )
 
     def load_sleep_days(self, selection: SnapshotDateSelection) -> SleepDays:

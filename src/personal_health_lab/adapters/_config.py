@@ -83,8 +83,6 @@ def load_runtime_config(
         else Path(_text_value(synthetic_value, "synthetic_store"))
     )
     real_store = (
-        real_value
-        if isinstance(real_value, Path)
-        else Path(_text_value(real_value, "real_store"))
+        real_value if isinstance(real_value, Path) else Path(_text_value(real_value, "real_store"))
     )
     return RuntimeConfig(mode=mode, synthetic_store=synthetic_store, real_store=real_store)

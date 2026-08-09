@@ -385,9 +385,7 @@ def resolve_sources(
         if source.logical_measurement_id == previous.logical_measurement_id
         and source.selected_measurement_version_id != previous.selected_measurement_version_id
     )
-    continued_version_ids = {
-        str(case.measurement_version_id) for case in continued_overrides
-    }
+    continued_version_ids = {str(case.measurement_version_id) for case in continued_overrides}
     plausibility_cases = tuple(
         case
         for case in _plausibility_cases(
@@ -416,9 +414,7 @@ def resolve_sources(
         *(_unknown_rule_case(source_type) for source_type in sorted(set(unknown_source_types))),
     )
     previous_case_ids = {item.review_case_id for item in previous_review_cases}
-    continued_logical_ids = {
-        str(case.logical_measurement_id) for case in continued_overrides
-    }
+    continued_logical_ids = {str(case.logical_measurement_id) for case in continued_overrides}
     cases_by_id = {
         item.review_case_id: item
         for item in previous_review_cases
@@ -504,10 +500,7 @@ def _plausibility_cases(
             else measurement.effective_value
         )
         reasons = list(_plausibility_reasons(rule, effective_value, version.canonical_unit))
-        if (
-            rule.personal_range_enabled
-            and version.canonical_type == "apple_resting_heart_rate"
-        ):
+        if rule.personal_range_enabled and version.canonical_type == "apple_resting_heart_rate":
             personal_bounds = _personal_bounds(
                 rule,
                 version.measurement_local_date,
@@ -552,9 +545,7 @@ def _preferred_daily_weight_conflicts(
     version_by_id: dict[str, MeasurementVersionFact],
     measurements: tuple[ResolvedMeasurement, ...],
 ) -> tuple[OpenDataReviewCase, ...]:
-    by_day: dict[date, list[tuple[MeasurementVersionFact, ResolvedMeasurement]]] = defaultdict(
-        list
-    )
+    by_day: dict[date, list[tuple[MeasurementVersionFact, ResolvedMeasurement]]] = defaultdict(list)
     for measurement in measurements:
         if measurement.effective_value is None:
             continue
@@ -1109,11 +1100,7 @@ def load_review_case_detail(store: LocalStore, review_case_id: str) -> ReviewCas
         reasons = (
             []
             if rule is None
-            else list(
-                _plausibility_reasons(
-                    rule, version.canonical_value, version.canonical_unit
-                )
-            )
+            else list(_plausibility_reasons(rule, version.canonical_value, version.canonical_unit))
         )
         if rule is not None and version.canonical_type == "apple_resting_heart_rate":
             series = next(
@@ -1130,9 +1117,7 @@ def load_review_case_detail(store: LocalStore, review_case_id: str) -> ReviewCas
             personal_bounds = _personal_bounds(
                 rule,
                 version.measurement_local_date,
-                ()
-                if series is None
-                else tuple((item.day, item.value) for item in series.values),
+                () if series is None else tuple((item.day, item.value) for item in series.values),
                 version.canonical_unit,
             )
             reasons.extend(
@@ -1143,7 +1128,8 @@ def load_review_case_detail(store: LocalStore, review_case_id: str) -> ReviewCas
                     version.canonical_unit,
                     personal_bounds,
                 )
-                if reason.code in {
+                if reason.code
+                in {
                     "below_personal_lower_bound",
                     "above_personal_upper_bound",
                 }
@@ -1152,9 +1138,7 @@ def load_review_case_detail(store: LocalStore, review_case_id: str) -> ReviewCas
             source_type=version.canonical_type,
             measured_at=datetime.fromisoformat(version.source_start_utc),
             effective_value=None if resolved is None else resolved.effective_value,
-            effective_value_source=(
-                None if resolved is None else resolved.effective_value_source
-            ),
+            effective_value_source=(None if resolved is None else resolved.effective_value_source),
             reasons=tuple(reasons),
             canonical_unit=version.canonical_unit,
         )
@@ -1289,8 +1273,7 @@ def _snapshot_review_detail(
         selected_on_day = daily.get(version.measurement_local_date)
         eligible = case.kind == "continued_override" or (
             selected_on_day is not None
-            and selected_on_day[1].selected_measurement_version_id
-            == version.measurement_version_id
+            and selected_on_day[1].selected_measurement_version_id == version.measurement_version_id
         )
         if eligible:
             personal_bounds = _personal_bounds(
@@ -1304,8 +1287,7 @@ def _snapshot_review_detail(
                 for reason in _plausibility_reasons(
                     rule, reason_value, version.canonical_unit, personal_bounds
                 )
-                if reason.code
-                in {"below_personal_lower_bound", "above_personal_upper_bound"}
+                if reason.code in {"below_personal_lower_bound", "above_personal_upper_bound"}
             )
     return ReviewCaseDetail(
         version.canonical_type,
@@ -1339,9 +1321,7 @@ def load_review_backup_facts(store: LocalStore) -> tuple[ReviewBackupFact, ...]:
         for snapshot in store.load_review_snapshot_facts()
         for case in sorted(snapshot.cases, key=lambda item: item.review_case_id)
         for detail in (
-            _snapshot_review_detail(
-                store, case, snapshot.versions, snapshot.measurements, rules
-            ),
+            _snapshot_review_detail(store, case, snapshot.versions, snapshot.measurements, rules),
         )
     )
 
