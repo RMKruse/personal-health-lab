@@ -3581,6 +3581,13 @@ class LocalStore:
                 "(SELECT version_id FROM activity_derivation_active WHERE singleton = 1))",
                 (str(snapshot_id),),
             )
+            if active is not None:
+                self._metadata.execute(
+                    "INSERT INTO manual_context_snapshot_bindings "
+                    "SELECT ?, revision_id FROM manual_context_snapshot_bindings "
+                    "WHERE snapshot_id = ?",
+                    (str(snapshot_id), str(active[0])),
+                )
             all_intervals: tuple[
                 CanonicalHealthRecord | CanonicalSleepInterval | CanonicalWorkout, ...
             ] = (

@@ -15,12 +15,12 @@ from personal_health_lab.application import (
 )
 
 
-def _package(path: Path) -> Path:
+def _package(path: Path, value: int = 1) -> Path:
     with ZipFile(path, "w") as archive:
         archive.writestr(
             "apple_health_export/export.xml",
-            """<HealthData><ExportDate value="2024-01-03 12:00:00 +0100"/>
-            <Record type="HKQuantityTypeIdentifierStepCount" unit="count" value="1"
+            f"""<HealthData><ExportDate value="2024-01-03 12:00:00 +0100"/>
+            <Record type="HKQuantityTypeIdentifierStepCount" unit="count" value="{value}"
             sourceName="Apple Watch" sourceVersion="1" device="Apple Watch"
             creationDate="2024-01-02 12:00:00 +0100"
             startDate="2024-01-02 12:00:00 +0100" endDate="2024-01-02 12:01:00 +0100"/>
@@ -48,7 +48,7 @@ def test_context_coverage_start_publishes_an_immutable_snapshot_and_baseline(
         )
         records = health_lab.load_context_records()
         audit = health_lab.load_context_audit(receipt.result.logical_id)
-        later_import = ImportHealthExport(_package(tmp_path / "later-export.zip"))
+        later_import = ImportHealthExport(_package(tmp_path / "later-export.zip", value=2))
         health_lab.execute_write(
             later_import, expected_plan=health_lab.preview_write(later_import).fingerprint
         )
