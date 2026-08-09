@@ -5639,8 +5639,9 @@ class LocalStore:
                     assert corrected_value is not None
                     self._query.execute(
                         "UPDATE resolved_workouts SET disposition = 'included_correction', "
-                        "effective_duration_minutes = ?, distance_kilometers = ?, "
-                        "active_energy_kilocalories = ?, effective_decision_id = ? "
+                        "effective_duration_minutes = ?, distance_kilometers = "
+                        "COALESCE(?, distance_kilometers), active_energy_kilocalories = "
+                        "COALESCE(?, active_energy_kilocalories), effective_decision_id = ? "
                         "WHERE logical_workout_id = ? AND selected_workout_version_id = ?",
                         (
                             corrected_value,
@@ -6195,9 +6196,13 @@ class LocalStore:
         links_path = path.parent / "workout_review_links.parquet"
         if links_path.exists():
             escaped_links = str(links_path).replace("'", "''")
+            review_path = path.parent / "open_review_cases.parquet"
+            escaped_reviews = str(review_path).replace("'", "''")
             grouped: dict[str, list[ReviewCaseId]] = {}
             for case_id, version_id in self._query.execute(
-                f"SELECT review_case_id, workout_version_id FROM read_parquet('{escaped_links}')"
+                f"SELECT links.review_case_id, links.workout_version_id "
+                f"FROM read_parquet('{escaped_links}') AS links JOIN "
+                f"read_parquet('{escaped_reviews}') AS reviews USING (review_case_id)"
             ).fetchall():
                 grouped.setdefault(str(version_id), []).append(ReviewCaseId(str(case_id)))
             review_cases = {

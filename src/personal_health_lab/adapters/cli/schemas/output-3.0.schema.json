@@ -91,14 +91,56 @@
       "additionalProperties": false,
       "required": ["aggregates", "kind", "runtime_config", "schema_version", "selection", "snapshot_ref", "status", "workouts"],
       "properties": {
-        "aggregates": { "type": "array", "items": { "type": "object" } },
+        "aggregates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["active_energy_kilocalories", "day", "distance_kilometers", "duration_minutes", "original_activity_type", "review_case_ids", "workout_count"],
+            "properties": {
+              "active_energy_kilocalories": { "type": ["number", "null"] },
+              "day": { "type": "string", "format": "date" },
+              "distance_kilometers": { "type": ["number", "null"] },
+              "duration_minutes": { "type": "number" },
+              "original_activity_type": { "type": "string" },
+              "review_case_ids": { "type": "array", "items": { "type": "string", "pattern": "^[0-9a-f]{32}$" } },
+              "workout_count": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
         "kind": { "const": "workouts" },
         "runtime_config": { "type": "object" },
         "schema_version": { "const": "3.0" },
         "selection": { "type": "object" },
         "snapshot_ref": { "$ref": "#/$defs/nullableString" },
         "status": { "type": "string" },
-        "workouts": { "type": "array", "items": { "type": "object" } }
+        "workouts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["active_energy_kilocalories", "device", "distance_kilometers", "effective_duration_minutes", "is_selected", "logical_workout_id", "measurement_local_day", "original_activity_type", "reported_duration_minutes", "review_case_ids", "source_end", "source_name", "source_start", "source_updated_at", "source_version", "strong_source_id_hash", "workout_version_id"],
+            "properties": {
+              "active_energy_kilocalories": { "type": ["number", "null"] },
+              "device": { "type": "string" },
+              "distance_kilometers": { "type": ["number", "null"] },
+              "effective_duration_minutes": { "type": "number" },
+              "is_selected": { "type": "boolean" },
+              "logical_workout_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+              "measurement_local_day": { "type": "string", "format": "date" },
+              "original_activity_type": { "type": "string" },
+              "reported_duration_minutes": { "type": ["number", "null"] },
+              "review_case_ids": { "type": "array", "items": { "type": "string", "pattern": "^[0-9a-f]{32}$" } },
+              "source_end": { "type": "string", "format": "date-time" },
+              "source_name": { "type": "string" },
+              "source_start": { "type": "string", "format": "date-time" },
+              "source_updated_at": { "type": "string", "format": "date-time" },
+              "source_version": { "type": "string" },
+              "strong_source_id_hash": { "$ref": "#/$defs/nullableString" },
+              "workout_version_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+            }
+          }
+        }
       }
     },
     "nullableString": {

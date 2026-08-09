@@ -81,10 +81,10 @@ def test_workout_correction_persists_through_data_review(tmp_path: Path) -> None
         health_lab.execute_write(
             correction, expected_plan=health_lab.preview_write(correction).fingerprint
         )
-        assert (
-            health_lab.load_workouts(SnapshotDateSelection()).workouts[0].effective_duration_minutes
-            == 30
-        )
+        corrected = health_lab.load_workouts(SnapshotDateSelection())
+        assert corrected.workouts[0].effective_duration_minutes == 30
+        assert corrected.status.value == "reviewed"
+        assert not corrected.workouts[0].review_case_ids
 
 
 def test_workouts_cli_serializes_the_shared_projection(
