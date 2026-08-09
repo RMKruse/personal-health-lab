@@ -18,6 +18,7 @@ from personal_health_lab.application import (
     AnalysisProvenance,
     AnalysisReceipt,
     AnalysisStatus,
+    AsNeededIntakeAuditRevision,
     AssociationInterval,
     BatchDecisionTarget,
     BeginMetadataRestore,
@@ -56,6 +57,7 @@ from personal_health_lab.application import (
     ImportId,
     ImportReceipt,
     ImportStatus,
+    IntakeReasonCategoryAuditRevision,
     LocalMeasurementExclusion,
     LocalWorkoutExclusion,
     MeasurementVersionId,
@@ -113,7 +115,12 @@ _OUTPUT_SCHEMA_VERSION = "3.0"
 
 
 def _medication_audit_revision_json(
-    item: MedicationAuditRevision | MedicationDeviationAuditRevision,
+    item: (
+        MedicationAuditRevision
+        | MedicationDeviationAuditRevision
+        | AsNeededIntakeAuditRevision
+        | IntakeReasonCategoryAuditRevision
+    ),
 ) -> dict[str, object]:
     if isinstance(item, MedicationDeviationAuditRevision):
         return {
@@ -128,6 +135,30 @@ def _medication_audit_revision_json(
                 {"taken_at": intake.taken_at.isoformat(), "amount": str(intake.amount)}
                 for intake in item.actual_intakes
             ],
+        }
+    if isinstance(item, AsNeededIntakeAuditRevision):
+        return {
+            "revision_id": str(item.revision_id),
+            "previous_revision_id": None
+            if item.previous_revision_id is None
+            else str(item.previous_revision_id),
+            "state": item.state,
+            "regime_logical_id": str(item.regime_logical_id),
+            "entry_id": str(item.entry_id),
+            "taken_at": item.taken_at.isoformat(),
+            "amount": str(item.amount),
+            "reason_category_logical_id": None
+            if item.reason_category_logical_id is None
+            else str(item.reason_category_logical_id),
+        }
+    if isinstance(item, IntakeReasonCategoryAuditRevision):
+        return {
+            "revision_id": str(item.revision_id),
+            "previous_revision_id": None
+            if item.previous_revision_id is None
+            else str(item.previous_revision_id),
+            "state": item.state,
+            "name": item.name,
         }
     return {
         "revision_id": str(item.revision_id),
@@ -2079,6 +2110,17 @@ def main(args: Sequence[str] | None = None) -> int:
                                 }
                                 for dose in item.occurrences
                             ],
+                            "as_needed_intakes": [
+                                {
+                                    "logical_id": str(intake.logical_id),
+                                    "taken_at": intake.taken_at.isoformat(),
+                                    "medication_name": intake.medication_name,
+                                    "amount": str(intake.amount),
+                                    "unit": intake.unit,
+                                    "reason_category_name": intake.reason_category_name,
+                                }
+                                for intake in item.as_needed_intakes
+                            ],
                         }
                         for item in medication_days.days
                     ],
@@ -2112,8 +2154,29 @@ def main(args: Sequence[str] | None = None) -> int:
                                 }
                                 for dose in item.scheduled_doses
                             ],
+                            "as_needed_medications": [
+                                {
+                                    "entry_id": str(medication.entry_id),
+                                    "medication_name": medication.medication_name,
+                                    "amount": str(medication.amount),
+                                    "unit": medication.unit,
+                                    "preferred_reason_category_ids": [
+                                        str(category_id)
+                                        for category_id in medication.preferred_reason_category_ids
+                                    ],
+                                }
+                                for medication in item.as_needed_medications
+                            ],
                         }
                         for item in medication_plan.regimes
+                    ],
+                    "intake_reason_categories": [
+                        {
+                            "logical_id": str(category.logical_id),
+                            "revision_id": str(category.revision_id),
+                            "name": category.name,
+                        }
+                        for category in medication_plan.intake_reason_categories
                     ],
                     "runtime_config": dict(runtime_config),
                     "schema_version": _OUTPUT_SCHEMA_VERSION,
@@ -2159,13 +2222,15 @@ def main(args: Sequence[str] | None = None) -> int:
         for medication_day in medication_days.days:
             print(
                 f"{medication_day.day} · {medication_day.status} · "
-                f"{len(medication_day.occurrences)} Dosen"
+                f"{len(medication_day.occurrences)} Dosen · "
+                f"{len(medication_day.as_needed_intakes)} Bedarfeinnahmen"
             )
     elif parsed.command == "medication" and parsed.medication_command == "plan":
         for medication_regime in medication_plan.regimes:
             print(
                 f"{medication_regime.starts_at.isoformat()} · {medication_regime.timezone} · "
-                f"{len(medication_regime.scheduled_doses)} Dosen"
+                f"{len(medication_regime.scheduled_doses)} Dosen · "
+                f"{len(medication_regime.as_needed_medications)} Bedarfsmedikationen"
             )
     elif parsed.command == "medication" and parsed.medication_command == "audit":
         for medication_revision in medication_audit.revisions:
@@ -2174,6 +2239,13 @@ def main(args: Sequence[str] | None = None) -> int:
                     f"{medication_revision.revision_id} · {medication_revision.state} · "
                     f"{medication_revision.scheduled_at.isoformat()}"
                 )
+            elif isinstance(medication_revision, AsNeededIntakeAuditRevision):
+                print(
+                    f"{medication_revision.revision_id} · {medication_revision.state} · "
+                    f"{medication_revision.taken_at.isoformat()}"
+                )
+            elif isinstance(medication_revision, IntakeReasonCategoryAuditRevision):
+                print(f"{medication_revision.revision_id} · {medication_revision.state}")
             else:
                 print(
                     f"{medication_revision.revision_id} · "

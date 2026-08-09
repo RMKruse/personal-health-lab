@@ -22,6 +22,9 @@
       "$ref": "#/$defs/contextOutput"
     },
     {
+      "$ref": "#/$defs/medicationOutput"
+    },
+    {
       "$ref": "#/$defs/writePlanOutput"
     },
     {
@@ -41,6 +44,23 @@
     }
   ],
   "$defs": {
+    "medicationOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "runtime_config", "schema_version"],
+      "properties": {
+        "kind": { "enum": ["medication_days", "medication_plan", "medication_audit"] },
+        "runtime_config": { "type": "object" },
+        "schema_version": { "const": "3.0" },
+        "snapshot_ref": { "$ref": "#/$defs/nullableString" },
+        "medication_as_of": { "$ref": "#/$defs/nullableString" },
+        "days": { "type": "array", "items": { "type": "object" } },
+        "regimes": { "type": "array", "items": { "type": "object" } },
+        "intake_reason_categories": { "type": "array", "items": { "type": "object" } },
+        "logical_id": { "type": "string" },
+        "revisions": { "type": "array", "items": { "type": "object" } }
+      }
+    },
     "contextOutput": {
       "oneOf": [
         {

@@ -83,6 +83,7 @@ from personal_health_lab.resting_hr_analysis import (
     run_resting_hr_analysis as execute_analysis,
 )
 from personal_health_lab.storage import (
+    AsNeededIntakePublication,
     CapacityCheck,
     CapacityStatus,
     ContextCoverageStartPublication,
@@ -90,6 +91,7 @@ from personal_health_lab.storage import (
     FileVaultReason,
     FileVaultStatus,
     IllnessPublication,
+    IntakeReasonCategoryPublication,
     LocalStore,
     MedicationDeviationPublication,
     MedicationRegimePublication,
@@ -346,6 +348,18 @@ class MedicationRevisionId:
         return self._value
 
 
+@dataclass(frozen=True, slots=True)
+class MedicationPlanEntryId:
+    _value: str
+
+    def __post_init__(self) -> None:
+        if len(self._value) != 32 or not set(self._value) <= set("0123456789abcdef"):
+            raise ValueError("Medikamentenplaneintrags-ID muss ein 32-stelliger Hex-Wert sein.")
+
+    def __str__(self) -> str:
+        return self._value
+
+
 class Weekday(StrEnum):
     MONDAY = "monday"
     TUESDAY = "tuesday"
@@ -378,10 +392,37 @@ class ScheduledDose:
 
 
 @dataclass(frozen=True, slots=True)
+class AsNeededMedication:
+    medication_name: str
+    amount: Decimal
+    unit: str
+    preferred_reason_category_ids: tuple[MedicationLogicalId, ...] = ()
+    entry_id: MedicationPlanEntryId | None = None
+
+    def __post_init__(self) -> None:
+        name = " ".join(self.medication_name.split())
+        unit = " ".join(self.unit.split())
+        if (
+            not (1 <= len(name) <= 120 and 1 <= len(unit) <= 32)
+            or any(ord(char) < 32 for char in name + unit)
+            or self.amount <= 0
+            or not all(
+                isinstance(item, MedicationLogicalId) for item in self.preferred_reason_category_ids
+            )
+            or len(set(self.preferred_reason_category_ids))
+            != len(self.preferred_reason_category_ids)
+        ):
+            raise ConfigurationError("Bedarfsmedikation ist ungültig.")
+        object.__setattr__(self, "medication_name", name)
+        object.__setattr__(self, "unit", unit)
+
+
+@dataclass(frozen=True, slots=True)
 class MedicationRegimeCreate:
     starts_at: datetime
     timezone: str
     scheduled_doses: tuple[ScheduledDose, ...]
+    as_needed_medications: tuple[AsNeededMedication, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -391,6 +432,7 @@ class MedicationRegimeRevise:
     starts_at: datetime
     timezone: str
     scheduled_doses: tuple[ScheduledDose, ...]
+    as_needed_medications: tuple[AsNeededMedication, ...] = ()
 
 
 MedicationRegimeIntent = MedicationRegimeCreate | MedicationRegimeRevise
@@ -475,6 +517,99 @@ class ReviseMedicationDeviation:
             and self.intent.scheduled_at.tzinfo is None
         ):
             raise ConfigurationError("Geplantes Dosisvorkommen muss zeitzonenbewusst sein.")
+
+
+@dataclass(frozen=True, slots=True)
+class IntakeReasonCategoryCreate:
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class IntakeReasonCategoryRevise:
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class IntakeReasonCategoryWithdraw:
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ConfigurationError("Rücknahme verlangt einen Grund.")
+
+
+@dataclass(frozen=True, slots=True)
+class IntakeReasonCategoryRestore(IntakeReasonCategoryRevise):
+    pass
+
+
+IntakeReasonCategoryIntent = (
+    IntakeReasonCategoryCreate
+    | IntakeReasonCategoryRevise
+    | IntakeReasonCategoryWithdraw
+    | IntakeReasonCategoryRestore
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseIntakeReasonCategory:
+    intent: IntakeReasonCategoryIntent
+
+
+@dataclass(frozen=True, slots=True)
+class AsNeededIntakeCreate:
+    regime_logical_id: MedicationLogicalId
+    entry_id: MedicationPlanEntryId
+    taken_at: datetime
+    amount: Decimal
+    reason_category_logical_id: MedicationLogicalId | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AsNeededIntakeRevise:
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId
+    taken_at: datetime
+    amount: Decimal
+    reason_category_logical_id: MedicationLogicalId | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AsNeededIntakeWithdraw:
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ConfigurationError("Rücknahme verlangt einen Grund.")
+
+
+@dataclass(frozen=True, slots=True)
+class AsNeededIntakeRestore(AsNeededIntakeRevise):
+    pass
+
+
+AsNeededIntakeIntent = (
+    AsNeededIntakeCreate | AsNeededIntakeRevise | AsNeededIntakeWithdraw | AsNeededIntakeRestore
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseAsNeededIntake:
+    intent: AsNeededIntakeIntent
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.intent, get_args(AsNeededIntakeIntent)):
+            raise ConfigurationError("Unbekannte Bedarfseinnahmeabsicht.")
+        if not isinstance(self.intent, AsNeededIntakeWithdraw) and (
+            self.intent.taken_at.tzinfo is None or self.intent.amount <= 0
+        ):
+            raise ConfigurationError("Bedarfseinnahme ist ungültig.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -820,10 +955,21 @@ class MedicationDoseOccurrence:
 
 
 @dataclass(frozen=True, slots=True)
+class MedicationAsNeededIntake:
+    logical_id: MedicationLogicalId
+    taken_at: datetime
+    medication_name: str
+    amount: Decimal
+    unit: str
+    reason_category_name: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class MedicationDay:
     day: date
     status: Literal["unknown", "empty", "planned"]
     occurrences: tuple[MedicationDoseOccurrence, ...]
+    as_needed_intakes: tuple[MedicationAsNeededIntake, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -841,6 +987,14 @@ class MedicationRegimeRecord:
     starts_at: datetime
     timezone: str
     scheduled_doses: tuple[ScheduledDose, ...]
+    as_needed_medications: tuple[AsNeededMedication, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class IntakeReasonCategoryRecord:
+    logical_id: MedicationLogicalId
+    revision_id: MedicationRevisionId
+    name: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -848,6 +1002,7 @@ class MedicationPlan:
     snapshot_ref: SnapshotRef | None
     medication_as_of: datetime | None
     regimes: tuple[MedicationRegimeRecord, ...]
+    intake_reason_categories: tuple[IntakeReasonCategoryRecord, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -870,9 +1025,35 @@ class MedicationDeviationAuditRevision:
 
 
 @dataclass(frozen=True, slots=True)
+class AsNeededIntakeAuditRevision:
+    revision_id: MedicationRevisionId
+    previous_revision_id: MedicationRevisionId | None
+    state: Literal["active", "withdrawn"]
+    regime_logical_id: MedicationLogicalId
+    entry_id: MedicationPlanEntryId
+    taken_at: datetime
+    amount: Decimal
+    reason_category_logical_id: MedicationLogicalId | None
+
+
+@dataclass(frozen=True, slots=True)
+class IntakeReasonCategoryAuditRevision:
+    revision_id: MedicationRevisionId
+    previous_revision_id: MedicationRevisionId | None
+    state: Literal["active", "withdrawn"]
+    name: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class MedicationAudit:
     logical_id: MedicationLogicalId
-    revisions: tuple[MedicationAuditRevision | MedicationDeviationAuditRevision, ...]
+    revisions: tuple[
+        MedicationAuditRevision
+        | MedicationDeviationAuditRevision
+        | AsNeededIntakeAuditRevision
+        | IntakeReasonCategoryAuditRevision,
+        ...,
+    ]
 
 
 class WeightDayStatus(StrEnum):
@@ -1756,6 +1937,8 @@ WriteRequest = (
     | ReviseCustomContextPeriod
     | ReviseMedicationRegime
     | ReviseMedicationDeviation
+    | ReviseAsNeededIntake
+    | ReviseIntakeReasonCategory
 )
 
 
@@ -1921,6 +2104,7 @@ class MedicationRegimePlan:
     starts_at: datetime
     timezone: str
     scheduled_doses: tuple[ScheduledDose, ...]
+    as_needed_medications: tuple[AsNeededMedication, ...]
     base_snapshot_ref: SnapshotRef | None
     medication_as_of: datetime
 
@@ -1933,6 +2117,32 @@ class MedicationDeviationPlan:
     regime_logical_id: MedicationLogicalId
     scheduled_at: datetime
     actual_intakes: tuple[MedicationActualIntake, ...]
+    withdrawal_reason: str | None
+    base_snapshot_ref: SnapshotRef | None
+    medication_as_of: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AsNeededIntakePlan:
+    intent: Literal["create", "revise", "withdraw", "restore"]
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId | None
+    regime_logical_id: MedicationLogicalId
+    entry_id: MedicationPlanEntryId
+    taken_at: datetime
+    amount: Decimal
+    reason_category_logical_id: MedicationLogicalId | None
+    withdrawal_reason: str | None
+    base_snapshot_ref: SnapshotRef | None
+    medication_as_of: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class IntakeReasonCategoryPlan:
+    intent: Literal["create", "revise", "withdraw", "restore"]
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId | None
+    name: str | None
     withdrawal_reason: str | None
     base_snapshot_ref: SnapshotRef | None
     medication_as_of: datetime
@@ -1988,6 +2198,8 @@ WritePlanDetails = (
     | ManualContextRevisionPlan
     | MedicationRegimePlan
     | MedicationDeviationPlan
+    | AsNeededIntakePlan
+    | IntakeReasonCategoryPlan
     | IllnessRevisionPlan
 )
 
@@ -2303,6 +2515,26 @@ class MedicationDeviationReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class AsNeededIntakeReceipt:
+    operation_id: OperationId
+    logical_id: MedicationLogicalId
+    revision_id: MedicationRevisionId
+    snapshot_ref: SnapshotRef
+    status: ImportStatus = ImportStatus.COMMITTED
+    diagnostics: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class IntakeReasonCategoryReceipt:
+    operation_id: OperationId
+    logical_id: MedicationLogicalId
+    revision_id: MedicationRevisionId
+    snapshot_ref: SnapshotRef
+    status: ImportStatus = ImportStatus.COMMITTED
+    diagnostics: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class WriteNoChange:
     status: NoChangeStatus = NoChangeStatus.NO_CHANGE
     diagnostics: tuple[str, ...] = ()
@@ -2341,6 +2573,8 @@ WriteResult = (
     | ManualContextRevisionReceipt
     | MedicationRegimeReceipt
     | MedicationDeviationReceipt
+    | AsNeededIntakeReceipt
+    | IntakeReasonCategoryReceipt
     | AnalysisReceipt
     | WriteNoChange
     | WriteNotStarted
@@ -2420,6 +2654,10 @@ class HealthLab:
             return self._build_medication_regime_plan(request)
         if isinstance(request, ReviseMedicationDeviation):
             return self._build_medication_deviation_plan(request)
+        if isinstance(request, ReviseAsNeededIntake):
+            return self._build_as_needed_intake_plan(request)
+        if isinstance(request, ReviseIntakeReasonCategory):
+            return self._build_intake_reason_category_plan(request)
         if isinstance(
             request,
             (
@@ -3109,6 +3347,17 @@ class HealthLab:
             kind, logical_id, expected = "revise", intent.logical_id, intent.expected_revision_id
         medication_as_of = self._store.load_medication_as_of(snapshot)
         current = self._store.load_medication_regime(snapshot, str(logical_id))
+        as_needed_medications = tuple(
+            item
+            if item.entry_id is not None
+            else replace(
+                item,
+                entry_id=MedicationPlanEntryId(
+                    hashlib.sha256(repr((logical_id, index, item)).encode()).hexdigest()[:32]
+                ),
+            )
+            for index, item in enumerate(intent.as_needed_medications)
+        )
         active_regimes = self._store.load_active_medication_regimes(snapshot)
         blocked = snapshot is None or intent.starts_at.astimezone(
             UTC
@@ -3144,9 +3393,19 @@ class HealthLab:
                 )
                 for deviation in self._store.load_active_medication_deviations(snapshot)
                 if deviation.regime_logical_id == str(logical_id)
+            ) or any(
+                not any(str(item.entry_id) == intake.entry_id for item in as_needed_medications)
+                for intake in self._store.load_active_as_needed_intakes(snapshot)
+                if intake.regime_logical_id == str(logical_id)
             )
             if invalid_reference:
-                blocked, diagnostics = True, ("medication_deviation_reference_invalid",)
+                blocked, diagnostics = True, ("medication_reference_invalid",)
+        if not blocked and any(
+            self._store.load_intake_reason_category(snapshot, str(category_id)) is None
+            for medication in as_needed_medications
+            for category_id in medication.preferred_reason_category_ids
+        ):
+            blocked, diagnostics = True, ("intake_reason_category_not_active",)
         no_change = (
             not blocked
             and kind == "revise"
@@ -3164,6 +3423,17 @@ class HealthLab:
                 )
                 for dose in intent.scheduled_doses
             )
+            and current.as_needed_medications
+            == tuple(
+                (
+                    item.medication_name,
+                    str(item.amount),
+                    item.unit,
+                    tuple(str(category_id) for category_id in item.preferred_reason_category_ids),
+                    str(item.entry_id),
+                )
+                for item in as_needed_medications
+            )
         )
         payload = {
             "intent": kind,
@@ -3180,6 +3450,16 @@ class HealthLab:
                     sorted(dose.weekdays),
                 )
                 for dose in intent.scheduled_doses
+            ],
+            "as_needed": [
+                (
+                    item.medication_name,
+                    str(item.amount),
+                    item.unit,
+                    tuple(str(category_id) for category_id in item.preferred_reason_category_ids),
+                    str(item.entry_id),
+                )
+                for item in as_needed_medications
             ],
             "base_snapshot_ref": None if snapshot is None else str(snapshot),
             "medication_as_of": medication_as_of.isoformat(),
@@ -3199,6 +3479,7 @@ class HealthLab:
                 intent.starts_at,
                 intent.timezone,
                 intent.scheduled_doses,
+                as_needed_medications,
                 snapshot,
                 medication_as_of,
             ),
@@ -3331,6 +3612,279 @@ class HealthLab:
                 regime_id,
                 scheduled_at,
                 actual_intakes,
+                withdrawal_reason,
+                snapshot,
+                as_of,
+            ),
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED
+                    if blocked
+                    else (WriteApprovalStatus.NO_CHANGE if no_change else WriteApprovalStatus.READY)
+                ),
+                diagnostics=diagnostics,
+            ),
+        )
+
+    def _build_intake_reason_category_plan(self, request: ReviseIntakeReasonCategory) -> WritePlan:
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        snapshot = self._store.load_active_snapshot_id()
+        as_of = self._store.load_medication_as_of(snapshot)
+        intent = request.intent
+        name: str | None
+        if isinstance(intent, IntakeReasonCategoryCreate):
+            kind: Literal["create", "revise", "withdraw", "restore"] = "create"
+            name = " ".join(intent.name.split())
+            logical_id = MedicationLogicalId(
+                hashlib.sha256(name.casefold().encode()).hexdigest()[:32]
+            )
+            expected, withdrawal_reason = None, None
+        else:
+            kind = (
+                "restore"
+                if isinstance(intent, IntakeReasonCategoryRestore)
+                else "withdraw"
+                if isinstance(intent, IntakeReasonCategoryWithdraw)
+                else "revise"
+            )
+            logical_id, expected = intent.logical_id, intent.expected_revision_id
+            current = self._store.load_intake_reason_category(snapshot, str(logical_id))
+            audit = self._store.load_intake_reason_category_audit(str(logical_id))
+            name = (
+                " ".join(intent.name.split())
+                if not isinstance(intent, IntakeReasonCategoryWithdraw)
+                else (current.name if current is not None else (audit[-1].name if audit else None))
+            )
+            withdrawal_reason = (
+                intent.reason.strip() if isinstance(intent, IntakeReasonCategoryWithdraw) else None
+            )
+        current = self._store.load_intake_reason_category(snapshot, str(logical_id))
+        audit = self._store.load_intake_reason_category_audit(str(logical_id))
+        invalid_name = (
+            name is None
+            or not 1 <= len(name) <= 80
+            or any(ord(char) < 32 for char in name)
+            or name.casefold() == "sonstige"
+        )
+        blocked = snapshot is None or invalid_name
+        diagnostics = (
+            ("medication_requires_snapshot",)
+            if snapshot is None
+            else (("invalid_intake_reason_category_name",) if invalid_name else ())
+        )
+        if not blocked and (
+            (kind == "create" and (current is not None or audit))
+            or (
+                kind == "restore"
+                and (
+                    not audit
+                    or audit[-1].revision_id != str(expected)
+                    or audit[-1].state != "withdrawn"
+                )
+            )
+            or (
+                kind in {"revise", "withdraw"}
+                and (current is None or current.revision_id != str(expected))
+            )
+        ):
+            blocked, diagnostics = True, ("medication_revision_changed",)
+        if (
+            not blocked
+            and kind != "withdraw"
+            and name is not None
+            and self._store.is_intake_reason_category_name_reserved(
+                name, excluding_logical_id=None if kind == "create" else str(logical_id)
+            )
+        ):
+            blocked, diagnostics = True, ("intake_reason_category_reserved",)
+        if (
+            not blocked
+            and kind == "withdraw"
+            and any(
+                str(logical_id) in entry[3]
+                for regime in self._store.load_active_medication_regimes(snapshot)
+                for entry in regime.as_needed_medications
+            )
+        ):
+            blocked, diagnostics = True, ("intake_reason_category_preferred",)
+        no_change = (
+            not blocked and kind == "revise" and current is not None and current.name == name
+        )
+        payload = {
+            "intent": kind,
+            "logical_id": str(logical_id),
+            "expected_revision_id": None if expected is None else str(expected),
+            "name": name,
+            "withdrawal_reason": withdrawal_reason,
+            "base_snapshot_ref": None if snapshot is None else str(snapshot),
+            "medication_as_of": as_of.isoformat(),
+            "diagnostics": diagnostics,
+            "approval": "no_change" if no_change else ("blocked" if blocked else "ready"),
+        }
+        return WritePlan(
+            PlanFingerprint(
+                hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+            ),
+            IntakeReasonCategoryPlan(
+                kind, logical_id, expected, name, withdrawal_reason, snapshot, as_of
+            ),
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED
+                    if blocked
+                    else (WriteApprovalStatus.NO_CHANGE if no_change else WriteApprovalStatus.READY)
+                ),
+                diagnostics=diagnostics,
+            ),
+        )
+
+    def _build_as_needed_intake_plan(self, request: ReviseAsNeededIntake) -> WritePlan:
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        snapshot = self._store.load_active_snapshot_id()
+        as_of = self._store.load_medication_as_of(snapshot)
+        intent = request.intent
+        if isinstance(intent, AsNeededIntakeCreate):
+            kind: Literal["create", "revise", "withdraw", "restore"] = "create"
+            logical_id = MedicationLogicalId(
+                hashlib.sha256(
+                    repr((intent.regime_logical_id, intent.entry_id, intent.taken_at)).encode()
+                ).hexdigest()[:32]
+            )
+            regime_id, entry_id, taken_at, amount, category_id = (
+                intent.regime_logical_id,
+                intent.entry_id,
+                intent.taken_at,
+                intent.amount,
+                intent.reason_category_logical_id,
+            )
+            expected, withdrawal_reason = None, None
+        else:
+            kind = (
+                "restore"
+                if isinstance(intent, AsNeededIntakeRestore)
+                else "withdraw"
+                if isinstance(intent, AsNeededIntakeWithdraw)
+                else "revise"
+            )
+            logical_id, expected = intent.logical_id, intent.expected_revision_id
+            current = self._store.load_as_needed_intake(snapshot, str(logical_id))
+            audit = self._store.load_as_needed_intake_audit(str(logical_id))
+            source = current if current is not None else (audit[-1] if audit else None)
+            regime_id = (
+                MedicationLogicalId(source.regime_logical_id) if source is not None else logical_id
+            )
+            entry_id = (
+                MedicationPlanEntryId(source.entry_id)
+                if source is not None
+                else MedicationPlanEntryId(str(logical_id))
+            )
+            if isinstance(intent, AsNeededIntakeWithdraw):
+                taken_at = source.taken_at if source is not None else as_of
+                amount = Decimal(source.amount) if source is not None else Decimal("1")
+                category_id = (
+                    None
+                    if source is None or source.reason_category_logical_id is None
+                    else MedicationLogicalId(source.reason_category_logical_id)
+                )
+                withdrawal_reason = intent.reason.strip()
+            else:
+                taken_at, amount, category_id = (
+                    intent.taken_at,
+                    intent.amount,
+                    intent.reason_category_logical_id,
+                )
+                withdrawal_reason = None
+        current = self._store.load_as_needed_intake(snapshot, str(logical_id))
+        audit = self._store.load_as_needed_intake_audit(str(logical_id))
+        regimes = self._store.load_active_medication_regimes(snapshot)
+        regime = next((item for item in regimes if item.logical_id == str(regime_id)), None)
+        next_regime = (
+            None
+            if regime is None
+            else next((item for item in regimes if item.starts_at > regime.starts_at), None)
+        )
+        entry = (
+            None
+            if regime is None
+            else next(
+                (item for item in regime.as_needed_medications if item[4] == str(entry_id)), None
+            )
+        )
+        reference_invalid = (
+            regime is None
+            or entry is None
+            or taken_at < regime.starts_at
+            or (next_regime is not None and taken_at >= next_regime.starts_at)
+            or (
+                category_id is not None
+                and self._store.load_intake_reason_category(snapshot, str(category_id)) is None
+            )
+        )
+        blocked = (
+            snapshot is None
+            or reference_invalid
+            or taken_at.astimezone(UTC) > as_of.astimezone(UTC)
+        )
+        diagnostics = (
+            ("medication_requires_snapshot",)
+            if snapshot is None
+            else (("as_needed_intake_reference_invalid",) if reference_invalid else ())
+        )
+        if not blocked and (
+            (kind == "create" and (current is not None or audit))
+            or (
+                kind == "restore"
+                and (
+                    not audit
+                    or audit[-1].revision_id != str(expected)
+                    or audit[-1].state != "withdrawn"
+                )
+            )
+            or (
+                kind in {"revise", "withdraw"}
+                and (current is None or current.revision_id != str(expected))
+            )
+        ):
+            blocked, diagnostics = True, ("medication_revision_changed",)
+        no_change = (
+            not blocked
+            and kind == "revise"
+            and current is not None
+            and current.taken_at == taken_at
+            and current.amount == str(amount)
+            and current.reason_category_logical_id
+            == (None if category_id is None else str(category_id))
+        )
+        payload = {
+            "intent": kind,
+            "logical_id": str(logical_id),
+            "expected_revision_id": None if expected is None else str(expected),
+            "regime_logical_id": str(regime_id),
+            "entry_id": str(entry_id),
+            "taken_at": taken_at.isoformat(),
+            "amount": str(amount),
+            "reason_category_logical_id": None if category_id is None else str(category_id),
+            "withdrawal_reason": withdrawal_reason,
+            "base_snapshot_ref": None if snapshot is None else str(snapshot),
+            "medication_as_of": as_of.isoformat(),
+            "diagnostics": diagnostics,
+            "approval": "no_change" if no_change else ("blocked" if blocked else "ready"),
+        }
+        return WritePlan(
+            PlanFingerprint(
+                hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+            ),
+            AsNeededIntakePlan(
+                kind,
+                logical_id,
+                expected,
+                regime_id,
+                entry_id,
+                taken_at,
+                amount,
+                category_id,
                 withdrawal_reason,
                 snapshot,
                 as_of,
@@ -4171,6 +4725,12 @@ class HealthLab:
             return self._execute_medication_deviation_write(
                 request, authorization_plan, expected_plan
             )
+        if isinstance(request, ReviseAsNeededIntake):
+            return self._execute_as_needed_intake_write(request, authorization_plan, expected_plan)
+        if isinstance(request, ReviseIntakeReasonCategory):
+            return self._execute_intake_reason_category_write(
+                request, authorization_plan, expected_plan
+            )
         if isinstance(
             request,
             (
@@ -4922,6 +5482,19 @@ class HealthLab:
                         )
                         for dose in plan.details.scheduled_doses
                     ),
+                    tuple(
+                        (
+                            item.medication_name,
+                            str(item.amount),
+                            item.unit,
+                            tuple(
+                                str(category_id)
+                                for category_id in item.preferred_reason_category_ids
+                            ),
+                            str(item.entry_id),
+                        )
+                        for item in plan.details.as_needed_medications
+                    ),
                     plan.details.base_snapshot_ref,
                     plan.details.medication_as_of,
                 )
@@ -4994,6 +5567,120 @@ class HealthLab:
             operation_id,
             expected_plan,
             MedicationDeviationReceipt(
+                operation_id,
+                MedicationLogicalId(str(publication.logical_id)),
+                MedicationRevisionId(str(publication.revision_id)),
+                publication.snapshot_id,
+            ),
+            plan.preflight,
+        )
+
+    def _execute_intake_reason_category_write(
+        self, request: ReviseIntakeReasonCategory, plan: WritePlan, expected_plan: PlanFingerprint
+    ) -> WriteReceipt:
+        if (
+            not isinstance(plan.details, IntakeReasonCategoryPlan)
+            or plan.details.base_snapshot_ref is None
+        ):
+            return self._not_started(
+                plan, WriteNotStartedStatus.BLOCKED, plan.diagnostics, expected_plan
+            )
+        if plan.approval.status is WriteApprovalStatus.NO_CHANGE:
+            return WriteReceipt(
+                OperationId(uuid4().hex), expected_plan, WriteNoChange(), plan.preflight
+            )
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        try:
+            operation_id = OperationId(uuid4().hex)
+            publication = writer.publish_intake_reason_category(
+                IntakeReasonCategoryPublication(
+                    operation_id,
+                    plan.details.intent,
+                    StoredMedicationLogicalId(str(plan.details.logical_id)),
+                    None
+                    if plan.details.expected_revision_id is None
+                    else StoredMedicationRevisionId(str(plan.details.expected_revision_id)),
+                    plan.details.name,
+                    plan.details.withdrawal_reason,
+                    plan.details.base_snapshot_ref,
+                    plan.details.medication_as_of,
+                )
+            )
+        except StoreError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.PLAN_CHANGED, ("plan_changed",), expected_plan
+            )
+        finally:
+            writer.close()
+        return WriteReceipt(
+            operation_id,
+            expected_plan,
+            IntakeReasonCategoryReceipt(
+                operation_id,
+                MedicationLogicalId(str(publication.logical_id)),
+                MedicationRevisionId(str(publication.revision_id)),
+                publication.snapshot_id,
+            ),
+            plan.preflight,
+        )
+
+    def _execute_as_needed_intake_write(
+        self, request: ReviseAsNeededIntake, plan: WritePlan, expected_plan: PlanFingerprint
+    ) -> WriteReceipt:
+        if (
+            not isinstance(plan.details, AsNeededIntakePlan)
+            or plan.details.base_snapshot_ref is None
+        ):
+            return self._not_started(
+                plan, WriteNotStartedStatus.BLOCKED, plan.diagnostics, expected_plan
+            )
+        if plan.approval.status is WriteApprovalStatus.NO_CHANGE:
+            return WriteReceipt(
+                OperationId(uuid4().hex), expected_plan, WriteNoChange(), plan.preflight
+            )
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        try:
+            operation_id = OperationId(uuid4().hex)
+            publication = writer.publish_as_needed_intake(
+                AsNeededIntakePublication(
+                    operation_id,
+                    plan.details.intent,
+                    StoredMedicationLogicalId(str(plan.details.logical_id)),
+                    None
+                    if plan.details.expected_revision_id is None
+                    else StoredMedicationRevisionId(str(plan.details.expected_revision_id)),
+                    StoredMedicationLogicalId(str(plan.details.regime_logical_id)),
+                    str(plan.details.entry_id),
+                    plan.details.taken_at,
+                    str(plan.details.amount),
+                    None
+                    if plan.details.reason_category_logical_id is None
+                    else StoredMedicationLogicalId(str(plan.details.reason_category_logical_id)),
+                    plan.details.withdrawal_reason,
+                    plan.details.base_snapshot_ref,
+                    plan.details.medication_as_of,
+                )
+            )
+        except StoreError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.PLAN_CHANGED, ("plan_changed",), expected_plan
+            )
+        finally:
+            writer.close()
+        return WriteReceipt(
+            operation_id,
+            expected_plan,
+            AsNeededIntakeReceipt(
                 operation_id,
                 MedicationLogicalId(str(publication.logical_id)),
                 MedicationRevisionId(str(publication.revision_id)),
@@ -6130,6 +6817,11 @@ class HealthLab:
             (item.regime_logical_id, item.scheduled_at): item
             for item in self._store.load_active_medication_deviations(snapshot)
         }
+        categories = {
+            item.logical_id: item.name
+            for item in self._store.load_active_intake_reason_categories(snapshot)
+        }
+        as_needed = self._store.load_active_as_needed_intakes(snapshot)
         days: list[MedicationDay] = []
         for offset in range((end - start).days + 1):
             current_day = start + timedelta(days=offset)
@@ -6167,8 +6859,39 @@ class HealthLab:
                 and scheduled <= as_of
                 and (next_regime is None or scheduled < next_regime.starts_at)
             )
+            as_needed_intakes = tuple(
+                MedicationAsNeededIntake(
+                    MedicationLogicalId(item.logical_id),
+                    item.taken_at,
+                    next(
+                        entry[0]
+                        for stored_regime in active
+                        if stored_regime.logical_id == item.regime_logical_id
+                        for entry in stored_regime.as_needed_medications
+                        if entry[4] == item.entry_id
+                    ),
+                    Decimal(item.amount),
+                    next(
+                        entry[2]
+                        for stored_regime in active
+                        if stored_regime.logical_id == item.regime_logical_id
+                        for entry in stored_regime.as_needed_medications
+                        if entry[4] == item.entry_id
+                    ),
+                    None
+                    if item.reason_category_logical_id is None
+                    else categories.get(item.reason_category_logical_id),
+                )
+                for item in as_needed
+                if item.taken_at.date() == current_day
+            )
             days.append(
-                MedicationDay(current_day, "planned" if occurrences else "empty", occurrences)
+                MedicationDay(
+                    current_day,
+                    "planned" if occurrences else "empty",
+                    occurrences,
+                    as_needed_intakes,
+                )
             )
         return MedicationDays(snapshot, as_of, timezone, tuple(days))
 
@@ -6199,8 +6922,27 @@ class HealthLab:
                         )
                         for name, amount, unit, local_time, weekdays in value.scheduled_doses
                     ),
+                    tuple(
+                        AsNeededMedication(
+                            name,
+                            Decimal(amount),
+                            unit,
+                            tuple(MedicationLogicalId(item) for item in preferred),
+                            MedicationPlanEntryId(entry_id),
+                        )
+                        for name, amount, unit, preferred, entry_id in value.as_needed_medications
+                    ),
                 )
                 for value in self._store.load_active_medication_regimes(selected)
+            ),
+            tuple(
+                IntakeReasonCategoryRecord(
+                    MedicationLogicalId(value.logical_id),
+                    MedicationRevisionId(value.revision_id),
+                    value.name,
+                )
+                for value in self._store.load_active_intake_reason_categories(selected)
+                if value.name is not None
             ),
         )
 
@@ -6233,6 +6975,44 @@ class HealthLab:
                         ),
                     )
                     for value in regimes
+                ),
+            )
+        categories = self._store.load_intake_reason_category_audit(str(logical_id))
+        if categories:
+            return MedicationAudit(
+                logical_id,
+                tuple(
+                    IntakeReasonCategoryAuditRevision(
+                        MedicationRevisionId(value.revision_id),
+                        None
+                        if value.previous_revision_id is None
+                        else MedicationRevisionId(value.previous_revision_id),
+                        value.state,
+                        value.name,
+                    )
+                    for value in categories
+                ),
+            )
+        as_needed = self._store.load_as_needed_intake_audit(str(logical_id))
+        if as_needed:
+            return MedicationAudit(
+                logical_id,
+                tuple(
+                    AsNeededIntakeAuditRevision(
+                        MedicationRevisionId(value.revision_id),
+                        None
+                        if value.previous_revision_id is None
+                        else MedicationRevisionId(value.previous_revision_id),
+                        value.state,
+                        MedicationLogicalId(value.regime_logical_id),
+                        MedicationPlanEntryId(value.entry_id),
+                        value.taken_at,
+                        Decimal(value.amount),
+                        None
+                        if value.reason_category_logical_id is None
+                        else MedicationLogicalId(value.reason_category_logical_id),
+                    )
+                    for value in as_needed
                 ),
             )
         return MedicationAudit(

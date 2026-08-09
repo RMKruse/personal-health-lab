@@ -709,6 +709,7 @@ def _render_context(config: RuntimeConfig) -> None:
                     "Beginn": regime.starts_at.isoformat(),
                     "Zeitzone": regime.timezone,
                     "Geplante Dosen": len(regime.scheduled_doses),
+                    "Bedarfsmedikationen": len(regime.as_needed_medications),
                 }
                 for regime in medication_plan.regimes
             ],
@@ -732,6 +733,15 @@ def _render_context(config: RuntimeConfig) -> None:
                             else ""
                         )
                         for dose in item.occurrences
+                    ),
+                    "Bedarfseinnahmen": ", ".join(
+                        f"{intake.medication_name} {intake.amount} {intake.unit}"
+                        + (
+                            f" ({intake.reason_category_name})"
+                            if intake.reason_category_name is not None
+                            else ""
+                        )
+                        for intake in item.as_needed_intakes
                     ),
                 }
                 for item in medication_days.days

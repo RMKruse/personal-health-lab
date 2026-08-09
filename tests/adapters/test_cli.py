@@ -178,6 +178,10 @@ def test_cli_renders_import_details_as_human_text_and_json_3(
     "MedicationRegimeReceipt",
     "MedicationDeviationPlan",
     "MedicationDeviationReceipt",
+    "AsNeededIntakePlan",
+    "AsNeededIntakeReceipt",
+    "IntakeReasonCategoryPlan",
+    "IntakeReasonCategoryReceipt",
     "IllnessRevisionPlan",
     "NoChangeStatus",
     "ReviseContextCoverageStart",
@@ -188,6 +192,8 @@ def test_cli_renders_import_details_as_human_text_and_json_3(
     "ReviseIllnessPeriod",
     "ReviseMedicationRegime",
     "ReviseMedicationDeviation",
+    "ReviseAsNeededIntake",
+    "ReviseIntakeReasonCategory",
     "WriteNoChange",
 )
 def test_cli_loads_context_projections(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

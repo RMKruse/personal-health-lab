@@ -4,15 +4,24 @@ from pathlib import Path
 from zipfile import ZipFile
 
 from personal_health_lab.application import (
+    AsNeededIntakeCreate,
+    AsNeededIntakeRestore,
+    AsNeededIntakeWithdraw,
+    AsNeededMedication,
     DataMode,
     HealthLab,
     ImportHealthExport,
+    IntakeReasonCategoryCreate,
+    IntakeReasonCategoryRevise,
+    IntakeReasonCategoryWithdraw,
     MedicationActualIntake,
     MedicationDeviationCreate,
     MedicationDeviationRestore,
     MedicationDeviationWithdraw,
     MedicationRegimeCreate,
     MedicationRegimeRevise,
+    ReviseAsNeededIntake,
+    ReviseIntakeReasonCategory,
     ReviseMedicationDeviation,
     ReviseMedicationRegime,
     RuntimeConfig,
@@ -169,4 +178,101 @@ def test_medication_deviation_binds_one_occurrence_and_keeps_old_snapshot_stable
     assert day.occurrences[0].actual_intakes[0].taken_at.isoformat() == "2024-04-02T09:00:00+09:00"
     assert current_day.occurrences[0].status == "assumed_as_planned"
     assert restored_day.occurrences[0].status == "deviated"
+    assert audit.revisions[-1].state == "active"
+
+
+def test_as_needed_intakes_and_reason_categories_are_snapshot_bound(tmp_path: Path) -> None:
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    taken_at = datetime.fromisoformat("2024-04-01T00:30:00+09:00")
+    with HealthLab.open(config) as health_lab:
+        imported = ImportHealthExport(_package(tmp_path / "export.zip"))
+        health_lab.execute_write(
+            imported, expected_plan=health_lab.preview_write(imported).fingerprint
+        )
+        category = ReviseIntakeReasonCategory(IntakeReasonCategoryCreate("  Kopfschmerz  "))
+        category_receipt = health_lab.execute_write(
+            category, expected_plan=health_lab.preview_write(category).fingerprint
+        )
+        regime = ReviseMedicationRegime(
+            MedicationRegimeCreate(
+                datetime.fromisoformat("2024-03-01T00:00:00+01:00"),
+                "Europe/Berlin",
+                (),
+                (
+                    AsNeededMedication(
+                        "Ibuprofen", Decimal("400"), "mg", (category_receipt.result.logical_id,)
+                    ),
+                ),
+            )
+        )
+        regime_receipt = health_lab.execute_write(
+            regime, expected_plan=health_lab.preview_write(regime).fingerprint
+        )
+        entry_id = health_lab.load_medication_plan().regimes[0].as_needed_medications[0].entry_id
+        intake = ReviseAsNeededIntake(
+            AsNeededIntakeCreate(
+                regime_receipt.result.logical_id,
+                entry_id,
+                taken_at,
+                Decimal("200"),
+                category_receipt.result.logical_id,
+            )
+        )
+        intake_receipt = health_lab.execute_write(
+            intake, expected_plan=health_lab.preview_write(intake).fingerprint
+        )
+        intake_snapshot = intake_receipt.result.snapshot_ref
+        renamed = ReviseIntakeReasonCategory(
+            IntakeReasonCategoryRevise(
+                category_receipt.result.logical_id,
+                category_receipt.result.revision_id,
+                "Schmerz",
+            )
+        )
+        health_lab.execute_write(
+            renamed, expected_plan=health_lab.preview_write(renamed).fingerprint
+        )
+        blocked = ReviseIntakeReasonCategory(
+            IntakeReasonCategoryWithdraw(
+                category_receipt.result.logical_id,
+                health_lab.load_medication_plan().intake_reason_categories[0].revision_id,
+                "Nicht mehr gebraucht",
+            )
+        )
+        blocked_plan = health_lab.preview_write(blocked)
+        old_day = health_lab.load_medication_days(
+            SnapshotDateSelection(intake_snapshot, taken_at.date(), taken_at.date())
+        ).days[0]
+        new_day = health_lab.load_medication_days(
+            SnapshotDateSelection(None, taken_at.date(), taken_at.date())
+        ).days[0]
+        withdrawal = ReviseAsNeededIntake(
+            AsNeededIntakeWithdraw(
+                intake_receipt.result.logical_id,
+                intake_receipt.result.revision_id,
+                "Doppelt erfasst",
+            )
+        )
+        withdrawn = health_lab.execute_write(
+            withdrawal, expected_plan=health_lab.preview_write(withdrawal).fingerprint
+        )
+        restore = ReviseAsNeededIntake(
+            AsNeededIntakeRestore(
+                intake_receipt.result.logical_id,
+                withdrawn.result.revision_id,
+                taken_at,
+                Decimal("200"),
+                category_receipt.result.logical_id,
+            )
+        )
+        health_lab.execute_write(
+            restore, expected_plan=health_lab.preview_write(restore).fingerprint
+        )
+        audit = health_lab.load_medication_audit(intake_receipt.result.logical_id)
+
+    assert old_day.as_needed_intakes[0].reason_category_name == "Kopfschmerz"
+    assert new_day.as_needed_intakes[0].reason_category_name == "Schmerz"
+    assert new_day.as_needed_intakes[0].medication_name == "Ibuprofen"
+    assert new_day.as_needed_intakes[0].amount == Decimal("200")
+    assert blocked_plan.approval.status.value == "blocked"
     assert audit.revisions[-1].state == "active"

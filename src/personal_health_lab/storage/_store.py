@@ -46,7 +46,7 @@ from personal_health_lab.health_data import (
 _METADATA_FILE = "metadata.sqlite3"
 _PARQUET_DIRECTORY = "parquet"
 _QUERY_FILE = "query.duckdb"
-_STORE_SCHEMA_VERSION = 9
+_STORE_SCHEMA_VERSION = 10
 _WRITER_LOCK_FILE = ".writer.lock"
 _FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
 _STORE_MIGRATION_METHOD = "cow-migration/v1"
@@ -1269,6 +1269,7 @@ class MedicationRegimePublication:
     starts_at: datetime
     timezone: str
     scheduled_doses: tuple[tuple[str, str, str, time, tuple[str, ...]], ...]
+    as_needed_medications: tuple[tuple[str, str, str, tuple[str, ...], str], ...]
     expected_snapshot_id: SnapshotId
     medication_as_of: datetime
 
@@ -1302,6 +1303,41 @@ class MedicationDeviationPublicationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class AsNeededIntakePublication:
+    operation_id: OperationId
+    intent: Literal["create", "revise", "withdraw", "restore"]
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId | None
+    regime_logical_id: MedicationLogicalId
+    entry_id: str
+    taken_at: datetime
+    amount: str
+    reason_category_logical_id: MedicationLogicalId | None
+    withdrawal_reason: str | None
+    expected_snapshot_id: SnapshotId
+    medication_as_of: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class IntakeReasonCategoryPublication:
+    operation_id: OperationId
+    intent: Literal["create", "revise", "withdraw", "restore"]
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId | None
+    name: str | None
+    withdrawal_reason: str | None
+    expected_snapshot_id: SnapshotId
+    medication_as_of: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRootPublicationResult:
+    logical_id: MedicationLogicalId
+    revision_id: MedicationRevisionId
+    snapshot_id: SnapshotId
+
+
+@dataclass(frozen=True, slots=True)
 class StoredMedicationDeviation:
     logical_id: str
     revision_id: str
@@ -1321,6 +1357,31 @@ class StoredMedicationRegime:
     starts_at: datetime
     timezone: str
     scheduled_doses: tuple[tuple[str, str, str, time, tuple[str, ...]], ...]
+    as_needed_medications: tuple[tuple[str, str, str, tuple[str, ...], str], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StoredAsNeededIntake:
+    logical_id: str
+    revision_id: str
+    previous_revision_id: str | None
+    state: Literal["active", "withdrawn"]
+    regime_logical_id: str
+    entry_id: str
+    taken_at: datetime
+    amount: str
+    reason_category_logical_id: str | None
+    withdrawal_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class StoredIntakeReasonCategory:
+    logical_id: str
+    revision_id: str
+    previous_revision_id: str | None
+    state: Literal["active", "withdrawn"]
+    name: str | None
+    withdrawal_reason: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1432,7 +1493,8 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                                  'create_plausibility_rule_version',
                                  'run_historical_review', 'migrate_store',
                                  'rollback_migration', 'revise_context_coverage_start',
-                                 'revise_medication_regime', 'revise_medication_deviation')
+                                 'revise_medication_regime', 'revise_medication_deviation',
+                                 'revise_as_needed_intake', 'revise_intake_reason_category')
             ),
             started_at_utc TEXT NOT NULL CHECK (
                 length(started_at_utc) >= 20 AND substr(started_at_utc, 11, 1) = 'T'
@@ -1804,6 +1866,17 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             local_time TEXT NOT NULL CHECK (length(local_time) = 8),
             weekdays TEXT NOT NULL
         ) STRICT;
+        CREATE TABLE IF NOT EXISTS medication_as_needed_entries (
+            entry_id TEXT NOT NULL CHECK (
+                length(entry_id) = 32 AND entry_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            revision_id TEXT NOT NULL REFERENCES medication_regime_revisions(revision_id),
+            medication_name TEXT NOT NULL CHECK (length(medication_name) BETWEEN 1 AND 120),
+            amount TEXT NOT NULL,
+            unit TEXT NOT NULL CHECK (length(unit) BETWEEN 1 AND 32),
+            preferred_reason_category_ids TEXT NOT NULL,
+            PRIMARY KEY (revision_id, entry_id)
+        ) STRICT;
         CREATE TABLE IF NOT EXISTS medication_snapshot_bindings (
             snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(snapshot_id),
             revision_id TEXT NOT NULL REFERENCES medication_regime_revisions(revision_id),
@@ -1852,6 +1925,74 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS medication_deviation_publications (
             audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
             revision_id TEXT NOT NULL UNIQUE REFERENCES medication_deviation_revisions(revision_id),
+            snapshot_id TEXT NOT NULL UNIQUE REFERENCES dataset_snapshots(snapshot_id),
+            medication_as_of TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS intake_reason_category_revisions (
+            revision_id TEXT PRIMARY KEY CHECK (
+                length(revision_id) = 32 AND revision_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            logical_id TEXT NOT NULL CHECK (
+                length(logical_id) = 32 AND logical_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            previous_revision_id TEXT UNIQUE
+                REFERENCES intake_reason_category_revisions(revision_id),
+            operation_id TEXT NOT NULL UNIQUE REFERENCES write_operations(operation_id),
+            state TEXT NOT NULL CHECK (state IN ('active', 'withdrawn')),
+            created_at_utc TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL CHECK (
+                length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'
+            )
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS intake_reason_category_values (
+            revision_id TEXT PRIMARY KEY REFERENCES intake_reason_category_revisions(revision_id),
+            name TEXT,
+            name_key TEXT
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS intake_reason_category_snapshot_bindings (
+            snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(snapshot_id),
+            revision_id TEXT NOT NULL REFERENCES intake_reason_category_revisions(revision_id),
+            PRIMARY KEY (snapshot_id, revision_id)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS intake_reason_category_publications (
+            audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
+            revision_id TEXT NOT NULL UNIQUE
+                REFERENCES intake_reason_category_revisions(revision_id),
+            snapshot_id TEXT NOT NULL UNIQUE REFERENCES dataset_snapshots(snapshot_id),
+            medication_as_of TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS as_needed_intake_revisions (
+            revision_id TEXT PRIMARY KEY CHECK (
+                length(revision_id) = 32 AND revision_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            logical_id TEXT NOT NULL CHECK (
+                length(logical_id) = 32 AND logical_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            previous_revision_id TEXT UNIQUE REFERENCES as_needed_intake_revisions(revision_id),
+            operation_id TEXT NOT NULL UNIQUE REFERENCES write_operations(operation_id),
+            state TEXT NOT NULL CHECK (state IN ('active', 'withdrawn')),
+            created_at_utc TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL CHECK (
+                length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'
+            )
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS as_needed_intake_values (
+            revision_id TEXT PRIMARY KEY REFERENCES as_needed_intake_revisions(revision_id),
+            regime_logical_id TEXT NOT NULL,
+            entry_id TEXT NOT NULL,
+            taken_at TEXT NOT NULL,
+            amount TEXT NOT NULL,
+            reason_category_logical_id TEXT,
+            withdrawal_reason TEXT
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS as_needed_intake_snapshot_bindings (
+            snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(snapshot_id),
+            revision_id TEXT NOT NULL REFERENCES as_needed_intake_revisions(revision_id),
+            PRIMARY KEY (snapshot_id, revision_id)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS as_needed_intake_publications (
+            audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
+            revision_id TEXT NOT NULL UNIQUE REFERENCES as_needed_intake_revisions(revision_id),
             snapshot_id TEXT NOT NULL UNIQUE REFERENCES dataset_snapshots(snapshot_id),
             medication_as_of TEXT NOT NULL
         ) STRICT;
@@ -4574,6 +4715,26 @@ class LocalStore:
                 if "medication_deviation_publications" in tables
                 else ""
             )
+            as_needed_count = (
+                "+ count(as_needed_intake_publications.audit_event_id)"
+                if "as_needed_intake_publications" in tables
+                else ""
+            )
+            as_needed_join = (
+                "LEFT JOIN as_needed_intake_publications USING (audit_event_id)"
+                if "as_needed_intake_publications" in tables
+                else ""
+            )
+            reason_category_count = (
+                "+ count(intake_reason_category_publications.audit_event_id)"
+                if "intake_reason_category_publications" in tables
+                else ""
+            )
+            reason_category_join = (
+                "LEFT JOIN intake_reason_category_publications USING (audit_event_id)"
+                if "intake_reason_category_publications" in tables
+                else ""
+            )
             audit = self._metadata.execute(
                 f"""
                 SELECT count(*), COALESCE(MIN(audit_position), 1),
@@ -4586,6 +4747,8 @@ class LocalStore:
                        {manual_count}
                        {medication_count}
                        {deviation_count}
+                       {as_needed_count}
+                       {reason_category_count}
                 FROM audit_events
                 LEFT JOIN import_publications USING (audit_event_id)
                 LEFT JOIN data_review_decisions USING (audit_event_id)
@@ -4595,6 +4758,8 @@ class LocalStore:
                 {manual_join}
                 {medication_join}
                 {deviation_join}
+                {as_needed_join}
+                {reason_category_join}
                 """
             ).fetchone()
             assert audit is not None
@@ -6404,6 +6569,18 @@ class LocalStore:
             "WHERE snapshot_id = ?",
             (str(snapshot_id), str(previous_snapshot_id)),
         )
+        self._metadata.execute(
+            "INSERT INTO intake_reason_category_snapshot_bindings "
+            "SELECT ?, revision_id FROM intake_reason_category_snapshot_bindings "
+            "WHERE snapshot_id = ?",
+            (str(snapshot_id), str(previous_snapshot_id)),
+        )
+        self._metadata.execute(
+            "INSERT INTO as_needed_intake_snapshot_bindings "
+            "SELECT ?, revision_id FROM as_needed_intake_snapshot_bindings "
+            "WHERE snapshot_id = ?",
+            (str(snapshot_id), str(previous_snapshot_id)),
+        )
 
     def load_daily_series(
         self, start_date: date | None, end_date: date | None
@@ -7017,6 +7194,17 @@ class LocalStore:
                 "WHERE snapshot_id = ?",
                 (str(selected),),
             ).fetchone()
+        if row is None:
+            row = self._metadata.execute(
+                "SELECT medication_as_of FROM intake_reason_category_publications "
+                "WHERE snapshot_id = ?",
+                (str(selected),),
+            ).fetchone()
+        if row is None:
+            row = self._metadata.execute(
+                "SELECT medication_as_of FROM as_needed_intake_publications WHERE snapshot_id = ?",
+                (str(selected),),
+            ).fetchone()
         if row is not None:
             return datetime.fromisoformat(str(row[0]))
         row = self._metadata.execute(
@@ -7053,6 +7241,20 @@ class LocalStore:
                     (str(row[1]),),
                 ).fetchall()
             )
+            as_needed = tuple(
+                (
+                    str(entry[0]),
+                    str(entry[1]),
+                    str(entry[2]),
+                    tuple(json.loads(str(entry[3]))),
+                    str(entry[4]),
+                )
+                for entry in self._metadata.execute(
+                    "SELECT medication_name, amount, unit, preferred_reason_category_ids, entry_id "
+                    "FROM medication_as_needed_entries WHERE revision_id = ? ORDER BY rowid",
+                    (str(row[1]),),
+                ).fetchall()
+            )
             values.append(
                 StoredMedicationRegime(
                     str(row[0]),
@@ -7061,6 +7263,7 @@ class LocalStore:
                     datetime.fromisoformat(str(row[3])),
                     str(row[4]),
                     doses,
+                    as_needed,
                 )
             )
         return tuple(values)
@@ -7158,6 +7361,395 @@ class LocalStore:
         self._require_open()
         return self._stored_medication_deviations("WHERE revision.logical_id = ?", (logical_id,))
 
+    def _stored_intake_reason_categories(
+        self, where: str, args: tuple[object, ...]
+    ) -> tuple[StoredIntakeReasonCategory, ...]:
+        rows = self._metadata.execute(
+            "SELECT revision.logical_id, revision.revision_id, revision.previous_revision_id, "
+            "revision.state, value.name, value.name_key, value.rowid "
+            "FROM intake_reason_category_revisions revision "
+            "JOIN intake_reason_category_values value USING (revision_id) "
+            + where
+            + " ORDER BY value.rowid",
+            args,
+        ).fetchall()
+        return tuple(
+            StoredIntakeReasonCategory(
+                str(row[0]),
+                str(row[1]),
+                None if row[2] is None else str(row[2]),
+                cast(Literal["active", "withdrawn"], str(row[3])),
+                None if row[4] is None else str(row[4]),
+                None,
+            )
+            for row in rows
+        )
+
+    def load_active_intake_reason_categories(
+        self, snapshot_id: SnapshotId | None
+    ) -> tuple[StoredIntakeReasonCategory, ...]:
+        self._require_open()
+        selected = self.load_active_snapshot_id() if snapshot_id is None else snapshot_id
+        if selected is None:
+            return ()
+        return self._stored_intake_reason_categories(
+            "JOIN intake_reason_category_snapshot_bindings binding USING (revision_id) "
+            "WHERE binding.snapshot_id = ? AND revision.state = 'active'",
+            (str(selected),),
+        )
+
+    def load_intake_reason_category(
+        self, snapshot_id: SnapshotId | None, logical_id: str
+    ) -> StoredIntakeReasonCategory | None:
+        return next(
+            (
+                item
+                for item in self.load_active_intake_reason_categories(snapshot_id)
+                if item.logical_id == logical_id
+            ),
+            None,
+        )
+
+    def load_intake_reason_category_audit(
+        self, logical_id: str
+    ) -> tuple[StoredIntakeReasonCategory, ...]:
+        self._require_open()
+        return self._stored_intake_reason_categories("WHERE revision.logical_id = ?", (logical_id,))
+
+    def is_intake_reason_category_name_reserved(
+        self, name: str, *, excluding_logical_id: str | None = None
+    ) -> bool:
+        self._require_open()
+        name_key = " ".join(name.split()).casefold()
+        return (
+            self._metadata.execute(
+                "SELECT 1 FROM intake_reason_category_values value "
+                "JOIN intake_reason_category_revisions revision USING (revision_id) "
+                "WHERE value.name_key = ? AND (? IS NULL OR revision.logical_id != ?)",
+                (name_key, excluding_logical_id, excluding_logical_id),
+            ).fetchone()
+            is not None
+        )
+
+    def _stored_as_needed_intakes(
+        self, where: str, args: tuple[object, ...]
+    ) -> tuple[StoredAsNeededIntake, ...]:
+        rows = self._metadata.execute(
+            "SELECT revision.logical_id, revision.revision_id, revision.previous_revision_id, "
+            "revision.state, value.regime_logical_id, value.entry_id, value.taken_at, "
+            "value.amount, "
+            "value.reason_category_logical_id, value.withdrawal_reason "
+            "FROM as_needed_intake_revisions revision "
+            "JOIN as_needed_intake_values value USING (revision_id) "
+            + where
+            + " ORDER BY revision.rowid",
+            args,
+        ).fetchall()
+        return tuple(
+            StoredAsNeededIntake(
+                str(row[0]),
+                str(row[1]),
+                None if row[2] is None else str(row[2]),
+                cast(Literal["active", "withdrawn"], str(row[3])),
+                str(row[4]),
+                str(row[5]),
+                datetime.fromisoformat(str(row[6])),
+                str(row[7]),
+                None if row[8] is None else str(row[8]),
+                None if row[9] is None else str(row[9]),
+            )
+            for row in rows
+        )
+
+    def load_active_as_needed_intakes(
+        self, snapshot_id: SnapshotId | None
+    ) -> tuple[StoredAsNeededIntake, ...]:
+        self._require_open()
+        selected = self.load_active_snapshot_id() if snapshot_id is None else snapshot_id
+        if selected is None:
+            return ()
+        return self._stored_as_needed_intakes(
+            "JOIN as_needed_intake_snapshot_bindings binding USING (revision_id) "
+            "WHERE binding.snapshot_id = ? AND revision.state = 'active'",
+            (str(selected),),
+        )
+
+    def load_as_needed_intake(
+        self, snapshot_id: SnapshotId | None, logical_id: str
+    ) -> StoredAsNeededIntake | None:
+        return next(
+            (
+                item
+                for item in self.load_active_as_needed_intakes(snapshot_id)
+                if item.logical_id == logical_id
+            ),
+            None,
+        )
+
+    def load_as_needed_intake_audit(self, logical_id: str) -> tuple[StoredAsNeededIntake, ...]:
+        self._require_open()
+        return self._stored_as_needed_intakes("WHERE revision.logical_id = ?", (logical_id,))
+
+    def publish_intake_reason_category(
+        self, publication: IntakeReasonCategoryPublication
+    ) -> MedicationRootPublicationResult:
+        self._require_open()
+        self._require_writer()
+        active = self.load_active_snapshot_id()
+        if active != publication.expected_snapshot_id:
+            raise StoreError("Aktiver Snapshot hat sich geändert.")
+        audit = self.load_intake_reason_category_audit(str(publication.logical_id))
+        current = self.load_intake_reason_category(active, str(publication.logical_id))
+        if publication.intent == "create":
+            if audit:
+                raise StoreError("Einnahmegrund existiert bereits.")
+            previous, state = None, "active"
+        elif publication.intent == "restore":
+            if (
+                not audit
+                or audit[-1].revision_id != str(publication.expected_revision_id)
+                or audit[-1].state != "withdrawn"
+            ):
+                raise StoreError("Einnahmegrundrevision hat sich geändert.")
+            previous, state = audit[-1].revision_id, "active"
+        else:
+            if current is None or current.revision_id != str(publication.expected_revision_id):
+                raise StoreError("Einnahmegrundrevision hat sich geändert.")
+            previous, state = (
+                current.revision_id,
+                "withdrawn" if publication.intent == "withdraw" else "active",
+            )
+        revision_id, snapshot_id = MedicationRevisionId(uuid4().hex), SnapshotId(uuid4().hex)
+        created_at = datetime.now(UTC).isoformat()
+        payload = {
+            "intent": publication.intent,
+            "name": publication.name,
+            "withdrawal_reason": publication.withdrawal_reason,
+        }
+        try:
+            with self._metadata:
+                self._metadata.execute(
+                    "INSERT INTO write_operations VALUES "
+                    "(?, 'revise_intake_reason_category', ?, ?, 'committed', 1)",
+                    (str(publication.operation_id), created_at, created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO intake_reason_category_revisions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        str(revision_id),
+                        str(publication.logical_id),
+                        previous,
+                        str(publication.operation_id),
+                        state,
+                        created_at,
+                        hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(),
+                    ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO intake_reason_category_values VALUES (?, ?, ?)",
+                    (
+                        str(revision_id),
+                        publication.name,
+                        None
+                        if publication.name is None
+                        else " ".join(publication.name.split()).casefold(),
+                    ),
+                )
+                position = int(
+                    self._metadata.execute(
+                        "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+                    ).fetchone()[0]
+                )
+                manifest = self._stage_review_snapshot(
+                    parent_snapshot_id=active,
+                    snapshot_id=snapshot_id,
+                    operation_id=publication.operation_id,
+                    audit_position=position,
+                    review_case_id=None,
+                    decision_id="",
+                    action="manual_medication_revision",
+                    selected_measurement_version_id=None,
+                    candidate_version_ids=(),
+                    replacement_plausibility_cases=(),
+                )
+                self._activate_review_snapshot(
+                    publication.operation_id,
+                    snapshot_id,
+                    active,
+                    manifest,
+                    created_at,
+                    activation_kind="manual_context_revision",
+                )
+                self._metadata.execute(
+                    "DELETE FROM intake_reason_category_snapshot_bindings WHERE snapshot_id = ? "
+                    "AND revision_id IN (SELECT revision_id FROM intake_reason_category_revisions "
+                    "WHERE logical_id = ?)",
+                    (str(snapshot_id), str(publication.logical_id)),
+                )
+                if state == "active":
+                    self._metadata.execute(
+                        "INSERT INTO intake_reason_category_snapshot_bindings VALUES (?, ?)",
+                        (str(snapshot_id), str(revision_id)),
+                    )
+                audit_event_id = uuid4().hex
+                self._metadata.execute(
+                    "INSERT INTO audit_events VALUES (?, ?, ?, 'manual_medication_revision', ?)",
+                    (position, audit_event_id, str(publication.operation_id), created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO intake_reason_category_publications VALUES (?, ?, ?, ?)",
+                    (
+                        audit_event_id,
+                        str(revision_id),
+                        str(snapshot_id),
+                        publication.medication_as_of.isoformat(),
+                    ),
+                )
+        except Exception:
+            shutil.rmtree(
+                self._root / "staging" / str(publication.operation_id), ignore_errors=True
+            )
+            shutil.rmtree(
+                self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id), ignore_errors=True
+            )
+            raise
+        return MedicationRootPublicationResult(publication.logical_id, revision_id, snapshot_id)
+
+    def publish_as_needed_intake(
+        self, publication: AsNeededIntakePublication
+    ) -> MedicationRootPublicationResult:
+        self._require_open()
+        self._require_writer()
+        active = self.load_active_snapshot_id()
+        if active != publication.expected_snapshot_id:
+            raise StoreError("Aktiver Snapshot hat sich geändert.")
+        audit = self.load_as_needed_intake_audit(str(publication.logical_id))
+        current = self.load_as_needed_intake(active, str(publication.logical_id))
+        if publication.intent == "create":
+            if audit:
+                raise StoreError("Bedarfseinnahme existiert bereits.")
+            previous, state = None, "active"
+        elif publication.intent == "restore":
+            if (
+                not audit
+                or audit[-1].revision_id != str(publication.expected_revision_id)
+                or audit[-1].state != "withdrawn"
+            ):
+                raise StoreError("Bedarfseinnahmerevision hat sich geändert.")
+            previous, state = audit[-1].revision_id, "active"
+        else:
+            if current is None or current.revision_id != str(publication.expected_revision_id):
+                raise StoreError("Bedarfseinnahmerevision hat sich geändert.")
+            previous, state = (
+                current.revision_id,
+                "withdrawn" if publication.intent == "withdraw" else "active",
+            )
+        revision_id, snapshot_id = MedicationRevisionId(uuid4().hex), SnapshotId(uuid4().hex)
+        created_at = datetime.now(UTC).isoformat()
+        payload = {
+            "intent": publication.intent,
+            "regime_logical_id": str(publication.regime_logical_id),
+            "entry_id": publication.entry_id,
+            "taken_at": publication.taken_at.isoformat(),
+            "amount": publication.amount,
+            "reason_category_logical_id": None
+            if publication.reason_category_logical_id is None
+            else str(publication.reason_category_logical_id),
+            "withdrawal_reason": publication.withdrawal_reason,
+        }
+        try:
+            with self._metadata:
+                self._metadata.execute(
+                    "INSERT INTO write_operations VALUES "
+                    "(?, 'revise_as_needed_intake', ?, ?, 'committed', 1)",
+                    (str(publication.operation_id), created_at, created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO as_needed_intake_revisions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        str(revision_id),
+                        str(publication.logical_id),
+                        previous,
+                        str(publication.operation_id),
+                        state,
+                        created_at,
+                        hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(),
+                    ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO as_needed_intake_values VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        str(revision_id),
+                        str(publication.regime_logical_id),
+                        publication.entry_id,
+                        publication.taken_at.isoformat(),
+                        publication.amount,
+                        None
+                        if publication.reason_category_logical_id is None
+                        else str(publication.reason_category_logical_id),
+                        publication.withdrawal_reason,
+                    ),
+                )
+                position = int(
+                    self._metadata.execute(
+                        "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+                    ).fetchone()[0]
+                )
+                manifest = self._stage_review_snapshot(
+                    parent_snapshot_id=active,
+                    snapshot_id=snapshot_id,
+                    operation_id=publication.operation_id,
+                    audit_position=position,
+                    review_case_id=None,
+                    decision_id="",
+                    action="manual_medication_revision",
+                    selected_measurement_version_id=None,
+                    candidate_version_ids=(),
+                    replacement_plausibility_cases=(),
+                )
+                self._activate_review_snapshot(
+                    publication.operation_id,
+                    snapshot_id,
+                    active,
+                    manifest,
+                    created_at,
+                    activation_kind="manual_context_revision",
+                )
+                self._metadata.execute(
+                    "DELETE FROM as_needed_intake_snapshot_bindings WHERE snapshot_id = ? "
+                    "AND revision_id IN (SELECT revision_id FROM as_needed_intake_revisions "
+                    "WHERE logical_id = ?)",
+                    (str(snapshot_id), str(publication.logical_id)),
+                )
+                if state == "active":
+                    self._metadata.execute(
+                        "INSERT INTO as_needed_intake_snapshot_bindings VALUES (?, ?)",
+                        (str(snapshot_id), str(revision_id)),
+                    )
+                audit_event_id = uuid4().hex
+                self._metadata.execute(
+                    "INSERT INTO audit_events VALUES (?, ?, ?, 'manual_medication_revision', ?)",
+                    (position, audit_event_id, str(publication.operation_id), created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO as_needed_intake_publications VALUES (?, ?, ?, ?)",
+                    (
+                        audit_event_id,
+                        str(revision_id),
+                        str(snapshot_id),
+                        publication.medication_as_of.isoformat(),
+                    ),
+                )
+        except Exception:
+            shutil.rmtree(
+                self._root / "staging" / str(publication.operation_id), ignore_errors=True
+            )
+            shutil.rmtree(
+                self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id), ignore_errors=True
+            )
+            raise
+        return MedicationRootPublicationResult(publication.logical_id, revision_id, snapshot_id)
+
     def publish_medication_regime(
         self, publication: MedicationRegimePublication
     ) -> MedicationRegimePublicationResult:
@@ -7193,6 +7785,7 @@ class LocalStore:
                 (name, amount, unit, local_time.isoformat(), days)
                 for name, amount, unit, local_time, days in publication.scheduled_doses
             ],
+            "as_needed": publication.as_needed_medications,
         }
         try:
             with self._metadata:
@@ -7229,6 +7822,22 @@ class LocalStore:
                             json.dumps(days),
                         )
                         for name, amount, unit, local_time, days in publication.scheduled_doses
+                    ],
+                )
+                self._metadata.executemany(
+                    "INSERT INTO medication_as_needed_entries VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            entry_id,
+                            str(revision_id),
+                            name,
+                            amount,
+                            unit,
+                            json.dumps(reason_ids),
+                        )
+                        for name, amount, unit, reason_ids, entry_id in (
+                            publication.as_needed_medications
+                        )
                     ],
                 )
                 position = int(

@@ -20,6 +20,12 @@ statement = "One immutable deviation binds one scheduled occurrence; omitted, ch
 evidence = ["positive", "negative", "transition", "boundary"]
 
 [[contract]]
+id = "V03-C-AS-NEEDED-INTAKE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/82"
+statement = "A snapshot-bound as-needed intake references the valid PRN entry at its actual instant, has a positive dose in that entry's unit, and may use one active globally normalized reason category; category revisions preserve old snapshot displays and active regime preferences block withdrawal."
+evidence = ["positive", "negative", "transition", "boundary"]
+
+[[contract]]
 id = "V03-C-DAILY-STRESS-CUSTOM-CONTEXT-V1"
 source = "https://github.com/RMKruse/personal-health-lab/issues/79"
 statement = "One daily stress revision is active per local day, an observed average remains distinct from the baseline assumption, and normalized custom labels reserve their names while same-label periods cannot overlap."
@@ -172,6 +178,20 @@ platform = "all"
 expected_result = "the old snapshot remains deviated while withdrawal restores assumed_as_planned in the active snapshot"
 expected_effect = "one immutable deviation revision, audit event, and snapshot for each successful state change"
 forbidden_side_effects = "no second day occurrence, automatic reassignment, or lock for no_change"
+evidence = ["positive", "negative", "transition", "boundary"]
+
+[[case]]
+id = "V03-A-AS-NEEDED-INTAKE-V1"
+contracts = ["V03-C-AS-NEEDED-INTAKE-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_medication.py::test_as_needed_intakes_and_reason_categories_are_snapshot_bound"
+initial_state = "committed synthetic snapshot with one reason category and one PRN medication"
+operation = "record a travel-zone PRN intake, rename its category, block category withdrawal through a regime preference, then withdraw and restore the intake"
+level = "application"
+platform = "all"
+expected_result = "the old snapshot retains the old category name, the current snapshot projects the rename, and the audit ends active after restoration"
+expected_effect = "one immutable medication revision and one snapshot per successful request"
+forbidden_side_effects = "no deviation, regime mutation, category free text, or automatic category withdrawal"
 evidence = ["positive", "negative", "transition", "boundary"]
 
 [[case]]
