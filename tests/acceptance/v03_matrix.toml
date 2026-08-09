@@ -398,3 +398,97 @@ expected_result = "day and canonical interval tables"
 expected_effect = "none"
 forbidden_side_effects = "no persistent UI state outside application"
 evidence = ["positive", "parity"]
+
+[[contract]]
+id = "V03-C-ACTIVITY-SOURCE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/74"
+statement = "Apple exercise time, steps, walking/running distance, and active energy preserve typed canonical values, units, timestamps, provenance, identity, and versions."
+evidence = ["positive", "boundary", "reproducibility"]
+
+[[contract]]
+id = "V03-C-ACTIVITY-PROJECTION-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/74"
+statement = "Activity days aggregate each metric independently on the measurement-local start day; cross-midnight quantities are not split and missing metrics remain null."
+evidence = ["positive", "boundary"]
+
+[[contract]]
+id = "V03-C-ACTIVITY-REVIEW-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/74"
+statement = "Same-metric same-source-class positive overlaps and negative activity values remain canonical, contribute until resolved, and open review cases; cross-metric overlap remains valid."
+evidence = ["positive", "negative", "boundary"]
+
+[[contract]]
+id = "V03-C-ACTIVITY-ADAPTERS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/74"
+statement = "CLI JSON and Streamlit forward the same SnapshotDateSelection to HealthLab.load_activity_days and render the complete activity projection."
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-ACTIVITY-OVERLAP-V1"
+contracts = ["V03-C-ACTIVITY-REVIEW-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_activity.py::test_same_metric_same_source_class_overlap_opens_a_review_case"
+initial_state = "empty synthetic store"
+operation = "import overlapping same-metric Watch samples and a cross-metric overlap"
+level = "application"
+platform = "all"
+expected_result = "one source-conflict review while all canonical values remain effective"
+expected_effect = "one immutable snapshot is published"
+forbidden_side_effects = "no overlap deduplication or cross-metric review"
+evidence = ["positive", "boundary"]
+
+[[case]]
+id = "V03-A-ACTIVITY-NEGATIVE-V1"
+contracts = ["V03-C-ACTIVITY-REVIEW-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_activity.py::test_negative_activity_value_remains_canonical_and_opens_plausibility_review"
+initial_state = "empty synthetic store"
+operation = "import a negative step-count sample"
+level = "application"
+platform = "all"
+expected_result = "the negative canonical value remains visible with one plausibility review"
+expected_effect = "one immutable snapshot is published"
+forbidden_side_effects = "no value coercion or automatic exclusion"
+evidence = ["negative"]
+
+[[case]]
+id = "V03-A-ACTIVITY-PROJECTION-V1"
+contracts = ["V03-C-ACTIVITY-SOURCE-V1", "V03-C-ACTIVITY-PROJECTION-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_activity.py::test_activity_import_preserves_typed_samples_and_assigns_cross_midnight_value_to_start_day"
+initial_state = "empty synthetic store"
+operation = "import all supported numeric activity types including a cross-midnight exercise sample"
+level = "application"
+platform = "all"
+expected_result = "typed samples and independent daily totals assigned to their measurement-local start day"
+expected_effect = "one immutable snapshot is published"
+forbidden_side_effects = "no quantity prorating or cross-metric aggregation"
+evidence = ["positive", "boundary", "reproducibility"]
+
+[[case]]
+id = "V03-A-ACTIVITY-CLI-V1"
+contracts = ["V03-C-ACTIVITY-ADAPTERS-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_activity.py::test_activity_days_cli_projects_the_shared_selection"
+initial_state = "committed activity sample"
+operation = "load selected activity days through human CLI and JSON 3.0"
+level = "adapter"
+platform = "all"
+expected_result = "complete selected activity projection with observed zero and missing metrics distinguished"
+expected_effect = "none"
+forbidden_side_effects = "no CLI derivation or source classification"
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-ACTIVITY-STREAMLIT-V1"
+contracts = ["V03-C-ACTIVITY-ADAPTERS-V1"]
+fixtures = []
+runner = "tests/adapters/test_streamlit.py::test_streamlit_loads_activity_days_through_the_application_seam"
+initial_state = "committed activity sample"
+operation = "load activity on the Kerndaten page"
+level = "adapter"
+platform = "all"
+expected_result = "daily activity and canonical measurement tables"
+expected_effect = "none"
+forbidden_side_effects = "no persistent UI state outside application"
+evidence = ["positive", "parity"]

@@ -179,7 +179,7 @@ def test_metadata_backup_conflict_blocks_without_overwriting(tmp_path: Path) -> 
     with sqlite3.connect(target) as backup:
         backup.execute(
             "UPDATE rule_version_refs SET rule_kind = 'identity' "
-            "WHERE rule_version_id = 'healthkit-canonical/v2'"
+                "WHERE rule_version_id = 'healthkit-canonical/v3'"
         )
     conflicted = target.read_bytes()
 

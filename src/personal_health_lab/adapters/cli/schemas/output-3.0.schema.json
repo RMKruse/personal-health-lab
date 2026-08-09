@@ -13,6 +13,9 @@
       "$ref": "#/$defs/sleepDaysOutput"
     },
     {
+      "$ref": "#/$defs/activityDaysOutput"
+    },
+    {
       "$ref": "#/$defs/writePlanOutput"
     },
     {
@@ -32,6 +35,30 @@
     }
   ],
   "$defs": {
+    "activityDaysOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "days",
+        "kind",
+        "measurements",
+        "runtime_config",
+        "schema_version",
+        "selection",
+        "snapshot_ref",
+        "status"
+      ],
+      "properties": {
+        "days": { "type": "array", "items": { "type": "object" } },
+        "kind": { "const": "activity_days" },
+        "measurements": { "type": "array", "items": { "type": "object" } },
+        "runtime_config": { "type": "object" },
+        "schema_version": { "const": "3.0" },
+        "selection": { "type": "object" },
+        "snapshot_ref": { "$ref": "#/$defs/nullableString" },
+        "status": { "type": "string" }
+      }
+    },
     "sleepDaysOutput": {
       "type": "object",
       "additionalProperties": false,

@@ -14,6 +14,7 @@ from personal_health_lab.health_data import (
     LogicalMeasurementId,
     MeasurementVersionId,
     canonical_unit_for,
+    classify_activity_source,
 )
 from personal_health_lab.storage import (
     ExportFact,
@@ -79,6 +80,23 @@ _FIXED_RULES = (
         False,
         None,
         datetime(1970, 1, 1, tzinfo=UTC),
+    ),
+    *(
+        PlausibilityRuleRecord(
+            "fixed-plausibility/v1",
+            data_type.value,
+            canonical_unit_for(data_type).value,
+            0.0,
+            None,
+            False,
+            None,
+            datetime(1970, 1, 1, tzinfo=UTC),
+        )
+        for data_type in (
+            CanonicalHealthType.APPLE_EXERCISE_TIME,
+            CanonicalHealthType.STEP_COUNT,
+            CanonicalHealthType.WALKING_RUNNING_DISTANCE,
+        )
     ),
 )
 _NUTRITION_RECOMMENDATIONS = tuple(
@@ -383,6 +401,7 @@ def resolve_sources(
 
     generated_cases = (
         *_source_conflicts(occurrences, version_by_id, conflict_keys),
+        *_activity_overlap_conflicts(version_by_id, measurements),
         *_source_deletions(
             occurrences,
             version_by_id,
@@ -920,6 +939,68 @@ def _source_deletions(
             )
         )
     return tuple(missing)
+
+
+def _activity_overlap_conflicts(
+    version_by_id: dict[str, MeasurementVersionFact],
+    measurements: tuple[ResolvedMeasurement, ...],
+) -> tuple[OpenDataReviewCase, ...]:
+    activity_types = {
+        "apple_exercise_time",
+        "step_count",
+        "walking_running_distance",
+        "active_energy",
+    }
+    grouped: dict[tuple[str, str], list[MeasurementVersionFact]] = defaultdict(list)
+    for measurement in measurements:
+        if measurement.effective_value is None:
+            continue
+        version = version_by_id[measurement.selected_measurement_version_id]
+        if version.canonical_type not in activity_types:
+            continue
+        source_class = classify_activity_source(version.source_name, version.device).value
+        grouped[(version.canonical_type, source_class)].append(version)
+    cases = []
+    for (data_type, source_class), versions in sorted(grouped.items()):
+        active: MeasurementVersionFact | None = None
+        active_end: datetime | None = None
+        for version in sorted(
+            versions,
+            key=lambda item: (
+                item.source_start_utc,
+                item.source_end_utc,
+                item.measurement_version_id,
+            ),
+        ):
+            start = datetime.fromisoformat(version.source_start_utc)
+            end = datetime.fromisoformat(version.source_end_utc)
+            if start >= end:
+                continue
+            if (
+                active is not None
+                and active_end is not None
+                and start < active_end
+                and active.logical_measurement_id != version.logical_measurement_id
+            ):
+                logical_ids = tuple(
+                    sorted((active.logical_measurement_id, version.logical_measurement_id))
+                )
+                case_key = f"activity_overlap:{data_type}:{source_class}:{':'.join(logical_ids)}"
+                cases.append(
+                    OpenDataReviewCase(
+                        review_case_id=hashlib.sha256(case_key.encode()).hexdigest()[:32],
+                        kind="source_conflict",
+                        logical_measurement_id=LogicalMeasurementId(logical_ids[0]),
+                        measurement_version_id=None,
+                        rule_version_id=None,
+                        evidence_fingerprint=hashlib.sha256(
+                            f"{case_key}:evidence".encode()
+                        ).hexdigest(),
+                    )
+                )
+            if active_end is None or end > active_end:
+                active, active_end = version, end
+    return tuple(cases)
 
 
 def _source_conflicts(

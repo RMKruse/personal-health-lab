@@ -2,6 +2,7 @@
 
 from personal_health_lab import DataMode
 from personal_health_lab.health_data import (
+    ActivitySourceClass,
     AnalysisDataStatusReason,
     AnalysisFreshness,
     DataQualityStatus,
@@ -54,6 +55,10 @@ from personal_health_lab.storage import (
 from ._application import (
     AbortMetadataRestore,
     AbortMetadataRestorePlan,
+    ActivityDay,
+    ActivityDays,
+    ActivityMeasurement,
+    ActivityMetric,
     AnalysisReceipt,
     AnalysisStatus,
     BatchDecisionTarget,
@@ -62,6 +67,7 @@ from ._application import (
     ConfirmDataReviewBatch,
     CreateMetadataBackup,
     CreatePlausibilityRuleVersion,
+    DailyActivityMetric,
     DailyNutrition,
     DailyNutritionFeature,
     DataConfirmation,
@@ -168,6 +174,11 @@ from ._application import (
 __all__ = [
     "AbortMetadataRestore",
     "AbortMetadataRestorePlan",
+    "ActivityDay",
+    "ActivityDays",
+    "ActivityMeasurement",
+    "ActivityMetric",
+    "ActivitySourceClass",
     "AnalysisDataStatusReason",
     "AnalysisDefinitionId",
     "AnalysisFreshness",
@@ -189,6 +200,7 @@ __all__ = [
     "ConfirmDataReviewBatch",
     "CreateMetadataBackup",
     "CreatePlausibilityRuleVersion",
+    "DailyActivityMetric",
     "DailyNutrition",
     "DailyNutritionFeature",
     "DataConfirmation",

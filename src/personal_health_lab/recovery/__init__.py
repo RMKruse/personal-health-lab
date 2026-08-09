@@ -46,8 +46,12 @@ _RESTORE_SOURCE_METHOD_ID = "restore-source-import/v1"
 _RESTORE_ACTIVATE_METHOD_ID = "restore-activate/v1"
 _IDENTITY_RULE_VERSION = "healthkit-identity/v3"
 _SUPPORTED_IDENTITY_RULE_VERSIONS = {"healthkit-natural/v2", _IDENTITY_RULE_VERSION}
-_MAPPING_RULE_VERSION = "healthkit-canonical/v2"
-_SUPPORTED_MAPPING_RULE_VERSIONS = {"healthkit-canonical/v1", _MAPPING_RULE_VERSION}
+_MAPPING_RULE_VERSION = "healthkit-canonical/v3"
+_SUPPORTED_MAPPING_RULE_VERSIONS = {
+    "healthkit-canonical/v1",
+    "healthkit-canonical/v2",
+    _MAPPING_RULE_VERSION,
+}
 _DIRECTORY_OVERHEAD = 64 * 1024
 _MINIMUM_ESTIMATE = 2 * 1024**2
 _RESTORE_DIRECTORY = "recovery"

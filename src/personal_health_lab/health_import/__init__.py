@@ -51,8 +51,11 @@ from personal_health_lab.storage import (
 
 _EXPORT_MEMBER = "apple_health_export/export.xml"
 _ACTIVE_ENERGY = "HKQuantityTypeIdentifierActiveEnergyBurned"
+_APPLE_EXERCISE_TIME = "HKQuantityTypeIdentifierAppleExerciseTime"
 _RESTING_HEART_RATE = "HKQuantityTypeIdentifierRestingHeartRate"
 _BODY_MASS = "HKQuantityTypeIdentifierBodyMass"
+_STEP_COUNT = "HKQuantityTypeIdentifierStepCount"
+_WALKING_RUNNING_DISTANCE = "HKQuantityTypeIdentifierDistanceWalkingRunning"
 _LOGICAL_IDENTITY_RULE_VERSION = "healthkit-natural/v2"
 _PAYLOAD_IDENTITY_RULE_VERSION = "healthkit-payload/v2"
 _SYNC_IDENTIFIER = "HKMetadataKeySyncIdentifier"
@@ -61,6 +64,11 @@ _MAPPINGS: dict[str, tuple[CanonicalHealthType, CanonicalUnit, dict[str, float]]
         CanonicalHealthType.ACTIVE_ENERGY,
         CanonicalUnit.KILOCALORIE,
         {"kcal": 1.0},
+    ),
+    _APPLE_EXERCISE_TIME: (
+        CanonicalHealthType.APPLE_EXERCISE_TIME,
+        CanonicalUnit.MINUTE,
+        {"min": 1.0, "s": 1 / 60},
     ),
     _RESTING_HEART_RATE: (
         CanonicalHealthType.APPLE_RESTING_HEART_RATE,
@@ -71,6 +79,12 @@ _MAPPINGS: dict[str, tuple[CanonicalHealthType, CanonicalUnit, dict[str, float]]
         CanonicalHealthType.BODY_MASS,
         CanonicalUnit.KILOGRAM,
         {"kg": 1.0, "g": 0.001, "lb": 0.45359237},
+    ),
+    _STEP_COUNT: (CanonicalHealthType.STEP_COUNT, CanonicalUnit.COUNT, {"count": 1.0}),
+    _WALKING_RUNNING_DISTANCE: (
+        CanonicalHealthType.WALKING_RUNNING_DISTANCE,
+        CanonicalUnit.KILOMETER,
+        {"m": 0.001, "km": 1.0, "mi": 1.609344},
     ),
 }
 _SLEEP_TYPE = "HKCategoryTypeIdentifierSleepAnalysis"
@@ -141,9 +155,9 @@ _DIETARY_TYPES = {
 }
 _V03_UNITS = {
     "HKQuantityTypeIdentifierBodyMass": frozenset({"kg", "g", "lb"}),
-    "HKQuantityTypeIdentifierAppleExerciseTime": frozenset({"min", "s"}),
-    "HKQuantityTypeIdentifierStepCount": frozenset({"count"}),
-    "HKQuantityTypeIdentifierDistanceWalkingRunning": frozenset({"m", "km", "mi"}),
+    _APPLE_EXERCISE_TIME: frozenset({"min", "s"}),
+    _STEP_COUNT: frozenset({"count"}),
+    _WALKING_RUNNING_DISTANCE: frozenset({"m", "km", "mi"}),
     _ACTIVE_ENERGY: frozenset({"kcal"}),
     _RESTING_HEART_RATE: frozenset({"count/min"}),
     **{

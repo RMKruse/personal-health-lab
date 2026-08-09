@@ -424,6 +424,7 @@ def _render_sleep_days(config: RuntimeConfig) -> None:
         ],
         width="stretch",
     )
+
     st.dataframe(
         [
             {"Tag": day.day.isoformat(), **episode_fields(nap)}
@@ -448,6 +449,84 @@ def _render_sleep_days(config: RuntimeConfig) -> None:
                 "Gerät": item.device,
             }
             for item in (*projection.accepted_intervals, *projection.rejected_intervals)
+        ],
+        width="stretch",
+    )
+
+
+def _render_activity_days(config: RuntimeConfig) -> None:
+    st.subheader("Aktivität")
+    snapshot = st.text_input("Aktivitäts-Snapshot-ID (optional)")
+    start = st.date_input("Aktivität von", value=None)
+    end = st.date_input("Aktivität bis", value=None)
+    if st.button("Aktivität laden"):
+        try:
+            assert start is None or isinstance(start, date)
+            assert end is None or isinstance(end, date)
+            st.session_state["activity_selection"] = SnapshotDateSelection(
+                snapshot_ref=SnapshotRef(snapshot) if snapshot else None,
+                start_date=start,
+                end_date=end,
+            )
+        except (ValueError, ConfigurationError, HealthLabError):
+            st.error("Aktivitätsdaten konnten nicht geladen werden.")
+    selection = st.session_state.get("activity_selection")
+    if not isinstance(selection, SnapshotDateSelection):
+        return
+    try:
+        with HealthLab.open(config) as health_lab:
+            projection = health_lab.load_activity_days(selection)
+    except (ConfigurationError, HealthLabError):
+        st.error("Aktivitätsdaten konnten nicht geladen werden.")
+        return
+    st.caption(f"Snapshot: {projection.snapshot_ref or '-'} · Status: {projection.status.value}")
+    st.dataframe(
+        [
+            {
+                "Tag": item.day.isoformat(),
+                "Trainingszeit (min)": item.exercise_time.value,
+                "Schritte": item.step_count.value,
+                "Geh-/Laufdistanz (km)": item.walking_running_distance.value,
+                "Aktive Energie (kcal)": item.active_energy.value,
+                "Prüffälle": [
+                    str(case_id)
+                    for metric in (
+                        item.exercise_time,
+                        item.step_count,
+                        item.walking_running_distance,
+                        item.active_energy,
+                    )
+                    for case_id in metric.review_case_ids
+                ],
+            }
+            for item in projection.days
+        ],
+        width="stretch",
+    )
+    st.dataframe(
+        [
+            {
+                "Datentyp": item.data_type.value,
+                "Logische Messung": str(item.logical_measurement_id),
+                "Wert": item.value,
+                "Einheit": item.unit.value,
+                "Effektiver Wert": item.effective_value,
+                "Disposition": item.disposition,
+                "Ausgewählt": item.is_selected,
+                "Quellenklasse": item.source_class.value,
+                "Originalwert": item.original_value,
+                "Originaleinheit": item.original_unit,
+                "Lokaler Tag": item.measurement_local_day.isoformat(),
+                "Quellbeginn": item.source_start.isoformat(),
+                "Quellende": item.source_end.isoformat(),
+                "Quellaktualisierung": item.source_updated_at.isoformat(),
+                "Quelle": item.source_name,
+                "Quellversion": item.source_version,
+                "Gerät": item.device,
+                "Messungsversion": str(item.measurement_version_id),
+                "Prüffälle": [str(case_id) for case_id in item.review_case_ids],
+            }
+            for item in projection.measurements
         ],
         width="stretch",
     )
@@ -631,6 +710,7 @@ if rollback_plan.details.migration_operation_id is not None:
 if st.session_state["active_page"] == "Kerndaten":
     _render_weight_nutrition(config)
     _render_sleep_days(config)
+    _render_activity_days(config)
     _render_import_details(config)
     st.stop()
 

@@ -52,10 +52,29 @@ _STORE_MIGRATION_METHOD = "cow-migration/v1"
 _SNAPSHOT_SCHEMA_VERSION = 1
 _CANONICAL_HEALTH_TYPES_SQL = ", ".join(f"'{item.value}'" for item in CanonicalHealthType)
 _CANONICAL_UNITS_SQL = ", ".join(f"'{item.value}'" for item in CanonicalUnit)
+_PRE_ACTIVITY_HEALTH_TYPES_SQL = ", ".join(
+    f"'{item.value}'"
+    for item in CanonicalHealthType
+    if item
+    not in {
+        CanonicalHealthType.APPLE_EXERCISE_TIME,
+        CanonicalHealthType.STEP_COUNT,
+        CanonicalHealthType.WALKING_RUNNING_DISTANCE,
+    }
+)
+_PRE_ACTIVITY_UNITS_SQL = ", ".join(
+    f"'{item.value}'"
+    for item in CanonicalUnit
+    if item not in {CanonicalUnit.COUNT, CanonicalUnit.KILOMETER, CanonicalUnit.MINUTE}
+)
 _IDENTITY_RULE_VERSION = "healthkit-identity/v3"
 _SUPPORTED_IDENTITY_RULE_VERSIONS = {"healthkit-natural/v2", _IDENTITY_RULE_VERSION}
-_MAPPING_RULE_VERSION = "healthkit-canonical/v2"
-_SUPPORTED_MAPPING_RULE_VERSIONS = {"healthkit-canonical/v1", _MAPPING_RULE_VERSION}
+_MAPPING_RULE_VERSION = "healthkit-canonical/v3"
+_SUPPORTED_MAPPING_RULE_VERSIONS = {
+    "healthkit-canonical/v1",
+    "healthkit-canonical/v2",
+    _MAPPING_RULE_VERSION,
+}
 _FIXED_PLAUSIBILITY_RULE_VERSION = "fixed-plausibility/v1"
 _SNAPSHOT_SCHEMAS = {
     "source_occurrences.parquet": (
@@ -811,7 +830,7 @@ class StoredImportDetails:
 
 
 @dataclass(frozen=True, slots=True)
-class StoredWeightNutritionMeasurement:
+class StoredMeasurement:
     logical_measurement_id: LogicalMeasurementId
     measurement_version_id: MeasurementVersionId
     data_type: CanonicalHealthType
@@ -1525,6 +1544,26 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                 "1970-01-01T00:00:00+00:00",
                 None,
             ),
+            *(
+                (
+                    _FIXED_PLAUSIBILITY_RULE_VERSION,
+                    data_type,
+                    unit,
+                    0.0,
+                    None,
+                    0,
+                    None,
+                    None,
+                    None,
+                    "1970-01-01T00:00:00+00:00",
+                    None,
+                )
+                for data_type, unit in (
+                    ("apple_exercise_time", "min"),
+                    ("step_count", "count"),
+                    ("walking_running_distance", "km"),
+                )
+            ),
         ),
     )
     import_columns = {
@@ -1679,6 +1718,14 @@ def _upgrade_v03_constraints(metadata: sqlite3.Connection) -> None:
                 (
                     "canonical_unit IN ('kcal', 'count/min', 'kg'))",
                     f"canonical_unit IN ({_CANONICAL_UNITS_SQL}))",
+                ),
+                (
+                    f"data_type IN ({_PRE_ACTIVITY_HEALTH_TYPES_SQL})",
+                    f"data_type IN ({_CANONICAL_HEALTH_TYPES_SQL})",
+                ),
+                (
+                    f"canonical_unit IN ({_PRE_ACTIVITY_UNITS_SQL})",
+                    f"canonical_unit IN ({_CANONICAL_UNITS_SQL})",
                 ),
             ),
         ),
@@ -4058,6 +4105,9 @@ class LocalStore:
                           WHEN canonical_type IN ('active_energy', 'dietary_energy_consumed')
                               THEN 'kcal'
                           WHEN canonical_type = 'apple_resting_heart_rate' THEN 'count/min'
+                          WHEN canonical_type = 'apple_exercise_time' THEN 'min'
+                          WHEN canonical_type = 'step_count' THEN 'count'
+                          WHEN canonical_type = 'walking_running_distance' THEN 'km'
                           WHEN canonical_type = 'body_mass' THEN 'kg'
                           WHEN canonical_type LIKE 'sleep_%' THEN 'count'
                           WHEN canonical_type = 'dietary_water' THEN 'mL'
@@ -5519,7 +5569,35 @@ class LocalStore:
         snapshot_id: SnapshotId | None,
         start_date: date | None,
         end_date: date | None,
-    ) -> tuple[SnapshotId | None, tuple[StoredWeightNutritionMeasurement, ...]]:
+    ) -> tuple[SnapshotId | None, tuple[StoredMeasurement, ...]]:
+        return self._load_measurements(
+            snapshot_id,
+            start_date,
+            end_date,
+            "(versions.canonical_type = 'body_mass' OR versions.canonical_type LIKE 'dietary_%')",
+        )
+
+    def load_activity_measurements(
+        self,
+        snapshot_id: SnapshotId | None,
+        start_date: date | None,
+        end_date: date | None,
+    ) -> tuple[SnapshotId | None, tuple[StoredMeasurement, ...]]:
+        return self._load_measurements(
+            snapshot_id,
+            start_date,
+            end_date,
+            "versions.canonical_type IN ('apple_exercise_time', 'step_count', "
+            "'walking_running_distance', 'active_energy')",
+        )
+
+    def _load_measurements(
+        self,
+        snapshot_id: SnapshotId | None,
+        start_date: date | None,
+        end_date: date | None,
+        type_clause: str,
+    ) -> tuple[SnapshotId | None, tuple[StoredMeasurement, ...]]:
         self._require_open()
         selected_snapshot = snapshot_id or self.load_active_snapshot_id()
         if selected_snapshot is None:
@@ -5535,9 +5613,7 @@ class LocalStore:
         versions = str(directory / "measurement_versions.parquet").replace("'", "''")
         resolved = str(directory / "resolved_measurements.parquet").replace("'", "''")
         reviews = str(directory / "open_review_cases.parquet").replace("'", "''")
-        clauses = [
-            "(versions.canonical_type = 'body_mass' OR versions.canonical_type LIKE 'dietary_%')"
-        ]
+        clauses = [type_clause]
         parameters: list[date] = []
         if start_date is not None:
             clauses.append("versions.measurement_local_date >= ?")
@@ -5576,7 +5652,7 @@ class LocalStore:
             return datetime.fromisoformat(value).astimezone(timezone(timedelta(minutes=offset)))
 
         return selected_snapshot, tuple(
-            StoredWeightNutritionMeasurement(
+            StoredMeasurement(
                 logical_measurement_id=LogicalMeasurementId(str(row[0])),
                 measurement_version_id=MeasurementVersionId(str(row[1])),
                 data_type=CanonicalHealthType(str(row[2])),
@@ -6170,11 +6246,41 @@ class LocalStore:
                 FROM read_parquet('{escaped}')
                 WHERE identity_candidate_id = ?
             )
-            SELECT DISTINCT measurement_version_id
-            FROM read_parquet('{escaped}')
-            WHERE identity_candidate_id = ?
-               OR (canonical_type, source_start_utc, source_end_utc, source_name, device)
+            SELECT DISTINCT candidates.measurement_version_id
+            FROM read_parquet('{escaped}') AS candidates
+            WHERE candidates.identity_candidate_id = ?
+               OR (candidates.canonical_type, candidates.source_start_utc,
+                   candidates.source_end_utc, candidates.source_name, candidates.device)
                   IN (SELECT * FROM seed)
+               OR EXISTS (
+                    SELECT 1 FROM seed
+                    WHERE candidates.canonical_type IN (
+                        'apple_exercise_time', 'step_count',
+                        'walking_running_distance', 'active_energy'
+                    )
+                      AND candidates.canonical_type = seed.canonical_type
+                      AND candidates.source_start_utc < candidates.source_end_utc
+                      AND seed.source_start_utc < seed.source_end_utc
+                      AND candidates.source_start_utc < seed.source_end_utc
+                      AND candidates.source_end_utc > seed.source_start_utc
+                      AND CASE
+                            WHEN candidates.source_name = 'Apple Watch'
+                             AND candidates.device = 'Apple Watch'
+                                THEN 'watch'
+                            WHEN candidates.source_name = 'iPhone' AND candidates.device = 'iPhone'
+                                THEN 'iphone'
+                            WHEN candidates.source_name != ''
+                              OR candidates.device != '' THEN 'other'
+                            ELSE 'unknown'
+                          END = CASE
+                            WHEN seed.source_name = 'Apple Watch' AND seed.device = 'Apple Watch'
+                                THEN 'watch'
+                            WHEN seed.source_name = 'iPhone' AND seed.device = 'iPhone'
+                                THEN 'iphone'
+                            WHEN seed.source_name != '' OR seed.device != '' THEN 'other'
+                            ELSE 'unknown'
+                          END
+               )
             ORDER BY measurement_version_id
             """,
             (str(logical_measurement_id), str(logical_measurement_id)),

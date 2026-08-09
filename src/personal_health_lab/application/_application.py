@@ -30,10 +30,12 @@ from personal_health_lab.data_quality import (
     run_historical_review,
 )
 from personal_health_lab.health_data import (
+    ActivitySourceClass,
     CanonicalSleepCategory,
     DataQualityStatus,
     ModelMaturityStatus,
     canonical_unit_for,
+    classify_activity_source,
 )
 from personal_health_lab.health_import import (
     CanonicalHealthType,
@@ -90,7 +92,7 @@ from personal_health_lab.storage import (
     PublishBatchDecisionResult,
     PublishDecisionResult,
     StoreBusyError,
-    StoredWeightNutritionMeasurement,
+    StoredMeasurement,
     StoreError,
     StoreId,
     probe_filevault,
@@ -469,6 +471,75 @@ class SleepDays:
     days: tuple[SleepDay, ...]
     accepted_intervals: tuple[SleepInterval, ...]
     rejected_intervals: tuple[SleepInterval, ...]
+
+
+class ActivityMetric(StrEnum):
+    EXERCISE_TIME = "apple_exercise_time"
+    STEP_COUNT = "step_count"
+    WALKING_RUNNING_DISTANCE = "walking_running_distance"
+    ACTIVE_ENERGY = "active_energy"
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityMeasurement:
+    logical_measurement_id: LogicalMeasurementId
+    measurement_version_id: MeasurementVersionId
+    data_type: ActivityMetric
+    unit: CanonicalUnit
+    value: float
+    effective_value: float | None
+    disposition: (
+        Literal[
+            "included_source",
+            "included_correction",
+            "excluded_local",
+            "excluded_source_deletion",
+        ]
+        | None
+    )
+    is_selected: bool
+    source_class: ActivitySourceClass
+    source_start: datetime
+    source_end: datetime
+    source_updated_at: datetime
+    measurement_local_day: date
+    source_name: str
+    source_version: str
+    device: str
+    original_value: float
+    original_unit: str
+    review_case_ids: tuple[DataReviewCaseId, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DailyActivityMetric:
+    data_type: ActivityMetric
+    unit: CanonicalUnit
+    value: float | None
+    logical_measurement_ids: tuple[LogicalMeasurementId, ...] = ()
+    measurement_version_ids: tuple[MeasurementVersionId, ...] = ()
+    review_case_ids: tuple[DataReviewCaseId, ...] = ()
+    quality_status: DataQualityStatus = DataQualityStatus.REVIEWED
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityDay:
+    day: date
+    exercise_time: DailyActivityMetric
+    step_count: DailyActivityMetric
+    walking_running_distance: DailyActivityMetric
+    active_energy: DailyActivityMetric
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityDays:
+    snapshot_ref: SnapshotRef | None
+    status: DataQualityStatus
+    days: tuple[ActivityDay, ...]
+    measurements: tuple[ActivityMeasurement, ...]
+
+
+_ACTIVITY_TYPES = {CanonicalHealthType(item.value): item for item in ActivityMetric}
 
 
 _SLEEP_SOURCE_CLASSIFIER_VERSION = "sleep-source-classification/v1"
@@ -3737,7 +3808,7 @@ class HealthLab:
                 "Gewichts- und Ernährungsprojektion ist nicht verfügbar."
             ) from error
 
-        def public_weight(item: StoredWeightNutritionMeasurement) -> WeightMeasurement:
+        def public_weight(item: StoredMeasurement) -> WeightMeasurement:
             return WeightMeasurement(
                 logical_measurement_id=item.logical_measurement_id,
                 measurement_version_id=item.measurement_version_id,
@@ -3760,7 +3831,7 @@ class HealthLab:
             )
 
         def public_nutrition_sample(
-            item: StoredWeightNutritionMeasurement,
+            item: StoredMeasurement,
         ) -> HealthKitNutritionSample:
             return HealthKitNutritionSample(
                 logical_measurement_id=item.logical_measurement_id,
@@ -3925,6 +3996,117 @@ class HealthLab:
             weight_measurements=weight_measurements,
             nutrition_days=tuple(nutrition_days),
             healthkit_nutrition_samples=healthkit_nutrition_samples,
+        )
+
+    def load_activity_days(self, selection: SnapshotDateSelection) -> ActivityDays:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        try:
+            snapshot_ref, stored_measurements = self._store.load_activity_measurements(
+                selection.snapshot_ref, selection.start_date, selection.end_date
+            )
+        except StoreError as error:
+            raise HealthLabError("Aktivitätstagsprojektion ist nicht verfügbar.") from error
+        measurements = tuple(
+            ActivityMeasurement(
+                logical_measurement_id=item.logical_measurement_id,
+                measurement_version_id=item.measurement_version_id,
+                data_type=_ACTIVITY_TYPES[item.data_type],
+                unit=item.unit,
+                value=item.value,
+                effective_value=item.effective_value,
+                disposition=item.disposition,
+                is_selected=item.is_selected,
+                source_class=classify_activity_source(item.source_name, item.device),
+                source_start=item.source_start,
+                source_end=item.source_end,
+                source_updated_at=item.source_updated_at,
+                measurement_local_day=item.measurement_local_day,
+                source_name=item.source_name,
+                source_version=item.source_version,
+                device=item.device,
+                original_value=item.original_value,
+                original_unit=item.original_unit,
+                review_case_ids=tuple(
+                    DataReviewCaseId(str(value)) for value in item.review_case_ids
+                ),
+            )
+            for item in stored_measurements
+        )
+        selected = tuple(
+            item
+            for item in measurements
+            if item.is_selected
+            and item.effective_value is not None
+            and item.disposition in {"included_source", "included_correction"}
+        )
+        start_date: date | None
+        end_date: date | None
+        if selection.start_date is not None and selection.end_date is not None:
+            start_date, end_date = selection.start_date, selection.end_date
+        elif selected:
+            start_date = min(item.measurement_local_day for item in selected)
+            end_date = max(item.measurement_local_day for item in selected)
+        else:
+            start_date = end_date = None
+
+        def feature(metric: ActivityMetric, day: date) -> DailyActivityMetric:
+            contributors = tuple(
+                item
+                for item in selected
+                if item.data_type is metric and item.measurement_local_day == day
+            )
+            review_case_ids = tuple(
+                sorted(
+                    {case_id for item in contributors for case_id in item.review_case_ids}, key=str
+                )
+            )
+            return DailyActivityMetric(
+                data_type=metric,
+                unit=canonical_unit_for(CanonicalHealthType(metric.value)),
+                value=(
+                    sum(
+                        item.effective_value
+                        for item in contributors
+                        if item.effective_value is not None
+                    )
+                    if contributors
+                    else None
+                ),
+                logical_measurement_ids=tuple(item.logical_measurement_id for item in contributors),
+                measurement_version_ids=tuple(item.measurement_version_id for item in contributors),
+                review_case_ids=review_case_ids,
+                quality_status=(
+                    DataQualityStatus.PROVISIONAL if review_case_ids else DataQualityStatus.REVIEWED
+                ),
+            )
+
+        days = []
+        current = start_date
+        while current is not None and end_date is not None and current <= end_date:
+            days.append(
+                ActivityDay(
+                    day=current,
+                    exercise_time=feature(ActivityMetric.EXERCISE_TIME, current),
+                    step_count=feature(ActivityMetric.STEP_COUNT, current),
+                    walking_running_distance=feature(
+                        ActivityMetric.WALKING_RUNNING_DISTANCE, current
+                    ),
+                    active_energy=feature(ActivityMetric.ACTIVE_ENERGY, current),
+                )
+            )
+            current += timedelta(days=1)
+        return ActivityDays(
+            snapshot_ref=snapshot_ref,
+            status=(
+                DataQualityStatus.PROVISIONAL
+                if any(item.review_case_ids for item in selected)
+                else DataQualityStatus.REVIEWED
+            ),
+            days=tuple(days),
+            measurements=measurements,
         )
 
     def load_sleep_days(self, selection: SnapshotDateSelection) -> SleepDays:

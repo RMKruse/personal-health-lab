@@ -96,6 +96,50 @@ def test_streamlit_loads_sleep_days_through_the_application_seam(
     assert app.dataframe
 
 
+def test_streamlit_loads_activity_days_through_the_application_seam(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package = tmp_path / "activity.zip"
+    with ZipFile(package, "w") as archive:
+        archive.writestr(
+            "apple_health_export/export.xml",
+            """
+            <HealthData>
+              <ExportDate value="2024-01-03 12:00:00 +0100"/>
+              <Record type="HKQuantityTypeIdentifierStepCount" unit="count" value="42"
+                sourceName="Apple Watch" sourceVersion="1" device="Apple Watch"
+                creationDate="2024-01-02 20:01:00 +0100"
+                startDate="2024-01-02 20:00:00 +0100" endDate="2024-01-02 20:01:00 +0100"/>
+            </HealthData>
+            """,
+        )
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "synthetic", tmp_path / "real")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(package)
+        health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+    monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
+    monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(config.synthetic_store))
+    monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(config.real_store))
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
+
+    app = AppTest.from_file(str(app_path)).run()
+    app.radio[0].set_value("Kerndaten").run()
+    next(button for button in app.button if button.label == "Aktivität laden").click().run()
+
+    assert not app.exception
+    assert any(item.value == "Aktivität" for item in app.subheader)
+    assert app.dataframe
+    assert {
+        "Logische Messung",
+        "Quellaktualisierung",
+        "Quellversion",
+        "Disposition",
+        "Ausgewählt",
+    } <= set(app.dataframe[-1].value.columns)
+
+
 @pytest.mark.v02_adapter("streamlit", "WeightDayStatus")
 def test_streamlit_renders_the_complete_weight_projection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -13,6 +13,7 @@ from personal_health_lab.adapters._config import load_runtime_config
 from personal_health_lab.application import (
     AbortMetadataRestore,
     AbortMetadataRestorePlan,
+    ActivityDays,
     AnalysisDefinitionId,
     AnalysisProvenance,
     AnalysisReceipt,
@@ -27,6 +28,7 @@ from personal_health_lab.application import (
     ConfirmDataReviewBatch,
     CreateMetadataBackup,
     CreatePlausibilityRuleVersion,
+    DailyActivityMetric,
     DailyNutritionFeature,
     DataConfirmation,
     DataCorrection,
@@ -145,6 +147,11 @@ def _parser() -> argparse.ArgumentParser:
     sleep.add_argument("--start-date", type=date.fromisoformat)
     sleep.add_argument("--end-date", type=date.fromisoformat)
     sleep.add_argument("--json", action="store_true", dest="as_json")
+    activity = commands.add_parser("activity-days", help="Aktivitätstage laden")
+    activity.add_argument("--snapshot", type=SnapshotRef)
+    activity.add_argument("--start-date", type=date.fromisoformat)
+    activity.add_argument("--end-date", type=date.fromisoformat)
+    activity.add_argument("--json", action="store_true", dest="as_json")
     analysis = commands.add_parser("analyze", help="Verzögerungsprofil analysieren")
     analysis.add_argument("--definition", default="lag-signal-v2")
     analysis.add_argument("--start-date", type=date.fromisoformat)
@@ -692,6 +699,74 @@ def _sleep_days_json(
     }
 
 
+def _activity_days_json(
+    projection: ActivityDays,
+    selection: SnapshotDateSelection,
+    runtime_config: Mapping[str, object],
+) -> dict[str, object]:
+    def metric(item: DailyActivityMetric) -> dict[str, object]:
+        return {
+            "data_type": item.data_type.value,
+            "logical_measurement_ids": [str(value) for value in item.logical_measurement_ids],
+            "measurement_version_ids": [str(value) for value in item.measurement_version_ids],
+            "quality_status": item.quality_status.value,
+            "review_case_ids": [str(value) for value in item.review_case_ids],
+            "unit": item.unit.value,
+            "value": item.value,
+        }
+
+    return {
+        "days": [
+            {
+                "active_energy": metric(item.active_energy),
+                "day": item.day.isoformat(),
+                "exercise_time": metric(item.exercise_time),
+                "step_count": metric(item.step_count),
+                "walking_running_distance": metric(item.walking_running_distance),
+            }
+            for item in projection.days
+        ],
+        "kind": "activity_days",
+        "measurements": [
+            {
+                "data_type": item.data_type.value,
+                "device": item.device,
+                "disposition": item.disposition,
+                "effective_value": item.effective_value,
+                "is_selected": item.is_selected,
+                "logical_measurement_id": str(item.logical_measurement_id),
+                "measurement_local_day": item.measurement_local_day.isoformat(),
+                "measurement_version_id": str(item.measurement_version_id),
+                "original_unit": item.original_unit,
+                "original_value": item.original_value,
+                "review_case_ids": [str(value) for value in item.review_case_ids],
+                "source_class": item.source_class.value,
+                "source_end": item.source_end.isoformat(),
+                "source_name": item.source_name,
+                "source_start": item.source_start.isoformat(),
+                "source_updated_at": item.source_updated_at.isoformat(),
+                "source_version": item.source_version,
+                "unit": item.unit.value,
+                "value": item.value,
+            }
+            for item in projection.measurements
+        ],
+        "runtime_config": dict(runtime_config),
+        "schema_version": _OUTPUT_SCHEMA_VERSION,
+        "selection": {
+            "end_date": None if selection.end_date is None else selection.end_date.isoformat(),
+            "snapshot_ref": (
+                None if selection.snapshot_ref is None else str(selection.snapshot_ref)
+            ),
+            "start_date": (
+                None if selection.start_date is None else selection.start_date.isoformat()
+            ),
+        },
+        "snapshot_ref": None if projection.snapshot_ref is None else str(projection.snapshot_ref),
+        "status": projection.status.value,
+    }
+
+
 def _recovery_status_json(
     status: RecoveryStatus,
     runtime_config: Mapping[str, object],
@@ -1223,6 +1298,11 @@ def main(args: Sequence[str] | None = None) -> int:
                     parsed.snapshot, parsed.start_date, parsed.end_date
                 )
                 sleep_days = health_lab.load_sleep_days(sleep_selection)
+            elif parsed.command == "activity-days":
+                activity_selection = SnapshotDateSelection(
+                    parsed.snapshot, parsed.start_date, parsed.end_date
+                )
+                activity_days = health_lab.load_activity_days(activity_selection)
             elif parsed.command == "restore":
                 restore_request = BeginMetadataRestore(parsed.backup)
                 restore_plan = health_lab.preview_write(restore_request)
@@ -1660,6 +1740,42 @@ def main(args: Sequence[str] | None = None) -> int:
                 sort_keys=True,
             )
         )
+    elif parsed.command == "activity-days" and parsed.as_json:
+        print(
+            json.dumps(
+                _activity_days_json(activity_days, activity_selection, runtime_config),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    elif parsed.command == "activity-days":
+        print("Aktivitätstage")
+        print(
+            f"Snapshot: {activity_days.snapshot_ref or '-'} · "
+            f"Status: {activity_days.status.value}"
+        )
+
+        def value_or_dash(value: float | None) -> float | str:
+            return "-" if value is None else value
+
+        for activity_day in activity_days.days:
+            print(
+                f"{activity_day.day} · "
+                f"Trainingszeit: {value_or_dash(activity_day.exercise_time.value)} min · "
+                f"Schritte: {value_or_dash(activity_day.step_count.value)} count · "
+                f"Distanz: {value_or_dash(activity_day.walking_running_distance.value)} km · "
+                f"Aktive Energie: {value_or_dash(activity_day.active_energy.value)} kcal"
+            )
+        for activity_measurement in activity_days.measurements:
+            print(
+                f"{activity_measurement.data_type.value} · "
+                f"{activity_measurement.value} {activity_measurement.unit.value} · "
+                f"Original: {activity_measurement.original_value} "
+                f"{activity_measurement.original_unit} · "
+                f"Quellenklasse: {activity_measurement.source_class.value} · "
+                f"Start: {activity_measurement.source_start.isoformat()} · "
+                f"Ende: {activity_measurement.source_end.isoformat()}"
+            )
     elif parsed.command == "sleep-days":
         print("Schlafnächte")
         print(f"Snapshot: {sleep_days.snapshot_ref or '-'}")

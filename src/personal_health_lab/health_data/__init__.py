@@ -10,6 +10,7 @@ from enum import StrEnum
 
 class CanonicalHealthType(StrEnum):
     ACTIVE_ENERGY = "active_energy"
+    APPLE_EXERCISE_TIME = "apple_exercise_time"
     APPLE_RESTING_HEART_RATE = "apple_resting_heart_rate"
     BODY_MASS = "body_mass"
     DIETARY_BIOTIN = "dietary_biotin"
@@ -51,12 +52,17 @@ class CanonicalHealthType(StrEnum):
     DIETARY_VITAMIN_K = "dietary_vitamin_k"
     DIETARY_WATER = "dietary_water"
     DIETARY_ZINC = "dietary_zinc"
+    STEP_COUNT = "step_count"
+    WALKING_RUNNING_DISTANCE = "walking_running_distance"
 
 
 class CanonicalUnit(StrEnum):
     KILOCALORIE = "kcal"
     BEATS_PER_MINUTE = "count/min"
+    COUNT = "count"
     KILOGRAM = "kg"
+    KILOMETER = "km"
+    MINUTE = "min"
     GRAM = "g"
     MILLILITER = "mL"
 
@@ -69,11 +75,34 @@ def canonical_unit_for(data_type: CanonicalHealthType) -> CanonicalUnit:
         return CanonicalUnit.KILOCALORIE
     if data_type is CanonicalHealthType.APPLE_RESTING_HEART_RATE:
         return CanonicalUnit.BEATS_PER_MINUTE
+    if data_type is CanonicalHealthType.APPLE_EXERCISE_TIME:
+        return CanonicalUnit.MINUTE
+    if data_type is CanonicalHealthType.STEP_COUNT:
+        return CanonicalUnit.COUNT
+    if data_type is CanonicalHealthType.WALKING_RUNNING_DISTANCE:
+        return CanonicalUnit.KILOMETER
     if data_type is CanonicalHealthType.BODY_MASS:
         return CanonicalUnit.KILOGRAM
     if data_type is CanonicalHealthType.DIETARY_WATER:
         return CanonicalUnit.MILLILITER
     return CanonicalUnit.GRAM
+
+
+class ActivitySourceClass(StrEnum):
+    WATCH = "watch"
+    IPHONE = "iphone"
+    OTHER = "other"
+    UNKNOWN = "unknown"
+
+
+def classify_activity_source(source_name: str, device: str) -> ActivitySourceClass:
+    if (source_name, device) == ("Apple Watch", "Apple Watch"):
+        return ActivitySourceClass.WATCH
+    if (source_name, device) == ("iPhone", "iPhone"):
+        return ActivitySourceClass.IPHONE
+    if source_name or device:
+        return ActivitySourceClass.OTHER
+    return ActivitySourceClass.UNKNOWN
 
 
 class AnalysisFreshness(StrEnum):
@@ -245,6 +274,7 @@ class DailyHealthSeries:
 
 
 __all__ = [
+    "ActivitySourceClass",
     "AnalysisDataStatusReason",
     "AnalysisFreshness",
     "CanonicalHealthRecord",
@@ -264,4 +294,5 @@ __all__ = [
     "ModelMaturityStatus",
     "ReproducibilityStatus",
     "canonical_unit_for",
+    "classify_activity_source",
 ]
