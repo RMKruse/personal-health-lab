@@ -541,6 +541,26 @@ source = "https://github.com/RMKruse/personal-health-lab/issues/75"
 statement = "HealthLab, CLI JSON, and Streamlit use the shared workout projection without merging it into activity-day totals."
 evidence = ["positive", "parity"]
 
+[[contract]]
+id = "V03-C-SNAPSHOT-LINEAGE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/83"
+statement = "Every V0.3 snapshot validates a closed flat lineage artifact for resolved measurements and workouts; immutable canonical sources are reused across a manual activation."
+evidence = ["positive", "reproducibility", "transition"]
+
+[[case]]
+id = "V03-A-SNAPSHOT-LINEAGE-V1"
+contracts = ["V03-C-SNAPSHOT-LINEAGE-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_medication.py::test_snapshot_lineage_is_flat_validated_and_reuses_immutable_sources"
+initial_state = "committed synthetic source snapshot"
+operation = "activate a manual intake-reason-category revision and inspect the published snapshot artifact"
+level = "application"
+platform = "all"
+expected_result = "flat source lineage for each resolved record and reused immutable canonical source files"
+expected_effect = "one fully validated child snapshot"
+forbidden_side_effects = "no copied canonical source artifact or unreferenced lineage row"
+evidence = ["positive", "reproducibility", "transition"]
+
 [[case]]
 id = "V03-A-ACTIVITY-OVERLAP-V1"
 contracts = ["V03-C-ACTIVITY-REVIEW-V1"]

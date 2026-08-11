@@ -50,7 +50,7 @@ _STORE_SCHEMA_VERSION = 10
 _WRITER_LOCK_FILE = ".writer.lock"
 _FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
 _STORE_MIGRATION_METHOD = "cow-migration/v1"
-_SNAPSHOT_SCHEMA_VERSION = 4
+_SNAPSHOT_SCHEMA_VERSION = 5
 _CANONICAL_HEALTH_TYPES_SQL = ", ".join(f"'{item.value}'" for item in CanonicalHealthType)
 _CANONICAL_UNITS_SQL = ", ".join(f"'{item.value}'" for item in CanonicalUnit)
 _PRE_ACTIVITY_HEALTH_TYPES_SQL = ", ".join(
@@ -178,6 +178,14 @@ _SNAPSHOT_SCHEMAS = {
         ("rule_version_id", "VARCHAR"),
         ("evidence_fingerprint", "VARCHAR"),
     ),
+    "derivation_lineage.parquet": (
+        ("derived_record_id", "VARCHAR"),
+        ("derived_family", "VARCHAR"),
+        ("derivation_contract_id", "VARCHAR"),
+        ("source_logical_id", "VARCHAR"),
+        ("source_version_id", "VARCHAR"),
+        ("contribution_role", "VARCHAR"),
+    ),
 }
 _LEGACY_SNAPSHOT_SCHEMAS = {
     name: schema
@@ -197,6 +205,11 @@ _V3_SNAPSHOT_SCHEMAS = {
     name: schema
     for name, schema in _SNAPSHOT_SCHEMAS.items()
     if name not in {"resolved_workouts.parquet", "workout_review_links.parquet"}
+}
+_V4_SNAPSHOT_SCHEMAS = {
+    name: schema
+    for name, schema in _SNAPSHOT_SCHEMAS.items()
+    if name != "derivation_lineage.parquet"
 }
 _KIB = 1024
 _MIB = 1024 * _KIB
@@ -4546,6 +4559,7 @@ class LocalStore:
             self._query.executemany(
                 "INSERT INTO open_review_cases VALUES (?, ?, ?, ?, ?, ?)", review_rows
             )
+        self._refresh_derivation_lineage()
 
         entries: list[dict[str, int | str]] = []
         for filename in sorted(_SNAPSHOT_SCHEMAS):
@@ -4619,6 +4633,7 @@ class LocalStore:
                 "identity_rule_version_id": _IDENTITY_RULE_VERSION,
                 "mapping_rule_version_id": _MAPPING_RULE_VERSION,
             },
+            "derivation_contract_ids": ["resolved-measurement/v1", "resolved-workout/v1"],
             "files": entries,
             "validation_counts": {
                 "exports": export_count,
@@ -4837,8 +4852,13 @@ class LocalStore:
                 "resolution_basis",
                 "files",
                 "validation_counts",
+                *(
+                    ("derivation_contract_ids",)
+                    if manifest.get("snapshot_schema_version") == _SNAPSHOT_SCHEMA_VERSION
+                    else ()
+                ),
             }
-            or manifest["snapshot_schema_version"] not in {1, 2, 3, _SNAPSHOT_SCHEMA_VERSION}
+            or manifest["snapshot_schema_version"] not in {1, 2, 3, 4, _SNAPSHOT_SCHEMA_VERSION}
             or manifest["snapshot_id"] != snapshot_id
             or not _is_lower_hex(manifest["snapshot_id"], 32)
             or not _is_lower_hex(manifest["store_id"], 32)
@@ -4861,6 +4881,11 @@ class LocalStore:
             or not _is_lower_hex(resolution_basis["governing_export_id"], 64)
             or resolution_basis["identity_rule_version_id"] not in _SUPPORTED_IDENTITY_RULE_VERSIONS
             or resolution_basis["mapping_rule_version_id"] not in _SUPPORTED_MAPPING_RULE_VERSIONS
+            or (
+                manifest["snapshot_schema_version"] == _SNAPSHOT_SCHEMA_VERSION
+                and manifest.get("derivation_contract_ids")
+                != ["resolved-measurement/v1", "resolved-workout/v1"]
+            )
             or not isinstance(validation_counts, dict)
             or set(validation_counts)
             != {
@@ -4879,6 +4904,7 @@ class LocalStore:
             1: _LEGACY_SNAPSHOT_SCHEMAS,
             2: _V2_SNAPSHOT_SCHEMAS,
             3: _V3_SNAPSHOT_SCHEMAS,
+            4: _V4_SNAPSHOT_SCHEMAS,
             _SNAPSHOT_SCHEMA_VERSION: _SNAPSHOT_SCHEMAS,
         }[manifest["snapshot_schema_version"]]
         files = manifest["files"]
@@ -5200,6 +5226,41 @@ class LocalStore:
         ).fetchone()
         if invalid is None or int(invalid[0]) != 0:
             raise StoreError("Snapshot-ID-Schließung oder Payloadvalidierung fehlgeschlagen.")
+        if manifest["snapshot_schema_version"] == _SNAPSHOT_SCHEMA_VERSION:
+            lineage = paths["derivation_lineage"]
+            invalid_lineage = self._query.execute(
+                f"""
+                WITH lineage AS (SELECT * FROM read_parquet('{lineage}')),
+                sources AS (
+                    SELECT identity_candidate_id AS source_logical_id,
+                           measurement_version_id AS source_version_id
+                    FROM read_parquet('{paths["measurement_versions"]}')
+                    UNION ALL
+                    SELECT logical_workout_id, workout_version_id
+                    FROM read_parquet('{paths["workouts"]}')
+                )
+                SELECT
+                    (SELECT count(*) - count(DISTINCT derived_record_id) FROM lineage)
+                  + (SELECT count(*) FROM lineage
+                     WHERE NOT regexp_full_match(derived_record_id, '[0-9a-f]{{64}}')
+                        OR NOT regexp_full_match(source_logical_id, '[0-9a-f]{{64}}')
+                        OR NOT regexp_full_match(source_version_id, '[0-9a-f]{{64}}')
+                        OR contribution_role != 'selected_source_version'
+                        OR (derived_family, derivation_contract_id) NOT IN (
+                            ('resolved_measurement', 'resolved-measurement/v1'),
+                            ('resolved_workout', 'resolved-workout/v1')
+                        ))
+                  + (SELECT count(*) FROM lineage l LEFT JOIN sources s
+                     USING (source_logical_id, source_version_id)
+                     WHERE s.source_version_id IS NULL)
+                  + abs((SELECT count(*) FROM lineage) - (
+                        (SELECT count(*) FROM read_parquet('{paths["resolved_measurements"]}'))
+                      + (SELECT count(*) FROM read_parquet('{paths["resolved_workouts"]}'))
+                    ))
+                """
+            ).fetchone()
+            if invalid_lineage is None or int(invalid_lineage[0]) != 0:
+                raise StoreError("Snapshot-Lineage ist nicht vollständig oder geschlossen.")
         counts = self._query.execute(
             f"""
             SELECT
@@ -6172,8 +6233,8 @@ class LocalStore:
     ) -> str:
         parent = self._root / _PARQUET_DIRECTORY / "snapshots" / str(parent_snapshot_id)
         staging = self._root / "staging" / str(operation_id)
-        shutil.copytree(parent, staging)
-        for filename in _SNAPSHOT_SCHEMAS:
+        shutil.copytree(parent, staging, copy_function=os.link)
+        for filename in _V4_SNAPSHOT_SCHEMAS:
             table = filename.removesuffix(".parquet")
             escaped = str(staging / filename).replace("'", "''")
             self._query.execute(
@@ -6431,18 +6492,27 @@ class LocalStore:
                         "'source', NULL, NULL, NULL, ?)",
                         (split_id, version_id, float(version[0]), str(version[1]), decision_id),
                     )
-        for filename in _SNAPSHOT_SCHEMAS:
+        self._refresh_derivation_lineage()
+        for filename in (
+            "resolved_measurements.parquet",
+            "resolved_workouts.parquet",
+            "workout_review_links.parquet",
+            "open_review_cases.parquet",
+            "derivation_lineage.parquet",
+        ):
             table = filename.removesuffix(".parquet")
             path = staging / filename
-            path.unlink()
+            path.unlink(missing_ok=True)
             escaped = str(path).replace("'", "''")
             self._query.execute(f"COPY (SELECT * FROM {table}) TO '{escaped}' (FORMAT PARQUET)")
         manifest = json.loads((staging / "manifest.json").read_bytes())
         manifest.update(
+            snapshot_schema_version=_SNAPSHOT_SCHEMA_VERSION,
             snapshot_id=str(snapshot_id),
             created_at_utc=datetime.now(UTC).isoformat(),
             created_by_operation_id=str(operation_id),
             parent_snapshot_id=str(parent_snapshot_id),
+            derivation_contract_ids=["resolved-measurement/v1", "resolved-workout/v1"],
         )
         manifest["resolution_basis"]["audit_max_position"] = audit_position
         entries = []
@@ -6501,7 +6571,9 @@ class LocalStore:
         manifest_bytes = json.dumps(
             manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True
         ).encode()
-        (staging / "manifest.json").write_bytes(manifest_bytes)
+        manifest_path = staging / "manifest.json"
+        manifest_path.unlink()
+        manifest_path.write_bytes(manifest_bytes)
         digest = hashlib.sha256(manifest_bytes).hexdigest()
         self._validate_snapshot(staging, str(snapshot_id), digest)
         return digest
@@ -6580,6 +6652,32 @@ class LocalStore:
             "SELECT ?, revision_id FROM as_needed_intake_snapshot_bindings "
             "WHERE snapshot_id = ?",
             (str(snapshot_id), str(previous_snapshot_id)),
+        )
+
+    def _refresh_derivation_lineage(self) -> None:
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE derivation_lineage AS
+            SELECT
+                sha256('resolved-measurement/v1:' || r.logical_measurement_id) AS derived_record_id,
+                'resolved_measurement' AS derived_family,
+                'resolved-measurement/v1' AS derivation_contract_id,
+                v.identity_candidate_id AS source_logical_id,
+                r.selected_measurement_version_id AS source_version_id,
+                'selected_source_version' AS contribution_role
+            FROM resolved_measurements r
+            JOIN measurement_versions v
+              ON v.measurement_version_id = r.selected_measurement_version_id
+            UNION ALL
+            SELECT
+                sha256('resolved-workout/v1:' || logical_workout_id) AS derived_record_id,
+                'resolved_workout' AS derived_family,
+                'resolved-workout/v1' AS derivation_contract_id,
+                logical_workout_id AS source_logical_id,
+                selected_workout_version_id AS source_version_id,
+                'selected_source_version' AS contribution_role
+            FROM resolved_workouts
+            """
         )
 
     def load_daily_series(

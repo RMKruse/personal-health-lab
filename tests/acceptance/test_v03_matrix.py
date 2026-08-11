@@ -18,7 +18,7 @@ def _matrix() -> dict[str, object]:
 
 def _collected_node_ids() -> set[str]:
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", "--collect-only", "-q"],
+        [sys.executable, "-m", "pytest", "tests", "--collect-only", "-q"],
         cwd=_ROOT,
         check=True,
         capture_output=True,

@@ -1,8 +1,11 @@
+import json
+import os
 from datetime import datetime, time
 from decimal import Decimal
 from pathlib import Path
 from zipfile import ZipFile
 
+import duckdb
 import pytest
 
 from personal_health_lab.application import (
@@ -48,6 +51,37 @@ def _package(path: Path) -> Path:
             'endDate="2024-04-01 12:01:00 +0200"/></HealthData>',
         )
     return path
+
+
+def test_snapshot_lineage_is_flat_validated_and_reuses_immutable_sources(tmp_path: Path) -> None:
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    with HealthLab.open(config) as health_lab:
+        imported = ImportHealthExport(_package(tmp_path / "export.zip"))
+        imported_receipt = health_lab.execute_write(
+            imported, expected_plan=health_lab.preview_write(imported).fingerprint
+        )
+        category = ReviseIntakeReasonCategory(IntakeReasonCategoryCreate("Schmerz"))
+        category_receipt = health_lab.execute_write(
+            category, expected_plan=health_lab.preview_write(category).fingerprint
+        )
+
+    snapshots = config.active_store / "parquet" / "snapshots"
+    parent = snapshots / str(imported_receipt.result.snapshot_ref)
+    snapshot = snapshots / str(category_receipt.result.snapshot_ref)
+    manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
+    lineage = str(snapshot / "derivation_lineage.parquet").replace("'", "''")
+    rows = duckdb.sql(f"SELECT * FROM read_parquet('{lineage}')").fetchall()
+
+    assert os.path.samefile(
+        parent / "measurement_versions.parquet", snapshot / "measurement_versions.parquet"
+    )
+    assert manifest["snapshot_schema_version"] == 5
+    assert manifest["derivation_contract_ids"] == [
+        "resolved-measurement/v1",
+        "resolved-workout/v1",
+    ]
+    assert len(rows) == 1
+    assert rows[0][1:3] == ("resolved_measurement", "resolved-measurement/v1")
 
 
 def test_medication_regime_projects_dst_and_keeps_old_snapshot_stable(tmp_path: Path) -> None:

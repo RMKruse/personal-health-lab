@@ -21,6 +21,7 @@ from personal_health_lab.application import (
 )
 
 PARQUET_FILES = (
+    "derivation_lineage.parquet",
     "measurement_versions.parquet",
     "open_review_cases.parquet",
     "resolved_measurements.parquet",
@@ -31,6 +32,7 @@ PARQUET_FILES = (
     "workouts.parquet",
 )
 LAST_COLUMNS = {
+    "derivation_lineage.parquet": "contribution_role",
     "measurement_versions.parquet": "strong_source_id_hash",
     "open_review_cases.parquet": "evidence_fingerprint",
     "resolved_measurements.parquet": "conflict_resolution_decision_id",
@@ -120,9 +122,8 @@ def test_import_publishes_one_validated_four_file_snapshot(tmp_path: Path) -> No
     assert receipt.result.status is ImportStatus.COMMITTED
     assert receipt.result.snapshot_ref is not None
     snapshot = config.active_store / "parquet" / "snapshots" / str(receipt.result.snapshot_ref)
-    assert tuple(sorted(path.name for path in snapshot.iterdir())) == (
-        "manifest.json",
-        *PARQUET_FILES,
+    assert tuple(sorted(path.name for path in snapshot.iterdir())) == tuple(
+        sorted(("manifest.json", *PARQUET_FILES))
     )
 
     manifest_bytes = (snapshot / "manifest.json").read_bytes()
