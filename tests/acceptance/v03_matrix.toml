@@ -714,3 +714,119 @@ expected_result = "complete shared workout projection"
 expected_effect = "none"
 forbidden_side_effects = "no adapter-side duration or aggregate derivation"
 evidence = ["positive", "parity"]
+
+[[contract]]
+id = "V03-C-MIGRATION-SCHEMAS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/84"
+statement = "Registered adjacent store, snapshot, and backup schema steps upgrade V0.2 into one complete validated V0.3 copy-on-write snapshot and reject newer or missing steps."
+evidence = ["positive", "negative", "reproducibility", "transition"]
+
+[[contract]]
+id = "V03-C-MIGRATION-ATOMICITY-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/84"
+statement = "A migration activates once, quarantines failed attempts, retries from the unchanged source, and permits rollback only before a later successful write."
+evidence = ["positive", "negative", "fault", "transition"]
+
+[[contract]]
+id = "V03-C-MIGRATION-ADAPTERS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/84"
+statement = "CLI JSON, human CLI, and Streamlit expose the shared migration plan and execute only through HealthLab."
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-MIGRATION-COW-V1"
+contracts = ["V03-C-MIGRATION-SCHEMAS-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_migration.py::test_v02_store_migrates_to_one_complete_v03_snapshot"
+initial_state = "V0.2 store with one four-file active snapshot"
+operation = "execute the registered V0.2 to V0.3 migration"
+level = "application"
+platform = "all"
+expected_result = "store schema 11 and one complete validated snapshot schema 7"
+expected_effect = "one metadata backup and one child snapshot activate together"
+forbidden_side_effects = "no source snapshot mutation, partial snapshot, or populated manual ledger"
+evidence = ["positive", "reproducibility", "transition"]
+
+[[case]]
+id = "V03-A-MIGRATION-REJECTION-V1"
+contracts = ["V03-C-MIGRATION-SCHEMAS-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_migration.py::test_v03_migration_rejects_newer_and_missing_registered_steps"
+initial_state = "newer or unregistered store, snapshot, and backup schema versions"
+operation = "plan schema migration"
+level = "application"
+platform = "all"
+expected_result = "explicit newer-schema or missing-step diagnosis"
+expected_effect = "none"
+forbidden_side_effects = "no downgrade, skipped step, or best-effort open"
+evidence = ["negative"]
+
+[[case]]
+id = "V03-A-MIGRATION-RETRY-V1"
+contracts = ["V03-C-MIGRATION-SCHEMAS-V1", "V03-C-MIGRATION-ATOMICITY-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_migration.py::test_v03_migration_fault_quarantines_attempt_and_retry_starts_fresh"
+initial_state = "V0.2 store with one four-file active snapshot"
+operation = "interrupt before SQLite commit, reopen, and retry"
+level = "application"
+platform = "all"
+expected_result = "failed target is quarantined and a fresh retry completes"
+expected_effect = "only the retry activates a target snapshot"
+forbidden_side_effects = "no source snapshot mutation or partial activation"
+evidence = ["fault", "transition"]
+
+[[case]]
+id = "V03-A-MIGRATION-ROLLBACK-V1"
+contracts = ["V03-C-MIGRATION-ATOMICITY-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v02_migration.py::test_direct_migration_rollback_restores_backup_and_old_snapshot"
+initial_state = "just-completed store migration"
+operation = "execute immediate migration rollback"
+level = "application"
+platform = "all"
+expected_result = "metadata backup and previous active snapshot are restored"
+expected_effect = "migrated snapshot becomes unreferenced"
+forbidden_side_effects = "no reverse migration or deletion of immutable snapshot files"
+evidence = ["positive", "transition"]
+
+[[case]]
+id = "V03-A-MIGRATION-ROLLBACK-LATE-V1"
+contracts = ["V03-C-MIGRATION-ATOMICITY-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v02_migration.py::test_later_successful_state_change_blocks_migration_rollback"
+initial_state = "completed migration followed by another successful write"
+operation = "preview migration rollback"
+level = "application"
+platform = "all"
+expected_result = "rollback is unavailable"
+expected_effect = "none"
+forbidden_side_effects = "no restoration over later committed state"
+evidence = ["negative", "transition"]
+
+[[case]]
+id = "V03-A-MIGRATION-ADAPTERS-V1"
+contracts = ["V03-C-MIGRATION-ADAPTERS-V1"]
+fixtures = []
+runner = "tests/adapters/test_cli.py::test_cli_maps_store_migration_plan_and_receipt"
+initial_state = "store requiring a registered migration"
+operation = "preview and execute through human and JSON CLI"
+level = "adapter"
+platform = "all"
+expected_result = "shared store and snapshot migration steps and receipt"
+expected_effect = "one application-owned migration execution"
+forbidden_side_effects = "no adapter-owned migration or hidden version coercion"
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-MIGRATION-STREAMLIT-V1"
+contracts = ["V03-C-MIGRATION-ADAPTERS-V1"]
+fixtures = []
+runner = "tests/adapters/test_streamlit.py::test_streamlit_focuses_migration_in_restricted_session"
+initial_state = "workspace restricted by a required store migration"
+operation = "render and execute the migration in Streamlit"
+level = "adapter"
+platform = "all"
+expected_result = "shared migration steps, backup, capacity, and confirmation UI"
+expected_effect = "one application-owned migration execution"
+forbidden_side_effects = "no unrelated page access or UI-owned migration state"
+evidence = ["positive", "parity"]

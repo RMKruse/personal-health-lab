@@ -100,8 +100,22 @@ def test_current_store_migration_is_a_no_op_without_backup(tmp_path: Path) -> No
 @pytest.mark.parametrize(
     ("source_version", "expected_steps"),
     [
-        (3, ((3, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9), (9, 10))),
-        (1, ((1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9), (9, 10))),
+        (3, ((3, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9), (9, 10), (10, 11))),
+        (
+            1,
+            (
+                (1, 2),
+                (2, 3),
+                (3, 4),
+                (4, 5),
+                (5, 6),
+                (6, 7),
+                (7, 8),
+                (8, 9),
+                (9, 10),
+                (10, 11),
+            ),
+        ),
     ],
 )
 def test_registered_store_migration_chain_executes_as_one_operation(
@@ -123,7 +137,7 @@ def test_registered_store_migration_chain_executes_as_one_operation(
     assert diagnostics.steps == expected_steps
     assert isinstance(plan.details, StoreMigrationPlan)
     assert plan.details.steps == expected_steps
-    assert plan.details.backup_file == f"metadata-v{source_version}-to-v10.sqlite3"
+    assert plan.details.backup_file == f"metadata-v{source_version}-to-v11.sqlite3"
     assert plan.details.affected_snapshot_refs == ()
     assert plan.details.existing_analyses_become_stale is False
     assert plan.preflight.capacity is not None
@@ -134,7 +148,7 @@ def test_registered_store_migration_chain_executes_as_one_operation(
     with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
         assert metadata.execute(
             "SELECT schema_version FROM store_identity WHERE singleton = 1"
-        ).fetchone() == (10,)
+        ).fetchone() == (11,)
 
 
 def test_migration_required_session_only_allows_diagnosis_and_migration(
@@ -155,7 +169,7 @@ def test_migration_required_session_only_allows_diagnosis_and_migration(
     assert status.allowed_reads == ("workspace_status", "migration_diagnostics")
     assert status.allowed_writes == ("migrate_store",)
     assert diagnostics.source_version == 3
-    assert diagnostics.target_version == 10
+    assert diagnostics.target_version == 11
 
 
 def test_migration_required_blocks_metadata_backup_bypass(tmp_path: Path) -> None:
@@ -300,7 +314,7 @@ def test_migration_fault_keeps_old_snapshot_and_retry_starts_fresh(
 
     assert isinstance(retry.result, StoreMigrationReceipt)
     assert retry.result.status is MigrationStatus.COMPLETED
-    assert retry_plan.details.backup_file == "metadata-v3-to-v10-2.sqlite3"
+    assert retry_plan.details.backup_file == "metadata-v3-to-v11-2.sqlite3"
     with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
         active = metadata.execute(
             "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
@@ -308,7 +322,7 @@ def test_migration_fault_keeps_old_snapshot_and_retry_starts_fresh(
         assert active is not None and active != (str(old_snapshot),)
         assert metadata.execute(
             "SELECT schema_version FROM store_identity WHERE singleton = 1"
-        ).fetchone() == (10,)
+        ).fetchone() == (11,)
 
 
 @pytest.mark.parametrize(
@@ -512,7 +526,7 @@ def test_restart_keeps_cataloged_snapshot_and_quarantines_incomplete_backup(
     )
     backup_root = config.active_store / "migration-backups"
     backup_root.mkdir()
-    temporary_backup = backup_root / "metadata-v3-to-v10.sqlite3.tmp"
+    temporary_backup = backup_root / "metadata-v3-to-v11.sqlite3.tmp"
     temporary_backup.write_bytes(b"partial")
 
     with HealthLab.open(config):
@@ -605,13 +619,13 @@ def test_unknown_newer_schema_opens_for_blocked_diagnosis(tmp_path: Path) -> Non
     config = _config(tmp_path / "newer")
     with HealthLab.open(config):
         pass
-    _set_version(config, 11)
+    _set_version(config, 12)
 
     with HealthLab.open(config) as health_lab:
         diagnostics = health_lab.load_migration_diagnostics()
         plan = health_lab.preview_write(MigrateStore())
 
-    assert diagnostics.source_version == 11
+    assert diagnostics.source_version == 12
     assert diagnostics.steps == ()
     assert diagnostics.diagnostics == ("newer_schema",)
     assert plan.approval.status is WriteApprovalStatus.BLOCKED
@@ -731,6 +745,7 @@ def test_abandoning_migration_plan_changes_nothing(tmp_path: Path) -> None:
         (7, 8),
         (8, 9),
         (9, 10),
+        (10, 11),
     )
     assert (config.active_store / "metadata.sqlite3").read_bytes() == before
     assert not (config.active_store / "migration-backups").exists()

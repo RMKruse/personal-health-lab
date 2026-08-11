@@ -53,7 +53,11 @@ from personal_health_lab.health_import import (
     import_health_export,
     inspect_restore_health_export,
 )
-from personal_health_lab.migration import plan_migration_rollback, plan_store_migration
+from personal_health_lab.migration import (
+    plan_migration_rollback,
+    plan_snapshot_migration,
+    plan_store_migration,
+)
 from personal_health_lab.overview import Overview, OverviewReader, OverviewSelection
 from personal_health_lab.recovery import (
     BackupId,
@@ -104,6 +108,7 @@ from personal_health_lab.storage import (
     StoredMeasurement,
     StoreError,
     StoreId,
+    current_snapshot_schema_version,
     probe_filevault,
 )
 from personal_health_lab.storage import (
@@ -1622,6 +1627,9 @@ class MigrationDiagnostics:
     source_version: int | None
     target_version: int
     steps: tuple[tuple[int, int], ...]
+    snapshot_source_version: int | None
+    snapshot_target_version: int
+    snapshot_steps: tuple[tuple[int, int], ...]
     diagnostics: tuple[str, ...] = ()
 
 
@@ -2012,6 +2020,10 @@ class StoreMigrationPlan:
     source_version: int | None
     target_version: int
     steps: tuple[tuple[int, int], ...]
+    snapshot_source_version: int | None
+    snapshot_target_version: int
+    snapshot_steps: tuple[tuple[int, int], ...]
+    snapshot_as_of: datetime | None
     backup_file: str | None
     affected_snapshot_refs: tuple[SnapshotRef, ...]
     existing_analyses_become_stale: bool
@@ -2289,6 +2301,10 @@ class StoreMigrationReceipt:
     source_version: int
     target_version: int
     steps: tuple[tuple[int, int], ...]
+    snapshot_source_version: int | None
+    snapshot_target_version: int
+    snapshot_steps: tuple[tuple[int, int], ...]
+    snapshot_as_of: datetime | None
     backup_file: str | None
     diagnostics: tuple[str, ...] = ()
 
@@ -2842,8 +2858,9 @@ class HealthLab:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
         diagnostics = self.load_migration_diagnostics()
         source = diagnostics.source_version
+        migration_needed = bool(diagnostics.steps or diagnostics.snapshot_steps)
         backup_file = None
-        if source is not None and diagnostics.steps:
+        if source is not None and migration_needed:
             stem = f"metadata-v{source}-to-v{diagnostics.target_version}"
             backup_directory = self._config.active_store / "migration-backups"
             sequence = 1
@@ -2858,20 +2875,20 @@ class HealthLab:
             if filevault_override is not None
             else (
                 probe_filevault(self._config.active_store)
-                if self._config.mode is DataMode.REAL and diagnostics.steps
+                if self._config.mode is DataMode.REAL and migration_needed
                 else None
             )
         )
         capacity = (
             capacity_override
             if capacity_override is not None
-            else (self._store.preflight_store_migration() if diagnostics.steps else None)
+            else (self._store.preflight_store_migration() if migration_needed else None)
         )
         blocked = bool(diagnostics.diagnostics) or (
             capacity is not None and capacity.status is not CapacityStatus.READY
         )
         confirmations: tuple[WriteConfirmation, ...] = (
-            () if not diagnostics.steps else (WriteConfirmation.STORE_MIGRATION,)
+            () if not migration_needed else (WriteConfirmation.STORE_MIGRATION,)
         )
         if filevault is not None and filevault.status is not FileVaultStatus.PROTECTED:
             confirmations += (WriteConfirmation("filevault_" + filevault.status.value),)
@@ -2882,6 +2899,7 @@ class HealthLab:
                 + (capacity.reason.value if capacity.reason is not None else capacity.status.value),
             )
         active_snapshot = self._store.load_active_snapshot_id()
+        snapshot_as_of = self._store.load_active_snapshot_as_of()
         affected_snapshot_refs = () if active_snapshot is None else (active_snapshot,)
         payload = {
             "affected_snapshot_refs": tuple(map(str, affected_snapshot_refs)),
@@ -2905,6 +2923,12 @@ class HealthLab:
             "source_version": source,
             "steps": diagnostics.steps,
             "target_version": diagnostics.target_version,
+            "snapshot_source_version": diagnostics.snapshot_source_version,
+            "snapshot_as_of": (
+                None if snapshot_as_of is None else snapshot_as_of.isoformat()
+            ),
+            "snapshot_steps": diagnostics.snapshot_steps,
+            "snapshot_target_version": diagnostics.snapshot_target_version,
             "existing_analyses_become_stale": active_snapshot is not None,
             "version": 1,
         }
@@ -2918,6 +2942,10 @@ class HealthLab:
                 source,
                 diagnostics.target_version,
                 diagnostics.steps,
+                diagnostics.snapshot_source_version,
+                diagnostics.snapshot_target_version,
+                diagnostics.snapshot_steps,
+                snapshot_as_of,
                 backup_file,
                 affected_snapshot_refs,
                 active_snapshot is not None,
@@ -2928,7 +2956,7 @@ class HealthLab:
                     if blocked
                     else (
                         WriteApprovalStatus.CONFIRMATION_REQUIRED
-                        if diagnostics.steps
+                        if migration_needed
                         else WriteApprovalStatus.READY
                     )
                 ),
@@ -4929,13 +4957,17 @@ class HealthLab:
                 plan, WriteNotStartedStatus.BLOCKED, plan.diagnostics, expected_plan
             )
         operation_id = OperationId(uuid4().hex)
-        if not plan.details.steps:
+        if not plan.details.steps and not plan.details.snapshot_steps:
             result = StoreMigrationReceipt(
                 operation_id,
                 MigrationStatus.NO_OP,
                 plan.details.source_version,
                 plan.details.target_version,
                 (),
+                plan.details.snapshot_source_version,
+                plan.details.snapshot_target_version,
+                (),
+                plan.details.snapshot_as_of,
                 None,
             )
             return WriteReceipt(operation_id, expected_plan, result, plan.preflight)
@@ -4980,7 +5012,13 @@ class HealthLab:
                     capacity=final_capacity,
                 )
             assert plan.details.backup_file is not None
-            writer.migrate_store_schema(plan.details.steps, plan.details.backup_file, operation_id)
+            writer.migrate_store_schema(
+                plan.details.steps,
+                plan.details.snapshot_steps,
+                plan.details.snapshot_as_of,
+                plan.details.backup_file,
+                operation_id,
+            )
         except StoreError as error:
             diagnostic = str(error)
             if diagnostic not in {"migration_backup_failed", "migration_validation_failed"}:
@@ -4999,6 +5037,10 @@ class HealthLab:
             plan.details.source_version,
             plan.details.target_version,
             plan.details.steps,
+            plan.details.snapshot_source_version,
+            plan.details.snapshot_target_version,
+            plan.details.snapshot_steps,
+            plan.details.snapshot_as_of,
             plan.details.backup_file,
         )
         return WriteReceipt(
@@ -7708,7 +7750,15 @@ class HealthLab:
         if self._store is None:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
         identity = self._store.load_identity()
-        if identity.store_id is None or not identity.is_current:
+        snapshot_version = self._store.load_active_snapshot_schema_version()
+        if (
+            identity.store_id is None
+            or not identity.is_current
+            or (
+                snapshot_version is not None
+                and snapshot_version != current_snapshot_schema_version()
+            )
+        ):
             state = WorkspaceState.MIGRATION_REQUIRED
         elif self._store.load_restore_session() is not None:
             state = WorkspaceState.RESTORE_PENDING
@@ -7764,11 +7814,25 @@ class HealthLab:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
         raw_source = self._store.load_identity().schema_version
         target, steps, diagnostics = plan_store_migration(raw_source)
+        snapshot_source = self._store.load_active_snapshot_schema_version()
+        snapshot_target, snapshot_steps, snapshot_diagnostics = (
+            (current_snapshot_schema_version(), (), ())
+            if snapshot_source is None
+            else plan_snapshot_migration(snapshot_source)
+        )
         try:
             source = int(raw_source)
         except ValueError:
             source = None
-        return MigrationDiagnostics(source, target, steps, diagnostics)
+        return MigrationDiagnostics(
+            source,
+            target,
+            steps,
+            snapshot_source,
+            snapshot_target,
+            snapshot_steps,
+            diagnostics + snapshot_diagnostics,
+        )
 
     def load_plausibility_rules(self) -> PlausibilityRules:
         self._require_ready()

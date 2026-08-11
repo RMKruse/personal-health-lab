@@ -1,9 +1,25 @@
 """Registered adjacent store-schema migration policy."""
 
-from personal_health_lab.storage import MigrationRollbackFacts, current_store_schema_version
+from personal_health_lab.storage import (
+    MigrationRollbackFacts,
+    current_snapshot_schema_version,
+    current_store_schema_version,
+)
 
-_REGISTERED_STEPS = ((1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9), (9, 10))
-_REGISTERED_BACKUP_STEPS = ((1, 2), (2, 3))
+_REGISTERED_STEPS = (
+    (1, 2),
+    (2, 3),
+    (3, 4),
+    (4, 5),
+    (5, 6),
+    (6, 7),
+    (7, 8),
+    (8, 9),
+    (9, 10),
+    (10, 11),
+)
+_REGISTERED_SNAPSHOT_STEPS = ((1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7))
+_REGISTERED_BACKUP_STEPS = ((1, 2), (2, 3), (3, 4))
 
 
 def _plan_adjacent_migration(
@@ -53,6 +69,22 @@ def plan_backup_migration(
     return _plan_adjacent_migration(source_version, target_version, _REGISTERED_BACKUP_STEPS)
 
 
+def plan_snapshot_migration(
+    source_version: int,
+) -> tuple[int, tuple[tuple[int, int], ...], tuple[str, ...]]:
+    target = current_snapshot_schema_version()
+    if source_version <= 0:
+        return target, (), ("invalid_snapshot_schema_version",)
+    if source_version == target:
+        return target, (), ()
+    if source_version > target:
+        return target, (), ("newer_snapshot_schema",)
+    steps = _plan_adjacent_migration(source_version, target, _REGISTERED_SNAPSHOT_STEPS)
+    if steps is None:
+        return target, (), ("missing_snapshot_migration_step",)
+    return target, steps, ()
+
+
 def plan_migration_rollback(facts: MigrationRollbackFacts | None) -> tuple[str, ...]:
     if facts is None:
         return ("migration_rollback_unavailable",)
@@ -71,5 +103,6 @@ def plan_migration_rollback(facts: MigrationRollbackFacts | None) -> tuple[str, 
 __all__ = [
     "plan_backup_migration",
     "plan_migration_rollback",
+    "plan_snapshot_migration",
     "plan_store_migration",
 ]

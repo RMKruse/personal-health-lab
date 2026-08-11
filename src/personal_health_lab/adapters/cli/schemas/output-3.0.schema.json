@@ -1502,6 +1502,10 @@
       "required": [
         "backup_file",
         "diagnostics",
+        "snapshot_as_of",
+        "snapshot_source_version",
+        "snapshot_steps",
+        "snapshot_target_version",
         "source_version",
         "status",
         "steps",
@@ -1519,6 +1523,34 @@
           }
         },
         "source_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "snapshot_as_of": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "snapshot_source_version": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "snapshot_steps": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "items": false
+          }
+        },
+        "snapshot_target_version": {
           "type": "integer",
           "minimum": 1
         },
@@ -2026,6 +2058,10 @@
                 "affected_snapshot_refs",
                 "backup_file",
                 "existing_analyses_become_stale",
+                "snapshot_as_of",
+                "snapshot_source_version",
+                "snapshot_steps",
+                "snapshot_target_version",
                 "source_version",
                 "steps",
                 "target_version",
@@ -2049,6 +2085,34 @@
                     "integer",
                     "null"
                   ]
+                },
+                "snapshot_as_of": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "snapshot_source_version": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "snapshot_steps": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "prefixItems": [
+                      {
+                        "type": "integer"
+                      },
+                      {
+                        "type": "integer"
+                      }
+                    ],
+                    "items": false
+                  }
+                },
+                "snapshot_target_version": {
+                  "type": "integer",
+                  "minimum": 1
                 },
                 "steps": {
                   "type": "array",

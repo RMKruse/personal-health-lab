@@ -39,7 +39,7 @@ from personal_health_lab.storage import (
     probe_capacity,
 )
 
-_BACKUP_SCHEMA_VERSION = 3
+_BACKUP_SCHEMA_VERSION = 4
 _METHOD_ID = "metadata-backup/v1"
 _RESTORE_START_METHOD_ID = "restore-start/v1"
 _RESTORE_SOURCE_METHOD_ID = "restore-source-import/v1"
@@ -650,7 +650,7 @@ def _read_restore_backup(path: Path) -> tuple[BackupId, StoreId, str, int, int]:
                     provenance is None
                     or str(provenance[0]) != str(backup_id)
                     or str(provenance[1]) != canonical_hash
-                    or int(provenance[2]) not in {1, 2, 3}
+                    or int(provenance[2]) not in {1, 2, 3, 4}
                     or int(provenance[3]) != schema_version
                 ):
                     raise StoreError("backup_integrity_conflict")
@@ -1068,6 +1068,16 @@ def _migrate_restore_working_copy(path: Path, inspection: MetadataRestoreInspect
                 )
                 working.execute(
                     "UPDATE backup_migration_provenance SET target_schema_version = 3 "
+                    "WHERE singleton = 1"
+                )
+            elif (source, target) == (3, 4):
+                migrated_hash = _canonical_hash(working)
+                working.execute(
+                    "UPDATE backup_manifest SET canonical_content_sha256 = ? WHERE singleton = 1",
+                    (migrated_hash,),
+                )
+                working.execute(
+                    "UPDATE backup_migration_provenance SET target_schema_version = 4 "
                     "WHERE singleton = 1"
                 )
             else:

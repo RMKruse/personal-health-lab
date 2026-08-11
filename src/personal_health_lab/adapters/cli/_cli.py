@@ -1171,6 +1171,12 @@ def _write_plan_json(
             "existing_analyses_become_stale": details.existing_analyses_become_stale,
             "source_version": details.source_version,
             "steps": details.steps,
+            "snapshot_source_version": details.snapshot_source_version,
+            "snapshot_as_of": (
+                None if details.snapshot_as_of is None else details.snapshot_as_of.isoformat()
+            ),
+            "snapshot_steps": details.snapshot_steps,
+            "snapshot_target_version": details.snapshot_target_version,
             "target_version": details.target_version,
             "type": "migrate_store",
         }
@@ -1347,6 +1353,12 @@ def _write_receipt_json(
             "backup_file": result.backup_file,
             "diagnostics": result.diagnostics,
             "source_version": result.source_version,
+            "snapshot_source_version": result.snapshot_source_version,
+            "snapshot_as_of": (
+                None if result.snapshot_as_of is None else result.snapshot_as_of.isoformat()
+            ),
+            "snapshot_steps": result.snapshot_steps,
+            "snapshot_target_version": result.snapshot_target_version,
             "status": result.status.value,
             "steps": result.steps,
             "target_version": result.target_version,
@@ -1460,6 +1472,21 @@ def _print_write_plan(plan: WritePlan, workspace: WorkspaceStatus) -> None:
             else "-"
         )
         print(f"Migrationskette: {chain}")
+        snapshot_chain = (
+            " -> ".join(
+                [
+                    str(migration.snapshot_steps[0][0]),
+                    *(str(target) for _, target in migration.snapshot_steps),
+                ]
+            )
+            if migration.snapshot_steps
+            else "-"
+        )
+        print(f"Snapshot-Migrationskette: {snapshot_chain}")
+        print(
+            "Snapshot-Stichtag: "
+            + (migration.snapshot_as_of.isoformat() if migration.snapshot_as_of else "-")
+        )
         print(f"Migrationssicherung: {migration.backup_file or '-'}")
         print(
             "Betroffene Snapshots: "

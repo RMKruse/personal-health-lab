@@ -940,6 +940,24 @@ if workspace_status.state is WorkspaceState.MIGRATION_REQUIRED:
             or "-"
         )
     )
+    st.caption(
+        "Snapshot-Schritte: "
+        + (
+            ", ".join(
+                f"{source} → {target}"
+                for source, target in migration_plan.details.snapshot_steps
+            )
+            or "-"
+        )
+    )
+    st.caption(
+        "Snapshot-Stichtag: "
+        + (
+            migration_plan.details.snapshot_as_of.isoformat()
+            if migration_plan.details.snapshot_as_of is not None
+            else "-"
+        )
+    )
     st.caption(f"Migrationssicherung: {migration_plan.details.backup_file or '-'}")
     st.caption(
         "Betroffene Snapshots: "

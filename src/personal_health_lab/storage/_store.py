@@ -47,11 +47,11 @@ from personal_health_lab.health_data import (
 _METADATA_FILE = "metadata.sqlite3"
 _PARQUET_DIRECTORY = "parquet"
 _QUERY_FILE = "query.duckdb"
-_STORE_SCHEMA_VERSION = 10
+_STORE_SCHEMA_VERSION = 11
 _WRITER_LOCK_FILE = ".writer.lock"
 _FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
 _STORE_MIGRATION_METHOD = "cow-migration/v1"
-_SNAPSHOT_SCHEMA_VERSION = 6
+_SNAPSHOT_SCHEMA_VERSION = 7
 _CANONICAL_HEALTH_TYPES_SQL = ", ".join(f"'{item.value}'" for item in CanonicalHealthType)
 _CANONICAL_UNITS_SQL = ", ".join(f"'{item.value}'" for item in CanonicalUnit)
 _PRE_ACTIVITY_HEALTH_TYPES_SQL = ", ".join(
@@ -327,17 +327,21 @@ _DERIVATION_CONTRACT_IDS = tuple(
         }
     )
 )
+_MAPPING_CONTRACT_FILES = {
+    "measurement_versions.parquet",
+    "sleep_intervals.parquet",
+    "workouts.parquet",
+}
 _LEGACY_SNAPSHOT_SCHEMAS = {
     name: schema
     for name, schema in _SNAPSHOT_SCHEMAS.items()
     if name
-    not in {
-        "workouts.parquet",
-        "resolved_workouts.parquet",
-        "workout_review_links.parquet",
-        "derivation_lineage.parquet",
+    in {
+        "source_occurrences.parquet",
+        "measurement_versions.parquet",
+        "resolved_measurements.parquet",
+        "open_review_cases.parquet",
     }
-    | _V6_DERIVATION_FILES
 }
 _V2_SNAPSHOT_SCHEMAS = {
     name: (
@@ -415,6 +419,16 @@ def _is_timestamp(value: object) -> bool:
     except ValueError:
         return False
     return parsed.tzinfo is not None
+
+
+def _snapshot_file_contract_ids(
+    filename: str, identity_rule_version_id: str, mapping_rule_version_id: str
+) -> tuple[str, ...]:
+    if filename == "source_occurrences.parquet":
+        return identity_rule_version_id, mapping_rule_version_id
+    if filename in _MAPPING_CONTRACT_FILES:
+        return (mapping_rule_version_id,)
+    return _SNAPSHOT_FILE_CONTRACTS[filename]
 
 
 class StoreError(RuntimeError):
@@ -889,6 +903,10 @@ class MigrationRollbackFacts:
 
 def current_store_schema_version() -> int:
     return _STORE_SCHEMA_VERSION
+
+
+def current_snapshot_schema_version() -> int:
+    return _SNAPSHOT_SCHEMA_VERSION
 
 
 @dataclass(frozen=True, slots=True)
@@ -1921,9 +1939,25 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             snapshot_id TEXT REFERENCES dataset_snapshots(snapshot_id),
             source_schema_version INTEGER NOT NULL CHECK (source_schema_version > 0),
             target_schema_version INTEGER NOT NULL CHECK (
-                target_schema_version > source_schema_version
+                target_schema_version >= source_schema_version
             ),
-            backup_file TEXT NOT NULL
+            snapshot_source_schema_version INTEGER CHECK (
+                snapshot_source_schema_version IS NULL
+                OR snapshot_source_schema_version > 0
+            ),
+            snapshot_target_schema_version INTEGER CHECK (
+                snapshot_target_schema_version IS NULL
+                OR snapshot_target_schema_version > snapshot_source_schema_version
+            ),
+            backup_file TEXT NOT NULL,
+            CHECK (
+                (snapshot_source_schema_version IS NULL)
+                    = (snapshot_target_schema_version IS NULL)
+            ),
+            CHECK (
+                target_schema_version > source_schema_version
+                OR snapshot_target_schema_version > snapshot_source_schema_version
+            )
         ) STRICT;
         CREATE TABLE IF NOT EXISTS restored_publications (
             audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id)
@@ -2594,6 +2628,57 @@ def _upgrade_migration_event_constraints(metadata: sqlite3.Connection) -> None:
         raise sqlite3.IntegrityError("foreign key violation after constraint upgrade")
 
 
+def _upgrade_migration_publication_schema(metadata: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1]) for row in metadata.execute("PRAGMA table_info(migration_publications)")
+    }
+    if not columns or "snapshot_source_schema_version" in columns:
+        return
+    for trigger in (
+        "migration_publications_no_update",
+        "migration_publications_no_delete",
+        "migration_publications_kind",
+    ):
+        metadata.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    metadata.execute("ALTER TABLE migration_publications RENAME TO legacy_migration_publications")
+    metadata.execute(
+        """
+        CREATE TABLE migration_publications (
+            audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
+            snapshot_id TEXT REFERENCES dataset_snapshots(snapshot_id),
+            source_schema_version INTEGER NOT NULL CHECK (source_schema_version > 0),
+            target_schema_version INTEGER NOT NULL CHECK (
+                target_schema_version >= source_schema_version
+            ),
+            snapshot_source_schema_version INTEGER CHECK (
+                snapshot_source_schema_version IS NULL
+                OR snapshot_source_schema_version > 0
+            ),
+            snapshot_target_schema_version INTEGER CHECK (
+                snapshot_target_schema_version IS NULL
+                OR snapshot_target_schema_version > snapshot_source_schema_version
+            ),
+            backup_file TEXT NOT NULL,
+            CHECK (
+                (snapshot_source_schema_version IS NULL)
+                    = (snapshot_target_schema_version IS NULL)
+            ),
+            CHECK (
+                target_schema_version > source_schema_version
+                OR snapshot_target_schema_version > snapshot_source_schema_version
+            )
+        ) STRICT
+        """
+    )
+    metadata.execute(
+        "INSERT INTO migration_publications "
+        "(audit_event_id, snapshot_id, source_schema_version, target_schema_version, "
+        "backup_file) SELECT audit_event_id, snapshot_id, source_schema_version, "
+        "target_schema_version, backup_file FROM legacy_migration_publications"
+    )
+    metadata.execute("DROP TABLE legacy_migration_publications")
+
+
 def _upgrade_v03_constraints(metadata: sqlite3.Connection) -> None:
     upgrades = (
         (
@@ -3147,6 +3232,8 @@ class LocalStore:
     def migrate_store_schema(
         self,
         steps: tuple[tuple[int, int], ...],
+        snapshot_steps: tuple[tuple[int, int], ...],
+        snapshot_as_of: datetime | None,
         backup_file: str,
         operation_id: OperationId,
     ) -> StoreIdentity:
@@ -3158,14 +3245,44 @@ class LocalStore:
             raise StoreConfigurationError(
                 "Datenspeicherschema ist keine positive Ganzzahl."
             ) from error
-        if (
-            not steps
-            or steps[0][0] != source_version
+        if steps and (
+            steps[0][0] != source_version
             or steps[-1][1] != _STORE_SCHEMA_VERSION
             or any(target != source + 1 for source, target in steps)
             or any(left[1] != right[0] for left, right in pairwise(steps))
         ):
             raise StoreConfigurationError("Migrationskette ist nicht lückenlos registriert.")
+        if not steps and source_version != _STORE_SCHEMA_VERSION:
+            raise StoreConfigurationError("Migrationskette ist nicht lückenlos registriert.")
+
+        active = self.load_active_snapshot_id()
+        snapshot_source_version = (
+            None if active is None else self.load_active_snapshot_schema_version()
+        )
+        if snapshot_steps and (
+            snapshot_source_version is None
+            or snapshot_steps[0][0] != snapshot_source_version
+            or snapshot_steps[-1][1] != _SNAPSHOT_SCHEMA_VERSION
+            or any(target != source + 1 for source, target in snapshot_steps)
+            or any(left[1] != right[0] for left, right in pairwise(snapshot_steps))
+        ):
+            raise StoreConfigurationError(
+                "Snapshot-Migrationskette ist nicht lückenlos registriert."
+            )
+        if active is not None and not snapshot_steps and (
+            snapshot_source_version != _SNAPSHOT_SCHEMA_VERSION
+        ):
+            raise StoreConfigurationError(
+                "Snapshot-Migrationskette ist nicht lückenlos registriert."
+            )
+        if active is None and snapshot_steps:
+            raise StoreConfigurationError(
+                "Snapshot-Migrationskette ist nicht lückenlos registriert."
+            )
+        if (active is None) != (snapshot_as_of is None) or (
+            snapshot_as_of is not None and snapshot_as_of.tzinfo is None
+        ):
+            raise StoreConfigurationError("Snapshot-Stichtag stimmt nicht mit dem Plan überein.")
 
         backup_directory = self._root / "migration-backups"
         backup_directory.mkdir(exist_ok=True)
@@ -3177,6 +3294,26 @@ class LocalStore:
             _migration_backup_fault_point(self._root)
             with sqlite3.connect(temporary) as backup:
                 self._metadata.backup(backup)
+                backup_identity = backup.execute(
+                    "SELECT schema_version FROM store_identity WHERE singleton = 1"
+                ).fetchone()
+                backup_active = backup.execute(
+                    "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
+                ).fetchone()
+                if (
+                    backup.execute("PRAGMA integrity_check").fetchone() != ("ok",)
+                    or backup.execute("PRAGMA foreign_key_check").fetchall()
+                    or backup_identity != (source_version,)
+                    or (
+                        active is None
+                        and backup_active not in {None, (None,)}
+                    )
+                    or (
+                        active is not None
+                        and backup_active != (str(active),)
+                    )
+                ):
+                    raise sqlite3.IntegrityError("migration backup validation failed")
             os.replace(temporary, backup_path)
             _allocation_checkpoint(self._root, "migration_backup")
             _migration_fault_point(self._root, "migration.after_backup/v1")
@@ -3184,7 +3321,6 @@ class LocalStore:
             temporary.unlink(missing_ok=True)
             raise StoreError("migration_backup_failed") from error
 
-        active = self.load_active_snapshot_id()
         existing_store_id = identity.store_id
         store_id = str(existing_store_id) if existing_store_id is not None else None
         if store_id is None and active is not None:
@@ -3205,7 +3341,7 @@ class LocalStore:
                 pass
         if store_id is None:
             store_id = uuid4().hex
-        binding = identity.person_binding
+        person_binding = identity.person_binding
         new_snapshot: SnapshotId | None = None
         manifest_sha256: str | None = None
         created_at = datetime.now(UTC).isoformat()
@@ -3213,6 +3349,7 @@ class LocalStore:
         staging: Path | None = None
         snapshot: Path | None = None
         if active is not None:
+            assert snapshot_as_of is not None
             new_snapshot = SnapshotId(uuid4().hex)
             staging_root = self._root / "migration-staging"
             staging_root.mkdir(exist_ok=True)
@@ -3227,64 +3364,21 @@ class LocalStore:
                 encoding="utf-8",
             )
             try:
-                shutil.copytree(
-                    self._root / _PARQUET_DIRECTORY / "snapshots" / str(active), staging
+                manifest_sha256, manifest = self._stage_migration_snapshot(
+                    source_snapshot_id=active,
+                    snapshot_id=new_snapshot,
+                    operation_id=operation_id,
+                    staging=staging,
+                    created_at=created_at,
+                    store_id=store_id,
+                    snapshot_as_of=snapshot_as_of,
                 )
-                manifest = json.loads((staging / "manifest.json").read_bytes())
-                rebound_files = (*sorted(_V6_DERIVATION_FILES), "derivation_lineage.parquet")
-                for filename in rebound_files:
-                    path = staging / filename
-                    escaped = str(path).replace("'", "''")
-                    table = filename.removesuffix(".parquet")
-                    self._query.execute(
-                        f"CREATE OR REPLACE TEMP TABLE {table} AS "
-                        f"SELECT * FROM read_parquet('{escaped}')"
-                    )
-                    self._query.execute(
-                        f"UPDATE {table} SET snapshot_id = ?, derived_at_utc = ?",
-                        (str(new_snapshot), created_at),
-                    )
-                    path.unlink()
-                    self._query.execute(
-                        f"COPY (SELECT * FROM {table}) TO '{escaped}' (FORMAT PARQUET)"
-                    )
-                    description = tuple(
-                        (str(row[0]), str(row[1]))
-                        for row in self._query.execute(
-                            f"DESCRIBE SELECT * FROM read_parquet('{escaped}')"
-                        ).fetchall()
-                    )
-                    entry = next(item for item in manifest["files"] if item["name"] == filename)
-                    entry.update(
-                        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
-                        allocated_bytes=path.stat().st_blocks * 512,
-                        parquet_schema_fingerprint=hashlib.sha256(
-                            json.dumps(description, separators=(",", ":")).encode()
-                        ).hexdigest(),
-                    )
-                manifest.update(
-                    {
-                        "created_at_utc": created_at,
-                        "created_by_operation_id": str(operation_id),
-                        "parent_snapshot_id": str(active),
-                        "snapshot_id": str(new_snapshot),
-                    }
-                )
-                manifest_bytes = json.dumps(
-                    manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True
-                ).encode()
-                (staging / "manifest.json").write_bytes(manifest_bytes)
-                manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-                self._validate_snapshot(
-                    staging,
-                    str(new_snapshot),
-                    manifest_sha256,
-                    expected_store_id=store_id,
-                )
+                _fsync_snapshot(staging)
                 _allocation_checkpoint(self._root, "migration_staged")
                 _migration_fault_point(self._root, "migration.before_snapshot_move/v1")
                 snapshot.parent.mkdir(parents=True, exist_ok=True)
                 staging.replace(snapshot)
+                _fsync_directory(snapshot.parent)
                 _allocation_checkpoint(self._root, "migration_moved")
                 _migration_fault_point(self._root, "migration.after_snapshot_move/v1")
             except (OSError, sqlite3.Error, duckdb.Error, StoreError) as error:
@@ -3297,12 +3391,13 @@ class LocalStore:
             with self._metadata:
                 _upgrade_migration_event_constraints(self._metadata)
                 _upgrade_v03_constraints(self._metadata)
+                _upgrade_migration_publication_schema(self._metadata)
                 _ensure_current_tables(self._metadata)
                 self._metadata.execute("ALTER TABLE store_identity RENAME TO legacy_store_identity")
                 self._metadata.execute(_STORE_IDENTITY_DDL)
                 self._metadata.execute(
                     "INSERT INTO store_identity VALUES (1, ?, ?, ?, ?)",
-                    (self._mode.value, _STORE_SCHEMA_VERSION, store_id, binding.value),
+                    (self._mode.value, _STORE_SCHEMA_VERSION, store_id, person_binding.value),
                 )
                 self._metadata.execute("DROP TABLE legacy_store_identity")
                 self._metadata.execute(
@@ -3324,19 +3419,24 @@ class LocalStore:
                             created_at,
                         ),
                     )
-                    binding = manifest["snapshot_binding"]
+                    snapshot_binding = manifest["snapshot_binding"]
+                    assert isinstance(snapshot_binding, dict)
                     self._metadata.execute(
                         "INSERT INTO snapshot_contract_bindings VALUES (?, ?, ?, ?, ?)",
                         (
                             str(new_snapshot),
-                            binding["snapshot_as_of"],
-                            binding["context_timezone"],
-                            binding["context_as_of_date"],
-                            binding["medication_as_of"],
+                            snapshot_binding["snapshot_as_of"],
+                            snapshot_binding["context_timezone"],
+                            snapshot_binding["context_as_of_date"],
+                            snapshot_binding["medication_as_of"],
                         ),
                     )
+                    self._metadata.execute(
+                        "INSERT INTO activity_derivation_snapshot_bindings "
+                        "SELECT ?, version_id FROM activity_derivation_active WHERE singleton = 1",
+                        (str(new_snapshot),),
+                    )
                     for table in (
-                        "activity_derivation_snapshot_bindings",
                         "manual_context_snapshot_bindings",
                         "medication_snapshot_bindings",
                         "medication_deviation_snapshot_bindings",
@@ -3380,12 +3480,16 @@ class LocalStore:
                 self._metadata.execute(
                     "INSERT INTO migration_publications "
                     "(audit_event_id, snapshot_id, source_schema_version, "
-                    "target_schema_version, backup_file) VALUES (?, ?, ?, ?, ?)",
+                    "target_schema_version, snapshot_source_schema_version, "
+                    "snapshot_target_schema_version, backup_file) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         audit_event_id,
                         None if new_snapshot is None else str(new_snapshot),
                         source_version,
                         _STORE_SCHEMA_VERSION,
+                        snapshot_source_version if snapshot_steps else None,
+                        _SNAPSHOT_SCHEMA_VERSION if snapshot_steps else None,
                         backup_file,
                     ),
                 )
@@ -3400,6 +3504,182 @@ class LocalStore:
         with suppress(OSError):
             marker.unlink(missing_ok=True)
         return self.load_identity()
+
+    def _stage_migration_snapshot(
+        self,
+        *,
+        source_snapshot_id: SnapshotId,
+        snapshot_id: SnapshotId,
+        operation_id: OperationId,
+        staging: Path,
+        created_at: str,
+        store_id: str,
+        snapshot_as_of: datetime,
+    ) -> tuple[str, dict[str, object]]:
+        source = self._root / _PARQUET_DIRECTORY / "snapshots" / str(source_snapshot_id)
+
+        def link_parquet(source_name: str, target_name: str) -> str:
+            if Path(source_name).suffix == ".parquet":
+                os.link(source_name, target_name)
+                return target_name
+            return shutil.copy2(source_name, target_name)
+
+        shutil.copytree(source, staging, copy_function=link_parquet)
+        manifest = json.loads((staging / "manifest.json").read_bytes())
+        if not isinstance(manifest, dict):
+            raise StoreError("Snapshot-Manifest ist ungültig.")
+        resolution_basis = manifest.get("resolution_basis")
+        if not isinstance(resolution_basis, dict):
+            raise StoreError("Snapshot-Auflösungsbasis fehlt.")
+        identity_rule_version_id = str(resolution_basis.get("identity_rule_version_id"))
+        mapping_rule_version_id = str(resolution_basis.get("mapping_rule_version_id"))
+
+        reused_files: set[str] = set()
+        for filename, schema in _SNAPSHOT_SCHEMAS.items():
+            table = filename.removesuffix(".parquet")
+            path = staging / filename
+            if path.exists():
+                escaped = str(path).replace("'", "''")
+                source_description = tuple(
+                    (str(row[0]), str(row[1]))
+                    for row in self._query.execute(
+                        f"DESCRIBE SELECT * FROM read_parquet('{escaped}')"
+                    ).fetchall()
+                )
+                columns = {name for name, _ in source_description}
+                if (
+                    source_description == schema
+                    and filename
+                    not in _V6_DERIVATION_FILES | {"derivation_lineage.parquet"}
+                ):
+                    reused_files.add(filename)
+                projection = ", ".join(
+                    f'CAST("{name}" AS {kind}) AS "{name}"'
+                    if name in columns
+                    else f'NULL::{kind} AS "{name}"'
+                    for name, kind in schema
+                )
+                self._query.execute(
+                    f"CREATE OR REPLACE TEMP TABLE {table} AS "
+                    f"SELECT {projection} FROM read_parquet('{escaped}')"
+                )
+            else:
+                definitions = ", ".join(f'"{name}" {kind}' for name, kind in schema)
+                self._query.execute(
+                    f"CREATE OR REPLACE TEMP TABLE {table} ({definitions})"
+                )
+
+        raw_binding = manifest.get("snapshot_binding")
+        source_binding = raw_binding if isinstance(raw_binding, dict) else {}
+        raw_revision_ids = source_binding.get("manual_revision_ids", [])
+        manual_revision_ids = (
+            tuple(str(value) for value in raw_revision_ids)
+            if isinstance(raw_revision_ids, list)
+            else ()
+        )
+        context_timezone = str(source_binding.get("context_timezone", "Europe/Berlin"))
+        self._refresh_v03_derivations(snapshot_id, snapshot_as_of, manual_revision_ids)
+        self._refresh_derivation_lineage(snapshot_id, snapshot_as_of, manual_revision_ids)
+
+        entries: list[dict[str, int | str | list[str]]] = []
+        for filename in sorted(_SNAPSHOT_SCHEMAS):
+            table = filename.removesuffix(".parquet")
+            path = staging / filename
+            escaped = str(path).replace("'", "''")
+            if filename not in reused_files:
+                path.unlink(missing_ok=True)
+                self._query.execute(
+                    f"COPY (SELECT * FROM {table}) TO '{escaped}' (FORMAT PARQUET)"
+                )
+            description = tuple(
+                (str(row[0]), str(row[1]))
+                for row in self._query.execute(
+                    f"DESCRIBE SELECT * FROM read_parquet('{escaped}')"
+                ).fetchall()
+            )
+            if description != _SNAPSHOT_SCHEMAS[filename]:
+                raise StoreError(
+                    f"Staging-Snapshot besitzt für {filename} ein unerwartetes Schema."
+                )
+            row = self._query.execute(
+                f"SELECT count(*) FROM read_parquet('{escaped}')"
+            ).fetchone()
+            assert row is not None
+            entries.append(
+                {
+                    "name": filename,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "allocated_bytes": path.stat().st_blocks * 512,
+                    "row_count": int(row[0]),
+                    "parquet_schema_fingerprint": hashlib.sha256(
+                        json.dumps(description, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                    "contract_ids": list(
+                        _snapshot_file_contract_ids(
+                            filename,
+                            identity_rule_version_id,
+                            mapping_rule_version_id,
+                        )
+                    ),
+                }
+            )
+
+        counts = self._query.execute(
+            "SELECT (SELECT count(DISTINCT export_id) FROM source_occurrences), "
+            "(SELECT count(*) FROM source_occurrences), "
+            "(SELECT count(*) FROM measurement_versions), "
+            "(SELECT count(*) FROM resolved_measurements), "
+            "(SELECT count(*) FROM resolved_measurements WHERE disposition LIKE 'included%'), "
+            "(SELECT count(*) FROM resolved_measurements WHERE disposition LIKE 'excluded%'), "
+            "(SELECT count(*) FROM open_review_cases)"
+        ).fetchone()
+        assert counts is not None
+        audit_position = int(
+            self._metadata.execute(
+                "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+            ).fetchone()[0]
+        )
+        resolution_basis["audit_max_position"] = audit_position
+        manifest.update(
+            snapshot_schema_version=_SNAPSHOT_SCHEMA_VERSION,
+            snapshot_id=str(snapshot_id),
+            store_id=store_id,
+            created_at_utc=created_at,
+            created_by_operation_id=str(operation_id),
+            parent_snapshot_id=str(source_snapshot_id),
+            resolution_basis=resolution_basis,
+            derivation_contract_ids=list(_DERIVATION_CONTRACT_IDS),
+            snapshot_binding=self._snapshot_binding(
+                snapshot_as_of=snapshot_as_of,
+                context_timezone=context_timezone,
+                manual_revision_ids=manual_revision_ids,
+            ),
+            files=entries,
+            validation_counts=dict(
+                zip(
+                    (
+                        "exports",
+                        "source_occurrences",
+                        "measurement_versions",
+                        "logical_measurements",
+                        "included",
+                        "excluded",
+                        "open_review_cases",
+                    ),
+                    map(int, counts),
+                    strict=True,
+                )
+            ),
+        )
+        manifest_bytes = json.dumps(
+            manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode()
+        (staging / "manifest.json").write_bytes(manifest_bytes)
+        digest = hashlib.sha256(manifest_bytes).hexdigest()
+        self._validate_snapshot(
+            staging, str(snapshot_id), digest, expected_store_id=store_id
+        )
+        return digest, manifest
 
     def _quarantine_migration_artifacts(
         self,
@@ -5199,11 +5479,11 @@ class LocalStore:
                 or manifest["parent_snapshot_id"] != parent_id
             ):
                 raise StoreError("Snapshot-Katalog und Manifest widersprechen sich.")
-            if schema_version == _SNAPSHOT_SCHEMA_VERSION and manifest["snapshot_binding"][
+            if schema_version >= 6 and manifest["snapshot_binding"][
                 "manual_revision_ids"
             ] != list(self._bound_manual_revision_ids(SnapshotId(snapshot_id))):
                 raise StoreError("Snapshot-Revisionsbindung ist nicht geschlossen.")
-            if schema_version == _SNAPSHOT_SCHEMA_VERSION:
+            if schema_version >= 6:
                 binding = manifest["snapshot_binding"]
                 catalog_binding = self._metadata.execute(
                     "SELECT snapshot_as_of, context_timezone, context_as_of_date, "
@@ -5233,6 +5513,12 @@ class LocalStore:
             manifest = json.loads(manifest_bytes)
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise StoreError("Snapshot-Manifest ist nicht lesbar.") from error
+        if (
+            not isinstance(manifest, dict)
+            or type(manifest.get("snapshot_schema_version")) is not int
+        ):
+            raise StoreError("Snapshot-Manifest ist nicht kanonisch oder gültig.")
+        snapshot_schema_version = int(manifest["snapshot_schema_version"])
         store_row = self._metadata.execute(
             "SELECT store_id FROM store_identity WHERE singleton = 1"
         ).fetchone()
@@ -5296,16 +5582,16 @@ class LocalStore:
                 "validation_counts",
                 *(
                     ("derivation_contract_ids",)
-                    if manifest.get("snapshot_schema_version") in {5, _SNAPSHOT_SCHEMA_VERSION}
+                    if snapshot_schema_version >= 5
                     else ()
                 ),
                 *(
                     ("snapshot_binding",)
-                    if manifest.get("snapshot_schema_version") == _SNAPSHOT_SCHEMA_VERSION
+                    if snapshot_schema_version >= 6
                     else ()
                 ),
             }
-            or manifest["snapshot_schema_version"] not in {1, 2, 3, 4, 5, _SNAPSHOT_SCHEMA_VERSION}
+            or snapshot_schema_version not in range(1, _SNAPSHOT_SCHEMA_VERSION + 1)
             or manifest["snapshot_id"] != snapshot_id
             or not _is_lower_hex(manifest["snapshot_id"], 32)
             or not _is_lower_hex(manifest["store_id"], 32)
@@ -5334,11 +5620,11 @@ class LocalStore:
                 != ["resolved-measurement/v1", "resolved-workout/v1"]
             )
             or (
-                manifest["snapshot_schema_version"] == _SNAPSHOT_SCHEMA_VERSION
+                manifest["snapshot_schema_version"] >= 6
                 and manifest.get("derivation_contract_ids") != list(_DERIVATION_CONTRACT_IDS)
             )
             or (
-                manifest["snapshot_schema_version"] == _SNAPSHOT_SCHEMA_VERSION
+                manifest["snapshot_schema_version"] >= 6
                 and not binding_valid
             )
             or not isinstance(validation_counts, dict)
@@ -5361,6 +5647,7 @@ class LocalStore:
             3: _V3_SNAPSHOT_SCHEMAS,
             4: _V4_SNAPSHOT_SCHEMAS,
             5: _V5_SNAPSHOT_SCHEMAS,
+            6: _SNAPSHOT_SCHEMAS,
             _SNAPSHOT_SCHEMA_VERSION: _SNAPSHOT_SCHEMAS,
         }[manifest["snapshot_schema_version"]]
         files = manifest["files"]
@@ -5378,7 +5665,7 @@ class LocalStore:
                 "row_count",
                 "parquet_schema_fingerprint",
             }
-            if manifest["snapshot_schema_version"] == _SNAPSHOT_SCHEMA_VERSION:
+            if manifest["snapshot_schema_version"] >= 6:
                 expected_entry_fields.add("contract_ids")
             if not isinstance(entry, dict) or set(entry) != expected_entry_fields:
                 raise StoreError("Snapshot-Dateieintrag ist ungültig.")
@@ -5391,8 +5678,15 @@ class LocalStore:
                 or type(entry["row_count"]) is not int
                 or entry["row_count"] < 0
                 or (
-                    manifest["snapshot_schema_version"] == _SNAPSHOT_SCHEMA_VERSION
-                    and entry["contract_ids"] != list(_SNAPSHOT_FILE_CONTRACTS[filename])
+                    manifest["snapshot_schema_version"] >= 6
+                    and entry["contract_ids"]
+                    != list(
+                        _snapshot_file_contract_ids(
+                            filename,
+                            str(resolution_basis["identity_rule_version_id"]),
+                            str(resolution_basis["mapping_rule_version_id"]),
+                        )
+                    )
                 )
             ):
                 raise StoreError("Snapshot-Dateieintrag ist ungültig.")
@@ -5436,7 +5730,7 @@ class LocalStore:
             name.removesuffix(".parquet"): str(directory / name).replace("'", "''")
             for name in _SNAPSHOT_SCHEMAS
         }
-        if manifest["snapshot_schema_version"] == _SNAPSHOT_SCHEMA_VERSION:
+        if manifest["snapshot_schema_version"] >= 6:
             for filename in _V6_DERIVATION_FILES:
                 contract = _SNAPSHOT_FILE_CONTRACTS[filename][0]
                 table = paths[filename.removesuffix(".parquet")]
@@ -5737,7 +6031,7 @@ class LocalStore:
         ).fetchone()
         if invalid is None or int(invalid[0]) != 0:
             raise StoreError("Snapshot-ID-Schließung oder Payloadvalidierung fehlgeschlagen.")
-        if manifest["snapshot_schema_version"] == _SNAPSHOT_SCHEMA_VERSION:
+        if manifest["snapshot_schema_version"] >= 6:
             lineage = paths["derivation_lineage"]
             invalid_lineage = self._query.execute(
                 f"""
@@ -7882,10 +8176,17 @@ class LocalStore:
                     merged.append((start, end))
             return tuple(merged)
 
-        version = self._metadata.execute(
-            "SELECT coverage_gap_minutes FROM activity_derivation_active "
-            "JOIN activity_derivation_versions USING (version_id) WHERE singleton = 1"
-        ).fetchone()
+        version = (
+            self._metadata.execute(
+                "SELECT coverage_gap_minutes FROM activity_derivation_active "
+                "JOIN activity_derivation_versions USING (version_id) WHERE singleton = 1"
+            ).fetchone()
+            if self._metadata.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'activity_derivation_active'"
+            ).fetchone()
+            else None
+        )
         gap_minutes = 240 if version is None else int(version[0])
 
         def bridge(
@@ -10725,6 +11026,40 @@ class LocalStore:
             "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
         ).fetchone()
         return None if row is None else SnapshotId(str(row[0]))
+
+    def load_active_snapshot_schema_version(self) -> int | None:
+        row = self._metadata.execute(
+            "SELECT snapshot_schema_version FROM dataset_snapshots "
+            "JOIN active_snapshot USING (snapshot_id) WHERE singleton = 1"
+        ).fetchone()
+        return None if row is None else int(row[0])
+
+    def load_active_snapshot_as_of(self) -> datetime | None:
+        active = self.load_active_snapshot_id()
+        if active is None:
+            return None
+        try:
+            manifest = json.loads(
+                (
+                    self._root
+                    / _PARQUET_DIRECTORY
+                    / "snapshots"
+                    / str(active)
+                    / "manifest.json"
+                ).read_bytes()
+            )
+            binding = manifest.get("snapshot_binding")
+            raw_value = (
+                binding.get("snapshot_as_of")
+                if isinstance(binding, dict)
+                else manifest.get("created_at_utc")
+            )
+            value = datetime.fromisoformat(str(raw_value))
+        except (OSError, AttributeError, ValueError, json.JSONDecodeError) as error:
+            raise StoreError("Snapshot-Stichtag ist ungültig.") from error
+        if value.tzinfo is None:
+            raise StoreError("Snapshot-Stichtag ist ungültig.")
+        return value
 
     def load_analysis_input(
         self, start_date: date | None, end_date: date | None

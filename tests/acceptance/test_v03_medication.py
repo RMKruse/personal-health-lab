@@ -85,7 +85,7 @@ def test_snapshot_lineage_is_flat_validated_and_reuses_immutable_sources(tmp_pat
         "resolved_measurements.parquet",
     ):
         assert os.path.samefile(parent / unchanged, snapshot / unchanged)
-    assert manifest["snapshot_schema_version"] == 6
+    assert manifest["snapshot_schema_version"] == 7
     assert {
         "resolved-measurement/v1",
         "resolved-workout/v1",

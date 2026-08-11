@@ -230,6 +230,20 @@ def test_manifest_rejects_nested_non_schema_fields(tmp_path: Path) -> None:
         pass
 
 
+def test_manifest_rejects_non_integer_snapshot_schema_version(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    snapshot = _publish_snapshot(config, _package(tmp_path / "health.zip"))
+    manifest = json.loads((snapshot / "manifest.json").read_bytes())
+    manifest["snapshot_schema_version"] = None
+    _rewrite_manifest(config, snapshot, manifest)
+
+    with (
+        pytest.raises(HealthLabError, match="Datenspeicher konnte nicht geöffnet"),
+        HealthLab.open(config),
+    ):
+        pass
+
+
 def test_legacy_versioned_store_with_identity_still_validates_snapshot(tmp_path: Path) -> None:
     config = _config(tmp_path)
     snapshot = _publish_snapshot(config, _package(tmp_path / "health.zip"))
@@ -698,7 +712,7 @@ def test_sqlite_catalog_and_audit_constraints_are_hard(tmp_path: Path) -> None:
         } <= strict_tables
         assert metadata.execute(
             "SELECT schema_version, typeof(schema_version) FROM store_identity"
-        ).fetchone() == (10, "integer")
+        ).fetchone() == (11, "integer")
 
         with pytest.raises(sqlite3.IntegrityError):
             metadata.execute(

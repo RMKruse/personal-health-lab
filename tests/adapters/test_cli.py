@@ -1627,9 +1627,21 @@ def test_cli_maps_store_migration_plan_and_receipt(
     _assert_json_contract(plan)
     assert plan["workspace"]["allowed_writes"] == ["migrate_store"]
     assert plan["details"]["steps"] == [
-        [2, 3], [3, 4], [4, 5], [5, 6], [6, 7], [7, 8], [8, 9], [9, 10]
+        [2, 3],
+        [3, 4],
+        [4, 5],
+        [5, 6],
+        [6, 7],
+        [7, 8],
+        [8, 9],
+        [9, 10],
+        [10, 11],
     ]
-    assert plan["details"]["backup_file"] == "metadata-v2-to-v10.sqlite3"
+    assert plan["details"]["backup_file"] == "metadata-v2-to-v11.sqlite3"
+    assert plan["details"]["snapshot_source_version"] == 7
+    assert plan["details"]["snapshot_as_of"] is not None
+    assert plan["details"]["snapshot_target_version"] == 7
+    assert plan["details"]["snapshot_steps"] == []
     assert plan["details"]["affected_snapshot_refs"] == [snapshot_ref]
     assert plan["details"]["existing_analyses_become_stale"] is True
 
@@ -1637,8 +1649,10 @@ def test_cli_maps_store_migration_plan_and_receipt(
         monkeypatch.setattr("builtins.input", lambda _prompt: "n")
         assert main([*common, "migrate"]) == 0
     human_plan = capsys.readouterr().out
-    assert "Migrationskette: 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9 -> 10" in human_plan
-    assert "Migrationssicherung: metadata-v2-to-v10.sqlite3" in human_plan
+    assert "Migrationskette: 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9 -> 10 -> 11" in human_plan
+    assert "Snapshot-Migrationskette: -" in human_plan
+    assert "Snapshot-Stichtag: " in human_plan
+    assert "Migrationssicherung: metadata-v2-to-v11.sqlite3" in human_plan
     assert f"Betroffene Snapshots: {snapshot_ref}" in human_plan
     assert "Bestehende Analysen werden veraltet: ja" in human_plan
 
@@ -1667,13 +1681,18 @@ def test_cli_maps_store_migration_plan_and_receipt(
         [7, 8],
         [8, 9],
         [9, 10],
+        [10, 11],
     ]
+    assert receipt["result"]["snapshot_source_version"] == 7
+    assert receipt["result"]["snapshot_as_of"] == plan["details"]["snapshot_as_of"]
+    assert receipt["result"]["snapshot_target_version"] == 7
+    assert receipt["result"]["snapshot_steps"] == []
 
     assert main([*common, "rollback-migration", "--json"]) == 0
     rollback_plan = json.loads(capsys.readouterr().out)
     _assert_json_contract(rollback_plan)
     assert rollback_plan["details"]["type"] == "rollback_migration"
-    assert rollback_plan["details"]["source_version"] == 10
+    assert rollback_plan["details"]["source_version"] == 11
     assert rollback_plan["details"]["target_version"] == 2
     assert rollback_plan["details"]["restored_snapshot_ref"] == snapshot_ref
 
