@@ -544,8 +544,8 @@ evidence = ["positive", "parity"]
 [[contract]]
 id = "V03-C-SNAPSHOT-LINEAGE-V1"
 source = "https://github.com/RMKruse/personal-health-lab/issues/83"
-statement = "Every V0.3 snapshot validates a closed flat lineage artifact for resolved measurements and workouts; immutable canonical sources are reused across a manual activation."
-evidence = ["positive", "reproducibility", "transition"]
+statement = "Every V0.3 snapshot binds its cutoff, context, source versions, effective manual revisions, contracts, and parent; validates exact flat derivation lineage; reuses immutable canonical sources; and activates only after durable staging in one SQLite commit."
+evidence = ["positive", "negative", "fault", "reproducibility", "transition"]
 
 [[case]]
 id = "V03-A-SNAPSHOT-LINEAGE-V1"
@@ -560,6 +560,48 @@ expected_result = "flat source lineage for each resolved record and reused immut
 expected_effect = "one fully validated child snapshot"
 forbidden_side_effects = "no copied canonical source artifact or unreferenced lineage row"
 evidence = ["positive", "reproducibility", "transition"]
+
+[[case]]
+id = "V03-A-SNAPSHOT-BINDINGS-V1"
+contracts = ["V03-C-SNAPSHOT-LINEAGE-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_medication.py::test_import_carries_every_effective_manual_revision_binding_forward"
+initial_state = "snapshot with all supported effective manual revision families"
+operation = "publish a cumulative import and inspect its SQLite and manifest bindings"
+level = "application"
+platform = "all"
+expected_result = "the child snapshot carries every effective manual revision binding"
+expected_effect = "manifest and SQLite bindings are identical"
+forbidden_side_effects = "no dropped medication deviation, reason category, or as-needed intake"
+evidence = ["positive", "transition"]
+
+[[case]]
+id = "V03-A-SNAPSHOT-BINDING-NEGATIVE-V1"
+contracts = ["V03-C-SNAPSHOT-LINEAGE-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_medication.py::test_manifest_manual_revision_binding_must_match_sqlite"
+initial_state = "committed snapshot with one effective manual revision"
+operation = "remove the revision from the manifest while preserving the catalog hash"
+level = "application"
+platform = "all"
+expected_result = "store validation rejects the unclosed revision binding"
+expected_effect = "the corrupt store does not open"
+forbidden_side_effects = "no acceptance of a manifest and SQLite binding mismatch"
+evidence = ["negative"]
+
+[[case]]
+id = "V03-A-SNAPSHOT-FAULT-V1"
+contracts = ["V03-C-SNAPSHOT-LINEAGE-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_medication.py::test_manual_snapshot_fault_keeps_revision_audit_and_activation_atomic"
+initial_state = "one committed source snapshot"
+operation = "inject faults immediately before and after moving a staged manual snapshot"
+level = "application"
+platform = "all"
+expected_result = "the previous snapshot remains active after either fault"
+expected_effect = "manual revision, audit event, and activation roll back together"
+forbidden_side_effects = "no partial revision, audit, or active snapshot state"
+evidence = ["fault", "transition"]
 
 [[case]]
 id = "V03-A-ACTIVITY-OVERLAP-V1"

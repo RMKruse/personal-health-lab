@@ -21,26 +21,42 @@ from personal_health_lab.application import (
 )
 
 PARQUET_FILES = (
+    "activity_coverage_segments.parquet",
+    "activity_days.parquet",
+    "daily_context.parquet",
     "derivation_lineage.parquet",
     "measurement_versions.parquet",
+    "medication_context.parquet",
     "open_review_cases.parquet",
     "resolved_measurements.parquet",
     "resolved_workouts.parquet",
+    "sleep_episodes.parquet",
     "sleep_intervals.parquet",
+    "sleep_nights.parquet",
     "source_occurrences.parquet",
+    "weight_nutrition_days.parquet",
+    "workout_features.parquet",
     "workout_review_links.parquet",
     "workouts.parquet",
 )
 LAST_COLUMNS = {
-    "derivation_lineage.parquet": "contribution_role",
+    "activity_coverage_segments.parquet": "coverage_kind",
+    "activity_days.parquet": "quality_status",
+    "daily_context.parquet": "quality_status",
+    "derivation_lineage.parquet": "derived_at_utc",
+    "medication_context.parquet": "quality_status",
     "measurement_versions.parquet": "strong_source_id_hash",
     "open_review_cases.parquet": "evidence_fingerprint",
     "resolved_measurements.parquet": "conflict_resolution_decision_id",
     "resolved_workouts.parquet": "effective_decision_id",
+    "sleep_episodes.parquet": "quality_status",
     "sleep_intervals.parquet": "is_selected",
+    "sleep_nights.parquet": "quality_status",
     "source_occurrences.parquet": "occurrence_fingerprint",
     "workout_review_links.parquet": "workout_version_id",
+    "workout_features.parquet": "quality_status",
     "workouts.parquet": "is_selected",
+    "weight_nutrition_days.parquet": "quality_status",
 }
 
 
@@ -596,9 +612,7 @@ def test_valid_open_review_case_is_closed_over_snapshot_ids(tmp_path: Path) -> N
     manifest["validation_counts"]["open_review_cases"] = 1
     _rewrite_manifest(config, snapshot, manifest)
     with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
-        metadata.execute(
-            "INSERT INTO rule_version_refs VALUES ('plausibility/v1', 'plausibility')"
-        )
+        metadata.execute("INSERT INTO rule_version_refs VALUES ('plausibility/v1', 'plausibility')")
 
     with HealthLab.open(config):
         pass
@@ -636,12 +650,8 @@ def test_next_import_carries_forward_resolution_and_open_review_state(tmp_path: 
     manifest["validation_counts"].update(included=0, excluded=1, open_review_cases=1)
     _rewrite_manifest(config, snapshot, manifest)
     with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
-        metadata.execute(
-            "INSERT INTO decision_refs VALUES (?, 'local_exclusion')", ("a" * 32,)
-        )
-        metadata.execute(
-            "INSERT INTO rule_version_refs VALUES ('plausibility/v1', 'plausibility')"
-        )
+        metadata.execute("INSERT INTO decision_refs VALUES (?, 'local_exclusion')", ("a" * 32,))
+        metadata.execute("INSERT INTO rule_version_refs VALUES ('plausibility/v1', 'plausibility')")
 
     next_snapshot = _publish_snapshot(config, _package(tmp_path / "second.zip", 61))
     next_resolved = next_snapshot / "resolved_measurements.parquet"

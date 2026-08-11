@@ -18,6 +18,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import IO, Literal, Self, cast
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import duckdb
 
@@ -50,7 +51,7 @@ _STORE_SCHEMA_VERSION = 10
 _WRITER_LOCK_FILE = ".writer.lock"
 _FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
 _STORE_MIGRATION_METHOD = "cow-migration/v1"
-_SNAPSHOT_SCHEMA_VERSION = 5
+_SNAPSHOT_SCHEMA_VERSION = 6
 _CANONICAL_HEALTH_TYPES_SQL = ", ".join(f"'{item.value}'" for item in CanonicalHealthType)
 _CANONICAL_UNITS_SQL = ", ".join(f"'{item.value}'" for item in CanonicalUnit)
 _PRE_ACTIVITY_HEALTH_TYPES_SQL = ", ".join(
@@ -178,6 +179,70 @@ _SNAPSHOT_SCHEMAS = {
         ("rule_version_id", "VARCHAR"),
         ("evidence_fingerprint", "VARCHAR"),
     ),
+    "weight_nutrition_days.parquet": (
+        ("derived_record_id", "VARCHAR"),
+        ("day", "DATE"),
+        ("feature_kind", "VARCHAR"),
+        ("canonical_unit", "VARCHAR"),
+        ("effective_value", "DOUBLE"),
+        ("observation_status", "VARCHAR"),
+        ("quality_status", "VARCHAR"),
+    ),
+    "sleep_episodes.parquet": (
+        ("derived_record_id", "VARCHAR"),
+        ("episode_start_utc", "VARCHAR"),
+        ("episode_end_utc", "VARCHAR"),
+        ("observed_sleep_minutes", "DOUBLE"),
+        ("quality_status", "VARCHAR"),
+    ),
+    "sleep_nights.parquet": (
+        ("derived_record_id", "VARCHAR"),
+        ("day", "DATE"),
+        ("observation_status", "VARCHAR"),
+        ("primary_episode_id", "VARCHAR"),
+        ("quality_status", "VARCHAR"),
+    ),
+    "activity_days.parquet": (
+        ("derived_record_id", "VARCHAR"),
+        ("day", "DATE"),
+        ("metric", "VARCHAR"),
+        ("canonical_unit", "VARCHAR"),
+        ("effective_value", "DOUBLE"),
+        ("watch_value", "DOUBLE"),
+        ("iphone_value", "DOUBLE"),
+        ("quality_status", "VARCHAR"),
+    ),
+    "activity_coverage_segments.parquet": (
+        ("derived_record_id", "VARCHAR"),
+        ("start_utc", "VARCHAR"),
+        ("end_utc", "VARCHAR"),
+        ("coverage_kind", "VARCHAR"),
+    ),
+    "workout_features.parquet": (
+        ("derived_record_id", "VARCHAR"),
+        ("logical_workout_id", "VARCHAR"),
+        ("day", "DATE"),
+        ("activity_type", "VARCHAR"),
+        ("duration_minutes", "DOUBLE"),
+        ("distance_kilometers", "DOUBLE"),
+        ("active_energy_kilocalories", "DOUBLE"),
+        ("quality_status", "VARCHAR"),
+    ),
+    "daily_context.parquet": (
+        ("derived_record_id", "VARCHAR"),
+        ("day", "DATE"),
+        ("illness_severity", "VARCHAR"),
+        ("stress_level", "VARCHAR"),
+        ("quality_status", "VARCHAR"),
+    ),
+    "medication_context.parquet": (
+        ("derived_record_id", "VARCHAR"),
+        ("day", "DATE"),
+        ("scheduled_dose_count", "BIGINT"),
+        ("deviation_count", "BIGINT"),
+        ("as_needed_intake_count", "BIGINT"),
+        ("quality_status", "VARCHAR"),
+    ),
     "derivation_lineage.parquet": (
         ("derived_record_id", "VARCHAR"),
         ("derived_family", "VARCHAR"),
@@ -185,12 +250,70 @@ _SNAPSHOT_SCHEMAS = {
         ("source_logical_id", "VARCHAR"),
         ("source_version_id", "VARCHAR"),
         ("contribution_role", "VARCHAR"),
+        ("snapshot_id", "VARCHAR"),
+        ("derived_at_utc", "VARCHAR"),
     ),
 }
+_SNAPSHOT_FILE_CONTRACTS = {
+    "source_occurrences.parquet": (_IDENTITY_RULE_VERSION, _MAPPING_RULE_VERSION),
+    "measurement_versions.parquet": (_MAPPING_RULE_VERSION,),
+    "sleep_intervals.parquet": (_MAPPING_RULE_VERSION,),
+    "workouts.parquet": (_MAPPING_RULE_VERSION,),
+    "resolved_measurements.parquet": ("resolved-measurement/v1",),
+    "resolved_workouts.parquet": ("resolved-workout/v1",),
+    "workout_review_links.parquet": ("resolved-workout/v1",),
+    "open_review_cases.parquet": (_FIXED_PLAUSIBILITY_RULE_VERSION,),
+    "weight_nutrition_days.parquet": ("weight-nutrition-day/v1",),
+    "sleep_episodes.parquet": ("sleep-episode/v1",),
+    "sleep_nights.parquet": ("sleep-night/v1",),
+    "activity_days.parquet": ("activity-day/v1",),
+    "activity_coverage_segments.parquet": ("activity-coverage/v1",),
+    "workout_features.parquet": ("workout-feature/v1",),
+    "daily_context.parquet": ("daily-context/v1",),
+    "medication_context.parquet": ("medication-context/v1",),
+    "derivation_lineage.parquet": (
+        "resolved-measurement/v1",
+        "resolved-workout/v1",
+        "weight-nutrition-day/v1",
+        "sleep-episode/v1",
+        "sleep-night/v1",
+        "activity-day/v1",
+        "activity-coverage/v1",
+        "workout-feature/v1",
+        "daily-context/v1",
+        "medication-context/v1",
+    ),
+}
+_V6_DERIVATION_FILES = {
+    "weight_nutrition_days.parquet",
+    "sleep_episodes.parquet",
+    "sleep_nights.parquet",
+    "activity_days.parquet",
+    "activity_coverage_segments.parquet",
+    "workout_features.parquet",
+    "daily_context.parquet",
+    "medication_context.parquet",
+}
+_DERIVATION_CONTRACT_IDS = tuple(
+    sorted(
+        {
+            contract_id
+            for filename in _V6_DERIVATION_FILES | {"derivation_lineage.parquet"}
+            for contract_id in _SNAPSHOT_FILE_CONTRACTS[filename]
+        }
+    )
+)
 _LEGACY_SNAPSHOT_SCHEMAS = {
     name: schema
     for name, schema in _SNAPSHOT_SCHEMAS.items()
-    if name not in {"workouts.parquet", "resolved_workouts.parquet", "workout_review_links.parquet"}
+    if name
+    not in {
+        "workouts.parquet",
+        "resolved_workouts.parquet",
+        "workout_review_links.parquet",
+        "derivation_lineage.parquet",
+    }
+    | _V6_DERIVATION_FILES
 }
 _V2_SNAPSHOT_SCHEMAS = {
     name: (
@@ -199,17 +322,38 @@ _V2_SNAPSHOT_SCHEMAS = {
         else schema
     )
     for name, schema in _SNAPSHOT_SCHEMAS.items()
-    if name not in {"resolved_workouts.parquet", "workout_review_links.parquet"}
+    if name
+    not in {
+        "resolved_workouts.parquet",
+        "workout_review_links.parquet",
+        "derivation_lineage.parquet",
+    }
+    | _V6_DERIVATION_FILES
 }
 _V3_SNAPSHOT_SCHEMAS = {
     name: schema
     for name, schema in _SNAPSHOT_SCHEMAS.items()
-    if name not in {"resolved_workouts.parquet", "workout_review_links.parquet"}
+    if name
+    not in {
+        "resolved_workouts.parquet",
+        "workout_review_links.parquet",
+        "derivation_lineage.parquet",
+    }
+    | _V6_DERIVATION_FILES
 }
 _V4_SNAPSHOT_SCHEMAS = {
     name: schema
     for name, schema in _SNAPSHOT_SCHEMAS.items()
-    if name != "derivation_lineage.parquet"
+    if name not in _V6_DERIVATION_FILES | {"derivation_lineage.parquet"}
+}
+_V5_SNAPSHOT_SCHEMAS = {
+    name: (
+        tuple(field for field in schema if field[0] not in {"snapshot_id", "derived_at_utc"})
+        if name == "derivation_lineage.parquet"
+        else schema
+    )
+    for name, schema in _SNAPSHOT_SCHEMAS.items()
+    if name not in _V6_DERIVATION_FILES
 }
 _KIB = 1024
 _MIB = 1024 * _KIB
@@ -384,6 +528,22 @@ def _allocation_checkpoint(root: Path, phase: str) -> None:
 
 def _publication_fault_point(root: Path, fault_point_id: str) -> None:
     """Private test seam for durable import-publication transitions."""
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_snapshot(directory: Path) -> None:
+    for path in sorted(directory.iterdir()):
+        if path.is_file():
+            with path.open("rb") as artifact:
+                os.fsync(artifact.fileno())
+    _fsync_directory(directory)
 
 
 def _migration_backup_fault_point(root: Path) -> None:
@@ -1238,6 +1398,7 @@ class ContextCoverageStartPublication:
     start_date: date | None
     withdrawal_reason: str | None
     expected_snapshot_id: SnapshotId
+    snapshot_as_of: datetime
     context_as_of_date: date
     context_timezone: str
 
@@ -1441,6 +1602,7 @@ class IllnessPublication:
     note: str | None
     withdrawal_reason: str | None
     expected_snapshot_id: SnapshotId
+    snapshot_as_of: datetime
     context_as_of_date: date
     context_timezone: str
 
@@ -1549,6 +1711,14 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             activated_at_utc TEXT NOT NULL CHECK (
                 length(activated_at_utc) >= 20 AND substr(activated_at_utc, 11, 1) = 'T'
             )
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS snapshot_contract_bindings (
+            snapshot_id TEXT PRIMARY KEY REFERENCES dataset_snapshots(snapshot_id),
+            snapshot_as_of TEXT NOT NULL,
+            context_timezone TEXT NOT NULL CHECK (context_timezone != ''),
+            context_as_of_date TEXT NOT NULL CHECK (length(context_as_of_date) = 10),
+            medication_as_of TEXT NOT NULL,
+            CHECK (snapshot_as_of = medication_as_of)
         ) STRICT;
         CREATE TABLE IF NOT EXISTS active_snapshot (
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -3972,11 +4142,15 @@ class LocalStore:
             restore_exports=restore_exports,
             restored_decision_refs=restored_decision_refs,
             restored_rule_refs=restored_rule_refs,
+            snapshot_as_of=observed_at,
+            context_timezone="Europe/Berlin",
         )
         _allocation_checkpoint(self._root, "staged")
+        _fsync_snapshot(staging)
         _publication_fault_point(self._root, "import.before_snapshot_move/v1")
         snapshot.parent.mkdir(parents=True, exist_ok=True)
         staging.replace(snapshot)
+        _fsync_directory(snapshot.parent)
         _publication_fault_point(self._root, "import.after_snapshot_move/v1")
         completed_at = datetime.now(UTC).isoformat()
         audit_event_id = uuid4().hex
@@ -4020,6 +4194,7 @@ class LocalStore:
                     completed_at,
                 ),
             )
+            self._insert_snapshot_contract_binding(snapshot_id)
             self._metadata.execute(
                 "INSERT INTO activity_derivation_snapshot_bindings VALUES (?, "
                 "(SELECT version_id FROM activity_derivation_active WHERE singleton = 1))",
@@ -4035,6 +4210,24 @@ class LocalStore:
                 self._metadata.execute(
                     "INSERT INTO medication_snapshot_bindings "
                     "SELECT ?, revision_id FROM medication_snapshot_bindings WHERE snapshot_id = ?",
+                    (str(snapshot_id), str(active[0])),
+                )
+                self._metadata.execute(
+                    "INSERT INTO medication_deviation_snapshot_bindings "
+                    "SELECT ?, revision_id FROM medication_deviation_snapshot_bindings "
+                    "WHERE snapshot_id = ?",
+                    (str(snapshot_id), str(active[0])),
+                )
+                self._metadata.execute(
+                    "INSERT INTO intake_reason_category_snapshot_bindings "
+                    "SELECT ?, revision_id FROM intake_reason_category_snapshot_bindings "
+                    "WHERE snapshot_id = ?",
+                    (str(snapshot_id), str(active[0])),
+                )
+                self._metadata.execute(
+                    "INSERT INTO as_needed_intake_snapshot_bindings "
+                    "SELECT ?, revision_id FROM as_needed_intake_snapshot_bindings "
+                    "WHERE snapshot_id = ?",
                     (str(snapshot_id), str(active[0])),
                 )
             all_intervals: tuple[
@@ -4196,6 +4389,106 @@ class LocalStore:
             "UPDATE store_identity SET person_binding = 'bound' WHERE singleton = 1"
         )
 
+    def _effective_manual_revision_ids(self) -> tuple[str, ...]:
+        rows = self._metadata.execute(
+            """
+            SELECT revision_id FROM manual_context_revisions current
+            WHERE state = 'active' AND NOT EXISTS (
+                SELECT 1 FROM manual_context_revisions next
+                WHERE next.previous_revision_id = current.revision_id
+            )
+            UNION ALL
+            SELECT revision_id FROM medication_regime_revisions current
+            WHERE NOT EXISTS (
+                SELECT 1 FROM medication_regime_revisions next
+                WHERE next.previous_revision_id = current.revision_id
+            )
+            UNION ALL
+            SELECT revision_id FROM medication_deviation_revisions current
+            WHERE state = 'active' AND NOT EXISTS (
+                SELECT 1 FROM medication_deviation_revisions next
+                WHERE next.previous_revision_id = current.revision_id
+            )
+            UNION ALL
+            SELECT revision_id FROM intake_reason_category_revisions current
+            WHERE state = 'active' AND NOT EXISTS (
+                SELECT 1 FROM intake_reason_category_revisions next
+                WHERE next.previous_revision_id = current.revision_id
+            )
+            UNION ALL
+            SELECT revision_id FROM as_needed_intake_revisions current
+            WHERE state = 'active' AND NOT EXISTS (
+                SELECT 1 FROM as_needed_intake_revisions next
+                WHERE next.previous_revision_id = current.revision_id
+            )
+            """
+        ).fetchall()
+        return tuple(sorted(str(row[0]) for row in rows))
+
+    def _bound_manual_revision_ids(self, snapshot_id: SnapshotId) -> tuple[str, ...]:
+        rows = self._metadata.execute(
+            """
+            SELECT revision_id FROM manual_context_snapshot_bindings WHERE snapshot_id = ?
+            UNION ALL
+            SELECT revision_id FROM medication_snapshot_bindings WHERE snapshot_id = ?
+            UNION ALL
+            SELECT revision_id FROM medication_deviation_snapshot_bindings WHERE snapshot_id = ?
+            UNION ALL
+            SELECT revision_id FROM intake_reason_category_snapshot_bindings WHERE snapshot_id = ?
+            UNION ALL
+            SELECT revision_id FROM as_needed_intake_snapshot_bindings WHERE snapshot_id = ?
+            """,
+            (str(snapshot_id),) * 5,
+        ).fetchall()
+        return tuple(sorted(str(row[0]) for row in rows))
+
+    def _snapshot_binding(
+        self,
+        *,
+        snapshot_as_of: datetime,
+        context_timezone: str,
+        manual_revision_ids: tuple[str, ...],
+    ) -> dict[str, str | list[str]]:
+        source_version_ids = tuple(
+            sorted(
+                str(row[0])
+                for row in self._query.execute(
+                    """
+                    SELECT selected_measurement_version_id FROM resolved_measurements
+                    UNION
+                    SELECT measurement_version_id FROM sleep_intervals WHERE is_selected
+                    UNION
+                    SELECT selected_workout_version_id FROM resolved_workouts
+                    """
+                ).fetchall()
+            )
+        )
+        return {
+            "snapshot_as_of": snapshot_as_of.isoformat(),
+            "context_timezone": context_timezone,
+            "context_as_of_date": snapshot_as_of.astimezone(ZoneInfo(context_timezone))
+            .date()
+            .isoformat(),
+            "medication_as_of": snapshot_as_of.isoformat(),
+            "source_version_ids": list(source_version_ids),
+            "manual_revision_ids": list(manual_revision_ids),
+        }
+
+    def _insert_snapshot_contract_binding(self, snapshot_id: SnapshotId) -> None:
+        binding = self._load_snapshot_binding(snapshot_id)
+        if binding is None:
+            raise StoreError("Snapshot-Vertragsbindung fehlt.")
+        self._metadata.execute(
+            "INSERT INTO snapshot_contract_bindings VALUES (?, ?, ?, ?, ?)",
+            (
+                str(snapshot_id),
+                str(binding["snapshot_as_of"]),
+                str(binding["context_timezone"]),
+                str(binding["context_as_of_date"]),
+                str(binding["medication_as_of"]),
+            ),
+        )
+
     def _stage_snapshot(
         self,
         directory: Path,
@@ -4216,6 +4509,8 @@ class LocalStore:
         ],
         restored_decision_refs: tuple[tuple[str, str], ...],
         restored_rule_refs: tuple[tuple[str, str], ...],
+        snapshot_as_of: datetime,
+        context_timezone: str,
     ) -> tuple[str, SourceResolution]:
         self._query.execute(
             """
@@ -4559,9 +4854,15 @@ class LocalStore:
             self._query.executemany(
                 "INSERT INTO open_review_cases VALUES (?, ?, ?, ?, ?, ?)", review_rows
             )
-        self._refresh_derivation_lineage()
+        bound_manual_revision_ids = (
+            ()
+            if parent_snapshot_id is None
+            else self._bound_manual_revision_ids(parent_snapshot_id)
+        )
+        self._refresh_v03_derivations(snapshot_as_of, bound_manual_revision_ids)
+        self._refresh_derivation_lineage(snapshot_id, snapshot_as_of, bound_manual_revision_ids)
 
-        entries: list[dict[str, int | str]] = []
+        entries: list[dict[str, int | str | list[str]]] = []
         for filename in sorted(_SNAPSHOT_SCHEMAS):
             table = filename.removesuffix(".parquet")
             path = directory / filename
@@ -4588,6 +4889,7 @@ class LocalStore:
                     "parquet_schema_fingerprint": hashlib.sha256(
                         json.dumps(description, separators=(",", ":")).encode()
                     ).hexdigest(),
+                    "contract_ids": list(_SNAPSHOT_FILE_CONTRACTS[filename]),
                 }
             )
 
@@ -4633,7 +4935,12 @@ class LocalStore:
                 "identity_rule_version_id": _IDENTITY_RULE_VERSION,
                 "mapping_rule_version_id": _MAPPING_RULE_VERSION,
             },
-            "derivation_contract_ids": ["resolved-measurement/v1", "resolved-workout/v1"],
+            "derivation_contract_ids": list(_DERIVATION_CONTRACT_IDS),
+            "snapshot_binding": self._snapshot_binding(
+                snapshot_as_of=snapshot_as_of,
+                context_timezone=context_timezone,
+                manual_revision_ids=bound_manual_revision_ids,
+            ),
             "files": entries,
             "validation_counts": {
                 "exports": export_count,
@@ -4808,6 +5115,24 @@ class LocalStore:
                 or manifest["parent_snapshot_id"] != parent_id
             ):
                 raise StoreError("Snapshot-Katalog und Manifest widersprechen sich.")
+            if schema_version == _SNAPSHOT_SCHEMA_VERSION and manifest["snapshot_binding"][
+                "manual_revision_ids"
+            ] != list(self._bound_manual_revision_ids(SnapshotId(snapshot_id))):
+                raise StoreError("Snapshot-Revisionsbindung ist nicht geschlossen.")
+            if schema_version == _SNAPSHOT_SCHEMA_VERSION:
+                binding = manifest["snapshot_binding"]
+                catalog_binding = self._metadata.execute(
+                    "SELECT snapshot_as_of, context_timezone, context_as_of_date, "
+                    "medication_as_of FROM snapshot_contract_bindings WHERE snapshot_id = ?",
+                    (snapshot_id,),
+                ).fetchone()
+                if catalog_binding != (
+                    binding["snapshot_as_of"],
+                    binding["context_timezone"],
+                    binding["context_as_of_date"],
+                    binding["medication_as_of"],
+                ):
+                    raise StoreError("Snapshot-Katalogbindung ist nicht geschlossen.")
 
     def _validate_snapshot(
         self,
@@ -4831,6 +5156,39 @@ class LocalStore:
         validation_counts = (
             manifest.get("validation_counts") if isinstance(manifest, dict) else None
         )
+        snapshot_binding = manifest.get("snapshot_binding") if isinstance(manifest, dict) else None
+        binding_valid = False
+        if isinstance(snapshot_binding, dict):
+            try:
+                snapshot_as_of = datetime.fromisoformat(str(snapshot_binding["snapshot_as_of"]))
+                medication_as_of = datetime.fromisoformat(str(snapshot_binding["medication_as_of"]))
+                context_timezone = str(snapshot_binding["context_timezone"])
+                context_as_of_date = date.fromisoformat(str(snapshot_binding["context_as_of_date"]))
+                source_version_ids = snapshot_binding["source_version_ids"]
+                manual_revision_ids = snapshot_binding["manual_revision_ids"]
+                binding_valid = (
+                    set(snapshot_binding)
+                    == {
+                        "snapshot_as_of",
+                        "context_timezone",
+                        "context_as_of_date",
+                        "medication_as_of",
+                        "source_version_ids",
+                        "manual_revision_ids",
+                    }
+                    and snapshot_as_of.tzinfo is not None
+                    and medication_as_of == snapshot_as_of
+                    and context_as_of_date
+                    == snapshot_as_of.astimezone(ZoneInfo(context_timezone)).date()
+                    and isinstance(source_version_ids, list)
+                    and source_version_ids == sorted(set(source_version_ids))
+                    and all(_is_lower_hex(value, 64) for value in source_version_ids)
+                    and isinstance(manual_revision_ids, list)
+                    and manual_revision_ids == sorted(set(manual_revision_ids))
+                    and all(_is_lower_hex(value, 32) for value in manual_revision_ids)
+                )
+            except (KeyError, TypeError, ValueError, ZoneInfoNotFoundError):
+                binding_valid = False
         if (
             not isinstance(manifest, dict)
             or store_row is None
@@ -4854,11 +5212,16 @@ class LocalStore:
                 "validation_counts",
                 *(
                     ("derivation_contract_ids",)
+                    if manifest.get("snapshot_schema_version") in {5, _SNAPSHOT_SCHEMA_VERSION}
+                    else ()
+                ),
+                *(
+                    ("snapshot_binding",)
                     if manifest.get("snapshot_schema_version") == _SNAPSHOT_SCHEMA_VERSION
                     else ()
                 ),
             }
-            or manifest["snapshot_schema_version"] not in {1, 2, 3, 4, _SNAPSHOT_SCHEMA_VERSION}
+            or manifest["snapshot_schema_version"] not in {1, 2, 3, 4, 5, _SNAPSHOT_SCHEMA_VERSION}
             or manifest["snapshot_id"] != snapshot_id
             or not _is_lower_hex(manifest["snapshot_id"], 32)
             or not _is_lower_hex(manifest["store_id"], 32)
@@ -4882,9 +5245,17 @@ class LocalStore:
             or resolution_basis["identity_rule_version_id"] not in _SUPPORTED_IDENTITY_RULE_VERSIONS
             or resolution_basis["mapping_rule_version_id"] not in _SUPPORTED_MAPPING_RULE_VERSIONS
             or (
-                manifest["snapshot_schema_version"] == _SNAPSHOT_SCHEMA_VERSION
+                manifest["snapshot_schema_version"] == 5
                 and manifest.get("derivation_contract_ids")
                 != ["resolved-measurement/v1", "resolved-workout/v1"]
+            )
+            or (
+                manifest["snapshot_schema_version"] == _SNAPSHOT_SCHEMA_VERSION
+                and manifest.get("derivation_contract_ids") != list(_DERIVATION_CONTRACT_IDS)
+            )
+            or (
+                manifest["snapshot_schema_version"] == _SNAPSHOT_SCHEMA_VERSION
+                and not binding_valid
             )
             or not isinstance(validation_counts, dict)
             or set(validation_counts)
@@ -4905,6 +5276,7 @@ class LocalStore:
             2: _V2_SNAPSHOT_SCHEMAS,
             3: _V3_SNAPSHOT_SCHEMAS,
             4: _V4_SNAPSHOT_SCHEMAS,
+            5: _V5_SNAPSHOT_SCHEMAS,
             _SNAPSHOT_SCHEMA_VERSION: _SNAPSHOT_SCHEMAS,
         }[manifest["snapshot_schema_version"]]
         files = manifest["files"]
@@ -4915,13 +5287,16 @@ class LocalStore:
         ):
             raise StoreError("Snapshot enthält nicht genau vier geschlossene Dateien.")
         for entry in files:
-            if not isinstance(entry, dict) or set(entry) != {
+            expected_entry_fields = {
                 "name",
                 "sha256",
                 "allocated_bytes",
                 "row_count",
                 "parquet_schema_fingerprint",
-            }:
+            }
+            if manifest["snapshot_schema_version"] == _SNAPSHOT_SCHEMA_VERSION:
+                expected_entry_fields.add("contract_ids")
+            if not isinstance(entry, dict) or set(entry) != expected_entry_fields:
                 raise StoreError("Snapshot-Dateieintrag ist ungültig.")
             filename = str(entry["name"])
             if (
@@ -4931,6 +5306,10 @@ class LocalStore:
                 or entry["allocated_bytes"] < 0
                 or type(entry["row_count"]) is not int
                 or entry["row_count"] < 0
+                or (
+                    manifest["snapshot_schema_version"] == _SNAPSHOT_SCHEMA_VERSION
+                    and entry["contract_ids"] != list(_SNAPSHOT_FILE_CONTRACTS[filename])
+                )
             ):
                 raise StoreError("Snapshot-Dateieintrag ist ungültig.")
             path = directory / filename
@@ -4973,6 +5352,43 @@ class LocalStore:
             name.removesuffix(".parquet"): str(directory / name).replace("'", "''")
             for name in _SNAPSHOT_SCHEMAS
         }
+        if manifest["snapshot_schema_version"] == _SNAPSHOT_SCHEMA_VERSION:
+            expected_source_version_ids = sorted(
+                str(row[0])
+                for row in self._query.execute(
+                    f"""
+                    SELECT selected_measurement_version_id
+                    FROM read_parquet('{paths["resolved_measurements"]}')
+                    UNION
+                    SELECT measurement_version_id
+                    FROM read_parquet('{paths["sleep_intervals"]}') WHERE is_selected
+                    UNION
+                    SELECT selected_workout_version_id
+                    FROM read_parquet('{paths["resolved_workouts"]}')
+                    """
+                ).fetchall()
+            )
+            assert isinstance(snapshot_binding, dict)
+            if snapshot_binding["source_version_ids"] != expected_source_version_ids:
+                raise StoreError("Snapshot-Quellversionsbindung ist nicht geschlossen.")
+            manual_revision_ids = cast(list[str], snapshot_binding["manual_revision_ids"])
+            if manual_revision_ids:
+                placeholders = ",".join("?" for _ in manual_revision_ids)
+                known_manual_revision_ids = {
+                    str(row[0])
+                    for row in self._metadata.execute(
+                        "SELECT revision_id FROM ("
+                        "SELECT revision_id FROM manual_context_revisions UNION ALL "
+                        "SELECT revision_id FROM medication_regime_revisions UNION ALL "
+                        "SELECT revision_id FROM medication_deviation_revisions UNION ALL "
+                        "SELECT revision_id FROM intake_reason_category_revisions UNION ALL "
+                        "SELECT revision_id FROM as_needed_intake_revisions"
+                        f") WHERE revision_id IN ({placeholders})",
+                        tuple(manual_revision_ids),
+                    ).fetchall()
+                }
+                if known_manual_revision_ids != set(manual_revision_ids):
+                    raise StoreError("Snapshot-Revisionsreferenz ist nicht geschlossen.")
         snapshot_decisions = {
             (str(row[0]), str(row[1]))
             for row in self._query.execute(
@@ -5236,31 +5652,139 @@ class LocalStore:
                            measurement_version_id AS source_version_id
                     FROM read_parquet('{paths["measurement_versions"]}')
                     UNION ALL
+                    SELECT identity_candidate_id, measurement_version_id
+                    FROM read_parquet('{paths["sleep_intervals"]}')
+                    UNION ALL
                     SELECT logical_workout_id, workout_version_id
                     FROM read_parquet('{paths["workouts"]}')
+                ),
+                expected AS (
+                    SELECT
+                        sha256('resolved-measurement/v1:' || r.logical_measurement_id),
+                        'resolved_measurement',
+                        'resolved-measurement/v1',
+                        v.identity_candidate_id,
+                        r.selected_measurement_version_id,
+                        'selected_source_version'
+                    FROM read_parquet('{paths["resolved_measurements"]}') r
+                    JOIN read_parquet('{paths["measurement_versions"]}') v
+                      ON v.measurement_version_id = r.selected_measurement_version_id
+                    UNION ALL
+                    SELECT
+                        sha256('resolved-workout/v1:' || r.logical_workout_id),
+                        'resolved_workout',
+                        'resolved-workout/v1',
+                        r.logical_workout_id,
+                        r.selected_workout_version_id,
+                        'selected_source_version'
+                    FROM read_parquet('{paths["resolved_workouts"]}') r
+                    JOIN read_parquet('{paths["workouts"]}') w
+                      ON w.workout_version_id = r.selected_workout_version_id
+                ),
+                derived_ids AS (
+                    SELECT sha256('resolved-measurement/v1:' || logical_measurement_id)
+                               AS derived_record_id,
+                           'resolved_measurement' AS derived_family,
+                           'resolved-measurement/v1' AS derivation_contract_id
+                    FROM read_parquet('{paths["resolved_measurements"]}')
+                    UNION ALL SELECT sha256('resolved-workout/v1:' || logical_workout_id),
+                           'resolved_workout', 'resolved-workout/v1'
+                    FROM read_parquet('{paths["resolved_workouts"]}')
+                    UNION ALL SELECT derived_record_id, 'weight_nutrition_day',
+                           'weight-nutrition-day/v1'
+                    FROM read_parquet('{paths["weight_nutrition_days"]}')
+                    UNION ALL SELECT derived_record_id, 'sleep_episode', 'sleep-episode/v1'
+                    FROM read_parquet('{paths["sleep_episodes"]}')
+                    UNION ALL SELECT derived_record_id, 'sleep_night', 'sleep-night/v1'
+                    FROM read_parquet('{paths["sleep_nights"]}')
+                    UNION ALL SELECT derived_record_id, 'activity_day', 'activity-day/v1'
+                    FROM read_parquet('{paths["activity_days"]}')
+                    UNION ALL SELECT derived_record_id, 'activity_coverage',
+                           'activity-coverage/v1'
+                    FROM read_parquet('{paths["activity_coverage_segments"]}')
+                    UNION ALL SELECT derived_record_id, 'workout_feature', 'workout-feature/v1'
+                    FROM read_parquet('{paths["workout_features"]}')
+                    UNION ALL SELECT derived_record_id, 'daily_context', 'daily-context/v1'
+                    FROM read_parquet('{paths["daily_context"]}')
+                    UNION ALL SELECT derived_record_id, 'medication_context',
+                           'medication-context/v1'
+                    FROM read_parquet('{paths["medication_context"]}')
                 )
                 SELECT
-                    (SELECT count(*) - count(DISTINCT derived_record_id) FROM lineage)
+                    (SELECT count(*) - count(DISTINCT
+                        derived_record_id || ':' || source_version_id || ':' || contribution_role
+                    ) FROM lineage)
                   + (SELECT count(*) FROM lineage
                      WHERE NOT regexp_full_match(derived_record_id, '[0-9a-f]{{64}}')
-                        OR NOT regexp_full_match(source_logical_id, '[0-9a-f]{{64}}')
-                        OR NOT regexp_full_match(source_version_id, '[0-9a-f]{{64}}')
-                        OR contribution_role != 'selected_source_version'
+                        OR NOT regexp_full_match(source_logical_id, '[0-9a-f]{{32}}|[0-9a-f]{{64}}')
+                        OR NOT regexp_full_match(source_version_id, '[0-9a-f]{{32}}|[0-9a-f]{{64}}')
+                        OR NOT regexp_full_match(snapshot_id, '[0-9a-f]{{32}}')
+                        OR try_cast(derived_at_utc AS TIMESTAMPTZ) IS NULL
+                        OR contribution_role NOT IN (
+                            'selected_source_version', 'daily_feature_contributor',
+                            'episode_interval', 'night_interval', 'daily_metric_contributor',
+                            'coverage_interval', 'workout_source_version', 'manual_revision'
+                        )
                         OR (derived_family, derivation_contract_id) NOT IN (
                             ('resolved_measurement', 'resolved-measurement/v1'),
-                            ('resolved_workout', 'resolved-workout/v1')
+                            ('resolved_workout', 'resolved-workout/v1'),
+                            ('weight_nutrition_day', 'weight-nutrition-day/v1'),
+                            ('sleep_episode', 'sleep-episode/v1'),
+                            ('sleep_night', 'sleep-night/v1'),
+                            ('activity_day', 'activity-day/v1'),
+                            ('activity_coverage', 'activity-coverage/v1'),
+                            ('workout_feature', 'workout-feature/v1'),
+                            ('daily_context', 'daily-context/v1'),
+                            ('medication_context', 'medication-context/v1')
                         ))
                   + (SELECT count(*) FROM lineage l LEFT JOIN sources s
                      USING (source_logical_id, source_version_id)
-                     WHERE s.source_version_id IS NULL)
-                  + abs((SELECT count(*) FROM lineage) - (
-                        (SELECT count(*) FROM read_parquet('{paths["resolved_measurements"]}'))
-                      + (SELECT count(*) FROM read_parquet('{paths["resolved_workouts"]}'))
+                     WHERE length(l.source_version_id) = 64 AND s.source_version_id IS NULL)
+                  + (SELECT count(*) FROM (
+                        SELECT * FROM expected EXCEPT
+                        SELECT derived_record_id, derived_family, derivation_contract_id,
+                               source_logical_id, source_version_id, contribution_role
+                        FROM lineage
                     ))
+                  + (SELECT count(*) FROM derived_ids d LEFT JOIN lineage l
+                     USING (derived_record_id, derived_family, derivation_contract_id)
+                     WHERE l.derived_record_id IS NULL)
+                  + (SELECT count(*) FROM lineage l LEFT JOIN derived_ids d
+                     USING (derived_record_id, derived_family, derivation_contract_id)
+                     WHERE d.derived_record_id IS NULL)
                 """
             ).fetchone()
             if invalid_lineage is None or int(invalid_lineage[0]) != 0:
                 raise StoreError("Snapshot-Lineage ist nicht vollständig oder geschlossen.")
+            manual_lineage_revision_ids = {
+                str(row[0])
+                for row in self._query.execute(
+                    f"SELECT DISTINCT source_version_id FROM read_parquet('{lineage}') "
+                    "WHERE length(source_version_id) = 32"
+                ).fetchall()
+            }
+            assert isinstance(snapshot_binding, dict)
+            if not manual_lineage_revision_ids <= set(snapshot_binding["manual_revision_ids"]):
+                raise StoreError("Snapshot-Lineage verweist auf ungebundene Revisionen.")
+            lineage_snapshot_ids = {
+                str(row[0])
+                for row in self._query.execute(
+                    f"SELECT DISTINCT snapshot_id FROM read_parquet('{lineage}')"
+                ).fetchall()
+            }
+            unknown_lineage_snapshots = lineage_snapshot_ids - {snapshot_id}
+            if unknown_lineage_snapshots:
+                known = {
+                    str(row[0])
+                    for row in self._metadata.execute(
+                        "SELECT snapshot_id FROM dataset_snapshots WHERE snapshot_id IN ("
+                        + ",".join("?" for _ in unknown_lineage_snapshots)
+                        + ")",
+                        tuple(sorted(unknown_lineage_snapshots)),
+                    ).fetchall()
+                }
+                if known != unknown_lineage_snapshots:
+                    raise StoreError("Snapshot-Lineage verweist auf unbekannte Snapshots.")
         counts = self._query.execute(
             f"""
             SELECT
@@ -6230,7 +6754,12 @@ class LocalStore:
         replaced_measurement_version_ids: tuple[str, ...] = (),
         batch_confirmations: tuple[tuple[OpenDataReviewCase, str], ...] = (),
         batch_revocations: tuple[tuple[OpenDataReviewCase, str, str, tuple[str, ...]], ...] = (),
+        snapshot_as_of: datetime | None = None,
+        context_timezone: str = "Europe/Berlin",
     ) -> str:
+        bound_as_of = (
+            datetime.now(ZoneInfo(context_timezone)) if snapshot_as_of is None else snapshot_as_of
+        )
         parent = self._root / _PARQUET_DIRECTORY / "snapshots" / str(parent_snapshot_id)
         staging = self._root / "staging" / str(operation_id)
         shutil.copytree(parent, staging, copy_function=os.link)
@@ -6492,27 +7021,51 @@ class LocalStore:
                         "'source', NULL, NULL, NULL, ?)",
                         (split_id, version_id, float(version[0]), str(version[1]), decision_id),
                     )
-        self._refresh_derivation_lineage()
-        for filename in (
-            "resolved_measurements.parquet",
-            "resolved_workouts.parquet",
-            "workout_review_links.parquet",
-            "open_review_cases.parquet",
-            "derivation_lineage.parquet",
+        manual_revision_ids = (
+            self._effective_manual_revision_ids()
+            if action.startswith("manual_")
+            else self._bound_manual_revision_ids(parent_snapshot_id)
+        )
+        self._refresh_v03_derivations(bound_as_of, manual_revision_ids)
+        self._refresh_derivation_lineage(snapshot_id, bound_as_of, manual_revision_ids)
+        manifest = json.loads((staging / "manifest.json").read_bytes())
+        rewritten_files: tuple[str, ...]
+        if (
+            action.startswith("manual_")
+            and manifest["snapshot_schema_version"] == _SNAPSHOT_SCHEMA_VERSION
         ):
+            rewritten_files = (
+                "daily_context.parquet",
+                "medication_context.parquet",
+                "derivation_lineage.parquet",
+            )
+        else:
+            rewritten_files = (
+                "resolved_measurements.parquet",
+                "resolved_workouts.parquet",
+                "workout_review_links.parquet",
+                "open_review_cases.parquet",
+                "derivation_lineage.parquet",
+                *sorted(_V6_DERIVATION_FILES),
+            )
+        for filename in rewritten_files:
             table = filename.removesuffix(".parquet")
             path = staging / filename
             path.unlink(missing_ok=True)
             escaped = str(path).replace("'", "''")
             self._query.execute(f"COPY (SELECT * FROM {table}) TO '{escaped}' (FORMAT PARQUET)")
-        manifest = json.loads((staging / "manifest.json").read_bytes())
         manifest.update(
             snapshot_schema_version=_SNAPSHOT_SCHEMA_VERSION,
             snapshot_id=str(snapshot_id),
             created_at_utc=datetime.now(UTC).isoformat(),
             created_by_operation_id=str(operation_id),
             parent_snapshot_id=str(parent_snapshot_id),
-            derivation_contract_ids=["resolved-measurement/v1", "resolved-workout/v1"],
+            derivation_contract_ids=list(_DERIVATION_CONTRACT_IDS),
+            snapshot_binding=self._snapshot_binding(
+                snapshot_as_of=bound_as_of,
+                context_timezone=context_timezone,
+                manual_revision_ids=manual_revision_ids,
+            ),
         )
         manifest["resolution_basis"]["audit_max_position"] = audit_position
         entries = []
@@ -6538,6 +7091,7 @@ class LocalStore:
                     "parquet_schema_fingerprint": hashlib.sha256(
                         json.dumps(description, separators=(",", ":")).encode()
                     ).hexdigest(),
+                    "contract_ids": list(_SNAPSHOT_FILE_CONTRACTS[filename]),
                 }
             )
         manifest["files"] = entries
@@ -6589,11 +7143,15 @@ class LocalStore:
         activation_kind: Literal[
             "data_review_decision", "rule_version", "historical", "manual_context_revision"
         ] = ("data_review_decision"),
-        copy_context_bindings: bool = True,
+        replaced_context_logical_id: str | None = None,
     ) -> None:
         staging = self._root / "staging" / str(operation_id)
         snapshot = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
+        _fsync_snapshot(staging)
+        _publication_fault_point(self._root, "snapshot.before_move/v1")
         staging.replace(snapshot)
+        _fsync_directory(snapshot.parent)
+        _publication_fault_point(self._root, "snapshot.after_move/v1")
         self._metadata.execute(
             "INSERT INTO dataset_snapshots VALUES (?, ?, ?, ?, ?, ?)",
             (
@@ -6605,6 +7163,7 @@ class LocalStore:
                 completed_at,
             ),
         )
+        self._insert_snapshot_contract_binding(snapshot_id)
         self._metadata.execute(
             "INSERT INTO snapshot_activations VALUES (?, ?, ?, ?, ?, ?)",
             (
@@ -6624,11 +7183,19 @@ class LocalStore:
             "SELECT ?, version_id FROM activity_derivation_snapshot_bindings WHERE snapshot_id = ?",
             (str(snapshot_id), str(previous_snapshot_id)),
         )
-        if copy_context_bindings:
+        if replaced_context_logical_id is None:
             self._metadata.execute(
                 "INSERT INTO manual_context_snapshot_bindings "
                 "SELECT ?, revision_id FROM manual_context_snapshot_bindings WHERE snapshot_id = ?",
                 (str(snapshot_id), str(previous_snapshot_id)),
+            )
+        else:
+            self._metadata.execute(
+                "INSERT INTO manual_context_snapshot_bindings "
+                "SELECT ?, revision_id FROM manual_context_snapshot_bindings "
+                "WHERE snapshot_id = ? AND revision_id NOT IN "
+                "(SELECT revision_id FROM manual_context_revisions WHERE logical_id = ?)",
+                (str(snapshot_id), str(previous_snapshot_id), replaced_context_logical_id),
             )
         self._metadata.execute(
             "INSERT INTO medication_snapshot_bindings "
@@ -6653,8 +7220,191 @@ class LocalStore:
             "WHERE snapshot_id = ?",
             (str(snapshot_id), str(previous_snapshot_id)),
         )
+        _publication_fault_point(self._root, "snapshot.before_sqlite_commit/v1")
 
-    def _refresh_derivation_lineage(self) -> None:
+    def _refresh_v03_derivations(
+        self, snapshot_as_of: datetime, manual_revision_ids: tuple[str, ...]
+    ) -> None:
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE weight_nutrition_days AS
+            WITH contributors AS (
+                SELECT v.measurement_local_date AS day, v.canonical_type AS feature_kind,
+                       v.canonical_unit, r.effective_value, v.source_start_utc
+                FROM resolved_measurements r JOIN measurement_versions v
+                  ON v.measurement_version_id = r.selected_measurement_version_id
+                WHERE r.disposition IN ('included_source', 'included_correction')
+                  AND (v.canonical_type = 'body_mass' OR v.canonical_type LIKE 'dietary_%')
+            )
+            SELECT sha256('weight-nutrition-day/v1:' || day || ':' || feature_kind)
+                       AS derived_record_id,
+                   day, feature_kind, canonical_unit,
+                   CASE WHEN feature_kind = 'body_mass'
+                        THEN arg_max(effective_value, source_start_utc)
+                        ELSE sum(effective_value) END AS effective_value,
+                   'observed' AS observation_status, 'reviewed' AS quality_status
+            FROM contributors GROUP BY day, feature_kind, canonical_unit
+            """
+        )
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE daily_context AS SELECT
+                ''::VARCHAR AS derived_record_id, NULL::DATE AS day,
+                NULL::VARCHAR AS illness_severity, NULL::VARCHAR AS stress_level,
+                ''::VARCHAR AS quality_status WHERE false;
+            CREATE OR REPLACE TEMP TABLE medication_context AS SELECT
+                ''::VARCHAR AS derived_record_id, NULL::DATE AS day,
+                0::BIGINT AS scheduled_dose_count, 0::BIGINT AS deviation_count,
+                0::BIGINT AS as_needed_intake_count,
+                ''::VARCHAR AS quality_status WHERE false;
+            """
+        )
+        context_revision_ids = tuple(
+            revision_id
+            for revision_id in manual_revision_ids
+            if self._metadata.execute(
+                "SELECT 1 FROM manual_context_revisions WHERE revision_id = ?", (revision_id,)
+            ).fetchone()
+        )
+        medication_revision_ids = tuple(
+            revision_id
+            for revision_id in manual_revision_ids
+            if self._metadata.execute(
+                "SELECT 1 FROM medication_regime_revisions WHERE revision_id = ? UNION ALL "
+                "SELECT 1 FROM medication_deviation_revisions WHERE revision_id = ? UNION ALL "
+                "SELECT 1 FROM intake_reason_category_revisions WHERE revision_id = ? UNION ALL "
+                "SELECT 1 FROM as_needed_intake_revisions WHERE revision_id = ?",
+                (revision_id,) * 4,
+            ).fetchone()
+        )
+        day = snapshot_as_of.astimezone(ZoneInfo("Europe/Berlin")).date()
+        if context_revision_ids:
+            self._query.execute(
+                "INSERT INTO daily_context VALUES (?, ?, NULL, NULL, 'reviewed')",
+                (hashlib.sha256(f"daily-context/v1:{day}".encode()).hexdigest(), day),
+            )
+        if medication_revision_ids:
+            self._query.execute(
+                "INSERT INTO medication_context VALUES (?, ?, ?, ?, ?, 'reviewed')",
+                (
+                    hashlib.sha256(f"medication-context/v1:{day}".encode()).hexdigest(),
+                    day,
+                    sum(
+                        int(row[0])
+                        for revision_id in medication_revision_ids
+                        if (
+                            row := self._metadata.execute(
+                                "SELECT count(*) FROM medication_scheduled_doses "
+                                "WHERE revision_id = ?",
+                                (revision_id,),
+                            ).fetchone()
+                        )
+                    ),
+                    sum(
+                        self._metadata.execute(
+                            "SELECT count(*) FROM medication_deviation_revisions "
+                            "WHERE revision_id = ?",
+                            (revision_id,),
+                        ).fetchone()[0]
+                        for revision_id in medication_revision_ids
+                    ),
+                    sum(
+                        self._metadata.execute(
+                            "SELECT count(*) FROM as_needed_intake_revisions WHERE revision_id = ?",
+                            (revision_id,),
+                        ).fetchone()[0]
+                        for revision_id in medication_revision_ids
+                    ),
+                ),
+            )
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE sleep_episodes AS
+            SELECT sha256('sleep-episode/v1:' || measurement_version_id) AS derived_record_id,
+                   source_start_utc AS episode_start_utc, source_end_utc AS episode_end_utc,
+                   date_diff('second', source_start_utc::TIMESTAMPTZ,
+                             source_end_utc::TIMESTAMPTZ) / 60.0
+                       AS observed_sleep_minutes,
+                   'reviewed' AS quality_status
+            FROM sleep_intervals
+            WHERE is_selected AND source_end_utc > source_start_utc
+              AND canonical_category != 'in_bed'
+              AND source_name = 'Apple Watch' AND device = 'Apple Watch'
+            """
+        )
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE sleep_nights AS
+            SELECT sha256('sleep-night/v1:' || episode_end_utc::TIMESTAMPTZ::DATE)
+                       AS derived_record_id,
+                   episode_end_utc::TIMESTAMPTZ::DATE AS day,
+                   'observed' AS observation_status,
+                   arg_max(derived_record_id, observed_sleep_minutes) AS primary_episode_id,
+                   'reviewed' AS quality_status
+            FROM sleep_episodes GROUP BY day
+            """
+        )
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE activity_days AS
+            SELECT sha256('activity-day/v1:' || v.measurement_local_date || ':'
+                          || v.canonical_type) AS derived_record_id,
+                   v.measurement_local_date AS day, v.canonical_type AS metric,
+                   v.canonical_unit, sum(r.effective_value) AS effective_value,
+                   sum(r.effective_value) FILTER (
+                       WHERE v.source_name = 'Apple Watch' AND v.device = 'Apple Watch'
+                   ) AS watch_value,
+                   sum(r.effective_value) FILTER (
+                       WHERE v.source_name = 'iPhone' AND v.device = 'iPhone'
+                   ) AS iphone_value,
+                   'reviewed' AS quality_status
+            FROM resolved_measurements r JOIN measurement_versions v
+              ON v.measurement_version_id = r.selected_measurement_version_id
+            WHERE r.disposition IN ('included_source', 'included_correction')
+              AND v.canonical_type IN ('apple_exercise_time', 'step_count',
+                                       'walking_running_distance', 'active_energy')
+              AND ((v.source_name = 'Apple Watch' AND v.device = 'Apple Watch')
+                   OR (v.source_name = 'iPhone' AND v.device = 'iPhone'))
+            GROUP BY v.measurement_local_date, v.canonical_type, v.canonical_unit
+            """
+        )
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE activity_coverage_segments AS
+            SELECT sha256('activity-coverage/v1:' || measurement_version_id)
+                       AS derived_record_id,
+                   source_start_utc AS start_utc, source_end_utc AS end_utc,
+                   CASE WHEN source_name = 'Apple Watch' AND device = 'Apple Watch'
+                        THEN 'watch' ELSE 'iphone_fallback' END AS coverage_kind
+            FROM measurement_versions
+            WHERE source_end_utc > source_start_utc
+              AND canonical_type IN ('apple_exercise_time', 'step_count',
+                                     'walking_running_distance', 'active_energy')
+              AND ((source_name = 'Apple Watch' AND device = 'Apple Watch')
+                   OR (source_name = 'iPhone' AND device = 'iPhone'))
+            """
+        )
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE workout_features AS
+            SELECT sha256('workout-feature/v1:' || r.logical_workout_id) AS derived_record_id,
+                   r.logical_workout_id, w.measurement_local_date AS day,
+                   w.original_activity_type AS activity_type,
+                   r.effective_duration_minutes AS duration_minutes,
+                   r.distance_kilometers, r.active_energy_kilocalories,
+                   'reviewed' AS quality_status
+            FROM resolved_workouts r JOIN workouts w
+              ON w.workout_version_id = r.selected_workout_version_id
+            WHERE r.disposition LIKE 'included%'
+            """
+        )
+
+    def _refresh_derivation_lineage(
+        self,
+        snapshot_id: SnapshotId,
+        derived_at: datetime,
+        manual_revision_ids: tuple[str, ...],
+    ) -> None:
         self._query.execute(
             """
             CREATE OR REPLACE TEMP TABLE derivation_lineage AS
@@ -6664,21 +7414,145 @@ class LocalStore:
                 'resolved-measurement/v1' AS derivation_contract_id,
                 v.identity_candidate_id AS source_logical_id,
                 r.selected_measurement_version_id AS source_version_id,
-                'selected_source_version' AS contribution_role
+                'selected_source_version' AS contribution_role,
+                ? AS snapshot_id,
+                ? AS derived_at_utc
             FROM resolved_measurements r
             JOIN measurement_versions v
               ON v.measurement_version_id = r.selected_measurement_version_id
             UNION ALL
             SELECT
-                sha256('resolved-workout/v1:' || logical_workout_id) AS derived_record_id,
+                sha256('resolved-workout/v1:' || r.logical_workout_id) AS derived_record_id,
                 'resolved_workout' AS derived_family,
                 'resolved-workout/v1' AS derivation_contract_id,
-                logical_workout_id AS source_logical_id,
-                selected_workout_version_id AS source_version_id,
-                'selected_source_version' AS contribution_role
-            FROM resolved_workouts
+                r.logical_workout_id AS source_logical_id,
+                r.selected_workout_version_id AS source_version_id,
+                'selected_source_version' AS contribution_role,
+                ? AS snapshot_id,
+                ? AS derived_at_utc
+            FROM resolved_workouts r
+            JOIN workouts w ON w.workout_version_id = r.selected_workout_version_id
+            """,
+            (
+                str(snapshot_id),
+                derived_at.astimezone(UTC).isoformat(),
+                str(snapshot_id),
+                derived_at.astimezone(UTC).isoformat(),
+            ),
+        )
+
+        snapshot_ref = str(snapshot_id)
+        derived_ref = derived_at.astimezone(UTC).isoformat()
+        self._query.execute(
+            f"""
+            INSERT INTO derivation_lineage
+            SELECT d.derived_record_id, 'weight_nutrition_day', 'weight-nutrition-day/v1',
+                   v.identity_candidate_id, v.measurement_version_id,
+                   'daily_feature_contributor', '{snapshot_ref}', '{derived_ref}'
+            FROM weight_nutrition_days d JOIN measurement_versions v
+              ON v.measurement_local_date = d.day AND v.canonical_type = d.feature_kind
+            JOIN resolved_measurements r
+              ON r.selected_measurement_version_id = v.measurement_version_id
+            WHERE r.disposition IN ('included_source', 'included_correction');
+
+            INSERT INTO derivation_lineage
+            SELECT e.derived_record_id, 'sleep_episode', 'sleep-episode/v1',
+                   s.identity_candidate_id, s.measurement_version_id,
+                   'episode_interval', '{snapshot_ref}', '{derived_ref}'
+            FROM sleep_episodes e JOIN sleep_intervals s
+              ON e.derived_record_id = sha256('sleep-episode/v1:' || s.measurement_version_id)
+            UNION ALL
+            SELECT n.derived_record_id, 'sleep_night', 'sleep-night/v1',
+                   s.identity_candidate_id, s.measurement_version_id,
+                   'night_interval', '{snapshot_ref}', '{derived_ref}'
+            FROM sleep_nights n JOIN sleep_intervals s
+              ON s.source_end_utc::TIMESTAMPTZ::DATE = n.day
+            WHERE s.is_selected AND s.source_name = 'Apple Watch' AND s.device = 'Apple Watch';
+
+            INSERT INTO derivation_lineage
+            SELECT d.derived_record_id, 'activity_day', 'activity-day/v1',
+                   v.identity_candidate_id, v.measurement_version_id,
+                   'daily_metric_contributor', '{snapshot_ref}', '{derived_ref}'
+            FROM activity_days d JOIN measurement_versions v
+              ON v.measurement_local_date = d.day AND v.canonical_type = d.metric
+            JOIN resolved_measurements r
+              ON r.selected_measurement_version_id = v.measurement_version_id
+            WHERE r.disposition IN ('included_source', 'included_correction')
+            UNION ALL
+            SELECT c.derived_record_id, 'activity_coverage', 'activity-coverage/v1',
+                   v.identity_candidate_id, v.measurement_version_id,
+                   'coverage_interval', '{snapshot_ref}', '{derived_ref}'
+            FROM activity_coverage_segments c JOIN measurement_versions v
+              ON c.derived_record_id = sha256('activity-coverage/v1:' || v.measurement_version_id);
+
+            INSERT INTO derivation_lineage
+            SELECT f.derived_record_id, 'workout_feature', 'workout-feature/v1',
+                   w.logical_workout_id, w.workout_version_id,
+                   'workout_source_version', '{snapshot_ref}', '{derived_ref}'
+            FROM workout_features f JOIN workouts w USING (logical_workout_id)
+            JOIN resolved_workouts r
+              ON r.selected_workout_version_id = w.workout_version_id;
             """
         )
+
+        effective_revision_ids = manual_revision_ids
+        for table, derived_table, family, contract in (
+            ("manual_context_revisions", "daily_context", "daily_context", "daily-context/v1"),
+            (
+                "medication_regime_revisions",
+                "medication_context",
+                "medication_context",
+                "medication-context/v1",
+            ),
+            (
+                "medication_deviation_revisions",
+                "medication_context",
+                "medication_context",
+                "medication-context/v1",
+            ),
+            (
+                "intake_reason_category_revisions",
+                "medication_context",
+                "medication_context",
+                "medication-context/v1",
+            ),
+            (
+                "as_needed_intake_revisions",
+                "medication_context",
+                "medication_context",
+                "medication-context/v1",
+            ),
+        ):
+            derived_rows = self._query.execute(
+                f"SELECT derived_record_id FROM {derived_table}"
+            ).fetchall()
+            if not derived_rows or not effective_revision_ids:
+                continue
+            revisions = self._metadata.execute(
+                f"SELECT logical_id, revision_id FROM {table} WHERE revision_id IN ("
+                + ",".join("?" for _ in effective_revision_ids)
+                + ")",
+                effective_revision_ids,
+            ).fetchall()
+            lineage_rows = tuple(
+                (
+                    str(derived[0]),
+                    family,
+                    contract,
+                    str(revision[0]),
+                    str(revision[1]),
+                    str(snapshot_id),
+                    derived_ref,
+                )
+                for derived in derived_rows
+                for revision in revisions
+            )
+            if lineage_rows:
+                self._query.executemany(
+                    "INSERT INTO derivation_lineage VALUES "
+                    "(?, ?, ?, ?, ?, 'manual_revision', ?, ?)",
+                    lineage_rows,
+                )
 
     def load_daily_series(
         self, start_date: date | None, end_date: date | None
@@ -7277,11 +8151,30 @@ class LocalStore:
             selected,
         )
 
+    def _load_snapshot_binding(self, snapshot_id: SnapshotId) -> dict[str, object] | None:
+        try:
+            manifest = json.loads(
+                (
+                    self._root
+                    / _PARQUET_DIRECTORY
+                    / "snapshots"
+                    / str(snapshot_id)
+                    / "manifest.json"
+                ).read_bytes()
+            )
+        except (OSError, json.JSONDecodeError) as error:
+            raise StoreError("Snapshot-Manifest ist nicht lesbar.") from error
+        binding = manifest.get("snapshot_binding") if isinstance(manifest, dict) else None
+        return binding if isinstance(binding, dict) else None
+
     def load_medication_as_of(self, snapshot_id: SnapshotId | None) -> datetime:
         self._require_open()
         selected = self.load_active_snapshot_id() if snapshot_id is None else snapshot_id
         if selected is None:
             return datetime.now(UTC)
+        binding = self._load_snapshot_binding(selected)
+        if binding is not None:
+            return datetime.fromisoformat(str(binding["medication_as_of"]))
         row = self._metadata.execute(
             "SELECT medication_as_of FROM medication_publications WHERE snapshot_id = ?",
             (str(selected),),
@@ -7669,6 +8562,7 @@ class LocalStore:
                     selected_measurement_version_id=None,
                     candidate_version_ids=(),
                     replacement_plausibility_cases=(),
+                    snapshot_as_of=publication.medication_as_of,
                 )
                 self._activate_review_snapshot(
                     publication.operation_id,
@@ -7804,6 +8698,7 @@ class LocalStore:
                     selected_measurement_version_id=None,
                     candidate_version_ids=(),
                     replacement_plausibility_cases=(),
+                    snapshot_as_of=publication.medication_as_of,
                 )
                 self._activate_review_snapshot(
                     publication.operation_id,
@@ -7954,6 +8849,7 @@ class LocalStore:
                     selected_measurement_version_id=None,
                     candidate_version_ids=(),
                     replacement_plausibility_cases=(),
+                    snapshot_as_of=publication.medication_as_of,
                 )
                 self._activate_review_snapshot(
                     publication.operation_id,
@@ -8092,6 +8988,7 @@ class LocalStore:
                     selected_measurement_version_id=None,
                     candidate_version_ids=(),
                     replacement_plausibility_cases=(),
+                    snapshot_as_of=publication.medication_as_of,
                 )
                 self._activate_review_snapshot(
                     publication.operation_id,
@@ -8295,6 +9192,12 @@ class LocalStore:
 
     def load_context_as_of_date(self, snapshot_id: SnapshotId) -> tuple[date, str]:
         self._require_open()
+        binding = self._load_snapshot_binding(snapshot_id)
+        if binding is not None:
+            return (
+                date.fromisoformat(str(binding["context_as_of_date"])),
+                str(binding["context_timezone"]),
+            )
         row = self._metadata.execute(
             "SELECT context_as_of_date, context_timezone FROM manual_context_publications "
             "WHERE snapshot_id = ?",
@@ -8409,6 +9312,8 @@ class LocalStore:
                     selected_measurement_version_id=None,
                     candidate_version_ids=(),
                     replacement_plausibility_cases=(),
+                    snapshot_as_of=publication.snapshot_as_of,
+                    context_timezone=publication.context_timezone,
                 )
                 self._activate_review_snapshot(
                     operation_id,
@@ -8417,7 +9322,7 @@ class LocalStore:
                     manifest,
                     created_at,
                     activation_kind="manual_context_revision",
-                    copy_context_bindings=False,
+                    replaced_context_logical_id=str(logical_id),
                 )
                 if state == "active":
                     self._metadata.execute(
@@ -8613,6 +9518,8 @@ class LocalStore:
                     selected_measurement_version_id=None,
                     candidate_version_ids=(),
                     replacement_plausibility_cases=(),
+                    snapshot_as_of=publication.snapshot_as_of,
+                    context_timezone=publication.context_timezone,
                 )
                 self._activate_review_snapshot(
                     publication.operation_id,
@@ -8621,12 +9528,7 @@ class LocalStore:
                     manifest,
                     created_at,
                     activation_kind="manual_context_revision",
-                )
-                self._metadata.execute(
-                    "DELETE FROM manual_context_snapshot_bindings WHERE snapshot_id = ? "
-                    "AND revision_id IN "
-                    "(SELECT revision_id FROM manual_context_revisions WHERE logical_id = ?)",
-                    (str(snapshot_id), str(publication.logical_id)),
+                    replaced_context_logical_id=str(publication.logical_id),
                 )
                 if state == "active":
                     self._metadata.execute(

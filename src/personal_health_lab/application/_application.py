@@ -5424,6 +5424,7 @@ class HealthLab:
                     plan.details.start_date,
                     plan.details.withdrawal_reason,
                     plan.details.base_snapshot_ref,
+                    plan.details.snapshot_as_of,
                     plan.details.snapshot_as_of.date(),
                     plan.details.context_timezone,
                 )
@@ -5747,6 +5748,7 @@ class HealthLab:
                     details.note,
                     details.withdrawal_reason,
                     details.base_snapshot_ref,
+                    details.snapshot_as_of,
                     details.snapshot_as_of.date(),
                     details.context_timezone,
                 )
