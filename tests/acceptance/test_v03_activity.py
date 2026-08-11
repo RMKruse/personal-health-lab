@@ -1,8 +1,9 @@
 import json
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
+import duckdb
 import pytest
 
 from personal_health_lab.adapters.cli import main
@@ -254,10 +255,23 @@ def test_activity_days_use_shared_watch_coverage_and_whole_interval_iphone_fallb
     config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
     with HealthLab.open(config) as health_lab:
         request = ImportHealthExport(_package(tmp_path / "coverage.zip", xml))
-        health_lab.execute_write(
+        receipt = health_lab.execute_write(
             request, expected_plan=health_lab.preview_write(request).fingerprint
         )
         activity = health_lab.load_activity_days(SnapshotDateSelection())
+
+    snapshot = config.active_store / "parquet/snapshots" / str(receipt.result.snapshot_ref)
+    with duckdb.connect() as query:
+        persisted_values = query.execute(
+            "SELECT watch_value, iphone_value, effective_value, derivation_contract_id, "
+            "snapshot_id, derived_at_utc "
+            "FROM read_parquet(?) WHERE metric = 'step_count'",
+            (str(snapshot / "activity_days.parquet"),),
+        ).fetchone()
+        persisted_segments = query.execute(
+            "SELECT coverage_kind FROM read_parquet(?) ORDER BY start_utc",
+            (str(snapshot / "activity_coverage_segments.parquet"),),
+        ).fetchall()
 
     day = activity.days[0]
     assert day.step_count.watch_value == 1
@@ -280,6 +294,18 @@ def test_activity_days_use_shared_watch_coverage_and_whole_interval_iphone_fallb
         item.suppression_reason for item in activity.measurements if item.suppression_reason
     ) == [
         "iphone_outside_watch_gap",
+    ]
+    assert persisted_values is not None
+    assert persisted_values[:5] == (
+        1,
+        2,
+        3,
+        "activity-day/v1",
+        str(receipt.result.snapshot_ref),
+    )
+    assert datetime.fromisoformat(persisted_values[5]).tzinfo is not None
+    assert [row[0] for row in persisted_segments] == [
+        segment.kind.value for segment in day.coverage_segments
     ]
 
 

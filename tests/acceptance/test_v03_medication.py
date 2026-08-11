@@ -339,8 +339,17 @@ def test_medication_regime_projects_dst_and_keeps_old_snapshot_stable(tmp_path: 
         old_plan = health_lab.load_medication_plan(old_snapshot)
         new_plan = health_lab.load_medication_plan()
 
+    snapshot = config.active_store / "parquet/snapshots" / str(old_snapshot)
+    with duckdb.connect() as query:
+        persisted = query.execute(
+            "SELECT scheduled_dose_count, deviation_count, as_needed_intake_count "
+            "FROM read_parquet(?) WHERE day = DATE '2024-03-31'",
+            (str(snapshot / "medication_context.parquet"),),
+        ).fetchone()
+
     assert projected.days[0].occurrences[0].scheduled_at.isoformat() == "2024-03-31T03:00:00+02:00"
     assert projected.days[0].occurrences[0].status == "assumed_as_planned"
+    assert persisted == (1, 0, 0)
     assert old_plan.regimes[0].scheduled_doses[0].medication_name == "Levothyroxin"
     assert not new_plan.regimes[0].scheduled_doses
 

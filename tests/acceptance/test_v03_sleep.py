@@ -1,8 +1,9 @@
 import json
-from datetime import date, timedelta
+from datetime import UTC, date, timedelta
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
+import duckdb
 import pytest
 
 from personal_health_lab.adapters.cli._cli import main
@@ -46,12 +47,32 @@ def test_sleep_import_preserves_categories_offsets_overlap_and_source_eligibilit
     config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
     with HealthLab.open(config) as health_lab:
         request = ImportHealthExport(_package(tmp_path / "sleep.zip", xml))
-        health_lab.execute_write(
+        receipt = health_lab.execute_write(
             request, expected_plan=health_lab.preview_write(request).fingerprint
         )
         sleep = health_lab.load_sleep_days(
             SnapshotDateSelection(start_date=date(2024, 1, 2), end_date=date(2024, 1, 4))
         )
+
+    snapshot = config.active_store / "parquet/snapshots" / str(receipt.result.snapshot_ref)
+    with duckdb.connect() as query:
+        persisted_episodes = query.execute(
+            "SELECT episode_start_utc, episode_end_utc, observed_sleep_minutes "
+            "FROM read_parquet(?) ORDER BY episode_start_utc",
+            (str(snapshot / "sleep_episodes.parquet"),),
+        ).fetchall()
+    projected_episodes = sorted(
+        (
+            episode.start.astimezone(UTC).isoformat(),
+            episode.end.astimezone(UTC).isoformat(),
+            episode.observed_sleep.total_seconds() / 60,
+        )
+        for day in sleep.days
+        for episode in (
+            *((day.primary_episode,) if day.primary_episode is not None else ()),
+            *day.naps,
+        )
+    )
 
     assert len(sleep.accepted_intervals) == 5
     assert {item.source_class for item in sleep.rejected_intervals} == {
@@ -83,6 +104,7 @@ def test_sleep_import_preserves_categories_offsets_overlap_and_source_eligibilit
     ]
     assert sleep.days[0].status is SleepObservationStatus.UNOBSERVED
     assert sleep.days[2].status is SleepObservationStatus.UNOBSERVED
+    assert [tuple(row) for row in persisted_episodes] == projected_episodes
 
 
 @pytest.mark.v02_adapter("cli", "SleepObservationStatus")

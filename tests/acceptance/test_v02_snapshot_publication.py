@@ -40,23 +40,23 @@ PARQUET_FILES = (
     "workouts.parquet",
 )
 LAST_COLUMNS = {
-    "activity_coverage_segments.parquet": "coverage_kind",
-    "activity_days.parquet": "quality_status",
-    "daily_context.parquet": "quality_status",
+    "activity_coverage_segments.parquet": "derived_at_utc",
+    "activity_days.parquet": "derived_at_utc",
+    "daily_context.parquet": "derived_at_utc",
     "derivation_lineage.parquet": "derived_at_utc",
-    "medication_context.parquet": "quality_status",
+    "medication_context.parquet": "derived_at_utc",
     "measurement_versions.parquet": "strong_source_id_hash",
     "open_review_cases.parquet": "evidence_fingerprint",
     "resolved_measurements.parquet": "conflict_resolution_decision_id",
     "resolved_workouts.parquet": "effective_decision_id",
-    "sleep_episodes.parquet": "quality_status",
+    "sleep_episodes.parquet": "derived_at_utc",
     "sleep_intervals.parquet": "is_selected",
-    "sleep_nights.parquet": "quality_status",
+    "sleep_nights.parquet": "derived_at_utc",
     "source_occurrences.parquet": "occurrence_fingerprint",
     "workout_review_links.parquet": "workout_version_id",
-    "workout_features.parquet": "quality_status",
+    "workout_features.parquet": "derived_at_utc",
     "workouts.parquet": "is_selected",
-    "weight_nutrition_days.parquet": "quality_status",
+    "weight_nutrition_days.parquet": "derived_at_utc",
 }
 
 

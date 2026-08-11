@@ -187,6 +187,9 @@ _SNAPSHOT_SCHEMAS = {
         ("effective_value", "DOUBLE"),
         ("observation_status", "VARCHAR"),
         ("quality_status", "VARCHAR"),
+        ("derivation_contract_id", "VARCHAR"),
+        ("snapshot_id", "VARCHAR"),
+        ("derived_at_utc", "VARCHAR"),
     ),
     "sleep_episodes.parquet": (
         ("derived_record_id", "VARCHAR"),
@@ -194,6 +197,9 @@ _SNAPSHOT_SCHEMAS = {
         ("episode_end_utc", "VARCHAR"),
         ("observed_sleep_minutes", "DOUBLE"),
         ("quality_status", "VARCHAR"),
+        ("derivation_contract_id", "VARCHAR"),
+        ("snapshot_id", "VARCHAR"),
+        ("derived_at_utc", "VARCHAR"),
     ),
     "sleep_nights.parquet": (
         ("derived_record_id", "VARCHAR"),
@@ -201,6 +207,9 @@ _SNAPSHOT_SCHEMAS = {
         ("observation_status", "VARCHAR"),
         ("primary_episode_id", "VARCHAR"),
         ("quality_status", "VARCHAR"),
+        ("derivation_contract_id", "VARCHAR"),
+        ("snapshot_id", "VARCHAR"),
+        ("derived_at_utc", "VARCHAR"),
     ),
     "activity_days.parquet": (
         ("derived_record_id", "VARCHAR"),
@@ -211,12 +220,18 @@ _SNAPSHOT_SCHEMAS = {
         ("watch_value", "DOUBLE"),
         ("iphone_value", "DOUBLE"),
         ("quality_status", "VARCHAR"),
+        ("derivation_contract_id", "VARCHAR"),
+        ("snapshot_id", "VARCHAR"),
+        ("derived_at_utc", "VARCHAR"),
     ),
     "activity_coverage_segments.parquet": (
         ("derived_record_id", "VARCHAR"),
         ("start_utc", "VARCHAR"),
         ("end_utc", "VARCHAR"),
         ("coverage_kind", "VARCHAR"),
+        ("derivation_contract_id", "VARCHAR"),
+        ("snapshot_id", "VARCHAR"),
+        ("derived_at_utc", "VARCHAR"),
     ),
     "workout_features.parquet": (
         ("derived_record_id", "VARCHAR"),
@@ -227,6 +242,9 @@ _SNAPSHOT_SCHEMAS = {
         ("distance_kilometers", "DOUBLE"),
         ("active_energy_kilocalories", "DOUBLE"),
         ("quality_status", "VARCHAR"),
+        ("derivation_contract_id", "VARCHAR"),
+        ("snapshot_id", "VARCHAR"),
+        ("derived_at_utc", "VARCHAR"),
     ),
     "daily_context.parquet": (
         ("derived_record_id", "VARCHAR"),
@@ -234,6 +252,9 @@ _SNAPSHOT_SCHEMAS = {
         ("illness_severity", "VARCHAR"),
         ("stress_level", "VARCHAR"),
         ("quality_status", "VARCHAR"),
+        ("derivation_contract_id", "VARCHAR"),
+        ("snapshot_id", "VARCHAR"),
+        ("derived_at_utc", "VARCHAR"),
     ),
     "medication_context.parquet": (
         ("derived_record_id", "VARCHAR"),
@@ -242,6 +263,9 @@ _SNAPSHOT_SCHEMAS = {
         ("deviation_count", "BIGINT"),
         ("as_needed_intake_count", "BIGINT"),
         ("quality_status", "VARCHAR"),
+        ("derivation_contract_id", "VARCHAR"),
+        ("snapshot_id", "VARCHAR"),
+        ("derived_at_utc", "VARCHAR"),
     ),
     "derivation_lineage.parquet": (
         ("derived_record_id", "VARCHAR"),
@@ -3207,6 +3231,37 @@ class LocalStore:
                     self._root / _PARQUET_DIRECTORY / "snapshots" / str(active), staging
                 )
                 manifest = json.loads((staging / "manifest.json").read_bytes())
+                rebound_files = (*sorted(_V6_DERIVATION_FILES), "derivation_lineage.parquet")
+                for filename in rebound_files:
+                    path = staging / filename
+                    escaped = str(path).replace("'", "''")
+                    table = filename.removesuffix(".parquet")
+                    self._query.execute(
+                        f"CREATE OR REPLACE TEMP TABLE {table} AS "
+                        f"SELECT * FROM read_parquet('{escaped}')"
+                    )
+                    self._query.execute(
+                        f"UPDATE {table} SET snapshot_id = ?, derived_at_utc = ?",
+                        (str(new_snapshot), created_at),
+                    )
+                    path.unlink()
+                    self._query.execute(
+                        f"COPY (SELECT * FROM {table}) TO '{escaped}' (FORMAT PARQUET)"
+                    )
+                    description = tuple(
+                        (str(row[0]), str(row[1]))
+                        for row in self._query.execute(
+                            f"DESCRIBE SELECT * FROM read_parquet('{escaped}')"
+                        ).fetchall()
+                    )
+                    entry = next(item for item in manifest["files"] if item["name"] == filename)
+                    entry.update(
+                        sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                        allocated_bytes=path.stat().st_blocks * 512,
+                        parquet_schema_fingerprint=hashlib.sha256(
+                            json.dumps(description, separators=(",", ":")).encode()
+                        ).hexdigest(),
+                    )
                 manifest.update(
                     {
                         "created_at_utc": created_at,
@@ -3269,6 +3324,35 @@ class LocalStore:
                             created_at,
                         ),
                     )
+                    binding = manifest["snapshot_binding"]
+                    self._metadata.execute(
+                        "INSERT INTO snapshot_contract_bindings VALUES (?, ?, ?, ?, ?)",
+                        (
+                            str(new_snapshot),
+                            binding["snapshot_as_of"],
+                            binding["context_timezone"],
+                            binding["context_as_of_date"],
+                            binding["medication_as_of"],
+                        ),
+                    )
+                    for table in (
+                        "activity_derivation_snapshot_bindings",
+                        "manual_context_snapshot_bindings",
+                        "medication_snapshot_bindings",
+                        "medication_deviation_snapshot_bindings",
+                        "intake_reason_category_snapshot_bindings",
+                        "as_needed_intake_snapshot_bindings",
+                    ):
+                        columns = (
+                            "version_id"
+                            if table == "activity_derivation_snapshot_bindings"
+                            else "revision_id"
+                        )
+                        self._metadata.execute(
+                            f"INSERT INTO {table} (snapshot_id, {columns}) "
+                            f"SELECT ?, {columns} FROM {table} WHERE snapshot_id = ?",
+                            (str(new_snapshot), str(active)),
+                        )
                     self._metadata.execute(
                         "INSERT INTO snapshot_activations VALUES (?, ?, ?, ?, 'migration', ?)",
                         (
@@ -4859,7 +4943,7 @@ class LocalStore:
             if parent_snapshot_id is None
             else self._bound_manual_revision_ids(parent_snapshot_id)
         )
-        self._refresh_v03_derivations(snapshot_as_of, bound_manual_revision_ids)
+        self._refresh_v03_derivations(snapshot_id, snapshot_as_of, bound_manual_revision_ids)
         self._refresh_derivation_lineage(snapshot_id, snapshot_as_of, bound_manual_revision_ids)
 
         entries: list[dict[str, int | str | list[str]]] = []
@@ -5353,6 +5437,17 @@ class LocalStore:
             for name in _SNAPSHOT_SCHEMAS
         }
         if manifest["snapshot_schema_version"] == _SNAPSHOT_SCHEMA_VERSION:
+            for filename in _V6_DERIVATION_FILES:
+                contract = _SNAPSHOT_FILE_CONTRACTS[filename][0]
+                table = paths[filename.removesuffix(".parquet")]
+                invalid_derivation = self._query.execute(
+                    f"SELECT count(*) FROM read_parquet('{table}') "
+                    "WHERE derivation_contract_id != ? OR snapshot_id != ? "
+                    "OR try_cast(derived_at_utc AS TIMESTAMPTZ) IS NULL",
+                    (contract, snapshot_id),
+                ).fetchone()
+                if invalid_derivation is None or int(invalid_derivation[0]) != 0:
+                    raise StoreError("Snapshot-Ableitungsbindung ist ungültig.")
             expected_source_version_ids = sorted(
                 str(row[0])
                 for row in self._query.execute(
@@ -5680,6 +5775,60 @@ class LocalStore:
                     FROM read_parquet('{paths["resolved_workouts"]}') r
                     JOIN read_parquet('{paths["workouts"]}') w
                       ON w.workout_version_id = r.selected_workout_version_id
+                    UNION ALL
+                    SELECT d.derived_record_id, 'weight_nutrition_day',
+                           'weight-nutrition-day/v1', v.identity_candidate_id,
+                           v.measurement_version_id, 'daily_feature_contributor'
+                    FROM read_parquet('{paths["weight_nutrition_days"]}') d
+                    JOIN read_parquet('{paths["measurement_versions"]}') v
+                      ON v.measurement_local_date = d.day AND v.canonical_type = d.feature_kind
+                    JOIN read_parquet('{paths["resolved_measurements"]}') r
+                      ON r.selected_measurement_version_id = v.measurement_version_id
+                    WHERE r.disposition IN ('included_source', 'included_correction')
+                    UNION ALL
+                    SELECT d.derived_record_id, 'activity_day', 'activity-day/v1',
+                           v.identity_candidate_id, v.measurement_version_id,
+                           'daily_metric_contributor'
+                    FROM read_parquet('{paths["activity_days"]}') d
+                    JOIN read_parquet('{paths["measurement_versions"]}') v
+                      ON v.measurement_local_date = d.day AND v.canonical_type = d.metric
+                    JOIN read_parquet('{paths["resolved_measurements"]}') r
+                      ON r.selected_measurement_version_id = v.measurement_version_id
+                    WHERE r.disposition IN ('included_source', 'included_correction')
+                      AND ((v.source_name = 'Apple Watch' AND v.device = 'Apple Watch')
+                           OR ((v.source_name = 'iPhone' AND v.device = 'iPhone')
+                               AND EXISTS (
+                                   SELECT 1
+                                   FROM read_parquet('{paths["activity_coverage_segments"]}') c
+                                   WHERE c.coverage_kind = 'iphone_fallback'
+                                     AND c.start_utc::TIMESTAMPTZ
+                                         <= v.source_start_utc::TIMESTAMPTZ
+                                     AND v.source_end_utc::TIMESTAMPTZ
+                                         <= c.end_utc::TIMESTAMPTZ)))
+                    UNION ALL
+                    SELECT c.derived_record_id, 'activity_coverage', 'activity-coverage/v1',
+                           v.identity_candidate_id, v.measurement_version_id, 'coverage_interval'
+                    FROM read_parquet('{paths["activity_coverage_segments"]}') c
+                    JOIN read_parquet('{paths["measurement_versions"]}') v
+                      ON (c.coverage_kind = 'unobserved'
+                          OR (v.source_start_utc::TIMESTAMPTZ < c.end_utc::TIMESTAMPTZ
+                              AND c.start_utc::TIMESTAMPTZ
+                                  < v.source_end_utc::TIMESTAMPTZ))
+                    JOIN read_parquet('{paths["resolved_measurements"]}') r
+                      ON r.selected_measurement_version_id = v.measurement_version_id
+                    WHERE r.disposition IN ('included_source', 'included_correction')
+                      AND v.canonical_type IN ('apple_exercise_time', 'step_count',
+                                               'walking_running_distance', 'active_energy')
+                      AND ((v.source_name = 'Apple Watch' AND v.device = 'Apple Watch')
+                           OR (v.source_name = 'iPhone' AND v.device = 'iPhone'))
+                    UNION ALL
+                    SELECT f.derived_record_id, 'workout_feature', 'workout-feature/v1',
+                           w.logical_workout_id, w.workout_version_id,
+                           'workout_source_version'
+                    FROM read_parquet('{paths["workout_features"]}') f
+                    JOIN read_parquet('{paths["workouts"]}') w USING (logical_workout_id)
+                    JOIN read_parquet('{paths["resolved_workouts"]}') r
+                      ON r.selected_workout_version_id = w.workout_version_id
                 ),
                 derived_ids AS (
                     SELECT sha256('resolved-measurement/v1:' || logical_measurement_id)
@@ -5745,6 +5894,14 @@ class LocalStore:
                         SELECT derived_record_id, derived_family, derivation_contract_id,
                                source_logical_id, source_version_id, contribution_role
                         FROM lineage
+                    ))
+                  + (SELECT count(*) FROM (
+                        SELECT derived_record_id, derived_family, derivation_contract_id,
+                               source_logical_id, source_version_id, contribution_role
+                        FROM lineage
+                        WHERE length(source_version_id) = 64
+                          AND derived_family NOT IN ('sleep_episode', 'sleep_night')
+                        EXCEPT SELECT * FROM expected
                     ))
                   + (SELECT count(*) FROM derived_ids d LEFT JOIN lineage l
                      USING (derived_record_id, derived_family, derivation_contract_id)
@@ -7026,28 +7183,23 @@ class LocalStore:
             if action.startswith("manual_")
             else self._bound_manual_revision_ids(parent_snapshot_id)
         )
-        self._refresh_v03_derivations(bound_as_of, manual_revision_ids)
+        self._refresh_v03_derivations(snapshot_id, bound_as_of, manual_revision_ids)
         self._refresh_derivation_lineage(snapshot_id, bound_as_of, manual_revision_ids)
         manifest = json.loads((staging / "manifest.json").read_bytes())
-        rewritten_files: tuple[str, ...]
-        if (
-            action.startswith("manual_")
-            and manifest["snapshot_schema_version"] == _SNAPSHOT_SCHEMA_VERSION
-        ):
-            rewritten_files = (
-                "daily_context.parquet",
-                "medication_context.parquet",
-                "derivation_lineage.parquet",
-            )
-        else:
-            rewritten_files = (
-                "resolved_measurements.parquet",
-                "resolved_workouts.parquet",
-                "workout_review_links.parquet",
-                "open_review_cases.parquet",
-                "derivation_lineage.parquet",
-                *sorted(_V6_DERIVATION_FILES),
-            )
+        rewritten_files = (
+            *(
+                (
+                    "resolved_measurements.parquet",
+                    "resolved_workouts.parquet",
+                    "workout_review_links.parquet",
+                    "open_review_cases.parquet",
+                )
+                if not action.startswith("manual_")
+                else ()
+            ),
+            "derivation_lineage.parquet",
+            *sorted(_V6_DERIVATION_FILES),
+        )
         for filename in rewritten_files:
             table = filename.removesuffix(".parquet")
             path = staging / filename
@@ -7223,7 +7375,10 @@ class LocalStore:
         _publication_fault_point(self._root, "snapshot.before_sqlite_commit/v1")
 
     def _refresh_v03_derivations(
-        self, snapshot_as_of: datetime, manual_revision_ids: tuple[str, ...]
+        self,
+        snapshot_id: SnapshotId,
+        snapshot_as_of: datetime,
+        manual_revision_ids: tuple[str, ...],
     ) -> None:
         self._query.execute(
             """
@@ -7246,19 +7401,6 @@ class LocalStore:
             FROM contributors GROUP BY day, feature_kind, canonical_unit
             """
         )
-        self._query.execute(
-            """
-            CREATE OR REPLACE TEMP TABLE daily_context AS SELECT
-                ''::VARCHAR AS derived_record_id, NULL::DATE AS day,
-                NULL::VARCHAR AS illness_severity, NULL::VARCHAR AS stress_level,
-                ''::VARCHAR AS quality_status WHERE false;
-            CREATE OR REPLACE TEMP TABLE medication_context AS SELECT
-                ''::VARCHAR AS derived_record_id, NULL::DATE AS day,
-                0::BIGINT AS scheduled_dose_count, 0::BIGINT AS deviation_count,
-                0::BIGINT AS as_needed_intake_count,
-                ''::VARCHAR AS quality_status WHERE false;
-            """
-        )
         context_revision_ids = tuple(
             revision_id
             for revision_id in manual_revision_ids
@@ -7277,113 +7419,10 @@ class LocalStore:
                 (revision_id,) * 4,
             ).fetchone()
         )
-        day = snapshot_as_of.astimezone(ZoneInfo("Europe/Berlin")).date()
-        if context_revision_ids:
-            self._query.execute(
-                "INSERT INTO daily_context VALUES (?, ?, NULL, NULL, 'reviewed')",
-                (hashlib.sha256(f"daily-context/v1:{day}".encode()).hexdigest(), day),
-            )
-        if medication_revision_ids:
-            self._query.execute(
-                "INSERT INTO medication_context VALUES (?, ?, ?, ?, ?, 'reviewed')",
-                (
-                    hashlib.sha256(f"medication-context/v1:{day}".encode()).hexdigest(),
-                    day,
-                    sum(
-                        int(row[0])
-                        for revision_id in medication_revision_ids
-                        if (
-                            row := self._metadata.execute(
-                                "SELECT count(*) FROM medication_scheduled_doses "
-                                "WHERE revision_id = ?",
-                                (revision_id,),
-                            ).fetchone()
-                        )
-                    ),
-                    sum(
-                        self._metadata.execute(
-                            "SELECT count(*) FROM medication_deviation_revisions "
-                            "WHERE revision_id = ?",
-                            (revision_id,),
-                        ).fetchone()[0]
-                        for revision_id in medication_revision_ids
-                    ),
-                    sum(
-                        self._metadata.execute(
-                            "SELECT count(*) FROM as_needed_intake_revisions WHERE revision_id = ?",
-                            (revision_id,),
-                        ).fetchone()[0]
-                        for revision_id in medication_revision_ids
-                    ),
-                ),
-            )
-        self._query.execute(
-            """
-            CREATE OR REPLACE TEMP TABLE sleep_episodes AS
-            SELECT sha256('sleep-episode/v1:' || measurement_version_id) AS derived_record_id,
-                   source_start_utc AS episode_start_utc, source_end_utc AS episode_end_utc,
-                   date_diff('second', source_start_utc::TIMESTAMPTZ,
-                             source_end_utc::TIMESTAMPTZ) / 60.0
-                       AS observed_sleep_minutes,
-                   'reviewed' AS quality_status
-            FROM sleep_intervals
-            WHERE is_selected AND source_end_utc > source_start_utc
-              AND canonical_category != 'in_bed'
-              AND source_name = 'Apple Watch' AND device = 'Apple Watch'
-            """
-        )
-        self._query.execute(
-            """
-            CREATE OR REPLACE TEMP TABLE sleep_nights AS
-            SELECT sha256('sleep-night/v1:' || episode_end_utc::TIMESTAMPTZ::DATE)
-                       AS derived_record_id,
-                   episode_end_utc::TIMESTAMPTZ::DATE AS day,
-                   'observed' AS observation_status,
-                   arg_max(derived_record_id, observed_sleep_minutes) AS primary_episode_id,
-                   'reviewed' AS quality_status
-            FROM sleep_episodes GROUP BY day
-            """
-        )
-        self._query.execute(
-            """
-            CREATE OR REPLACE TEMP TABLE activity_days AS
-            SELECT sha256('activity-day/v1:' || v.measurement_local_date || ':'
-                          || v.canonical_type) AS derived_record_id,
-                   v.measurement_local_date AS day, v.canonical_type AS metric,
-                   v.canonical_unit, sum(r.effective_value) AS effective_value,
-                   sum(r.effective_value) FILTER (
-                       WHERE v.source_name = 'Apple Watch' AND v.device = 'Apple Watch'
-                   ) AS watch_value,
-                   sum(r.effective_value) FILTER (
-                       WHERE v.source_name = 'iPhone' AND v.device = 'iPhone'
-                   ) AS iphone_value,
-                   'reviewed' AS quality_status
-            FROM resolved_measurements r JOIN measurement_versions v
-              ON v.measurement_version_id = r.selected_measurement_version_id
-            WHERE r.disposition IN ('included_source', 'included_correction')
-              AND v.canonical_type IN ('apple_exercise_time', 'step_count',
-                                       'walking_running_distance', 'active_energy')
-              AND ((v.source_name = 'Apple Watch' AND v.device = 'Apple Watch')
-                   OR (v.source_name = 'iPhone' AND v.device = 'iPhone'))
-            GROUP BY v.measurement_local_date, v.canonical_type, v.canonical_unit
-            """
-        )
-        self._query.execute(
-            """
-            CREATE OR REPLACE TEMP TABLE activity_coverage_segments AS
-            SELECT sha256('activity-coverage/v1:' || measurement_version_id)
-                       AS derived_record_id,
-                   source_start_utc AS start_utc, source_end_utc AS end_utc,
-                   CASE WHEN source_name = 'Apple Watch' AND device = 'Apple Watch'
-                        THEN 'watch' ELSE 'iphone_fallback' END AS coverage_kind
-            FROM measurement_versions
-            WHERE source_end_utc > source_start_utc
-              AND canonical_type IN ('apple_exercise_time', 'step_count',
-                                     'walking_running_distance', 'active_energy')
-              AND ((source_name = 'Apple Watch' AND device = 'Apple Watch')
-                   OR (source_name = 'iPhone' AND device = 'iPhone'))
-            """
-        )
+        self._refresh_context_derivations(snapshot_as_of, context_revision_ids)
+        self._refresh_medication_derivations(snapshot_as_of, medication_revision_ids)
+        self._refresh_sleep_derivations()
+        self._refresh_activity_derivations()
         self._query.execute(
             """
             CREATE OR REPLACE TEMP TABLE workout_features AS
@@ -7398,6 +7437,609 @@ class LocalStore:
             WHERE r.disposition LIKE 'included%'
             """
         )
+        derived_at = snapshot_as_of.astimezone(UTC).isoformat()
+        for filename in _V6_DERIVATION_FILES:
+            table = filename.removesuffix(".parquet")
+            contract = _SNAPSHOT_FILE_CONTRACTS[filename][0]
+            self._query.execute(
+                f"ALTER TABLE {table} ADD COLUMN derivation_contract_id VARCHAR; "
+                f"ALTER TABLE {table} ADD COLUMN snapshot_id VARCHAR; "
+                f"ALTER TABLE {table} ADD COLUMN derived_at_utc VARCHAR; "
+                f"UPDATE {table} SET derivation_contract_id = ?, snapshot_id = ?, "
+                "derived_at_utc = ?",
+                (contract, str(snapshot_id), derived_at),
+            )
+
+    def _refresh_context_derivations(
+        self, snapshot_as_of: datetime, revision_ids: tuple[str, ...]
+    ) -> None:
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE daily_context (
+                derived_record_id VARCHAR, day DATE, illness_severity VARCHAR,
+                stress_level VARCHAR, quality_status VARCHAR
+            );
+            CREATE OR REPLACE TEMP TABLE daily_context_contributors (
+                derived_record_id VARCHAR, source_logical_id VARCHAR, source_version_id VARCHAR
+            );
+            """
+        )
+        if not revision_ids:
+            return
+        placeholders = ",".join("?" for _ in revision_ids)
+        rows = self._metadata.execute(
+            "SELECT revision.logical_id, revision.revision_id, revision.object_kind, "
+            "revision.state, COALESCE(period.start_date, stress.day, custom.start_date), "
+            "COALESCE(period.end_date, custom.end_date), period.severity, stress.level, "
+            "COALESCE(period.category_logical_id, custom.label_logical_id) "
+            "FROM manual_context_revisions revision "
+            "LEFT JOIN illness_period_values period USING (revision_id) "
+            "LEFT JOIN daily_stress_values stress USING (revision_id) "
+            "LEFT JOIN custom_context_period_values custom USING (revision_id) "
+            f"WHERE revision.revision_id IN ({placeholders}) ORDER BY revision.rowid",
+            revision_ids,
+        ).fetchall()
+        coverage = self._metadata.execute(
+            "SELECT revision.logical_id, revision.revision_id, value.start_date "
+            "FROM manual_context_revisions revision "
+            "JOIN context_coverage_start_values value USING (revision_id) "
+            f"WHERE revision.revision_id IN ({placeholders}) AND revision.state = 'active'",
+            revision_ids,
+        ).fetchone()
+        if coverage is None and not any(
+            row[2] in {"illness_period", "daily_stress", "custom_context_period"}
+            and row[3] == "active"
+            for row in rows
+        ):
+            return
+        as_of = snapshot_as_of.astimezone(ZoneInfo("Europe/Berlin")).date()
+        severity_order = {"mild": 0, "moderate": 1, "severe": 2}
+        derived_rows = []
+        lineage_rows = []
+        if coverage is not None:
+            start = date.fromisoformat(str(coverage[2]))
+            days = tuple(
+                start + timedelta(days=offset) for offset in range((as_of - start).days + 1)
+            )
+        else:
+            days = tuple(
+                sorted(
+                    {
+                        current
+                        for row in rows
+                        if row[3] == "active" and row[4] is not None
+                        for start in (date.fromisoformat(str(row[4])),)
+                        for end in (
+                            min(
+                                as_of,
+                                as_of if row[5] is None else date.fromisoformat(str(row[5])),
+                            ),
+                        )
+                        for current in (
+                            start + timedelta(days=offset)
+                            for offset in range((end - start).days + 1)
+                        )
+                    }
+                )
+            )
+        for current in days:
+            active_periods = tuple(
+                row
+                for row in rows
+                if row[2] == "illness_period"
+                and row[3] == "active"
+                and row[4] is not None
+                and date.fromisoformat(str(row[4])) <= current
+                and (row[5] is None or current <= date.fromisoformat(str(row[5])))
+            )
+            stress = next(
+                (
+                    row
+                    for row in rows
+                    if row[2] == "daily_stress"
+                    and row[3] == "active"
+                    and row[4] is not None
+                    and date.fromisoformat(str(row[4])) == current
+                ),
+                None,
+            )
+            severity = (
+                max((str(row[6]) for row in active_periods), key=severity_order.__getitem__)
+                if active_periods
+                else None
+            )
+            stress_level = str(stress[7]) if stress is not None else "average"
+            derived_id = hashlib.sha256(f"daily-context/v1:{current}".encode()).hexdigest()
+            derived_rows.append((derived_id, current, severity, stress_level, "reviewed"))
+            contributors = list(active_periods)
+            if stress is not None:
+                contributors.append(stress)
+            contributors.extend(
+                row
+                for row in rows
+                if row[2] == "custom_context_period"
+                and row[3] == "active"
+                and row[4] is not None
+                and date.fromisoformat(str(row[4])) <= current
+                and (row[5] is None or current <= date.fromisoformat(str(row[5])))
+            )
+            if coverage is not None:
+                lineage_rows.append((derived_id, str(coverage[0]), str(coverage[1])))
+            lineage_rows.extend((derived_id, str(row[0]), str(row[1])) for row in contributors)
+        self._query.executemany("INSERT INTO daily_context VALUES (?, ?, ?, ?, ?)", derived_rows)
+        if lineage_rows:
+            self._query.executemany(
+                "INSERT INTO daily_context_contributors VALUES (?, ?, ?)", lineage_rows
+            )
+
+    def _refresh_medication_derivations(
+        self, snapshot_as_of: datetime, revision_ids: tuple[str, ...]
+    ) -> None:
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE medication_context (
+                derived_record_id VARCHAR, day DATE, scheduled_dose_count BIGINT,
+                deviation_count BIGINT, as_needed_intake_count BIGINT,
+                quality_status VARCHAR
+            );
+            CREATE OR REPLACE TEMP TABLE medication_context_contributors (
+                derived_record_id VARCHAR, source_logical_id VARCHAR, source_version_id VARCHAR
+            );
+            """
+        )
+        if not revision_ids:
+            return
+        placeholders = ",".join("?" for _ in revision_ids)
+        regimes = self._metadata.execute(
+            "SELECT revision.logical_id, revision.revision_id, value.starts_at, value.timezone "
+            "FROM medication_regime_revisions revision "
+            "JOIN medication_regime_values value USING (revision_id) "
+            f"WHERE revision.revision_id IN ({placeholders}) "
+            "ORDER BY value.starts_at, revision.rowid",
+            revision_ids,
+        ).fetchall()
+        deviations = self._metadata.execute(
+            "SELECT revision.logical_id, revision.revision_id, value.regime_logical_id, "
+            "value.scheduled_at FROM medication_deviation_revisions revision "
+            "JOIN medication_deviation_values value USING (revision_id) "
+            f"WHERE revision.revision_id IN ({placeholders}) AND revision.state = 'active'",
+            revision_ids,
+        ).fetchall()
+        as_needed = self._metadata.execute(
+            "SELECT revision.logical_id, revision.revision_id, value.taken_at "
+            "FROM as_needed_intake_revisions revision "
+            "JOIN as_needed_intake_values value USING (revision_id) "
+            f"WHERE revision.revision_id IN ({placeholders}) AND revision.state = 'active'",
+            revision_ids,
+        ).fetchall()
+        categories = self._metadata.execute(
+            "SELECT logical_id, revision_id FROM intake_reason_category_revisions "
+            f"WHERE revision_id IN ({placeholders}) AND state = 'active'",
+            revision_ids,
+        ).fetchall()
+        if not regimes and not deviations and not as_needed and not categories:
+            return
+        timezone_name = str(regimes[0][3]) if regimes else "Europe/Berlin"
+        as_of_day = snapshot_as_of.astimezone(ZoneInfo(timezone_name)).date()
+        start = (
+            min(datetime.fromisoformat(str(row[2])).date() for row in regimes)
+            if regimes
+            else as_of_day
+        )
+
+        def scheduled_at(day: date, local_time: time, zone_name: str) -> datetime:
+            zone = ZoneInfo(zone_name)
+            local = datetime.combine(day, local_time)
+            for minute in range(181):
+                shifted = local + timedelta(minutes=minute)
+                candidate = shifted.replace(tzinfo=zone, fold=0)
+                if candidate.astimezone(UTC).astimezone(zone).replace(tzinfo=None) == shifted:
+                    return candidate
+            raise StoreError("Lokale Dosiszeit konnte nicht aufgelöst werden.")
+
+        derived_rows = []
+        lineage_rows = []
+        parsed_regimes = tuple(
+            (str(row[0]), str(row[1]), datetime.fromisoformat(str(row[2])), str(row[3]))
+            for row in regimes
+        )
+        for offset in range((as_of_day - start).days + 1):
+            current = start + timedelta(days=offset)
+            regime = next(
+                (row for row in reversed(parsed_regimes) if row[2].date() <= current), None
+            )
+            next_regime = (
+                None
+                if regime is None
+                else next((row for row in parsed_regimes if row[2] > regime[2]), None)
+            )
+            scheduled_count = 0
+            if regime is not None:
+                for local_time, weekdays in self._metadata.execute(
+                    "SELECT local_time, weekdays FROM medication_scheduled_doses "
+                    "WHERE revision_id = ?",
+                    (regime[1],),
+                ).fetchall():
+                    if current.strftime("%A").lower() not in json.loads(str(weekdays)):
+                        continue
+                    occurrence = scheduled_at(
+                        current, time.fromisoformat(str(local_time)), regime[3]
+                    )
+                    if (
+                        occurrence >= regime[2]
+                        and occurrence <= snapshot_as_of
+                        and (next_regime is None or occurrence < next_regime[2])
+                    ):
+                        scheduled_count += 1
+            day_deviations = tuple(
+                row for row in deviations if datetime.fromisoformat(str(row[3])).date() == current
+            )
+            day_as_needed = tuple(
+                row for row in as_needed if datetime.fromisoformat(str(row[2])).date() == current
+            )
+            derived_id = hashlib.sha256(f"medication-context/v1:{current}".encode()).hexdigest()
+            derived_rows.append(
+                (
+                    derived_id,
+                    current,
+                    scheduled_count,
+                    len(day_deviations),
+                    len(day_as_needed),
+                    "reviewed",
+                )
+            )
+            if regime is not None:
+                lineage_rows.append((derived_id, regime[0], regime[1]))
+            lineage_rows.extend((derived_id, str(row[0]), str(row[1])) for row in day_deviations)
+            lineage_rows.extend((derived_id, str(row[0]), str(row[1])) for row in day_as_needed)
+            if regime is None and not day_deviations and not day_as_needed:
+                lineage_rows.extend((derived_id, str(row[0]), str(row[1])) for row in categories)
+        self._query.executemany(
+            "INSERT INTO medication_context VALUES (?, ?, ?, ?, ?, ?)", derived_rows
+        )
+        if lineage_rows:
+            self._query.executemany(
+                "INSERT INTO medication_context_contributors VALUES (?, ?, ?)", lineage_rows
+            )
+
+    def _refresh_sleep_derivations(self) -> None:
+        rows = self._query.execute(
+            """
+            SELECT measurement_version_id, identity_candidate_id, canonical_category,
+                   source_start_utc, source_end_utc, source_start_offset_minutes,
+                   source_end_offset_minutes
+            FROM sleep_intervals
+            WHERE is_selected AND source_end_utc::TIMESTAMPTZ > source_start_utc::TIMESTAMPTZ
+              AND source_name = 'Apple Watch' AND device = 'Apple Watch'
+            ORDER BY source_start_utc, source_end_utc, measurement_version_id
+            """
+        ).fetchall()
+
+        def value_datetime(value: object, offset: object) -> datetime:
+            return datetime.fromisoformat(str(value)).astimezone(
+                timezone(timedelta(minutes=int(str(offset))))
+            )
+
+        intervals = tuple(
+            (
+                str(row[0]),
+                str(row[1]),
+                str(row[2]),
+                value_datetime(row[3], row[5]),
+                value_datetime(row[4], row[6]),
+            )
+            for row in rows
+        )
+        groups: list[list[tuple[str, str, str, datetime, datetime]]] = []
+        for interval in intervals:
+            if interval[2] == "in_bed":
+                continue
+            if not groups or interval[3] - max(item[4] for item in groups[-1]) > timedelta(
+                minutes=90
+            ):
+                groups.append([interval])
+            else:
+                groups[-1].append(interval)
+
+        asleep_categories = {"asleep_unspecified", "asleep_core", "asleep_deep", "asleep_rem"}
+        episode_rows: list[tuple[str, str, str, float, str]] = []
+        contributor_rows: list[tuple[str, str, str]] = []
+        episodes_by_day: dict[date, list[tuple[str, float]]] = {}
+        for group in groups:
+            start = min(item[3] for item in group)
+            end = max(item[4] for item in group)
+            boundaries = sorted({value for item in group for value in (item[3], item[4])})
+            observed = timedelta()
+            for left, right in pairwise(boundaries):
+                active = {item[2] for item in group if item[3] <= left and item[4] >= right}
+                asleep = active & asleep_categories
+                if asleep and "awake" not in active:
+                    observed += right - left
+            version_ids = tuple(sorted(item[0] for item in group))
+            derived_id = hashlib.sha256(
+                f"sleep-episode/v1:{':'.join(version_ids)}".encode()
+            ).hexdigest()
+            observed_minutes = observed.total_seconds() / 60
+            episode_rows.append(
+                (
+                    derived_id,
+                    start.astimezone(UTC).isoformat(),
+                    end.astimezone(UTC).isoformat(),
+                    observed_minutes,
+                    "reviewed",
+                )
+            )
+            contributors = tuple(group) + tuple(
+                item
+                for item in intervals
+                if item[2] == "in_bed" and item[3] < end and item[4] > start
+            )
+            contributor_rows.extend((derived_id, item[1], item[0]) for item in contributors)
+            episodes_by_day.setdefault(end.date(), []).append((derived_id, observed_minutes))
+        night_rows: list[tuple[str, date, str, str | None, str]] = []
+        night_contributors: list[tuple[str, str, str]] = []
+        for day, episodes in sorted(episodes_by_day.items()):
+            largest = max(value for _, value in episodes)
+            primary = tuple(derived_id for derived_id, value in episodes if value == largest)
+            night_id = hashlib.sha256(f"sleep-night/v1:{day}".encode()).hexdigest()
+            night_rows.append(
+                (
+                    night_id,
+                    day,
+                    "observed" if len(primary) == 1 else "partial",
+                    primary[0] if len(primary) == 1 else None,
+                    "reviewed" if len(primary) == 1 else "provisional",
+                )
+            )
+            episode_ids = {derived_id for derived_id, _ in episodes}
+            night_contributors.extend(
+                (night_id, logical_id, version_id)
+                for episode_id, logical_id, version_id in contributor_rows
+                if episode_id in episode_ids
+            )
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE sleep_episodes (
+                derived_record_id VARCHAR, episode_start_utc VARCHAR, episode_end_utc VARCHAR,
+                observed_sleep_minutes DOUBLE, quality_status VARCHAR
+            );
+            CREATE OR REPLACE TEMP TABLE sleep_nights (
+                derived_record_id VARCHAR, day DATE, observation_status VARCHAR,
+                primary_episode_id VARCHAR, quality_status VARCHAR
+            );
+            CREATE OR REPLACE TEMP TABLE sleep_episode_contributors (
+                derived_record_id VARCHAR, source_logical_id VARCHAR, source_version_id VARCHAR
+            );
+            CREATE OR REPLACE TEMP TABLE sleep_night_contributors (
+                derived_record_id VARCHAR, source_logical_id VARCHAR, source_version_id VARCHAR
+            );
+            """
+        )
+        if episode_rows:
+            self._query.executemany(
+                "INSERT INTO sleep_episodes VALUES (?, ?, ?, ?, ?)", episode_rows
+            )
+            self._query.executemany(
+                "INSERT INTO sleep_episode_contributors VALUES (?, ?, ?)", contributor_rows
+            )
+        if night_rows:
+            self._query.executemany("INSERT INTO sleep_nights VALUES (?, ?, ?, ?, ?)", night_rows)
+            self._query.executemany(
+                "INSERT INTO sleep_night_contributors VALUES (?, ?, ?)", night_contributors
+            )
+
+    def _refresh_activity_derivations(self) -> None:
+        rows = self._query.execute(
+            """
+            SELECT v.measurement_version_id, v.measurement_local_date, v.canonical_type,
+                   v.canonical_unit, r.effective_value, v.source_start_utc, v.source_end_utc,
+                   v.source_start_offset_minutes, v.source_end_offset_minutes,
+                   v.source_name, v.device,
+                   EXISTS (SELECT 1 FROM open_review_cases c
+                           WHERE c.logical_measurement_id = r.logical_measurement_id
+                              OR c.measurement_version_id = v.measurement_version_id)
+            FROM resolved_measurements r JOIN measurement_versions v
+              ON v.measurement_version_id = r.selected_measurement_version_id
+            WHERE r.disposition IN ('included_source', 'included_correction')
+              AND v.canonical_type IN ('apple_exercise_time', 'step_count',
+                                       'walking_running_distance', 'active_energy')
+            ORDER BY v.source_start_utc, v.measurement_version_id
+            """
+        ).fetchall()
+
+        def local_datetime(value: object, offset: object) -> datetime:
+            return datetime.fromisoformat(str(value)).astimezone(
+                timezone(timedelta(minutes=int(str(offset))))
+            )
+
+        measurements = tuple(
+            (
+                str(row[0]),
+                cast(date, row[1]),
+                str(row[2]),
+                str(row[3]),
+                float(row[4]),
+                local_datetime(row[5], row[7]),
+                local_datetime(row[6], row[8]),
+                "watch"
+                if (str(row[9]), str(row[10])) == ("Apple Watch", "Apple Watch")
+                else "iphone"
+                if (str(row[9]), str(row[10])) == ("iPhone", "iPhone")
+                else "other",
+                bool(row[11]),
+            )
+            for row in rows
+        )
+
+        def union(
+            intervals: tuple[tuple[datetime, datetime], ...],
+        ) -> tuple[tuple[datetime, datetime], ...]:
+            merged: list[tuple[datetime, datetime]] = []
+            for start, end in sorted(intervals):
+                if merged and start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                else:
+                    merged.append((start, end))
+            return tuple(merged)
+
+        version = self._metadata.execute(
+            "SELECT coverage_gap_minutes FROM activity_derivation_active "
+            "JOIN activity_derivation_versions USING (version_id) WHERE singleton = 1"
+        ).fetchone()
+        gap_minutes = 240 if version is None else int(version[0])
+
+        def bridge(
+            intervals: tuple[tuple[datetime, datetime], ...],
+        ) -> tuple[tuple[datetime, datetime], ...]:
+            merged: list[tuple[datetime, datetime]] = []
+            for start, end in intervals:
+                if (
+                    merged
+                    and start - merged[-1][1] < timedelta(minutes=gap_minutes)
+                    and merged[-1][1].utcoffset() == start.utcoffset()
+                ):
+                    merged[-1] = (merged[-1][0], end)
+                else:
+                    merged.append((start, end))
+            return tuple(merged)
+
+        interval_measurements = tuple(item for item in measurements if item[6] > item[5])
+        watch_intervals = [
+            (item[5], item[6]) for item in interval_measurements if item[7] == "watch"
+        ]
+        for table in ("workouts", "sleep_intervals"):
+            watch_intervals.extend(
+                (
+                    local_datetime(row[0], row[2]),
+                    local_datetime(row[1], row[3]),
+                )
+                for row in self._query.execute(
+                    f"SELECT source_start_utc, source_end_utc, source_start_offset_minutes, "
+                    f"source_end_offset_minutes FROM {table} WHERE is_selected "
+                    "AND source_end_utc::TIMESTAMPTZ > source_start_utc::TIMESTAMPTZ "
+                    "AND source_name = 'Apple Watch' AND device = 'Apple Watch'"
+                ).fetchall()
+            )
+        watch_coverage = bridge(union(tuple(watch_intervals)))
+        watch_gaps = tuple(
+            (left[1], right[0]) for left, right in pairwise(watch_coverage) if left[1] < right[0]
+        )
+        iphone_ids = {
+            item[0]
+            for item in interval_measurements
+            if item[7] == "iphone"
+            and any(start <= item[5] and item[6] <= end for start, end in watch_gaps)
+        }
+        iphone_coverage = tuple(
+            interval
+            for gap_start, gap_end in watch_gaps
+            for interval in bridge(
+                union(
+                    tuple(
+                        (item[5], item[6])
+                        for item in interval_measurements
+                        if item[0] in iphone_ids and gap_start <= item[5] and item[6] <= gap_end
+                    )
+                )
+            )
+        )
+        eligible = tuple(
+            item for item in measurements if item[7] == "watch" or item[0] in iphone_ids
+        )
+        day_rows = []
+        for day, metric, unit in sorted({(item[1], item[2], item[3]) for item in eligible}):
+            contributors = tuple(
+                item for item in eligible if (item[1], item[2], item[3]) == (day, metric, unit)
+            )
+            watch = tuple(item[4] for item in contributors if item[7] == "watch")
+            iphone = tuple(item[4] for item in contributors if item[7] == "iphone")
+            day_rows.append(
+                (
+                    hashlib.sha256(f"activity-day/v1:{day}:{metric}".encode()).hexdigest(),
+                    day,
+                    metric,
+                    unit,
+                    sum(item[4] for item in contributors),
+                    sum(watch) if watch else None,
+                    sum(iphone) if iphone else None,
+                    "provisional" if any(item[8] for item in contributors) else "reviewed",
+                )
+            )
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE activity_days (
+                derived_record_id VARCHAR, day DATE, metric VARCHAR, canonical_unit VARCHAR,
+                effective_value DOUBLE, watch_value DOUBLE, iphone_value DOUBLE,
+                quality_status VARCHAR
+            )
+            """
+        )
+        if day_rows:
+            self._query.executemany(
+                "INSERT INTO activity_days VALUES (?, ?, ?, ?, ?, ?, ?, ?)", day_rows
+            )
+
+        segments: list[tuple[str, str, str, str]] = []
+        coverage_candidates = tuple(
+            item for item in interval_measurements if item[7] in {"watch", "iphone"}
+        )
+        if coverage_candidates:
+            first = min(coverage_candidates, key=lambda item: item[1])
+            last = max(coverage_candidates, key=lambda item: item[1])
+            range_start = datetime.combine(first[1], time.min, first[5].tzinfo)
+            range_end = datetime.combine(last[1] + timedelta(days=1), time.min, last[5].tzinfo)
+            covered = tuple((start, end, "watch") for start, end in watch_coverage) + tuple(
+                (start, end, "iphone_fallback") for start, end in iphone_coverage
+            )
+            boundaries = sorted(
+                {
+                    range_start,
+                    range_end,
+                    *(
+                        value
+                        for start, end, _ in covered
+                        for value in (max(start, range_start), min(end, range_end))
+                    ),
+                }
+            )
+            for start, end in pairwise(boundaries):
+                if start == end:
+                    continue
+                kind = next(
+                    (kind for left, right, kind in covered if left <= start and end <= right),
+                    "unobserved",
+                )
+                current = start
+                while current < end:
+                    midnight = datetime.combine(
+                        current.date() + timedelta(days=1), time.min, current.tzinfo
+                    )
+                    current_end = min(end, midnight)
+                    key = (
+                        f"activity-coverage/v1:{current.isoformat()}:"
+                        f"{current_end.isoformat()}:{kind}"
+                    )
+                    segments.append(
+                        (
+                            hashlib.sha256(key.encode()).hexdigest(),
+                            current.astimezone(UTC).isoformat(),
+                            current_end.astimezone(UTC).isoformat(),
+                            kind,
+                        )
+                    )
+                    current = current_end
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE activity_coverage_segments (
+                derived_record_id VARCHAR, start_utc VARCHAR, end_utc VARCHAR,
+                coverage_kind VARCHAR
+            )
+            """
+        )
+        if segments:
+            self._query.executemany(
+                "INSERT INTO activity_coverage_segments VALUES (?, ?, ?, ?)", segments
+            )
 
     def _refresh_derivation_lineage(
         self,
@@ -7457,17 +8099,16 @@ class LocalStore:
 
             INSERT INTO derivation_lineage
             SELECT e.derived_record_id, 'sleep_episode', 'sleep-episode/v1',
-                   s.identity_candidate_id, s.measurement_version_id,
+                   s.source_logical_id, s.source_version_id,
                    'episode_interval', '{snapshot_ref}', '{derived_ref}'
-            FROM sleep_episodes e JOIN sleep_intervals s
-              ON e.derived_record_id = sha256('sleep-episode/v1:' || s.measurement_version_id)
+            FROM sleep_episodes e JOIN sleep_episode_contributors s
+              USING (derived_record_id)
             UNION ALL
             SELECT n.derived_record_id, 'sleep_night', 'sleep-night/v1',
-                   s.identity_candidate_id, s.measurement_version_id,
+                   s.source_logical_id, s.source_version_id,
                    'night_interval', '{snapshot_ref}', '{derived_ref}'
-            FROM sleep_nights n JOIN sleep_intervals s
-              ON s.source_end_utc::TIMESTAMPTZ::DATE = n.day
-            WHERE s.is_selected AND s.source_name = 'Apple Watch' AND s.device = 'Apple Watch';
+            FROM sleep_nights n JOIN sleep_night_contributors s
+              USING (derived_record_id);
 
             INSERT INTO derivation_lineage
             SELECT d.derived_record_id, 'activity_day', 'activity-day/v1',
@@ -7478,12 +8119,29 @@ class LocalStore:
             JOIN resolved_measurements r
               ON r.selected_measurement_version_id = v.measurement_version_id
             WHERE r.disposition IN ('included_source', 'included_correction')
+              AND ((v.source_name = 'Apple Watch' AND v.device = 'Apple Watch')
+                   OR ((v.source_name = 'iPhone' AND v.device = 'iPhone')
+                       AND EXISTS (
+                           SELECT 1 FROM activity_coverage_segments c
+                           WHERE c.coverage_kind = 'iphone_fallback'
+                             AND c.start_utc::TIMESTAMPTZ <= v.source_start_utc::TIMESTAMPTZ
+                             AND v.source_end_utc::TIMESTAMPTZ <= c.end_utc::TIMESTAMPTZ
+                       )))
             UNION ALL
             SELECT c.derived_record_id, 'activity_coverage', 'activity-coverage/v1',
                    v.identity_candidate_id, v.measurement_version_id,
                    'coverage_interval', '{snapshot_ref}', '{derived_ref}'
             FROM activity_coverage_segments c JOIN measurement_versions v
-              ON c.derived_record_id = sha256('activity-coverage/v1:' || v.measurement_version_id);
+              ON (c.coverage_kind = 'unobserved'
+                  OR (v.source_start_utc::TIMESTAMPTZ < c.end_utc::TIMESTAMPTZ
+                      AND c.start_utc::TIMESTAMPTZ < v.source_end_utc::TIMESTAMPTZ))
+            JOIN resolved_measurements r
+              ON r.selected_measurement_version_id = v.measurement_version_id
+            WHERE r.disposition IN ('included_source', 'included_correction')
+              AND v.canonical_type IN ('apple_exercise_time', 'step_count',
+                                       'walking_running_distance', 'active_energy')
+              AND ((v.source_name = 'Apple Watch' AND v.device = 'Apple Watch')
+                   OR (v.source_name = 'iPhone' AND v.device = 'iPhone'));
 
             INSERT INTO derivation_lineage
             SELECT f.derived_record_id, 'workout_feature', 'workout-feature/v1',
@@ -7495,64 +8153,20 @@ class LocalStore:
             """
         )
 
-        effective_revision_ids = manual_revision_ids
-        for table, derived_table, family, contract in (
-            ("manual_context_revisions", "daily_context", "daily_context", "daily-context/v1"),
-            (
-                "medication_regime_revisions",
-                "medication_context",
-                "medication_context",
-                "medication-context/v1",
-            ),
-            (
-                "medication_deviation_revisions",
-                "medication_context",
-                "medication_context",
-                "medication-context/v1",
-            ),
-            (
-                "intake_reason_category_revisions",
-                "medication_context",
-                "medication_context",
-                "medication-context/v1",
-            ),
-            (
-                "as_needed_intake_revisions",
-                "medication_context",
-                "medication_context",
-                "medication-context/v1",
-            ),
-        ):
-            derived_rows = self._query.execute(
-                f"SELECT derived_record_id FROM {derived_table}"
-            ).fetchall()
-            if not derived_rows or not effective_revision_ids:
-                continue
-            revisions = self._metadata.execute(
-                f"SELECT logical_id, revision_id FROM {table} WHERE revision_id IN ("
-                + ",".join("?" for _ in effective_revision_ids)
-                + ")",
-                effective_revision_ids,
-            ).fetchall()
-            lineage_rows = tuple(
-                (
-                    str(derived[0]),
-                    family,
-                    contract,
-                    str(revision[0]),
-                    str(revision[1]),
-                    str(snapshot_id),
-                    derived_ref,
-                )
-                for derived in derived_rows
-                for revision in revisions
-            )
-            if lineage_rows:
-                self._query.executemany(
-                    "INSERT INTO derivation_lineage VALUES "
-                    "(?, ?, ?, ?, ?, 'manual_revision', ?, ?)",
-                    lineage_rows,
-                )
+        self._query.execute(
+            f"""
+            INSERT INTO derivation_lineage
+            SELECT derived_record_id, 'daily_context', 'daily-context/v1',
+                   source_logical_id, source_version_id, 'manual_revision',
+                   '{snapshot_ref}', '{derived_ref}'
+            FROM daily_context_contributors
+            UNION ALL
+            SELECT derived_record_id, 'medication_context', 'medication-context/v1',
+                   source_logical_id, source_version_id, 'manual_revision',
+                   '{snapshot_ref}', '{derived_ref}'
+            FROM medication_context_contributors
+            """
+        )
 
     def load_daily_series(
         self, start_date: date | None, end_date: date | None
