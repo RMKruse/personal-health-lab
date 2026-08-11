@@ -87,6 +87,42 @@ def test_streamlit_loads_import_details_through_the_application_seam(
     assert app.dataframe
 
 
+def test_streamlit_exposes_as_needed_write_lifecycles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "synthetic", tmp_path / "real")
+    fixture = generate_export("null-v1", 42, tmp_path / "fixture")
+    with HealthLab.open(config) as health_lab:
+        request = ImportHealthExport(fixture.export_path)
+        health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+    monkeypatch.setenv("HEALTHLAB_MODE", "synthetic")
+    monkeypatch.setenv("HEALTHLAB_SYNTHETIC_STORE", str(config.synthetic_store))
+    monkeypatch.setenv("HEALTHLAB_REAL_STORE", str(config.real_store))
+    app_path = Path(__file__).parents[2] / "src/personal_health_lab/adapters/streamlit/app.py"
+
+    app = AppTest.from_file(str(app_path)).run()
+    app.radio[0].set_value("Kontext & Medikamente").run()
+
+    actions = [item for item in app.selectbox if item.label.endswith("Aktion")]
+    assert len(actions) == 2
+    assert all(item.options == ["create", "revise", "withdraw", "restore"] for item in actions)
+    next(item for item in app.text_input if item.label == "Name des Einnahmegrunds").set_value(
+        "Kopfschmerz"
+    )
+    next(button for button in app.button if button.label == "Einnahmegrund prüfen").click().run()
+    next(
+        button
+        for button in app.button
+        if button.label == "Medikamentenschreibvorgang ausführen"
+    ).click().run()
+
+    with HealthLab.open(config) as health_lab:
+        categories = health_lab.load_medication_plan().intake_reason_categories
+    assert tuple(item.name for item in categories) == ("Kopfschmerz",)
+
+
 @pytest.mark.v02_adapter("streamlit", "SleepObservationStatus")
 def test_streamlit_loads_sleep_days_through_the_application_seam(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -334,7 +370,7 @@ def test_streamlit_focuses_migration_in_restricted_session(
 
     assert not app.exception
     assert any(item.value == "Datenspeichermigration" for item in app.subheader)
-    assert any("Schema: 2 → 8" in item.value for item in app.caption)
+    assert any("Schema: 2 → 10" in item.value for item in app.caption)
     assert any("2 → 3, 3 → 4, 4 → 5, 5 → 6" in item.value for item in app.caption)
     assert any(f"Betroffene Snapshots: {snapshot_ref}" in item.value for item in app.caption)
     assert any("Bestehende Analysen werden stale: true" in item.value for item in app.caption)

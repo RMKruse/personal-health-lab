@@ -164,6 +164,10 @@ def _restore_rule_constraints(
     old_types = ", ".join(f"'{item.value}'" for item in data_types)
     old_units = ", ".join(f"'{item.value}'" for item in units)
     with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
+        metadata.execute("DROP TRIGGER plausibility_rule_versions_no_delete")
+        metadata.execute(
+            f"DELETE FROM plausibility_rule_versions WHERE data_type NOT IN ({old_types})"
+        )
         sqlite_schema_version = int(metadata.execute("PRAGMA schema_version").fetchone()[0])
         metadata.execute("PRAGMA writable_schema = ON")
         metadata.execute(

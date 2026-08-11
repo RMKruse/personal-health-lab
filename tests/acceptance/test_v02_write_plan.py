@@ -738,6 +738,7 @@ def test_v02_import_write_contract(
                 "ready",
                 "confirmation_required",
                 "blocked",
+                "no_change",
             }
             assert plan.approval.status is WriteApprovalStatus.READY
             assert blocked.approval.status is WriteApprovalStatus.BLOCKED

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from urllib.parse import quote
@@ -14,6 +15,10 @@ from personal_health_lab.application import (
     AbortMetadataRestore,
     AnalysisDefinitionId,
     AnalysisStatus,
+    AsNeededIntakeCreate,
+    AsNeededIntakeRestore,
+    AsNeededIntakeRevise,
+    AsNeededIntakeWithdraw,
     BatchDecisionTarget,
     BeginMetadataRestore,
     CanonicalHealthType,
@@ -37,9 +42,16 @@ from personal_health_lab.application import (
     ImportId,
     ImportReceipt,
     ImportStatus,
+    IntakeReasonCategoryCreate,
+    IntakeReasonCategoryRestore,
+    IntakeReasonCategoryRevise,
+    IntakeReasonCategoryWithdraw,
     LocalMeasurementExclusion,
     LocalWorkoutExclusion,
     MeasurementVersionId,
+    MedicationLogicalId,
+    MedicationPlanEntryId,
+    MedicationRevisionId,
     MetadataBackupReceipt,
     MetadataRestorePlan,
     MetadataRestoreReceipt,
@@ -48,6 +60,8 @@ from personal_health_lab.application import (
     OverviewStatus,
     PlausibilityRuleSpecification,
     ResolveDataReviewCase,
+    ReviseAsNeededIntake,
+    ReviseIntakeReasonCategory,
     RevokeDataReviewDecision,
     RollbackMigration,
     RollbackMigrationPlan,
@@ -748,6 +762,126 @@ def _render_context(config: RuntimeConfig) -> None:
             ],
             width="stretch",
         )
+    actions = ("create", "revise", "withdraw", "restore")
+    with st.expander("Einnahmegrund bearbeiten"):
+        reason_action = st.selectbox("Einnahmegrund-Aktion", actions)
+        reason_logical_id = st.text_input("Einnahmegrund-ID")
+        reason_revision_id = st.text_input("Einnahmegrund-Revisions-ID")
+        reason_name = st.text_input("Name des Einnahmegrunds")
+        reason_withdrawal = st.text_input("Rücknahmegrund des Einnahmegrunds")
+        if st.button("Einnahmegrund prüfen"):
+            try:
+                reason_intent: (
+                    IntakeReasonCategoryCreate
+                    | IntakeReasonCategoryRevise
+                    | IntakeReasonCategoryWithdraw
+                    | IntakeReasonCategoryRestore
+                )
+                if reason_action == "create":
+                    reason_intent = IntakeReasonCategoryCreate(reason_name)
+                elif reason_action == "withdraw":
+                    reason_intent = IntakeReasonCategoryWithdraw(
+                        MedicationLogicalId(reason_logical_id),
+                        MedicationRevisionId(reason_revision_id),
+                        reason_withdrawal,
+                    )
+                else:
+                    reason_type = (
+                        IntakeReasonCategoryRevise
+                        if reason_action == "revise"
+                        else IntakeReasonCategoryRestore
+                    )
+                    reason_intent = reason_type(
+                        MedicationLogicalId(reason_logical_id),
+                        MedicationRevisionId(reason_revision_id),
+                        reason_name,
+                    )
+                reason_request = ReviseIntakeReasonCategory(reason_intent)
+                with HealthLab.open(config) as health_lab:
+                    st.session_state["medication_write_plan"] = health_lab.preview_write(
+                        reason_request
+                    )
+                st.session_state["medication_write_request"] = reason_request
+                st.rerun()
+            except (ValueError, ConfigurationError, HealthLabError):
+                st.error("Einnahmegrund ist ungültig.")
+    with st.expander("Bedarfseinnahme bearbeiten"):
+        intake_action = st.selectbox("Bedarfseinnahme-Aktion", actions)
+        intake_logical_id = st.text_input("Bedarfseinnahme-ID")
+        intake_revision_id = st.text_input("Bedarfseinnahme-Revisions-ID")
+        regime_logical_id = st.text_input("Regime-ID der Bedarfseinnahme")
+        entry_id = st.text_input("Bedarfsmedikations-Eintrags-ID")
+        taken_at = st.text_input("Einnahmezeitpunkt (ISO 8601)")
+        amount = st.text_input("Eingenommene Menge")
+        reason_category_id = st.text_input("Optionale Einnahmegrund-ID")
+        intake_withdrawal = st.text_input("Rücknahmegrund der Bedarfseinnahme")
+        if st.button("Bedarfseinnahme prüfen"):
+            try:
+                intake_intent: (
+                    AsNeededIntakeCreate
+                    | AsNeededIntakeRevise
+                    | AsNeededIntakeWithdraw
+                    | AsNeededIntakeRestore
+                )
+                category_id = (
+                    MedicationLogicalId(reason_category_id) if reason_category_id else None
+                )
+                if intake_action == "create":
+                    intake_intent = AsNeededIntakeCreate(
+                        MedicationLogicalId(regime_logical_id),
+                        MedicationPlanEntryId(entry_id),
+                        datetime.fromisoformat(taken_at),
+                        Decimal(amount),
+                        category_id,
+                    )
+                elif intake_action == "withdraw":
+                    intake_intent = AsNeededIntakeWithdraw(
+                        MedicationLogicalId(intake_logical_id),
+                        MedicationRevisionId(intake_revision_id),
+                        intake_withdrawal,
+                    )
+                else:
+                    intake_type = (
+                        AsNeededIntakeRevise
+                        if intake_action == "revise"
+                        else AsNeededIntakeRestore
+                    )
+                    intake_intent = intake_type(
+                        MedicationLogicalId(intake_logical_id),
+                        MedicationRevisionId(intake_revision_id),
+                        datetime.fromisoformat(taken_at),
+                        Decimal(amount),
+                        category_id,
+                    )
+                intake_request = ReviseAsNeededIntake(intake_intent)
+                with HealthLab.open(config) as health_lab:
+                    st.session_state["medication_write_plan"] = health_lab.preview_write(
+                        intake_request
+                    )
+                st.session_state["medication_write_request"] = intake_request
+                st.rerun()
+            except (ValueError, ArithmeticError, ConfigurationError, HealthLabError):
+                st.error("Bedarfseinnahme ist ungültig.")
+    medication_write_plan = st.session_state.get("medication_write_plan")
+    if medication_write_plan is not None:
+        st.code(str(medication_write_plan.fingerprint))
+        st.caption(f"Freigabe: {medication_write_plan.approval.status.value}")
+        if st.button(
+            "Medikamentenschreibvorgang ausführen",
+            disabled=medication_write_plan.approval.status is WriteApprovalStatus.BLOCKED,
+        ):
+            try:
+                with HealthLab.open(config) as health_lab:
+                    result = health_lab.execute_write(
+                        st.session_state["medication_write_request"],
+                        expected_plan=medication_write_plan.fingerprint,
+                    ).result
+                st.success(f"Medikamentenschreibvorgang: {result.status.value}")
+                st.session_state.pop("medication_write_plan", None)
+                st.session_state.pop("medication_write_request", None)
+                st.rerun()
+            except HealthLabError:
+                st.error("Medikamentenschreibvorgang konnte nicht ausgeführt werden.")
 
 
 def _discard_pending_previews() -> None:

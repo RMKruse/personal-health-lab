@@ -24,15 +24,21 @@ PARQUET_FILES = (
     "measurement_versions.parquet",
     "open_review_cases.parquet",
     "resolved_measurements.parquet",
+    "resolved_workouts.parquet",
     "sleep_intervals.parquet",
     "source_occurrences.parquet",
+    "workout_review_links.parquet",
+    "workouts.parquet",
 )
 LAST_COLUMNS = {
     "measurement_versions.parquet": "strong_source_id_hash",
     "open_review_cases.parquet": "evidence_fingerprint",
     "resolved_measurements.parquet": "conflict_resolution_decision_id",
+    "resolved_workouts.parquet": "effective_decision_id",
     "sleep_intervals.parquet": "is_selected",
     "source_occurrences.parquet": "occurrence_fingerprint",
+    "workout_review_links.parquet": "workout_version_id",
+    "workouts.parquet": "is_selected",
 }
 
 
@@ -681,7 +687,7 @@ def test_sqlite_catalog_and_audit_constraints_are_hard(tmp_path: Path) -> None:
         } <= strict_tables
         assert metadata.execute(
             "SELECT schema_version, typeof(schema_version) FROM store_identity"
-        ).fetchone() == (8, "integer")
+        ).fetchone() == (10, "integer")
 
         with pytest.raises(sqlite3.IntegrityError):
             metadata.execute(

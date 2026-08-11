@@ -7,6 +7,7 @@ import pydoc
 import sys
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 from personal_health_lab.adapters._config import load_runtime_config
@@ -19,6 +20,10 @@ from personal_health_lab.application import (
     AnalysisReceipt,
     AnalysisStatus,
     AsNeededIntakeAuditRevision,
+    AsNeededIntakeCreate,
+    AsNeededIntakeRestore,
+    AsNeededIntakeRevise,
+    AsNeededIntakeWithdraw,
     AssociationInterval,
     BatchDecisionTarget,
     BeginMetadataRestore,
@@ -58,12 +63,18 @@ from personal_health_lab.application import (
     ImportReceipt,
     ImportStatus,
     IntakeReasonCategoryAuditRevision,
+    IntakeReasonCategoryCreate,
+    IntakeReasonCategoryRestore,
+    IntakeReasonCategoryRevise,
+    IntakeReasonCategoryWithdraw,
     LocalMeasurementExclusion,
     LocalWorkoutExclusion,
     MeasurementVersionId,
     MedicationAuditRevision,
     MedicationDeviationAuditRevision,
     MedicationLogicalId,
+    MedicationPlanEntryId,
+    MedicationRevisionId,
     MetadataBackupPlan,
     MetadataBackupReceipt,
     MetadataRestorePlan,
@@ -79,6 +90,8 @@ from personal_health_lab.application import (
     ResolveDataReviewCase,
     RestingHeartRateAnalysisPlan,
     RestingHeartRateAnalysisResult,
+    ReviseAsNeededIntake,
+    ReviseIntakeReasonCategory,
     RevokeDataReviewDecision,
     RollbackMigration,
     RollbackMigrationPlan,
@@ -250,6 +263,44 @@ def _parser() -> argparse.ArgumentParser:
     medication_audit = medication_commands.add_parser("audit", help="Regimeaudit laden")
     medication_audit.add_argument("logical_id", type=MedicationLogicalId)
     medication_audit.add_argument("--json", action="store_true", dest="as_json")
+    medication_reason = medication_commands.add_parser(
+        "reason", help="Einnahmegrund anlegen oder revidieren"
+    )
+    medication_reason.set_defaults(as_json=False)
+    reason_actions = medication_reason.add_subparsers(dest="medication_action", required=True)
+    reason_create = reason_actions.add_parser("create")
+    reason_create.add_argument("name")
+    for action in ("revise", "restore"):
+        command = reason_actions.add_parser(action)
+        command.add_argument("logical_id", type=MedicationLogicalId)
+        command.add_argument("expected_revision_id", type=MedicationRevisionId)
+        command.add_argument("name")
+    reason_withdraw = reason_actions.add_parser("withdraw")
+    reason_withdraw.add_argument("logical_id", type=MedicationLogicalId)
+    reason_withdraw.add_argument("expected_revision_id", type=MedicationRevisionId)
+    reason_withdraw.add_argument("--reason", required=True)
+    medication_intake = medication_commands.add_parser(
+        "intake", help="Bedarfseinnahme anlegen oder revidieren"
+    )
+    medication_intake.set_defaults(as_json=False)
+    intake_actions = medication_intake.add_subparsers(dest="medication_action", required=True)
+    intake_create = intake_actions.add_parser("create")
+    intake_create.add_argument("regime_logical_id", type=MedicationLogicalId)
+    intake_create.add_argument("entry_id", type=MedicationPlanEntryId)
+    intake_create.add_argument("taken_at", type=datetime.fromisoformat)
+    intake_create.add_argument("amount", type=Decimal)
+    intake_create.add_argument("--reason-category", type=MedicationLogicalId)
+    for action in ("revise", "restore"):
+        command = intake_actions.add_parser(action)
+        command.add_argument("logical_id", type=MedicationLogicalId)
+        command.add_argument("expected_revision_id", type=MedicationRevisionId)
+        command.add_argument("taken_at", type=datetime.fromisoformat)
+        command.add_argument("amount", type=Decimal)
+        command.add_argument("--reason-category", type=MedicationLogicalId)
+    intake_withdraw = intake_actions.add_parser("withdraw")
+    intake_withdraw.add_argument("logical_id", type=MedicationLogicalId)
+    intake_withdraw.add_argument("expected_revision_id", type=MedicationRevisionId)
+    intake_withdraw.add_argument("--reason", required=True)
     analysis = commands.add_parser("analyze", help="Verzögerungsprofil analysieren")
     analysis.add_argument("--definition", default="lag-signal-v2")
     analysis.add_argument("--start-date", type=date.fromisoformat)
@@ -1525,6 +1576,7 @@ def main(args: Sequence[str] | None = None) -> int:
         parser.error("Genau eine Entscheidungs- oder Sammelaktions-ID muss angegeben werden.")
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
     decision_request: WriteRequest
+    medication_write_request: ReviseAsNeededIntake | ReviseIntakeReasonCategory
     try:
         config = load_runtime_config(
             explicit_mode=parsed.mode,
@@ -1576,6 +1628,86 @@ def main(args: Sequence[str] | None = None) -> int:
                 medication_plan = health_lab.load_medication_plan(parsed.snapshot)
             elif parsed.command == "medication" and parsed.medication_command == "audit":
                 medication_audit = health_lab.load_medication_audit(parsed.logical_id)
+            elif parsed.command == "medication" and parsed.medication_command == "reason":
+                reason_intent: (
+                    IntakeReasonCategoryCreate
+                    | IntakeReasonCategoryRevise
+                    | IntakeReasonCategoryWithdraw
+                    | IntakeReasonCategoryRestore
+                )
+                if parsed.medication_action == "create":
+                    reason_intent = IntakeReasonCategoryCreate(parsed.name)
+                elif parsed.medication_action == "withdraw":
+                    reason_intent = IntakeReasonCategoryWithdraw(
+                        parsed.logical_id, parsed.expected_revision_id, parsed.reason
+                    )
+                else:
+                    intent_type = (
+                        IntakeReasonCategoryRevise
+                        if parsed.medication_action == "revise"
+                        else IntakeReasonCategoryRestore
+                    )
+                    reason_intent = intent_type(
+                        parsed.logical_id, parsed.expected_revision_id, parsed.name
+                    )
+                medication_write_request = ReviseIntakeReasonCategory(reason_intent)
+                medication_write_plan = health_lab.preview_write(medication_write_request)
+                medication_write_receipt = None
+                _print_write_plan(medication_write_plan, workspace_status)
+                if (
+                    medication_write_plan.approval.status is not WriteApprovalStatus.BLOCKED
+                    and input("Medikamentenschreibvorgang ausführen? [j/N] ").strip().lower()
+                    in {"j", "ja"}
+                ):
+                    medication_write_receipt = health_lab.execute_write(
+                        medication_write_request,
+                        expected_plan=medication_write_plan.fingerprint,
+                    )
+            elif parsed.command == "medication" and parsed.medication_command == "intake":
+                intake_intent: (
+                    AsNeededIntakeCreate
+                    | AsNeededIntakeRevise
+                    | AsNeededIntakeWithdraw
+                    | AsNeededIntakeRestore
+                )
+                if parsed.medication_action == "create":
+                    intake_intent = AsNeededIntakeCreate(
+                        parsed.regime_logical_id,
+                        parsed.entry_id,
+                        parsed.taken_at,
+                        parsed.amount,
+                        parsed.reason_category,
+                    )
+                elif parsed.medication_action == "withdraw":
+                    intake_intent = AsNeededIntakeWithdraw(
+                        parsed.logical_id, parsed.expected_revision_id, parsed.reason
+                    )
+                else:
+                    intake_type = (
+                        AsNeededIntakeRevise
+                        if parsed.medication_action == "revise"
+                        else AsNeededIntakeRestore
+                    )
+                    intake_intent = intake_type(
+                        parsed.logical_id,
+                        parsed.expected_revision_id,
+                        parsed.taken_at,
+                        parsed.amount,
+                        parsed.reason_category,
+                    )
+                medication_write_request = ReviseAsNeededIntake(intake_intent)
+                medication_write_plan = health_lab.preview_write(medication_write_request)
+                medication_write_receipt = None
+                _print_write_plan(medication_write_plan, workspace_status)
+                if (
+                    medication_write_plan.approval.status is not WriteApprovalStatus.BLOCKED
+                    and input("Medikamentenschreibvorgang ausführen? [j/N] ").strip().lower()
+                    in {"j", "ja"}
+                ):
+                    medication_write_receipt = health_lab.execute_write(
+                        medication_write_request,
+                        expected_plan=medication_write_plan.fingerprint,
+                    )
             elif parsed.command == "restore":
                 restore_request = BeginMetadataRestore(parsed.backup)
                 restore_plan = health_lab.preview_write(restore_request)
@@ -2218,6 +2350,11 @@ def main(args: Sequence[str] | None = None) -> int:
         print("Kontextaudit")
         for revision in context_audit.revisions:
             print(f"{revision.revision_id} · {revision.state} · {revision.start_date or '-'}")
+    elif parsed.command == "medication" and parsed.medication_command in {"reason", "intake"}:
+        if medication_write_receipt is None:
+            print("Medikamentenschreibvorgang nicht ausgeführt.")
+        else:
+            print(f"Medikamentenschreibvorgang: {medication_write_receipt.result.status.value}")
     elif parsed.command == "medication" and parsed.medication_command == "days":
         for medication_day in medication_days.days:
             print(
@@ -2684,6 +2821,10 @@ def main(args: Sequence[str] | None = None) -> int:
                 "Ausgeführt "
                 f"{historical.completed_at.isoformat() if historical.completed_at else '-'}"
             )
+    if parsed.command == "medication" and parsed.medication_command in {"reason", "intake"}:
+        if medication_write_receipt is None:
+            return 3 if medication_write_plan.approval.status is WriteApprovalStatus.BLOCKED else 0
+        return 3 if isinstance(medication_write_receipt.result, WriteNotStarted) else 0
     if parsed.command in write_commands:
         if parsed.command == "restore":
             if restore_write_receipt is None:
