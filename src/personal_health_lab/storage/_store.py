@@ -9,7 +9,7 @@ import plistlib
 import shutil
 import sqlite3
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone
@@ -52,6 +52,33 @@ _WRITER_LOCK_FILE = ".writer.lock"
 _FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
 _STORE_MIGRATION_METHOD = "cow-migration/v1"
 _SNAPSHOT_SCHEMA_VERSION = 7
+_RESTORABLE_MANUAL_METADATA_TABLES = (
+    "activity_derivation_versions",
+    "manual_context_revisions",
+    "context_coverage_start_values",
+    "illness_category_values",
+    "daily_stress_values",
+    "custom_context_label_values",
+    "custom_context_period_values",
+    "illness_period_values",
+    "manual_context_publications",
+    "medication_regime_revisions",
+    "medication_regime_values",
+    "medication_scheduled_doses",
+    "medication_as_needed_entries",
+    "medication_publications",
+    "medication_deviation_revisions",
+    "medication_deviation_values",
+    "medication_deviation_intakes",
+    "medication_deviation_publications",
+    "intake_reason_category_revisions",
+    "intake_reason_category_values",
+    "intake_reason_category_publications",
+    "as_needed_intake_revisions",
+    "as_needed_intake_values",
+    "as_needed_intake_publications",
+    "manual_revision_intents",
+)
 _CANONICAL_HEALTH_TYPES_SQL = ", ".join(f"'{item.value}'" for item in CanonicalHealthType)
 _CANONICAL_UNITS_SQL = ", ".join(f"'{item.value}'" for item in CanonicalUnit)
 _PRE_ACTIVITY_HEALTH_TYPES_SQL = ", ".join(
@@ -1390,6 +1417,19 @@ class BackupSnapshotFact:
 
 
 @dataclass(frozen=True, slots=True)
+class BackupSnapshotOrigin:
+    snapshot_id: SnapshotId
+    schema_version: int
+    manifest_sha256: str
+    snapshot_as_of: datetime
+    context_timezone: str
+    context_as_of_date: date
+    medication_as_of: datetime
+    activity_derivation_version_id: str
+    manual_revision_bindings: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ReviewSnapshotFacts:
     snapshot_id: SnapshotId
     cases: tuple[OpenDataReviewCase, ...]
@@ -1669,6 +1709,11 @@ def _execute_script(metadata: sqlite3.Connection, script: str) -> None:
 
 def _normalized_context_name(name: str) -> str:
     return " ".join(name.split()).casefold()
+
+
+def _manual_payload_sha256(payload: Mapping[str, object]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
 
 
 def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
@@ -1962,6 +2007,23 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS restored_publications (
             audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id)
         ) STRICT;
+        CREATE TABLE IF NOT EXISTS snapshot_restore_origins (
+            snapshot_id TEXT PRIMARY KEY REFERENCES dataset_snapshots(snapshot_id),
+            backup_id TEXT NOT NULL CHECK (
+                length(backup_id) = 32 AND backup_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            source_snapshot_id TEXT NOT NULL CHECK (
+                length(source_snapshot_id) = 32
+                AND source_snapshot_id NOT GLOB '*[^0-9a-f]*'
+            )
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS manual_revision_intents (
+            revision_id TEXT PRIMARY KEY CHECK (
+                length(revision_id) = 32 AND revision_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            intent TEXT NOT NULL CHECK (intent IN ('create', 'revise', 'withdraw', 'restore')),
+            withdrawal_reason TEXT
+        ) STRICT;
         CREATE TABLE IF NOT EXISTS manual_context_revisions (
             revision_id TEXT PRIMARY KEY CHECK (
                 length(revision_id) = 32 AND revision_id NOT GLOB '*[^0-9a-f]*'
@@ -2237,6 +2299,24 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             snapshot_id TEXT NOT NULL UNIQUE REFERENCES dataset_snapshots(snapshot_id),
             medication_as_of TEXT NOT NULL
         ) STRICT;
+        CREATE TRIGGER IF NOT EXISTS manual_revision_intents_owner
+        BEFORE INSERT ON manual_revision_intents
+        WHEN (
+            SELECT count(*) FROM (
+                SELECT revision_id FROM manual_context_revisions
+                UNION ALL SELECT revision_id FROM medication_regime_revisions
+                UNION ALL SELECT revision_id FROM medication_deviation_revisions
+                UNION ALL SELECT revision_id FROM intake_reason_category_revisions
+                UNION ALL SELECT revision_id FROM as_needed_intake_revisions
+            ) WHERE revision_id = NEW.revision_id
+        ) != 1
+        BEGIN SELECT RAISE(ABORT, 'manual revision intent owner invalid'); END;
+        CREATE TRIGGER IF NOT EXISTS manual_revision_intents_no_update
+        BEFORE UPDATE ON manual_revision_intents
+        BEGIN SELECT RAISE(ABORT, 'manual revision intents are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS manual_revision_intents_no_delete
+        BEFORE DELETE ON manual_revision_intents
+        BEGIN SELECT RAISE(ABORT, 'manual revision intents are append-only'); END;
         CREATE TABLE IF NOT EXISTS metadata_restores (
             restore_id TEXT PRIMARY KEY CHECK (
                 length(restore_id) = 32 AND restore_id NOT GLOB '*[^0-9a-f]*'
@@ -2629,9 +2709,7 @@ def _upgrade_migration_event_constraints(metadata: sqlite3.Connection) -> None:
 
 
 def _upgrade_migration_publication_schema(metadata: sqlite3.Connection) -> None:
-    columns = {
-        str(row[1]) for row in metadata.execute("PRAGMA table_info(migration_publications)")
-    }
+    columns = {str(row[1]) for row in metadata.execute("PRAGMA table_info(migration_publications)")}
     if not columns or "snapshot_source_schema_version" in columns:
         return
     for trigger in (
@@ -2680,6 +2758,7 @@ def _upgrade_migration_publication_schema(metadata: sqlite3.Connection) -> None:
 
 
 def _upgrade_v03_constraints(metadata: sqlite3.Connection) -> None:
+    metadata.execute("DROP TRIGGER IF EXISTS manual_revision_intents_owner")
     upgrades = (
         (
             "plausibility_rule_versions",
@@ -2932,6 +3011,78 @@ class LocalStore:
                 "ORDER BY snapshot_id"
             )
         )
+
+    def load_backup_snapshot_origin(self) -> BackupSnapshotOrigin | None:
+        self._require_open()
+        row = self._metadata.execute(
+            "SELECT snapshot.snapshot_id, snapshot.snapshot_schema_version, "
+            "snapshot.manifest_sha256, binding.snapshot_as_of, binding.context_timezone, "
+            "binding.context_as_of_date, binding.medication_as_of, derivation.version_id "
+            "FROM active_snapshot active "
+            "JOIN dataset_snapshots snapshot USING (snapshot_id) "
+            "JOIN snapshot_contract_bindings binding USING (snapshot_id) "
+            "JOIN activity_derivation_snapshot_bindings derivation USING (snapshot_id)"
+        ).fetchone()
+        if row is None:
+            return None
+        snapshot_id = str(row[0])
+        bindings = tuple(
+            (str(item[0]), str(item[1]))
+            for item in self._metadata.execute(
+                "SELECT 'context', revision_id FROM manual_context_snapshot_bindings "
+                "WHERE snapshot_id = ? UNION ALL "
+                "SELECT 'medication_regime', revision_id FROM medication_snapshot_bindings "
+                "WHERE snapshot_id = ? UNION ALL "
+                "SELECT 'medication_deviation', revision_id "
+                "FROM medication_deviation_snapshot_bindings WHERE snapshot_id = ? UNION ALL "
+                "SELECT 'intake_reason_category', revision_id "
+                "FROM intake_reason_category_snapshot_bindings WHERE snapshot_id = ? UNION ALL "
+                "SELECT 'as_needed_intake', revision_id "
+                "FROM as_needed_intake_snapshot_bindings WHERE snapshot_id = ? "
+                "ORDER BY 1, 2",
+                (snapshot_id,) * 5,
+            )
+        )
+        return BackupSnapshotOrigin(
+            SnapshotId(snapshot_id),
+            int(row[1]),
+            str(row[2]),
+            datetime.fromisoformat(str(row[3])),
+            str(row[4]),
+            date.fromisoformat(str(row[5])),
+            datetime.fromisoformat(str(row[6])),
+            str(row[7]),
+            bindings,
+        )
+
+    def load_backup_interval_source_refs(self) -> tuple[tuple[str, str, str], ...]:
+        self._require_open()
+        snapshot_id = self.load_active_snapshot_id()
+        if snapshot_id is None:
+            return ()
+        directory = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
+        refs: list[tuple[str, str, str]] = []
+        for family, filename, logical_column, version_column in (
+            (
+                "sleep",
+                "sleep_intervals.parquet",
+                "identity_candidate_id",
+                "measurement_version_id",
+            ),
+            ("workout", "workouts.parquet", "logical_workout_id", "workout_version_id"),
+        ):
+            path = directory / filename
+            if not path.exists():
+                continue
+            escaped = str(path).replace("'", "''")
+            refs.extend(
+                (family, str(row[0]), str(row[1]))
+                for row in self._query.execute(
+                    f"SELECT {logical_column}, {version_column} "
+                    f"FROM read_parquet('{escaped}') ORDER BY {version_column}"
+                ).fetchall()
+            )
+        return tuple(refs)
 
     def load_migration_rollback_facts(self) -> MigrationRollbackFacts | None:
         self._require_open()
@@ -3269,8 +3420,10 @@ class LocalStore:
             raise StoreConfigurationError(
                 "Snapshot-Migrationskette ist nicht lückenlos registriert."
             )
-        if active is not None and not snapshot_steps and (
-            snapshot_source_version != _SNAPSHOT_SCHEMA_VERSION
+        if (
+            active is not None
+            and not snapshot_steps
+            and (snapshot_source_version != _SNAPSHOT_SCHEMA_VERSION)
         ):
             raise StoreConfigurationError(
                 "Snapshot-Migrationskette ist nicht lückenlos registriert."
@@ -3304,14 +3457,8 @@ class LocalStore:
                     backup.execute("PRAGMA integrity_check").fetchone() != ("ok",)
                     or backup.execute("PRAGMA foreign_key_check").fetchall()
                     or backup_identity != (source_version,)
-                    or (
-                        active is None
-                        and backup_active not in {None, (None,)}
-                    )
-                    or (
-                        active is not None
-                        and backup_active != (str(active),)
-                    )
+                    or (active is None and backup_active not in {None, (None,)})
+                    or (active is not None and backup_active != (str(active),))
                 ):
                     raise sqlite3.IntegrityError("migration backup validation failed")
             os.replace(temporary, backup_path)
@@ -3547,11 +3694,9 @@ class LocalStore:
                     ).fetchall()
                 )
                 columns = {name for name, _ in source_description}
-                if (
-                    source_description == schema
-                    and filename
-                    not in _V6_DERIVATION_FILES | {"derivation_lineage.parquet"}
-                ):
+                if source_description == schema and filename not in _V6_DERIVATION_FILES | {
+                    "derivation_lineage.parquet"
+                }:
                     reused_files.add(filename)
                 projection = ", ".join(
                     f'CAST("{name}" AS {kind}) AS "{name}"'
@@ -3565,9 +3710,7 @@ class LocalStore:
                 )
             else:
                 definitions = ", ".join(f'"{name}" {kind}' for name, kind in schema)
-                self._query.execute(
-                    f"CREATE OR REPLACE TEMP TABLE {table} ({definitions})"
-                )
+                self._query.execute(f"CREATE OR REPLACE TEMP TABLE {table} ({definitions})")
 
         raw_binding = manifest.get("snapshot_binding")
         source_binding = raw_binding if isinstance(raw_binding, dict) else {}
@@ -3588,9 +3731,7 @@ class LocalStore:
             escaped = str(path).replace("'", "''")
             if filename not in reused_files:
                 path.unlink(missing_ok=True)
-                self._query.execute(
-                    f"COPY (SELECT * FROM {table}) TO '{escaped}' (FORMAT PARQUET)"
-                )
+                self._query.execute(f"COPY (SELECT * FROM {table}) TO '{escaped}' (FORMAT PARQUET)")
             description = tuple(
                 (str(row[0]), str(row[1]))
                 for row in self._query.execute(
@@ -3601,9 +3742,7 @@ class LocalStore:
                 raise StoreError(
                     f"Staging-Snapshot besitzt für {filename} ein unerwartetes Schema."
                 )
-            row = self._query.execute(
-                f"SELECT count(*) FROM read_parquet('{escaped}')"
-            ).fetchone()
+            row = self._query.execute(f"SELECT count(*) FROM read_parquet('{escaped}')").fetchone()
             assert row is not None
             entries.append(
                 {
@@ -3676,9 +3815,7 @@ class LocalStore:
         ).encode()
         (staging / "manifest.json").write_bytes(manifest_bytes)
         digest = hashlib.sha256(manifest_bytes).hexdigest()
-        self._validate_snapshot(
-            staging, str(snapshot_id), digest, expected_store_id=store_id
-        )
+        self._validate_snapshot(staging, str(snapshot_id), digest, expected_store_id=store_id)
         return digest, manifest
 
     def _quarantine_migration_artifacts(
@@ -4044,7 +4181,21 @@ class LocalStore:
     ) -> PublishImportResult:
         self._require_open()
         self._require_writer()
+        verified_overlay: Path | None = None
         try:
+            if restore_overlay is not None:
+                if restore_overlay_sha256 is None:
+                    raise StoreError("restore_working_copy_changed")
+                verified_overlay = self._root / "staging" / f".{operation_id}.restore.sqlite3"
+                verified_overlay.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(restore_overlay, verified_overlay)
+                verified_overlay.chmod(0o400)
+                with verified_overlay.open("rb") as working:
+                    if (
+                        hashlib.file_digest(working, "sha256").hexdigest()
+                        != restore_overlay_sha256
+                    ):
+                        raise StoreError("restore_working_copy_changed")
             return self._publish_import(
                 operation_id=operation_id,
                 import_id=import_id,
@@ -4060,12 +4211,16 @@ class LocalStore:
                 governing_export_id=governing_export_id,
                 resolve_sources=resolve_sources,
                 resolve_workouts=resolve_workouts,
-                restore_overlay=restore_overlay,
+                restore_overlay=verified_overlay,
                 restore_overlay_sha256=restore_overlay_sha256,
                 restore_exports=restore_exports,
             )
         except (OSError, sqlite3.Error, duckdb.Error) as error:
             raise StoreError("Health-Import konnte nicht veröffentlicht werden.") from error
+        finally:
+            if verified_overlay is not None and verified_overlay.exists():
+                verified_overlay.chmod(0o600)
+                verified_overlay.unlink(missing_ok=True)
 
     def _publish_import(
         self,
@@ -4463,6 +4618,8 @@ class LocalStore:
 
         restored_decision_refs: tuple[tuple[str, str], ...] = ()
         restored_rule_refs: tuple[tuple[str, str], ...] = ()
+        bound_snapshot_as_of = observed_at
+        bound_context_timezone = "Europe/Berlin"
         if restore_overlay is None:
             audit_position = int(
                 self._metadata.execute(
@@ -4490,6 +4647,17 @@ class LocalStore:
                         "SELECT rule_version_id, rule_kind FROM rule_version_refs"
                     ).fetchall()
                 )
+                if "snapshot_origin" in {
+                    str(row[0])
+                    for row in backup.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+                }:
+                    origin = backup.execute(
+                        "SELECT snapshot_as_of, context_timezone FROM snapshot_origin"
+                    ).fetchone()
+                    if origin is None:
+                        raise StoreError("backup_integrity_conflict")
+                    bound_snapshot_as_of = datetime.fromisoformat(str(origin[0]))
+                    bound_context_timezone = str(origin[1])
         manifest_sha256, resolution = self._stage_snapshot(
             staging,
             operation_id=operation_id,
@@ -4506,8 +4674,9 @@ class LocalStore:
             restore_exports=restore_exports,
             restored_decision_refs=restored_decision_refs,
             restored_rule_refs=restored_rule_refs,
-            snapshot_as_of=observed_at,
-            context_timezone="Europe/Berlin",
+            snapshot_as_of=bound_snapshot_as_of,
+            context_timezone=bound_context_timezone,
+            restore_overlay=restore_overlay,
         )
         _allocation_checkpoint(self._root, "staged")
         _fsync_snapshot(staging)
@@ -4594,6 +4763,8 @@ class LocalStore:
                     "WHERE snapshot_id = ?",
                     (str(snapshot_id), str(active[0])),
                 )
+            elif restore_overlay is not None:
+                self._bind_restored_snapshot(snapshot_id, restore_overlay)
             all_intervals: tuple[
                 CanonicalHealthRecord | CanonicalSleepInterval | CanonicalWorkout, ...
             ] = (
@@ -4703,6 +4874,10 @@ class LocalStore:
             if hashlib.file_digest(working, "sha256").hexdigest() != expected_sha256:
                 raise StoreError("restore_working_copy_changed")
         with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True) as backup:
+            backup_tables = {
+                str(row[0])
+                for row in backup.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
 
             def copy(
                 table: str, *, ignore_existing: bool = False, order_by: str | None = None
@@ -4726,6 +4901,8 @@ class LocalStore:
                 copy(table)
             copy("rule_version_refs", ignore_existing=True)
             copy("plausibility_rule_versions", ignore_existing=True)
+            if "activity_derivation_versions" in backup_tables:
+                copy("activity_derivation_versions", ignore_existing=True)
             copy("audit_events", order_by="audit_position")
             for table in (
                 "data_review_decisions",
@@ -4734,6 +4911,23 @@ class LocalStore:
                 "source_absence_suppressions",
             ):
                 copy(table)
+            for table in _RESTORABLE_MANUAL_METADATA_TABLES:
+                if (
+                    table in backup_tables
+                    and table != "activity_derivation_versions"
+                    and not table.endswith("_publications")
+                ):
+                    copy(table)
+            if "snapshot_origin" in backup_tables:
+                version = backup.execute(
+                    "SELECT activity_derivation_version_id FROM snapshot_origin"
+                ).fetchone()
+                if version is None:
+                    raise StoreError("backup_integrity_conflict")
+                self._metadata.execute(
+                    "UPDATE activity_derivation_active SET version_id = ? WHERE singleton = 1",
+                    (str(version[0]),),
+                )
             payload_ids = {
                 str(row[0])
                 for table in ("data_review_decisions", "metadata_tombstones")
@@ -4752,6 +4946,42 @@ class LocalStore:
         self._metadata.execute(
             "UPDATE store_identity SET person_binding = 'bound' WHERE singleton = 1"
         )
+
+    def _bind_restored_snapshot(self, snapshot_id: SnapshotId, path: Path) -> None:
+        with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True) as backup:
+            tables = {
+                str(row[0])
+                for row in backup.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+            if "snapshot_origin" not in tables:
+                return
+            origin = backup.execute("SELECT source_snapshot_id FROM snapshot_origin").fetchone()
+            manifest = backup.execute(
+                "SELECT backup_id FROM backup_manifest WHERE singleton = 1"
+            ).fetchone()
+            if origin is None or manifest is None:
+                raise StoreError("backup_integrity_conflict")
+            binding_tables = {
+                "context": "manual_context_snapshot_bindings",
+                "medication_regime": "medication_snapshot_bindings",
+                "medication_deviation": "medication_deviation_snapshot_bindings",
+                "intake_reason_category": "intake_reason_category_snapshot_bindings",
+                "as_needed_intake": "as_needed_intake_snapshot_bindings",
+            }
+            for kind, revision_id in backup.execute(
+                "SELECT revision_kind, revision_id FROM manual_revision_bindings"
+            ):
+                table = binding_tables.get(str(kind))
+                if table is None:
+                    raise StoreError("backup_integrity_conflict")
+                self._metadata.execute(
+                    f'INSERT INTO "{table}" VALUES (?, ?)',
+                    (str(snapshot_id), str(revision_id)),
+                )
+            self._metadata.execute(
+                "INSERT INTO snapshot_restore_origins VALUES (?, ?, ?)",
+                (str(snapshot_id), str(manifest[0]), str(origin[0])),
+            )
 
     def _effective_manual_revision_ids(self) -> tuple[str, ...]:
         rows = self._metadata.execute(
@@ -4875,6 +5105,7 @@ class LocalStore:
         restored_rule_refs: tuple[tuple[str, str], ...],
         snapshot_as_of: datetime,
         context_timezone: str,
+        restore_overlay: Path | None,
     ) -> tuple[str, SourceResolution]:
         self._query.execute(
             """
@@ -5218,12 +5449,43 @@ class LocalStore:
             self._query.executemany(
                 "INSERT INTO open_review_cases VALUES (?, ?, ?, ?, ?, ?)", review_rows
             )
-        bound_manual_revision_ids = (
-            ()
-            if parent_snapshot_id is None
-            else self._bound_manual_revision_ids(parent_snapshot_id)
-        )
-        self._refresh_v03_derivations(snapshot_id, snapshot_as_of, bound_manual_revision_ids)
+        restored_metadata: sqlite3.Connection | None = None
+        if restore_overlay is not None:
+            restored_metadata = sqlite3.connect(
+                f"{restore_overlay.resolve().as_uri()}?mode=ro", uri=True
+            )
+            restored_tables = {
+                str(row[0])
+                for row in restored_metadata.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            bound_manual_revision_ids = (
+                tuple(
+                    str(row[0])
+                    for row in restored_metadata.execute(
+                        "SELECT revision_id FROM manual_revision_bindings ORDER BY revision_id"
+                    )
+                )
+                if "manual_revision_bindings" in restored_tables
+                else ()
+            )
+        else:
+            bound_manual_revision_ids = (
+                ()
+                if parent_snapshot_id is None
+                else self._bound_manual_revision_ids(parent_snapshot_id)
+            )
+        try:
+            self._refresh_v03_derivations(
+                snapshot_id,
+                snapshot_as_of,
+                bound_manual_revision_ids,
+                restored_metadata,
+            )
+        finally:
+            if restored_metadata is not None:
+                restored_metadata.close()
         self._refresh_derivation_lineage(snapshot_id, snapshot_as_of, bound_manual_revision_ids)
 
         entries: list[dict[str, int | str | list[str]]] = []
@@ -5327,6 +5589,7 @@ class LocalStore:
             manifest_sha256,
             additional_decision_refs=restored_decision_refs,
             additional_rule_refs=restored_rule_refs,
+            additional_manual_revision_ids=bound_manual_revision_ids,
         )
         return manifest_sha256, resolution
 
@@ -5479,9 +5742,9 @@ class LocalStore:
                 or manifest["parent_snapshot_id"] != parent_id
             ):
                 raise StoreError("Snapshot-Katalog und Manifest widersprechen sich.")
-            if schema_version >= 6 and manifest["snapshot_binding"][
-                "manual_revision_ids"
-            ] != list(self._bound_manual_revision_ids(SnapshotId(snapshot_id))):
+            if schema_version >= 6 and manifest["snapshot_binding"]["manual_revision_ids"] != list(
+                self._bound_manual_revision_ids(SnapshotId(snapshot_id))
+            ):
                 raise StoreError("Snapshot-Revisionsbindung ist nicht geschlossen.")
             if schema_version >= 6:
                 binding = manifest["snapshot_binding"]
@@ -5507,6 +5770,7 @@ class LocalStore:
         expected_store_id: str | None = None,
         additional_decision_refs: tuple[tuple[str, str], ...] = (),
         additional_rule_refs: tuple[tuple[str, str], ...] = (),
+        additional_manual_revision_ids: tuple[str, ...] = (),
     ) -> None:
         try:
             manifest_bytes = (directory / "manifest.json").read_bytes()
@@ -5580,16 +5844,8 @@ class LocalStore:
                 "resolution_basis",
                 "files",
                 "validation_counts",
-                *(
-                    ("derivation_contract_ids",)
-                    if snapshot_schema_version >= 5
-                    else ()
-                ),
-                *(
-                    ("snapshot_binding",)
-                    if snapshot_schema_version >= 6
-                    else ()
-                ),
+                *(("derivation_contract_ids",) if snapshot_schema_version >= 5 else ()),
+                *(("snapshot_binding",) if snapshot_schema_version >= 6 else ()),
             }
             or snapshot_schema_version not in range(1, _SNAPSHOT_SCHEMA_VERSION + 1)
             or manifest["snapshot_id"] != snapshot_id
@@ -5623,10 +5879,7 @@ class LocalStore:
                 manifest["snapshot_schema_version"] >= 6
                 and manifest.get("derivation_contract_ids") != list(_DERIVATION_CONTRACT_IDS)
             )
-            or (
-                manifest["snapshot_schema_version"] >= 6
-                and not binding_valid
-            )
+            or (manifest["snapshot_schema_version"] >= 6 and not binding_valid)
             or not isinstance(validation_counts, dict)
             or set(validation_counts)
             != {
@@ -5776,6 +6029,7 @@ class LocalStore:
                         tuple(manual_revision_ids),
                     ).fetchall()
                 }
+                known_manual_revision_ids.update(additional_manual_revision_ids)
                 if known_manual_revision_ids != set(manual_revision_ids):
                     raise StoreError("Snapshot-Revisionsreferenz ist nicht geschlossen.")
         snapshot_decisions = {
@@ -7673,7 +7927,9 @@ class LocalStore:
         snapshot_id: SnapshotId,
         snapshot_as_of: datetime,
         manual_revision_ids: tuple[str, ...],
+        metadata: sqlite3.Connection | None = None,
     ) -> None:
+        source = self._metadata if metadata is None else metadata
         self._query.execute(
             """
             CREATE OR REPLACE TEMP TABLE weight_nutrition_days AS
@@ -7698,14 +7954,14 @@ class LocalStore:
         context_revision_ids = tuple(
             revision_id
             for revision_id in manual_revision_ids
-            if self._metadata.execute(
+            if source.execute(
                 "SELECT 1 FROM manual_context_revisions WHERE revision_id = ?", (revision_id,)
             ).fetchone()
         )
         medication_revision_ids = tuple(
             revision_id
             for revision_id in manual_revision_ids
-            if self._metadata.execute(
+            if source.execute(
                 "SELECT 1 FROM medication_regime_revisions WHERE revision_id = ? UNION ALL "
                 "SELECT 1 FROM medication_deviation_revisions WHERE revision_id = ? UNION ALL "
                 "SELECT 1 FROM intake_reason_category_revisions WHERE revision_id = ? UNION ALL "
@@ -7713,10 +7969,10 @@ class LocalStore:
                 (revision_id,) * 4,
             ).fetchone()
         )
-        self._refresh_context_derivations(snapshot_as_of, context_revision_ids)
-        self._refresh_medication_derivations(snapshot_as_of, medication_revision_ids)
+        self._refresh_context_derivations(snapshot_as_of, context_revision_ids, source)
+        self._refresh_medication_derivations(snapshot_as_of, medication_revision_ids, source)
         self._refresh_sleep_derivations()
-        self._refresh_activity_derivations()
+        self._refresh_activity_derivations(source)
         self._query.execute(
             """
             CREATE OR REPLACE TEMP TABLE workout_features AS
@@ -7745,7 +8001,10 @@ class LocalStore:
             )
 
     def _refresh_context_derivations(
-        self, snapshot_as_of: datetime, revision_ids: tuple[str, ...]
+        self,
+        snapshot_as_of: datetime,
+        revision_ids: tuple[str, ...],
+        metadata: sqlite3.Connection,
     ) -> None:
         self._query.execute(
             """
@@ -7761,7 +8020,7 @@ class LocalStore:
         if not revision_ids:
             return
         placeholders = ",".join("?" for _ in revision_ids)
-        rows = self._metadata.execute(
+        rows = metadata.execute(
             "SELECT revision.logical_id, revision.revision_id, revision.object_kind, "
             "revision.state, COALESCE(period.start_date, stress.day, custom.start_date), "
             "COALESCE(period.end_date, custom.end_date), period.severity, stress.level, "
@@ -7773,7 +8032,7 @@ class LocalStore:
             f"WHERE revision.revision_id IN ({placeholders}) ORDER BY revision.rowid",
             revision_ids,
         ).fetchall()
-        coverage = self._metadata.execute(
+        coverage = metadata.execute(
             "SELECT revision.logical_id, revision.revision_id, value.start_date "
             "FROM manual_context_revisions revision "
             "JOIN context_coverage_start_values value USING (revision_id) "
@@ -7867,7 +8126,10 @@ class LocalStore:
             )
 
     def _refresh_medication_derivations(
-        self, snapshot_as_of: datetime, revision_ids: tuple[str, ...]
+        self,
+        snapshot_as_of: datetime,
+        revision_ids: tuple[str, ...],
+        metadata: sqlite3.Connection,
     ) -> None:
         self._query.execute(
             """
@@ -7884,7 +8146,7 @@ class LocalStore:
         if not revision_ids:
             return
         placeholders = ",".join("?" for _ in revision_ids)
-        regimes = self._metadata.execute(
+        regimes = metadata.execute(
             "SELECT revision.logical_id, revision.revision_id, value.starts_at, value.timezone "
             "FROM medication_regime_revisions revision "
             "JOIN medication_regime_values value USING (revision_id) "
@@ -7892,21 +8154,21 @@ class LocalStore:
             "ORDER BY value.starts_at, revision.rowid",
             revision_ids,
         ).fetchall()
-        deviations = self._metadata.execute(
+        deviations = metadata.execute(
             "SELECT revision.logical_id, revision.revision_id, value.regime_logical_id, "
             "value.scheduled_at FROM medication_deviation_revisions revision "
             "JOIN medication_deviation_values value USING (revision_id) "
             f"WHERE revision.revision_id IN ({placeholders}) AND revision.state = 'active'",
             revision_ids,
         ).fetchall()
-        as_needed = self._metadata.execute(
+        as_needed = metadata.execute(
             "SELECT revision.logical_id, revision.revision_id, value.taken_at "
             "FROM as_needed_intake_revisions revision "
             "JOIN as_needed_intake_values value USING (revision_id) "
             f"WHERE revision.revision_id IN ({placeholders}) AND revision.state = 'active'",
             revision_ids,
         ).fetchall()
-        categories = self._metadata.execute(
+        categories = metadata.execute(
             "SELECT logical_id, revision_id FROM intake_reason_category_revisions "
             f"WHERE revision_id IN ({placeholders}) AND state = 'active'",
             revision_ids,
@@ -7949,7 +8211,7 @@ class LocalStore:
             )
             scheduled_count = 0
             if regime is not None:
-                for local_time, weekdays in self._metadata.execute(
+                for local_time, weekdays in metadata.execute(
                     "SELECT local_time, weekdays FROM medication_scheduled_doses "
                     "WHERE revision_id = ?",
                     (regime[1],),
@@ -8122,7 +8384,7 @@ class LocalStore:
                 "INSERT INTO sleep_night_contributors VALUES (?, ?, ?)", night_contributors
             )
 
-    def _refresh_activity_derivations(self) -> None:
+    def _refresh_activity_derivations(self, metadata: sqlite3.Connection) -> None:
         rows = self._query.execute(
             """
             SELECT v.measurement_version_id, v.measurement_local_date, v.canonical_type,
@@ -8176,15 +8438,22 @@ class LocalStore:
                     merged.append((start, end))
             return tuple(merged)
 
+        metadata_tables = {
+            str(row[0])
+            for row in metadata.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
         version = (
-            self._metadata.execute(
+            metadata.execute(
                 "SELECT coverage_gap_minutes FROM activity_derivation_active "
                 "JOIN activity_derivation_versions USING (version_id) WHERE singleton = 1"
             ).fetchone()
-            if self._metadata.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-                "AND name = 'activity_derivation_active'"
+            if "activity_derivation_active" in metadata_tables
+            else metadata.execute(
+                "SELECT coverage_gap_minutes FROM snapshot_origin origin "
+                "JOIN activity_derivation_versions version "
+                "ON version.version_id = origin.activity_derivation_version_id"
             ).fetchone()
+            if "snapshot_origin" in metadata_tables
             else None
         )
         gap_minutes = 240 if version is None else int(version[0])
@@ -9432,6 +9701,7 @@ class LocalStore:
             "name": publication.name,
             "withdrawal_reason": publication.withdrawal_reason,
         }
+        payload_sha256 = _manual_payload_sha256(payload)
         try:
             with self._metadata:
                 self._metadata.execute(
@@ -9448,8 +9718,12 @@ class LocalStore:
                         str(publication.operation_id),
                         state,
                         created_at,
-                        hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(),
+                        payload_sha256,
                     ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO manual_revision_intents VALUES (?, ?, ?)",
+                    (str(revision_id), publication.intent, publication.withdrawal_reason),
                 )
                 self._metadata.execute(
                     "INSERT INTO intake_reason_category_values VALUES (?, ?, ?)",
@@ -9564,6 +9838,7 @@ class LocalStore:
             else str(publication.reason_category_logical_id),
             "withdrawal_reason": publication.withdrawal_reason,
         }
+        payload_sha256 = _manual_payload_sha256(payload)
         try:
             with self._metadata:
                 self._metadata.execute(
@@ -9580,8 +9855,12 @@ class LocalStore:
                         str(publication.operation_id),
                         state,
                         created_at,
-                        hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(),
+                        payload_sha256,
                     ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO manual_revision_intents VALUES (?, ?, ?)",
+                    (str(revision_id), publication.intent, publication.withdrawal_reason),
                 )
                 self._metadata.execute(
                     "INSERT INTO as_needed_intake_values VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -9695,6 +9974,7 @@ class LocalStore:
             ],
             "as_needed": publication.as_needed_medications,
         }
+        payload_sha256 = _manual_payload_sha256(payload)
         try:
             with self._metadata:
                 self._metadata.execute(
@@ -9710,8 +9990,12 @@ class LocalStore:
                         previous,
                         str(publication.operation_id),
                         created_at,
-                        hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(),
+                        payload_sha256,
                     ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO manual_revision_intents VALUES (?, ?, NULL)",
+                    (str(revision_id), publication.intent),
                 )
                 self._metadata.execute(
                     "INSERT INTO medication_regime_values VALUES (?, ?, ?)",
@@ -9852,6 +10136,7 @@ class LocalStore:
                 (item.isoformat(), amount) for item, amount in publication.actual_intakes
             ],
         }
+        payload_sha256 = _manual_payload_sha256(payload)
         try:
             with self._metadata:
                 self._metadata.execute(
@@ -9868,8 +10153,12 @@ class LocalStore:
                         str(publication.operation_id),
                         state,
                         created_at,
-                        hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(),
+                        payload_sha256,
                     ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO manual_revision_intents VALUES (?, ?, ?)",
+                    (str(revision_id), publication.intent, publication.withdrawal_reason),
                 )
                 self._metadata.execute(
                     "INSERT INTO medication_deviation_values VALUES (?, ?, ?, ?)",
@@ -10174,18 +10463,14 @@ class LocalStore:
         revision_id = ContextRevisionId(uuid4().hex)
         snapshot_id = SnapshotId(uuid4().hex)
         created_at = datetime.now(UTC).isoformat()
-        payload_sha256 = hashlib.sha256(
-            json.dumps(
-                {
-                    "intent": intent,
-                    "logical_id": str(logical_id),
-                    "start_date": None if start_date is None else start_date.isoformat(),
-                    "withdrawal_reason": withdrawal_reason,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest()
+        payload_sha256 = _manual_payload_sha256(
+            {
+                "intent": intent,
+                "logical_id": str(logical_id),
+                "start_date": None if start_date is None else start_date.isoformat(),
+                "withdrawal_reason": withdrawal_reason,
+            }
+        )
         try:
             with self._metadata:
                 self._metadata.execute(
@@ -10205,6 +10490,10 @@ class LocalStore:
                         created_at,
                         payload_sha256,
                     ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO manual_revision_intents VALUES (?, ?, ?)",
+                    (str(revision_id), intent, withdrawal_reason),
                 )
                 if start_date is not None:
                     self._metadata.execute(
@@ -10302,30 +10591,26 @@ class LocalStore:
         revision_id = ContextRevisionId(uuid4().hex)
         snapshot_id = SnapshotId(uuid4().hex)
         created_at = datetime.now(UTC).isoformat()
-        payload_sha256 = hashlib.sha256(
-            json.dumps(
-                {
-                    "intent": publication.intent,
-                    "kind": publication.object_kind,
-                    "name": publication.name,
-                    "category": None
-                    if publication.category_logical_id is None
-                    else str(publication.category_logical_id),
-                    "start": None
-                    if publication.start_date is None
-                    else publication.start_date.isoformat(),
-                    "end": None
-                    if publication.end_date is None
-                    else publication.end_date.isoformat(),
-                    "severity": publication.severity,
-                    "stress": publication.stress_level,
-                    "note": publication.note,
-                    "reason": publication.withdrawal_reason,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest()
+        payload_sha256 = _manual_payload_sha256(
+            {
+                "intent": publication.intent,
+                "kind": publication.object_kind,
+                "name": publication.name,
+                "category": None
+                if publication.category_logical_id is None
+                else str(publication.category_logical_id),
+                "start": None
+                if publication.start_date is None
+                else publication.start_date.isoformat(),
+                "end": None
+                if publication.end_date is None
+                else publication.end_date.isoformat(),
+                "severity": publication.severity,
+                "stress": publication.stress_level,
+                "note": publication.note,
+                "reason": publication.withdrawal_reason,
+            }
+        )
         try:
             with self._metadata:
                 self._metadata.execute(
@@ -10348,6 +10633,14 @@ class LocalStore:
                         str(publication.operation_id),
                         created_at,
                         payload_sha256,
+                    ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO manual_revision_intents VALUES (?, ?, ?)",
+                    (
+                        str(revision_id),
+                        publication.intent,
+                        publication.withdrawal_reason,
                     ),
                 )
                 if state == "active" and publication.object_kind == "illness_category":
@@ -11041,11 +11334,7 @@ class LocalStore:
         try:
             manifest = json.loads(
                 (
-                    self._root
-                    / _PARQUET_DIRECTORY
-                    / "snapshots"
-                    / str(active)
-                    / "manifest.json"
+                    self._root / _PARQUET_DIRECTORY / "snapshots" / str(active) / "manifest.json"
                 ).read_bytes()
             )
             binding = manifest.get("snapshot_binding")

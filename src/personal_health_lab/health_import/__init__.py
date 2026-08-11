@@ -826,7 +826,7 @@ def inspect_restore_health_export(
         max_uncompressed_bytes=max_uncompressed_bytes,
         max_compression_ratio=max_compression_ratio,
     )
-    sources = inspect_restore_sources(store, target_root, records)
+    sources = inspect_restore_sources(store, target_root, records, sleep_intervals, workouts)
     estimate = HealthExportEstimate(
         max(input_bytes, 1), len(records) + len(sleep_intervals) + len(workouts)
     )
@@ -879,7 +879,9 @@ def _import_restore_health_export(
             max_uncompressed_bytes=max_uncompressed_bytes,
             max_compression_ratio=max_compression_ratio,
         )
-        inspection = inspect_restore_sources(store, target_root, records)
+        inspection = inspect_restore_sources(
+            store, target_root, records, sleep_intervals, workouts
+        )
     except (_RejectedPackage, OSError, BadZipFile, NotImplementedError):
         return HealthImportResult(
             operation_id,
@@ -920,12 +922,32 @@ def _import_restore_health_export(
             diagnostics=("restore_sources_pending",),
         )
 
-    selected_records = select_restore_source_versions(store, target_root, records)
+    selected_records, selected_sleep, selected_workouts = select_restore_source_versions(
+        store, target_root, records, sleep_intervals, workouts
+    )
     selected_version_ids = {
         str(original.measurement_version_id): selected.measurement_version_id
-        for original, selected in zip(records, selected_records, strict=True)
+        for original in records
+        for selected in selected_records
+        if original.logical_measurement_id == selected.logical_measurement_id
+        and selected.measurement_version_id
+        in {
+            original.measurement_version_id,
+            original.legacy_measurement_version_id,
+        }
     }
-    records = selected_records
+    records, sleep_intervals, workouts = selected_records, selected_sleep, selected_workouts
+    selected_export_ids = {
+        export.export_id
+        for export in exports
+        if any(
+            str(item.measurement_version_id) in selected_version_ids
+            for item in export.records
+        )
+        or any(item in selected_sleep for item in export.sleep_intervals)
+        or any(item in selected_workouts for item in export.workouts)
+    }
+    exports = tuple(export for export in exports if export.export_id in selected_export_ids)
     restore_exports = tuple(
         (
             item_export_id,
@@ -939,9 +961,11 @@ def _import_restore_health_export(
                     ),
                 )
                 for record in item_records
+                if str(record.measurement_version_id) in selected_version_ids
             ),
         )
         for item_export_id, item_export_date, item_package_hash, item_records in restore_exports
+        if item_export_id in selected_export_ids
     )
 
     session = store.load_restore_session()

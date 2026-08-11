@@ -830,3 +830,57 @@ expected_result = "shared migration steps, backup, capacity, and confirmation UI
 expected_effect = "one application-owned migration execution"
 forbidden_side_effects = "no unrelated page access or UI-owned migration state"
 evidence = ["positive", "parity"]
+
+[[contract]]
+id = "V03-C-METADATA-BACKUP-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/85"
+statement = "A V0.3 metadata-only backup positively lists every revision ledger, catalog, audit event, contract binding, cutoff, source reference, and content hash while excluding health data and operational artifacts."
+evidence = ["positive", "negative", "reproducibility"]
+
+[[contract]]
+id = "V03-C-METADATA-RESTORE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/85"
+statement = "A two-phase restore validates manifest counts, references, identifiers, chains, and hashes before deterministically rebuilding one new physical snapshot in an empty real store with stable logical revisions and explicit source-snapshot provenance."
+evidence = ["positive", "negative", "transition", "reproducibility"]
+
+[[case]]
+id = "V03-A-METADATA-BACKUP-V1"
+contracts = ["V03-C-METADATA-BACKUP-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v02_metadata_backup.py::test_metadata_backup_is_one_redacted_portable_sqlite_file"
+initial_state = "empty real store with the complete V0.3 metadata schema"
+operation = "create a metadata backup through HealthLab and inspect its manifest and closed table set"
+level = "application"
+platform = "all"
+expected_result = "one portable SQLite file with canonical hash and exact row counts for every positively listed metadata table"
+expected_effect = "none"
+forbidden_side_effects = "no health rows, Parquet, analyses, pointers, caches, logs, staging data, paths, or secrets"
+evidence = ["positive", "negative", "reproducibility"]
+
+[[case]]
+id = "V03-A-METADATA-RESTORE-V1"
+contracts = ["V03-C-METADATA-BACKUP-V1", "V03-C-METADATA-RESTORE-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v02_metadata_restore.py::test_v03_restore_preserves_manual_revisions_and_rebinds_one_new_snapshot"
+initial_state = "backup from a real store with one imported snapshot and active context and medication-category revisions"
+operation = "begin restore into a new empty real store and reconstruct the source data through the normal import seam"
+level = "application"
+platform = "all"
+expected_result = "stable logical and revision identities bind to one new physical snapshot with the original cutoffs and source-snapshot provenance"
+expected_effect = "the restore stays pending until reconstruction completes, then activates exactly one complete snapshot"
+forbidden_side_effects = "no heuristic relinking, source snapshot reuse, overlay on an existing store, or partial activation"
+evidence = ["positive", "transition", "reproducibility"]
+
+[[case]]
+id = "V03-A-METADATA-RESTORE-REJECTION-V1"
+contracts = ["V03-C-METADATA-RESTORE-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v02_metadata_restore.py::test_v03_restore_rejects_broken_manual_revision_binding"
+initial_state = "metadata backup whose canonical hash is recomputed after replacing a bound revision identity"
+operation = "preview the first restore phase"
+level = "application"
+platform = "all"
+expected_result = "backup_integrity_conflict"
+expected_effect = "the new real store remains ready and no restore session activates"
+forbidden_side_effects = "no best-effort chain repair, missing revision fabrication, or partial snapshot"
+evidence = ["negative"]
