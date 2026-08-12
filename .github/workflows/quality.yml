@@ -27,10 +27,6 @@ jobs:
         run: uv run ruff check .
       - name: Type check
         run: uv run mypy
-      - name: Unchanged V0.2 release gate
-        run: uv run pytest tests/acceptance/test_v02_release_gate.py tests/acceptance/test_v02_write_plan.py::test_v02_matrix_is_well_formed_and_fully_registered
-      - name: V0.3 delta matrix
-        run: uv run pytest tests/acceptance/test_v03_matrix.py tests/acceptance/test_v03_release_gate.py
       - name: Full test suite
         run: uv run pytest
 

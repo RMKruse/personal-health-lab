@@ -465,35 +465,6 @@ def test_snapshot_duplicate_key_blocks_open(tmp_path: Path) -> None:
         pass
 
 
-def test_snapshot_validation_rejects_every_closed_contract_violation(tmp_path: Path) -> None:
-    for filename in PARQUET_FILES:
-        for corruption in ("hash", "row_count", "schema"):
-            case = tmp_path / f"{filename}-{corruption}"
-            case.mkdir()
-            test_each_snapshot_file_rejects_hash_schema_and_row_count_corruption(
-                filename, corruption, case
-            )
-    for index, (filename, replacement) in enumerate(
-        (
-            ("source_occurrences.parquet", "NULL::VARCHAR AS occurrence_id"),
-            ("measurement_versions.parquet", "'kg'::VARCHAR AS canonical_unit"),
-            ("measurement_versions.parquet", "'Infinity'::DOUBLE AS canonical_value"),
-            ("resolved_measurements.parquet", "'none'::VARCHAR AS effective_value_source"),
-        )
-    ):
-        case = tmp_path / f"payload-{index}"
-        case.mkdir()
-        test_snapshot_payload_constraint_violation_blocks_open(filename, replacement, case)
-    for name, test in (
-        ("id-closure", test_active_snapshot_with_unclosed_measurement_reference_blocks_open),
-        ("uniqueness", test_snapshot_duplicate_key_blocks_open),
-        ("review-xor", test_open_review_case_xor_violation_blocks_open),
-    ):
-        case = tmp_path / name
-        case.mkdir()
-        test(case)
-
-
 def test_open_review_case_xor_violation_blocks_open(tmp_path: Path) -> None:
     config = _config(tmp_path)
     snapshot = _publish_snapshot(config, _package(tmp_path / "health.zip"))

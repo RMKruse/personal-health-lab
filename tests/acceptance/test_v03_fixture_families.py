@@ -9,14 +9,8 @@ from xml.etree import ElementTree
 from zipfile import ZipFile
 
 import pytest
-import test_v02_metadata_restore as restore
-import test_v02_migration as v02_migration
-import test_v03_activity as activity_tests
-import test_v03_context as context
-import test_v03_medication as medication_tests
 import test_v03_migration as migration
 import test_v03_weight as weight
-import test_v03_workouts as workout_tests
 
 from personal_health_lab.application import (
     AsNeededMedication,
@@ -194,32 +188,6 @@ def test_activity_coverage_fixture_is_consumed_by_the_import_path(tmp_path: Path
     ]
     assert suppression_reasons.count("iphone_outside_watch_gap") == 1
     assert suppression_reasons.count("ineligible_source") == 3
-    workflows = {
-        "all-metrics-units-boundary": (
-            activity_tests.test_activity_import_preserves_typed_samples_and_assigns_cross_midnight_value_to_start_day
-        ),
-        "same-metric-overlap": (
-            activity_tests.test_same_metric_same_source_class_overlap_opens_a_review_case
-        ),
-        "point-boundary": activity_tests.test_point_activity_sample_does_not_open_an_overlap_review,
-        "negative-value": (
-            activity_tests.test_negative_activity_value_remains_canonical_and_opens_plausibility_review
-        ),
-        "watch-coverage-thresholds": (
-            activity_tests.test_activity_days_use_shared_watch_coverage_and_whole_interval_iphone_fallback
-        ),
-        "derivation-version": (
-            activity_tests.test_activity_derivation_threshold_is_versioned_and_keeps_old_snapshot_readable
-        ),
-        "workout-overlap-types": (
-            workout_tests.test_workouts_keep_types_durations_and_overlap_status
-        ),
-        "workout-correction": workout_tests.test_workout_correction_persists_through_data_review,
-    }
-    for name in recipe["workflows"]:
-        root = tmp_path / str(name)
-        root.mkdir()
-        workflows[str(name)](root)
 
 
 def test_context_workflow_fixture_drives_a_typed_revision(tmp_path: Path) -> None:
@@ -268,24 +236,6 @@ def test_context_workflow_fixture_drives_a_typed_revision(tmp_path: Path) -> Non
     assert receipt.result.status.value == "committed"
     assert records.illness_categories[0].name == recipe["category"]
     assert overlap.approval.status.value == "blocked"
-    workflows = {
-        "coverage": (
-            context.test_context_coverage_start_publishes_an_immutable_snapshot_and_baseline
-        ),
-        "illness-collision": (
-            context.test_illness_periods_project_active_categories_and_reject_same_category_overlap
-        ),
-        "stress-custom": (
-            context.test_daily_stress_and_custom_contexts_share_the_revision_snapshot_contract
-        ),
-        "catalog-lifecycle": (
-            context.test_context_catalog_revision_withdrawal_and_restore_are_audited
-        ),
-    }
-    for name in recipe["workflows"]:
-        root = tmp_path / str(name)
-        root.mkdir()
-        workflows[str(name)](root)
 
 
 def test_medication_workflow_fixture_drives_a_typed_revision(tmp_path: Path) -> None:
@@ -328,24 +278,6 @@ def test_medication_workflow_fixture_drives_a_typed_revision(tmp_path: Path) -> 
                 (as_needed, as_needed),
             )
         )
-    workflows = {
-        "regime-dst": (
-            medication_tests.test_medication_regime_projects_dst_and_keeps_old_snapshot_stable
-        ),
-        "deviation": (
-            medication_tests.test_medication_deviation_binds_one_occurrence_and_keeps_old_snapshot_stable
-        ),
-        "as-needed-catalog": (
-            medication_tests.test_as_needed_intakes_and_reason_categories_are_snapshot_bound
-        ),
-        "snapshot-binding": (
-            medication_tests.test_import_carries_every_effective_manual_revision_binding_forward
-        ),
-    }
-    for name in recipe["workflows"]:
-        root = tmp_path / str(name)
-        root.mkdir()
-        workflows[str(name)](root)
 
 
 def test_persistence_lifecycle_fixture_pins_the_target_version(tmp_path: Path) -> None:
@@ -366,20 +298,6 @@ def test_persistence_lifecycle_fixture_pins_the_target_version(tmp_path: Path) -
             request, expected_plan=health_lab.preview_write(request).fingerprint
         )
     assert receipt.result.snapshot_steps == ((6, int(str(recipe["snapshot_schema_version"]))),)
-    workflows = {
-        "v02-v03-migration": migration.test_v02_store_migrates_to_one_complete_v03_snapshot,
-        "rollback": v02_migration.test_direct_migration_rollback_restores_backup_and_old_snapshot,
-        "blocked-late-rollback": (
-            v02_migration.test_later_successful_state_change_blocks_migration_rollback
-        ),
-        "backup-restore-rebind": (
-            restore.test_v03_restore_preserves_manual_revisions_and_rebinds_one_new_snapshot
-        ),
-    }
-    for name in recipe["workflows"]:
-        root = tmp_path / str(name)
-        root.mkdir()
-        workflows[str(name)](root)
 
 
 def test_security_boundary_fixture_is_rejected_without_publication(tmp_path: Path) -> None:

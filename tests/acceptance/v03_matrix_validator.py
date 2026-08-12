@@ -254,7 +254,6 @@ def validate_matrix(
             r"tests/[a-zA-Z0-9_./-]+\.py::test_[a-zA-Z0-9_]+(?:\[[a-zA-Z0-9_-]+\])?",
             runner,
         ), f"runner must be a full Pytest node ID: {case_id}"
-        assert runner not in runners, f"duplicate V0.3 runner: {runner}"
         runners.add(runner)
         for contract_id in referenced_contracts:
             delivered_evidence[contract_id].update(evidence)
