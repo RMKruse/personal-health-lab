@@ -91,10 +91,13 @@ def test_public_application_values_are_immutable_and_storage_neutral() -> None:
     projection_methods = (
         "load_data_review",
         "load_data_review_case",
+        "load_activity_days",
         "load_migration_diagnostics",
         "load_overview",
         "load_plausibility_rules",
         "load_recovery_status",
+        "load_sleep_days",
+        "load_workouts",
         "load_workspace_status",
     )
     request_values = set(get_args(WriteRequest))

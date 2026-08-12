@@ -4,21 +4,30 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import shutil
 import stat
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Literal, cast
 from uuid import uuid4
 from xml.etree.ElementTree import ParseError, iterparse
 from zipfile import BadZipFile, ZipFile, is_zipfile
 
-from personal_health_lab.data_quality import resolve_sources, select_governing_export
+from personal_health_lab.data_quality import (
+    resolve_sources,
+    resolve_workouts,
+    select_governing_export,
+)
 from personal_health_lab.health_data import (
     CanonicalHealthRecord,
     CanonicalHealthType,
+    CanonicalSleepCategory,
+    CanonicalSleepInterval,
     CanonicalUnit,
+    CanonicalWorkout,
     HealthProvenance,
     LogicalMeasurementId,
     MeasurementVersionId,
@@ -30,6 +39,7 @@ from personal_health_lab.recovery import (
     load_restore_working_copy,
     preflight_restore_source_import,
     restore_source_resolver,
+    select_restore_source_versions,
     stage_restore_source_package,
 )
 from personal_health_lab.storage import (
@@ -40,21 +50,154 @@ from personal_health_lab.storage import (
     OperationId,
     SnapshotId,
     StoreError,
+    UnsupportedContentCategory,
+    UnsupportedImportContent,
 )
 
 _EXPORT_MEMBER = "apple_health_export/export.xml"
 _ACTIVE_ENERGY = "HKQuantityTypeIdentifierActiveEnergyBurned"
+_APPLE_EXERCISE_TIME = "HKQuantityTypeIdentifierAppleExerciseTime"
 _RESTING_HEART_RATE = "HKQuantityTypeIdentifierRestingHeartRate"
-_IDENTITY_RULE_VERSION = "healthkit-natural/v2"
+_BODY_MASS = "HKQuantityTypeIdentifierBodyMass"
+_STEP_COUNT = "HKQuantityTypeIdentifierStepCount"
+_WALKING_RUNNING_DISTANCE = "HKQuantityTypeIdentifierDistanceWalkingRunning"
+_LOGICAL_IDENTITY_RULE_VERSION = "healthkit-natural/v2"
+_PAYLOAD_IDENTITY_RULE_VERSION = "healthkit-payload/v2"
 _SYNC_IDENTIFIER = "HKMetadataKeySyncIdentifier"
-_MAPPINGS = {
-    _ACTIVE_ENERGY: (CanonicalHealthType.ACTIVE_ENERGY, CanonicalUnit.KILOCALORIE, "kcal"),
+_MAPPINGS: dict[str, tuple[CanonicalHealthType, CanonicalUnit, dict[str, float]]] = {
+    _ACTIVE_ENERGY: (
+        CanonicalHealthType.ACTIVE_ENERGY,
+        CanonicalUnit.KILOCALORIE,
+        {"kcal": 1.0},
+    ),
+    _APPLE_EXERCISE_TIME: (
+        CanonicalHealthType.APPLE_EXERCISE_TIME,
+        CanonicalUnit.MINUTE,
+        {"min": 1.0, "s": 1 / 60},
+    ),
     _RESTING_HEART_RATE: (
         CanonicalHealthType.APPLE_RESTING_HEART_RATE,
         CanonicalUnit.BEATS_PER_MINUTE,
-        "count/min",
+        {"count/min": 1.0},
+    ),
+    _BODY_MASS: (
+        CanonicalHealthType.BODY_MASS,
+        CanonicalUnit.KILOGRAM,
+        {"kg": 1.0, "g": 0.001, "lb": 0.45359237},
+    ),
+    _STEP_COUNT: (CanonicalHealthType.STEP_COUNT, CanonicalUnit.COUNT, {"count": 1.0}),
+    _WALKING_RUNNING_DISTANCE: (
+        CanonicalHealthType.WALKING_RUNNING_DISTANCE,
+        CanonicalUnit.KILOMETER,
+        {"m": 0.001, "km": 1.0, "mi": 1.609344},
     ),
 }
+_SLEEP_TYPE = "HKCategoryTypeIdentifierSleepAnalysis"
+_SLEEP_VALUES = {
+    "HKCategoryValueSleepAnalysisInBed",
+    "HKCategoryValueSleepAnalysisAwake",
+    "HKCategoryValueSleepAnalysisAsleep",
+    "HKCategoryValueSleepAnalysisAsleepUnspecified",
+    "HKCategoryValueSleepAnalysisAsleepCore",
+    "HKCategoryValueSleepAnalysisAsleepDeep",
+    "HKCategoryValueSleepAnalysisAsleepREM",
+}
+_SLEEP_CATEGORIES = {
+    "HKCategoryValueSleepAnalysisInBed": CanonicalSleepCategory.IN_BED,
+    "HKCategoryValueSleepAnalysisAwake": CanonicalSleepCategory.AWAKE,
+    "HKCategoryValueSleepAnalysisAsleep": CanonicalSleepCategory.ASLEEP_UNSPECIFIED,
+    "HKCategoryValueSleepAnalysisAsleepUnspecified": CanonicalSleepCategory.ASLEEP_UNSPECIFIED,
+    "HKCategoryValueSleepAnalysisAsleepCore": CanonicalSleepCategory.ASLEEP_CORE,
+    "HKCategoryValueSleepAnalysisAsleepDeep": CanonicalSleepCategory.ASLEEP_DEEP,
+    "HKCategoryValueSleepAnalysisAsleepREM": CanonicalSleepCategory.ASLEEP_REM,
+}
+_DIETARY_TYPES = {
+    "HKQuantityTypeIdentifierDietaryBiotin": CanonicalHealthType.DIETARY_BIOTIN,
+    "HKQuantityTypeIdentifierDietaryCaffeine": CanonicalHealthType.DIETARY_CAFFEINE,
+    "HKQuantityTypeIdentifierDietaryCalcium": CanonicalHealthType.DIETARY_CALCIUM,
+    "HKQuantityTypeIdentifierDietaryCarbohydrates": CanonicalHealthType.DIETARY_CARBOHYDRATES,
+    "HKQuantityTypeIdentifierDietaryChloride": CanonicalHealthType.DIETARY_CHLORIDE,
+    "HKQuantityTypeIdentifierDietaryCholesterol": CanonicalHealthType.DIETARY_CHOLESTEROL,
+    "HKQuantityTypeIdentifierDietaryChromium": CanonicalHealthType.DIETARY_CHROMIUM,
+    "HKQuantityTypeIdentifierDietaryCopper": CanonicalHealthType.DIETARY_COPPER,
+    "HKQuantityTypeIdentifierDietaryEnergyConsumed": (CanonicalHealthType.DIETARY_ENERGY_CONSUMED),
+    "HKQuantityTypeIdentifierDietaryFatMonounsaturated": (
+        CanonicalHealthType.DIETARY_FAT_MONOUNSATURATED
+    ),
+    "HKQuantityTypeIdentifierDietaryFatPolyunsaturated": (
+        CanonicalHealthType.DIETARY_FAT_POLYUNSATURATED
+    ),
+    "HKQuantityTypeIdentifierDietaryFatSaturated": CanonicalHealthType.DIETARY_FAT_SATURATED,
+    "HKQuantityTypeIdentifierDietaryFatTotal": CanonicalHealthType.DIETARY_FAT_TOTAL,
+    "HKQuantityTypeIdentifierDietaryFiber": CanonicalHealthType.DIETARY_FIBER,
+    "HKQuantityTypeIdentifierDietaryFolate": CanonicalHealthType.DIETARY_FOLATE,
+    "HKQuantityTypeIdentifierDietaryIodine": CanonicalHealthType.DIETARY_IODINE,
+    "HKQuantityTypeIdentifierDietaryIron": CanonicalHealthType.DIETARY_IRON,
+    "HKQuantityTypeIdentifierDietaryMagnesium": CanonicalHealthType.DIETARY_MAGNESIUM,
+    "HKQuantityTypeIdentifierDietaryManganese": CanonicalHealthType.DIETARY_MANGANESE,
+    "HKQuantityTypeIdentifierDietaryMolybdenum": CanonicalHealthType.DIETARY_MOLYBDENUM,
+    "HKQuantityTypeIdentifierDietaryNiacin": CanonicalHealthType.DIETARY_NIACIN,
+    "HKQuantityTypeIdentifierDietaryPantothenicAcid": (
+        CanonicalHealthType.DIETARY_PANTOTHENIC_ACID
+    ),
+    "HKQuantityTypeIdentifierDietaryPhosphorus": CanonicalHealthType.DIETARY_PHOSPHORUS,
+    "HKQuantityTypeIdentifierDietaryPotassium": CanonicalHealthType.DIETARY_POTASSIUM,
+    "HKQuantityTypeIdentifierDietaryProtein": CanonicalHealthType.DIETARY_PROTEIN,
+    "HKQuantityTypeIdentifierDietaryRiboflavin": CanonicalHealthType.DIETARY_RIBOFLAVIN,
+    "HKQuantityTypeIdentifierDietarySelenium": CanonicalHealthType.DIETARY_SELENIUM,
+    "HKQuantityTypeIdentifierDietarySodium": CanonicalHealthType.DIETARY_SODIUM,
+    "HKQuantityTypeIdentifierDietarySugar": CanonicalHealthType.DIETARY_SUGAR,
+    "HKQuantityTypeIdentifierDietaryThiamin": CanonicalHealthType.DIETARY_THIAMIN,
+    "HKQuantityTypeIdentifierDietaryVitaminA": CanonicalHealthType.DIETARY_VITAMIN_A,
+    "HKQuantityTypeIdentifierDietaryVitaminB12": CanonicalHealthType.DIETARY_VITAMIN_B12,
+    "HKQuantityTypeIdentifierDietaryVitaminB6": CanonicalHealthType.DIETARY_VITAMIN_B6,
+    "HKQuantityTypeIdentifierDietaryVitaminC": CanonicalHealthType.DIETARY_VITAMIN_C,
+    "HKQuantityTypeIdentifierDietaryVitaminD": CanonicalHealthType.DIETARY_VITAMIN_D,
+    "HKQuantityTypeIdentifierDietaryVitaminE": CanonicalHealthType.DIETARY_VITAMIN_E,
+    "HKQuantityTypeIdentifierDietaryVitaminK": CanonicalHealthType.DIETARY_VITAMIN_K,
+    "HKQuantityTypeIdentifierDietaryWater": CanonicalHealthType.DIETARY_WATER,
+    "HKQuantityTypeIdentifierDietaryZinc": CanonicalHealthType.DIETARY_ZINC,
+}
+_V03_UNITS = {
+    "HKQuantityTypeIdentifierBodyMass": frozenset({"kg", "g", "lb"}),
+    _APPLE_EXERCISE_TIME: frozenset({"min", "s"}),
+    _STEP_COUNT: frozenset({"count"}),
+    _WALKING_RUNNING_DISTANCE: frozenset({"m", "km", "mi"}),
+    _ACTIVE_ENERGY: frozenset({"kcal"}),
+    _RESTING_HEART_RATE: frozenset({"count/min"}),
+    **{
+        source_type: (
+            frozenset({"kcal", "kJ"})
+            if source_type.endswith("EnergyConsumed")
+            else frozenset({"mL", "L"})
+            if source_type.endswith("Water")
+            else frozenset({"mcg", "mg", "g"})
+        )
+        for source_type in _DIETARY_TYPES
+    },
+}
+_MAPPINGS.update(
+    {
+        source_type: (
+            data_type,
+            CanonicalUnit.KILOCALORIE,
+            {"kcal": 1.0, "kJ": 1 / 4.184},
+        )
+        if data_type is CanonicalHealthType.DIETARY_ENERGY_CONSUMED
+        else (
+            data_type,
+            CanonicalUnit.MILLILITER,
+            {"mL": 1.0, "L": 1000.0},
+        )
+        if data_type is CanonicalHealthType.DIETARY_WATER
+        else (
+            data_type,
+            CanonicalUnit.GRAM,
+            {"mcg": 0.000001, "mg": 0.001, "g": 1.0},
+        )
+        for source_type, data_type in _DIETARY_TYPES.items()
+    }
+)
 
 
 class HealthImportError(Exception):
@@ -69,9 +212,7 @@ class _RejectedPackage(ValueError):
 class HealthImportResult:
     operation_id: OperationId
     import_id: ImportId
-    status: Literal[
-        "committed", "duplicate", "quarantined", "rejected", "restore_pending"
-    ]
+    status: Literal["committed", "duplicate", "quarantined", "rejected", "restore_pending"]
     package_hash: str
     snapshot_id: SnapshotId | None
     record_count: int
@@ -101,7 +242,10 @@ class _ParsedExport:
     export_id: str
     export_date: datetime | None
     records: tuple[CanonicalHealthRecord, ...]
+    sleep_intervals: tuple[CanonicalSleepInterval, ...] = ()
+    workouts: tuple[CanonicalWorkout, ...] = ()
     unknown_source_types: tuple[str, ...] = ()
+    unsupported_content: tuple[UnsupportedImportContent, ...] = ()
 
 
 def _source_datetime(value: str) -> datetime:
@@ -113,6 +257,46 @@ def _source_datetime(value: str) -> datetime:
 
 def _id(*parts: object) -> str:
     return hashlib.sha256("\x1f".join(map(str, parts)).encode()).hexdigest()
+
+
+def _measurement_version_ids(
+    logical_id: LogicalMeasurementId,
+    *,
+    data_type: CanonicalHealthType,
+    source_unit: str,
+    original_value: float,
+    source_start: datetime,
+    source_end: datetime,
+    source_updated_at: datetime,
+    source_name: str,
+    source_version: str,
+    device: str,
+) -> tuple[MeasurementVersionId, MeasurementVersionId]:
+    legacy_payload = _id(
+        data_type.value,
+        source_unit,
+        original_value,
+        source_start.isoformat(),
+        source_end.isoformat(),
+        source_name,
+        device,
+    )
+    current_payload = _id(
+        _PAYLOAD_IDENTITY_RULE_VERSION,
+        data_type.value,
+        source_unit,
+        original_value,
+        source_start.isoformat(),
+        source_end.isoformat(),
+        source_updated_at.isoformat(),
+        source_name,
+        source_version,
+        device,
+    )
+    return (
+        MeasurementVersionId(_id(_PAYLOAD_IDENTITY_RULE_VERSION, logical_id, current_payload)),
+        MeasurementVersionId(_id(_LOGICAL_IDENTITY_RULE_VERSION, logical_id, legacy_payload)),
+    )
 
 
 def _records(
@@ -129,7 +313,10 @@ def _records(
     if package_path.stat().st_size > max_package_bytes:
         raise _RejectedPackage("package too large")
     records: list[CanonicalHealthRecord] = []
+    sleep_intervals: list[CanonicalSleepInterval] = []
+    workouts: list[CanonicalWorkout] = []
     unknown_source_types: set[str] = set()
+    unsupported: Counter[tuple[str, str]] = Counter()
     with ZipFile(package_path) as archive:
         entries = archive.infolist()
         if len(entries) > max_entries:
@@ -172,31 +359,52 @@ def _records(
         with archive.open(_EXPORT_MEMBER) as source:
             root_seen = False
             export_date = None
+            tags: list[str] = []
             for event, element in iterparse(source, events=("start", "end")):
-                if not root_seen:
-                    if event != "start" or element.tag != "HealthData":
+                if event == "start":
+                    if not root_seen and element.tag != "HealthData":
                         raise ValueError("invalid root")
                     root_seen = True
-                if event == "end" and element.tag == "ExportDate":
+                    tags.append(element.tag)
+                    continue
+                parent = tags[-2] if len(tags) > 1 else None
+                if parent == "HealthData" and element.tag == "ExportDate":
                     if export_date is not None:
                         raise ValueError("duplicate export date")
                     export_date = _source_datetime(element.attrib["value"])
                     element.clear()
-                    continue
-                if event != "end" or element.tag != "Record":
-                    continue
-                mapping = _MAPPINGS.get(element.attrib.get("type", ""))
-                if mapping is not None:
-                    data_type, canonical_unit, source_unit = mapping
-                    if element.attrib.get("unit") != source_unit:
-                        raise ValueError("unsupported unit")
-                    value = float(element.attrib["value"])
+                elif parent == "Workout" and element.tag != "MetadataEntry":
+                    unsupported["workout_child", element.tag] += 1
+                elif parent == "HealthData" and element.tag == "Workout":
+                    attrs = element.attrib
+                    if (
+                        not {
+                            "workoutActivityType",
+                            "startDate",
+                            "endDate",
+                            "creationDate",
+                            "sourceName",
+                        }
+                        <= attrs.keys()
+                    ):
+                        unsupported[
+                            "workout_activity_type", attrs.get("workoutActivityType", "")
+                        ] += 1
+                        element.clear()
+                        tags.pop()
+                        continue
                     source_start = _source_datetime(element.attrib["startDate"])
                     source_end = _source_datetime(element.attrib["endDate"])
                     source_updated_at = _source_datetime(element.attrib["creationDate"])
                     source_name = element.attrib["sourceName"]
                     source_version = element.attrib.get("sourceVersion", "")
                     device = element.attrib.get("device", "")
+                    activity_type = element.attrib.get("workoutActivityType", "")
+                    if not activity_type:
+                        unsupported["workout_activity_type", ""] += 1
+                        element.clear()
+                        tags.pop()
+                        continue
                     sync_id = next(
                         (
                             child.attrib.get("value")
@@ -209,64 +417,271 @@ def _records(
                     )
                     strong_source_id_hash = None if sync_id is None else _id(source_name, sync_id)
                     logical_id = LogicalMeasurementId(
-                        _id(_IDENTITY_RULE_VERSION, "strong", strong_source_id_hash)
+                        _id(_LOGICAL_IDENTITY_RULE_VERSION, "strong", strong_source_id_hash)
                         if strong_source_id_hash is not None
                         else _id(
-                            _IDENTITY_RULE_VERSION,
+                            _LOGICAL_IDENTITY_RULE_VERSION,
                             "natural",
-                            data_type.value,
+                            "Workout",
                             source_start.isoformat(),
                             source_end.isoformat(),
                             source_name,
                             device,
                         )
                     )
-                    payload_sha256 = _id(
-                        data_type.value,
-                        canonical_unit.value,
-                        value,
-                        source_start.isoformat(),
-                        source_end.isoformat(),
-                        source_name,
-                        device,
+
+                    def optional_value(
+                        attributes: dict[str, str],
+                        name: str,
+                        unit_name: str,
+                        units: dict[str, float],
+                    ) -> float | None:
+                        raw = attributes.get(name)
+                        if raw is None:
+                            return None
+                        unit = attributes.get(unit_name, "")
+                        if unit not in units:
+                            unsupported[
+                                "unit", json.dumps(["Workout", unit], separators=(",", ":"))
+                            ] += 1
+                            return None
+                        return float(raw) * units[unit]
+
+                    duration = optional_value(
+                        attrs, "duration", "durationUnit", {"min": 1.0, "s": 1 / 60}
                     )
-                    records.append(
-                        CanonicalHealthRecord(
-                            logical_measurement_id=logical_id,
-                            measurement_version_id=MeasurementVersionId(
-                                _id(
-                                    _IDENTITY_RULE_VERSION,
-                                    logical_id,
-                                    payload_sha256,
-                                )
-                            ),
-                            data_type=data_type,
-                            unit=canonical_unit,
-                            value=value,
+                    distance = optional_value(
+                        attrs,
+                        "totalDistance",
+                        "totalDistanceUnit",
+                        {"m": 0.001, "km": 1.0, "mi": 1.609344},
+                    )
+                    energy = optional_value(
+                        attrs, "totalEnergyBurned", "totalEnergyBurnedUnit", {"kcal": 1.0}
+                    )
+                    version_id = MeasurementVersionId(
+                        _id(
+                            _PAYLOAD_IDENTITY_RULE_VERSION,
+                            logical_id,
+                            activity_type,
+                            duration,
+                            distance,
+                            energy,
+                            source_start.isoformat(),
+                            source_end.isoformat(),
+                            source_updated_at.isoformat(),
+                            source_name,
+                            source_version,
+                            device,
+                        )
+                    )
+                    workouts.append(
+                        CanonicalWorkout(
+                            logical_workout_id=logical_id,
+                            workout_version_id=version_id,
+                            original_activity_type=activity_type,
                             source_start=source_start,
                             source_end=source_end,
                             source_updated_at=source_updated_at,
                             measurement_local_day=source_start.date(),
                             provenance=HealthProvenance(
+                                source_name, source_version, device, 0.0, "", strong_source_id_hash
+                            ),
+                            reported_duration_minutes=duration,
+                            distance_kilometers=distance,
+                            active_energy_kilocalories=energy,
+                        )
+                    )
+                    element.clear()
+                elif parent == "HealthData" and element.tag == "Record":
+                    source_type = element.attrib.get("type", "")
+                    mapping = _MAPPINGS.get(source_type)
+                    source_unit = element.attrib.get("unit", "")
+                    if source_type == _SLEEP_TYPE:
+                        original_category = element.attrib.get("value", "")
+                        category = _SLEEP_CATEGORIES.get(original_category)
+                        if category is None:
+                            unsupported["sleep_value", original_category] += 1
+                        elif source_unit:
+                            unsupported[
+                                "unit",
+                                json.dumps([source_type, source_unit], separators=(",", ":")),
+                            ] += 1
+                        else:
+                            source_start = _source_datetime(element.attrib["startDate"])
+                            source_end = _source_datetime(element.attrib["endDate"])
+                            source_updated_at = _source_datetime(element.attrib["creationDate"])
+                            source_name = element.attrib["sourceName"]
+                            source_version = element.attrib.get("sourceVersion", "")
+                            device = element.attrib.get("device", "")
+                            sync_id = next(
+                                (
+                                    child.attrib.get("value")
+                                    for child in element
+                                    if child.tag == "MetadataEntry"
+                                    and child.attrib.get("key") == _SYNC_IDENTIFIER
+                                    and child.attrib.get("value")
+                                ),
+                                None,
+                            )
+                            strong_source_id_hash = (
+                                None if sync_id is None else _id(source_name, sync_id)
+                            )
+                            logical_id = LogicalMeasurementId(
+                                _id(_LOGICAL_IDENTITY_RULE_VERSION, "strong", strong_source_id_hash)
+                                if strong_source_id_hash is not None
+                                else _id(
+                                    _LOGICAL_IDENTITY_RULE_VERSION,
+                                    "natural",
+                                    _SLEEP_TYPE,
+                                    source_start.isoformat(),
+                                    source_end.isoformat(),
+                                    source_name,
+                                    device,
+                                )
+                            )
+                            measurement_version_id = MeasurementVersionId(
+                                _id(
+                                    _PAYLOAD_IDENTITY_RULE_VERSION,
+                                    logical_id,
+                                    original_category,
+                                    source_start.isoformat(),
+                                    source_end.isoformat(),
+                                    source_updated_at.isoformat(),
+                                    source_name,
+                                    source_version,
+                                    device,
+                                )
+                            )
+                            sleep_intervals.append(
+                                CanonicalSleepInterval(
+                                    logical_measurement_id=logical_id,
+                                    measurement_version_id=measurement_version_id,
+                                    original_category=original_category,
+                                    canonical_category=category,
+                                    source_start=source_start,
+                                    source_end=source_end,
+                                    source_updated_at=source_updated_at,
+                                    source_name=source_name,
+                                    source_version=source_version,
+                                    device=device,
+                                    strong_source_id_hash=strong_source_id_hash,
+                                )
+                            )
+                    elif mapping is not None and source_unit in mapping[2]:
+                        data_type, canonical_unit, conversions = mapping
+                        original_value = (
+                            1.0 if source_type == _SLEEP_TYPE else float(element.attrib["value"])
+                        )
+                        value = original_value * conversions[source_unit]
+                        source_start = _source_datetime(element.attrib["startDate"])
+                        source_end = _source_datetime(element.attrib["endDate"])
+                        source_updated_at = _source_datetime(element.attrib["creationDate"])
+                        source_name = element.attrib["sourceName"]
+                        source_version = element.attrib.get("sourceVersion", "")
+                        device = element.attrib.get("device", "")
+                        sync_id = next(
+                            (
+                                child.attrib.get("value")
+                                for child in element
+                                if child.tag == "MetadataEntry"
+                                and child.attrib.get("key") == _SYNC_IDENTIFIER
+                                and child.attrib.get("value")
+                            ),
+                            None,
+                        )
+                        strong_source_id_hash = (
+                            None if sync_id is None else _id(source_name, sync_id)
+                        )
+                        logical_id = LogicalMeasurementId(
+                            _id(
+                                _LOGICAL_IDENTITY_RULE_VERSION,
+                                "strong",
+                                strong_source_id_hash,
+                            )
+                            if strong_source_id_hash is not None
+                            else _id(
+                                _LOGICAL_IDENTITY_RULE_VERSION,
+                                "natural",
+                                source_type,
+                                source_start.isoformat(),
+                                source_end.isoformat(),
+                                source_name,
+                                device,
+                            )
+                        )
+                        measurement_version_id, legacy_measurement_version_id = (
+                            _measurement_version_ids(
+                                logical_id,
+                                data_type=data_type,
+                                source_unit=source_unit,
+                                original_value=original_value,
+                                source_start=source_start,
+                                source_end=source_end,
+                                source_updated_at=source_updated_at,
                                 source_name=source_name,
                                 source_version=source_version,
                                 device=device,
-                                original_value=value,
-                                original_unit=source_unit,
-                                strong_source_id_hash=strong_source_id_hash,
-                            ),
+                            )
                         )
-                    )
-                elif source_type := element.attrib.get("type"):
-                    unknown_source_types.add(source_type)
-                element.clear()
-    if not records and not unknown_source_types:
+                        records.append(
+                            CanonicalHealthRecord(
+                                logical_measurement_id=logical_id,
+                                measurement_version_id=measurement_version_id,
+                                data_type=data_type,
+                                unit=canonical_unit,
+                                value=value,
+                                source_start=source_start,
+                                source_end=source_end,
+                                source_updated_at=source_updated_at,
+                                measurement_local_day=source_start.date(),
+                                provenance=HealthProvenance(
+                                    source_name=source_name,
+                                    source_version=source_version,
+                                    device=device,
+                                    original_value=original_value,
+                                    original_unit=source_unit,
+                                    strong_source_id_hash=strong_source_id_hash,
+                                ),
+                                legacy_measurement_version_id=legacy_measurement_version_id,
+                            )
+                        )
+                    elif source_type:
+                        unknown_source_types.add(source_type)
+                        if source_type in _V03_UNITS:
+                            unit = element.attrib.get("unit", "")
+                            if unit not in _V03_UNITS[source_type]:
+                                unsupported[
+                                    "unit",
+                                    json.dumps([source_type, unit], separators=(",", ":")),
+                                ] += 1
+                        else:
+                            unsupported["record_type", source_type] += 1
+                    element.clear()
+                elif parent == "HealthData":
+                    unsupported["top_level_element", element.tag] += 1
+                    element.clear()
+                tags.pop()
+    if (
+        not records
+        and not sleep_intervals
+        and not workouts
+        and not unknown_source_types
+        and not unsupported
+    ):
         raise ValueError("no supported records")
     return _ParsedExport(
         export_digest.hexdigest(),
         export_date,
         tuple(records),
+        tuple(sleep_intervals),
+        tuple(workouts),
         tuple(sorted(unknown_source_types)),
+        tuple(
+            UnsupportedImportContent(cast(UnsupportedContentCategory, category), identifier, count)
+            for (category, identifier), count in sorted(unsupported.items())
+            if identifier
+        ),
     )
 
 
@@ -291,7 +706,10 @@ def estimate_health_export(
             max_uncompressed_bytes=max_uncompressed_bytes,
             max_compression_ratio=max_compression_ratio,
         )
-        return HealthExportEstimate(max(input_bytes, package_size), len(parsed.records))
+        return HealthExportEstimate(
+            max(input_bytes, package_size),
+            len(parsed.records) + len(parsed.sleep_intervals) + len(parsed.workouts),
+        )
     except (
         BadZipFile,
         KeyError,
@@ -316,6 +734,8 @@ def _restore_exports(
 ) -> tuple[
     tuple[_ParsedExport, ...],
     tuple[CanonicalHealthRecord, ...],
+    tuple[CanonicalSleepInterval, ...],
+    tuple[CanonicalWorkout, ...],
     int,
     tuple[tuple[str, datetime | None, str, tuple[CanonicalHealthRecord, ...]], ...],
 ]:
@@ -362,9 +782,21 @@ def _restore_exports(
         for export in reversed(exports)
         for record in export.records
     }
+    sleep_intervals = {
+        str(interval.measurement_version_id): interval
+        for export in reversed(exports)
+        for interval in export.sleep_intervals
+    }
+    workouts = {
+        str(workout.workout_version_id): workout
+        for export in reversed(exports)
+        for workout in export.workouts
+    }
     return (
         exports,
         tuple(records.values()),
+        tuple(sleep_intervals.values()),
+        tuple(workouts.values()),
         sum(path.stat().st_size for path in packages.values()),
         tuple(
             (export.export_id, export.export_date, package_hash, export.records)
@@ -384,7 +816,7 @@ def inspect_restore_health_export(
     max_uncompressed_bytes: int,
     max_compression_ratio: float,
 ) -> RestoreHealthExportInspection:
-    _, records, input_bytes, _ = _restore_exports(
+    _, records, sleep_intervals, workouts, input_bytes, _ = _restore_exports(
         package_path,
         store=store,
         target_root=target_root,
@@ -394,8 +826,10 @@ def inspect_restore_health_export(
         max_uncompressed_bytes=max_uncompressed_bytes,
         max_compression_ratio=max_compression_ratio,
     )
-    sources = inspect_restore_sources(store, target_root, records)
-    estimate = HealthExportEstimate(max(input_bytes, 1), len(records))
+    sources = inspect_restore_sources(store, target_root, records, sleep_intervals, workouts)
+    estimate = HealthExportEstimate(
+        max(input_bytes, 1), len(records) + len(sleep_intervals) + len(workouts)
+    )
     return RestoreHealthExportInspection(
         estimate,
         sources,
@@ -435,7 +869,7 @@ def _import_restore_health_export(
             max_uncompressed_bytes=max_uncompressed_bytes,
             max_compression_ratio=max_compression_ratio,
         )
-        exports, records, _, restore_exports = _restore_exports(
+        exports, records, sleep_intervals, workouts, _, restore_exports = _restore_exports(
             package_path,
             store=store,
             target_root=target_root,
@@ -445,7 +879,9 @@ def _import_restore_health_export(
             max_uncompressed_bytes=max_uncompressed_bytes,
             max_compression_ratio=max_compression_ratio,
         )
-        inspection = inspect_restore_sources(store, target_root, records)
+        inspection = inspect_restore_sources(
+            store, target_root, records, sleep_intervals, workouts
+        )
     except (_RejectedPackage, OSError, BadZipFile, NotImplementedError):
         return HealthImportResult(
             operation_id,
@@ -476,13 +912,61 @@ def _import_restore_health_export(
             package_hash,
             None,
             0,
-            package_record_count=len(current.records),
+            package_record_count=len(current.records)
+            + len(current.sleep_intervals)
+            + len(current.workouts),
             logical_measurement_count=len(
                 {str(record.logical_measurement_id) for record in records}
             ),
             measurement_version_count=len(records),
             diagnostics=("restore_sources_pending",),
         )
+
+    selected_records, selected_sleep, selected_workouts = select_restore_source_versions(
+        store, target_root, records, sleep_intervals, workouts
+    )
+    selected_version_ids = {
+        str(original.measurement_version_id): selected.measurement_version_id
+        for original in records
+        for selected in selected_records
+        if original.logical_measurement_id == selected.logical_measurement_id
+        and selected.measurement_version_id
+        in {
+            original.measurement_version_id,
+            original.legacy_measurement_version_id,
+        }
+    }
+    records, sleep_intervals, workouts = selected_records, selected_sleep, selected_workouts
+    selected_export_ids = {
+        export.export_id
+        for export in exports
+        if any(
+            str(item.measurement_version_id) in selected_version_ids
+            for item in export.records
+        )
+        or any(item in selected_sleep for item in export.sleep_intervals)
+        or any(item in selected_workouts for item in export.workouts)
+    }
+    exports = tuple(export for export in exports if export.export_id in selected_export_ids)
+    restore_exports = tuple(
+        (
+            item_export_id,
+            item_export_date,
+            item_package_hash,
+            tuple(
+                replace(
+                    record,
+                    measurement_version_id=selected_version_ids.get(
+                        str(record.measurement_version_id), record.measurement_version_id
+                    ),
+                )
+                for record in item_records
+                if str(record.measurement_version_id) in selected_version_ids
+            ),
+        )
+        for item_export_id, item_export_date, item_package_hash, item_records in restore_exports
+        if item_export_id in selected_export_ids
+    )
 
     session = store.load_restore_session()
     if session is None:
@@ -505,6 +989,8 @@ def _import_restore_health_export(
             export_id=export_id,
             export_date=export_date,
             records=records,
+            sleep_intervals=sleep_intervals,
+            workouts=workouts,
             unknown_source_types=tuple(
                 sorted(
                     {
@@ -514,8 +1000,10 @@ def _import_restore_health_export(
                     }
                 )
             ),
+            unsupported_content=current.unsupported_content,
             governing_export_id=export_id,
             resolve_sources=restore_source_resolver(working),
+            resolve_workouts=resolve_workouts,
             restore_overlay=working,
             restore_overlay_sha256=session.working_copy_sha256,
             restore_exports=restore_exports,
@@ -531,7 +1019,9 @@ def _import_restore_health_export(
         package_hash,
         published.snapshot_id,
         published.record_count,
-        package_record_count=len(current.records),
+        package_record_count=len(current.records)
+        + len(current.sleep_intervals)
+        + len(current.workouts),
         logical_measurement_count=published.logical_measurement_count,
         measurement_version_count=published.measurement_version_count,
         source_occurrence_count=published.source_occurrence_count,
@@ -630,9 +1120,13 @@ def import_health_export(
                 export_id=parsed.export_id,
                 export_date=parsed.export_date,
                 records=parsed.records,
+                sleep_intervals=parsed.sleep_intervals,
+                workouts=parsed.workouts,
                 unknown_source_types=parsed.unknown_source_types,
+                unsupported_content=parsed.unsupported_content,
                 governing_export_id=governing_export_id,
                 resolve_sources=resolve_sources,
+                resolve_workouts=resolve_workouts,
             )
         except (OSError, StoreError) as error:
             cause = error.__cause__ if isinstance(error, StoreError) else error
@@ -652,7 +1146,9 @@ def import_health_export(
                 package_hash=package_hash,
                 snapshot_id=None,
                 record_count=0,
-                package_record_count=len(parsed.records),
+                package_record_count=len(parsed.records)
+                + len(parsed.sleep_intervals)
+                + len(parsed.workouts),
                 diagnostics=(diagnostic,),
             )
     except StoreError as error:
@@ -664,7 +1160,9 @@ def import_health_export(
         package_hash=package_hash,
         snapshot_id=published.snapshot_id,
         record_count=published.record_count,
-        package_record_count=len(parsed.records),
+        package_record_count=len(parsed.records)
+        + len(parsed.sleep_intervals)
+        + len(parsed.workouts),
         logical_measurement_count=published.logical_measurement_count,
         measurement_version_count=published.measurement_version_count,
         source_occurrence_count=published.source_occurrence_count,

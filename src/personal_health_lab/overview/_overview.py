@@ -124,11 +124,7 @@ class OverviewReader:
             resting_hr_analysis=analysis,
             analysis_history=history,
             last_reviewed_analysis=next(
-                (
-                    item
-                    for item in history
-                    if item.data_status is DataQualityStatus.REVIEWED
-                ),
+                (item for item in history if item.data_status is DataQualityStatus.REVIEWED),
                 None,
             ),
             last_ready_analysis_provenance=(

@@ -1,0 +1,282 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:personal-health-lab:cli-input:3.0",
+  "title": "HealthLab production CLI input 3.0",
+  "oneOf": [
+    { "$ref": "#/$defs/contextCoverageStart" },
+    { "$ref": "#/$defs/illnessCategory" },
+    { "$ref": "#/$defs/customContextLabel" },
+    { "$ref": "#/$defs/illnessPeriod" },
+    { "$ref": "#/$defs/dailyStress" },
+    { "$ref": "#/$defs/customContextPeriod" },
+    { "$ref": "#/$defs/medicationRegime" },
+    { "$ref": "#/$defs/medicationDeviation" },
+    { "$ref": "#/$defs/asNeededIntake" },
+    { "$ref": "#/$defs/intakeReasonCategory" },
+    { "$ref": "#/$defs/activityDerivation" }
+  ],
+  "$defs": {
+    "base": {
+      "type": "object",
+      "required": ["schema_version", "type", "intent"],
+      "properties": {
+        "schema_version": { "const": "3.0" },
+        "type": { "type": "string" },
+        "intent": { "enum": ["create", "revise", "withdraw", "restore"] }
+      }
+    },
+    "logicalId": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+    "revisionId": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+    "amount": { "type": ["string", "number"] },
+    "withdraw": {
+      "type": "object",
+      "required": ["logical_id", "expected_revision_id", "reason"],
+      "properties": {
+        "intent": { "const": "withdraw" },
+        "logical_id": { "$ref": "#/$defs/logicalId" },
+        "expected_revision_id": { "$ref": "#/$defs/revisionId" },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "scheduledDose": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["medication_name", "amount", "unit", "local_time", "weekdays"],
+      "properties": {
+        "medication_name": { "type": "string", "minLength": 1 },
+        "amount": { "$ref": "#/$defs/amount" },
+        "unit": { "type": "string", "minLength": 1 },
+        "local_time": { "type": "string", "format": "time" },
+        "weekdays": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+          }
+        }
+      }
+    },
+    "asNeededMedication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["medication_name", "amount", "unit"],
+      "properties": {
+        "medication_name": { "type": "string", "minLength": 1 },
+        "amount": { "$ref": "#/$defs/amount" },
+        "unit": { "type": "string", "minLength": 1 },
+        "preferred_reason_category_ids": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/logicalId" }
+        },
+        "entry_id": { "$ref": "#/$defs/logicalId" }
+      }
+    },
+    "actualIntake": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["taken_at", "amount"],
+      "properties": {
+        "taken_at": { "type": "string", "format": "date-time" },
+        "amount": { "$ref": "#/$defs/amount" }
+      }
+    },
+    "contextCoverageStartValue": {
+      "type": "object",
+      "required": ["start_date"],
+      "properties": { "start_date": { "type": "string", "format": "date" } }
+    },
+    "nameValue": {
+      "type": "object",
+      "required": ["name"],
+      "properties": { "name": { "type": "string", "minLength": 1 } }
+    },
+    "illnessPeriodValue": {
+      "type": "object",
+      "required": ["category_logical_id", "start_date", "end_date", "severity"],
+      "properties": {
+        "category_logical_id": { "$ref": "#/$defs/logicalId" },
+        "start_date": { "type": "string", "format": "date" },
+        "end_date": { "type": ["string", "null"], "format": "date" },
+        "severity": { "enum": ["mild", "moderate", "severe"] }
+      }
+    },
+    "dailyStressValue": {
+      "type": "object",
+      "required": ["day", "level"],
+      "properties": {
+        "day": { "type": "string", "format": "date" },
+        "level": { "enum": ["very_low", "low", "average", "high", "very_high"] }
+      }
+    },
+    "customContextPeriodValue": {
+      "type": "object",
+      "required": ["label_logical_id", "start_date", "end_date", "note"],
+      "properties": {
+        "label_logical_id": { "$ref": "#/$defs/logicalId" },
+        "start_date": { "type": "string", "format": "date" },
+        "end_date": { "type": ["string", "null"], "format": "date" },
+        "note": { "type": ["string", "null"] }
+      }
+    },
+    "medicationRegimeValue": {
+      "type": "object",
+      "required": ["starts_at", "timezone", "scheduled_doses", "as_needed_medications"],
+      "properties": {
+        "starts_at": { "type": "string", "format": "date-time" },
+        "timezone": { "type": "string", "minLength": 1 },
+        "scheduled_doses": { "type": "array", "items": { "$ref": "#/$defs/scheduledDose" } },
+        "as_needed_medications": { "type": "array", "items": { "$ref": "#/$defs/asNeededMedication" } }
+      }
+    },
+    "medicationDeviationCreateValue": {
+      "type": "object",
+      "required": ["regime_logical_id", "scheduled_at", "actual_intakes"],
+      "properties": {
+        "regime_logical_id": { "$ref": "#/$defs/logicalId" },
+        "scheduled_at": { "type": "string", "format": "date-time" },
+        "actual_intakes": { "type": "array", "items": { "$ref": "#/$defs/actualIntake" } }
+      }
+    },
+    "medicationDeviationRevisionValue": {
+      "type": "object",
+      "required": ["regime_logical_id", "scheduled_at", "actual_intakes"],
+      "properties": {
+        "regime_logical_id": { "$ref": "#/$defs/logicalId" },
+        "scheduled_at": { "type": "string", "format": "date-time" },
+        "actual_intakes": { "type": "array", "items": { "$ref": "#/$defs/actualIntake" } }
+      }
+    },
+    "asNeededIntakeCreateValue": {
+      "type": "object",
+      "required": ["regime_logical_id", "entry_id", "taken_at", "amount", "reason_category_logical_id"],
+      "properties": {
+        "regime_logical_id": { "$ref": "#/$defs/logicalId" },
+        "entry_id": { "$ref": "#/$defs/logicalId" },
+        "taken_at": { "type": "string", "format": "date-time" },
+        "amount": { "$ref": "#/$defs/amount" },
+        "reason_category_logical_id": { "anyOf": [{ "$ref": "#/$defs/logicalId" }, { "type": "null" }] }
+      }
+    },
+    "asNeededIntakeRevisionValue": {
+      "type": "object",
+      "required": ["regime_logical_id", "entry_id", "taken_at", "amount", "reason_category_logical_id"],
+      "properties": {
+        "regime_logical_id": { "$ref": "#/$defs/logicalId" },
+        "entry_id": { "$ref": "#/$defs/logicalId" },
+        "taken_at": { "type": "string", "format": "date-time" },
+        "amount": { "$ref": "#/$defs/amount" },
+        "reason_category_logical_id": { "anyOf": [{ "$ref": "#/$defs/logicalId" }, { "type": "null" }] }
+      }
+    },
+    "contextCoverageStart": {
+      "oneOf": [
+        { "$ref": "#/$defs/contextCoverageStartCreate" },
+        { "$ref": "#/$defs/contextCoverageStartRevise" },
+        { "$ref": "#/$defs/contextCoverageStartWithdraw" },
+        { "$ref": "#/$defs/contextCoverageStartRestore" }
+      ]
+    },
+    "contextCoverageStartCreate": { "$ref": "#/$defs/contextCoverageStartCreateShape" },
+    "contextCoverageStartCreateShape": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        { "properties": { "type": { "const": "revise_context_coverage_start" }, "intent": { "const": "create" } } },
+        { "$ref": "#/$defs/contextCoverageStartValue" }
+      ],
+      "unevaluatedProperties": false
+    },
+    "contextCoverageStartRevise": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        { "required": ["logical_id", "expected_revision_id"], "properties": { "type": { "const": "revise_context_coverage_start" }, "intent": { "const": "revise" }, "logical_id": { "$ref": "#/$defs/logicalId" }, "expected_revision_id": { "$ref": "#/$defs/revisionId" } } },
+        { "$ref": "#/$defs/contextCoverageStartValue" }
+      ],
+      "unevaluatedProperties": false
+    },
+    "contextCoverageStartWithdraw": {
+      "allOf": [{ "$ref": "#/$defs/base" }, { "properties": { "type": { "const": "revise_context_coverage_start" } } }, { "$ref": "#/$defs/withdraw" }],
+      "unevaluatedProperties": false
+    },
+    "contextCoverageStartRestore": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        { "required": ["logical_id", "expected_revision_id"], "properties": { "type": { "const": "revise_context_coverage_start" }, "intent": { "const": "restore" }, "logical_id": { "$ref": "#/$defs/logicalId" }, "expected_revision_id": { "$ref": "#/$defs/revisionId" } } },
+        { "$ref": "#/$defs/contextCoverageStartValue" }
+      ],
+      "unevaluatedProperties": false
+    },
+    "illnessCategory": { "$ref": "#/$defs/namedContext" },
+    "customContextLabel": { "$ref": "#/$defs/namedContextLabel" },
+    "namedContext": {
+      "oneOf": [
+        { "$ref": "#/$defs/illnessCategoryCreate" }, { "$ref": "#/$defs/illnessCategoryRevise" },
+        { "$ref": "#/$defs/illnessCategoryWithdraw" }, { "$ref": "#/$defs/illnessCategoryRestore" }
+      ]
+    },
+    "namedContextLabel": {
+      "oneOf": [
+        { "$ref": "#/$defs/customLabelCreate" }, { "$ref": "#/$defs/customLabelRevise" },
+        { "$ref": "#/$defs/customLabelWithdraw" }, { "$ref": "#/$defs/customLabelRestore" }
+      ]
+    },
+    "illnessCategoryCreate": { "$ref": "#/$defs/illnessCategoryCreateShape" },
+    "illnessCategoryCreateShape": { "allOf": [{ "$ref": "#/$defs/base" }, { "properties": { "type": { "const": "revise_illness_category" }, "intent": { "const": "create" } } }, { "$ref": "#/$defs/nameValue" }], "unevaluatedProperties": false },
+    "illnessCategoryRevise": { "allOf": [{ "$ref": "#/$defs/base" }, { "required": ["logical_id", "expected_revision_id"], "properties": { "type": { "const": "revise_illness_category" }, "intent": { "const": "revise" }, "logical_id": { "$ref": "#/$defs/logicalId" }, "expected_revision_id": { "$ref": "#/$defs/revisionId" } } }, { "$ref": "#/$defs/nameValue" }], "unevaluatedProperties": false },
+    "illnessCategoryWithdraw": { "allOf": [{ "$ref": "#/$defs/base" }, { "properties": { "type": { "const": "revise_illness_category" } } }, { "$ref": "#/$defs/withdraw" }], "unevaluatedProperties": false },
+    "illnessCategoryRestore": { "allOf": [{ "$ref": "#/$defs/base" }, { "required": ["logical_id", "expected_revision_id"], "properties": { "type": { "const": "revise_illness_category" }, "intent": { "const": "restore" }, "logical_id": { "$ref": "#/$defs/logicalId" }, "expected_revision_id": { "$ref": "#/$defs/revisionId" } } }, { "$ref": "#/$defs/nameValue" }], "unevaluatedProperties": false },
+    "customLabelCreate": { "allOf": [{ "$ref": "#/$defs/base" }, { "properties": { "type": { "const": "revise_custom_context_label" }, "intent": { "const": "create" } } }, { "$ref": "#/$defs/nameValue" }], "unevaluatedProperties": false },
+    "customLabelRevise": { "allOf": [{ "$ref": "#/$defs/base" }, { "required": ["logical_id", "expected_revision_id"], "properties": { "type": { "const": "revise_custom_context_label" }, "intent": { "const": "revise" }, "logical_id": { "$ref": "#/$defs/logicalId" }, "expected_revision_id": { "$ref": "#/$defs/revisionId" } } }, { "$ref": "#/$defs/nameValue" }], "unevaluatedProperties": false },
+    "customLabelWithdraw": { "allOf": [{ "$ref": "#/$defs/base" }, { "properties": { "type": { "const": "revise_custom_context_label" } } }, { "$ref": "#/$defs/withdraw" }], "unevaluatedProperties": false },
+    "customLabelRestore": { "allOf": [{ "$ref": "#/$defs/base" }, { "required": ["logical_id", "expected_revision_id"], "properties": { "type": { "const": "revise_custom_context_label" }, "intent": { "const": "restore" }, "logical_id": { "$ref": "#/$defs/logicalId" }, "expected_revision_id": { "$ref": "#/$defs/revisionId" } } }, { "$ref": "#/$defs/nameValue" }], "unevaluatedProperties": false },
+    "illnessPeriod": { "$ref": "#/$defs/illnessPeriodIntents" },
+    "illnessPeriodIntents": { "oneOf": [{ "$ref": "#/$defs/illnessPeriodCreate" }, { "$ref": "#/$defs/illnessPeriodRevise" }, { "$ref": "#/$defs/illnessPeriodWithdraw" }, { "$ref": "#/$defs/illnessPeriodRestore" }] },
+    "illnessPeriodCreate": { "allOf": [{ "$ref": "#/$defs/base" }, { "properties": { "type": { "const": "revise_illness_period" }, "intent": { "const": "create" } } }, { "$ref": "#/$defs/illnessPeriodValue" }], "unevaluatedProperties": false },
+    "illnessPeriodRevise": { "allOf": [{ "$ref": "#/$defs/base" }, { "required": ["logical_id", "expected_revision_id"], "properties": { "type": { "const": "revise_illness_period" }, "intent": { "const": "revise" }, "logical_id": { "$ref": "#/$defs/logicalId" }, "expected_revision_id": { "$ref": "#/$defs/revisionId" } } }, { "$ref": "#/$defs/illnessPeriodValue" }], "unevaluatedProperties": false },
+    "illnessPeriodWithdraw": { "allOf": [{ "$ref": "#/$defs/base" }, { "properties": { "type": { "const": "revise_illness_period" } } }, { "$ref": "#/$defs/withdraw" }], "unevaluatedProperties": false },
+    "illnessPeriodRestore": { "allOf": [{ "$ref": "#/$defs/base" }, { "required": ["logical_id", "expected_revision_id"], "properties": { "type": { "const": "revise_illness_period" }, "intent": { "const": "restore" }, "logical_id": { "$ref": "#/$defs/logicalId" }, "expected_revision_id": { "$ref": "#/$defs/revisionId" } } }, { "$ref": "#/$defs/illnessPeriodValue" }], "unevaluatedProperties": false },
+    "dailyStress": { "oneOf": [{ "$ref": "#/$defs/dailyStressCreate" }, { "$ref": "#/$defs/dailyStressRevise" }, { "$ref": "#/$defs/dailyStressWithdraw" }, { "$ref": "#/$defs/dailyStressRestore" }] },
+    "dailyStressCreate": { "allOf": [{ "$ref": "#/$defs/base" }, { "properties": { "type": { "const": "revise_daily_stress" }, "intent": { "const": "create" } } }, { "$ref": "#/$defs/dailyStressValue" }], "unevaluatedProperties": false },
+    "dailyStressRevise": { "allOf": [{ "$ref": "#/$defs/base" }, { "required": ["logical_id", "expected_revision_id"], "properties": { "type": { "const": "revise_daily_stress" }, "intent": { "const": "revise" }, "logical_id": { "$ref": "#/$defs/logicalId" }, "expected_revision_id": { "$ref": "#/$defs/revisionId" } } }, { "$ref": "#/$defs/dailyStressValue" }], "unevaluatedProperties": false },
+    "dailyStressWithdraw": { "allOf": [{ "$ref": "#/$defs/base" }, { "properties": { "type": { "const": "revise_daily_stress" } } }, { "$ref": "#/$defs/withdraw" }], "unevaluatedProperties": false },
+    "dailyStressRestore": { "allOf": [{ "$ref": "#/$defs/base" }, { "required": ["logical_id", "expected_revision_id"], "properties": { "type": { "const": "revise_daily_stress" }, "intent": { "const": "restore" }, "logical_id": { "$ref": "#/$defs/logicalId" }, "expected_revision_id": { "$ref": "#/$defs/revisionId" } } }, { "$ref": "#/$defs/dailyStressValue" }], "unevaluatedProperties": false },
+    "customContextPeriod": { "oneOf": [{ "$ref": "#/$defs/customPeriodCreate" }, { "$ref": "#/$defs/customPeriodRevise" }, { "$ref": "#/$defs/customPeriodWithdraw" }, { "$ref": "#/$defs/customPeriodRestore" }] },
+    "customPeriodCreate": { "allOf": [{ "$ref": "#/$defs/base" }, { "properties": { "type": { "const": "revise_custom_context_period" }, "intent": { "const": "create" } } }, { "$ref": "#/$defs/customContextPeriodValue" }], "unevaluatedProperties": false },
+    "customPeriodRevise": { "allOf": [{ "$ref": "#/$defs/base" }, { "required": ["logical_id", "expected_revision_id"], "properties": { "type": { "const": "revise_custom_context_period" }, "intent": { "const": "revise" }, "logical_id": { "$ref": "#/$defs/logicalId" }, "expected_revision_id": { "$ref": "#/$defs/revisionId" } } }, { "$ref": "#/$defs/customContextPeriodValue" }], "unevaluatedProperties": false },
+    "customPeriodWithdraw": { "allOf": [{ "$ref": "#/$defs/base" }, { "properties": { "type": { "const": "revise_custom_context_period" } } }, { "$ref": "#/$defs/withdraw" }], "unevaluatedProperties": false },
+    "customPeriodRestore": { "allOf": [{ "$ref": "#/$defs/base" }, { "required": ["logical_id", "expected_revision_id"], "properties": { "type": { "const": "revise_custom_context_period" }, "intent": { "const": "restore" }, "logical_id": { "$ref": "#/$defs/logicalId" }, "expected_revision_id": { "$ref": "#/$defs/revisionId" } } }, { "$ref": "#/$defs/customContextPeriodValue" }], "unevaluatedProperties": false },
+    "medicationRegime": { "oneOf": [{ "$ref": "#/$defs/regimeCreate" }, { "$ref": "#/$defs/regimeRevise" }, { "$ref": "#/$defs/regimeWithdraw" }, { "$ref": "#/$defs/regimeRestore" }] },
+    "regimeCreate": { "allOf": [{ "$ref": "#/$defs/base" }, { "properties": { "type": { "const": "revise_medication_regime" }, "intent": { "const": "create" } } }, { "$ref": "#/$defs/medicationRegimeValue" }], "unevaluatedProperties": false },
+    "regimeRevise": { "allOf": [{ "$ref": "#/$defs/base" }, { "required": ["logical_id", "expected_revision_id"], "properties": { "type": { "const": "revise_medication_regime" }, "intent": { "const": "revise" }, "logical_id": { "$ref": "#/$defs/logicalId" }, "expected_revision_id": { "$ref": "#/$defs/revisionId" } } }, { "$ref": "#/$defs/medicationRegimeValue" }], "unevaluatedProperties": false },
+    "regimeWithdraw": { "allOf": [{ "$ref": "#/$defs/base" }, { "properties": { "type": { "const": "revise_medication_regime" } } }, { "$ref": "#/$defs/withdraw" }], "unevaluatedProperties": false },
+    "regimeRestore": { "allOf": [{ "$ref": "#/$defs/base" }, { "required": ["logical_id", "expected_revision_id"], "properties": { "type": { "const": "revise_medication_regime" }, "intent": { "const": "restore" }, "logical_id": { "$ref": "#/$defs/logicalId" }, "expected_revision_id": { "$ref": "#/$defs/revisionId" } } }, { "$ref": "#/$defs/medicationRegimeValue" }], "unevaluatedProperties": false },
+    "medicationDeviation": { "oneOf": [{ "$ref": "#/$defs/deviationCreate" }, { "$ref": "#/$defs/deviationRevise" }, { "$ref": "#/$defs/deviationWithdraw" }, { "$ref": "#/$defs/deviationRestore" }] },
+    "deviationCreate": { "allOf": [{ "$ref": "#/$defs/base" }, { "properties": { "type": { "const": "revise_medication_deviation" }, "intent": { "const": "create" } } }, { "$ref": "#/$defs/medicationDeviationCreateValue" }], "unevaluatedProperties": false },
+    "deviationRevise": { "allOf": [{ "$ref": "#/$defs/base" }, { "required": ["logical_id", "expected_revision_id"], "properties": { "type": { "const": "revise_medication_deviation" }, "intent": { "const": "revise" }, "logical_id": { "$ref": "#/$defs/logicalId" }, "expected_revision_id": { "$ref": "#/$defs/revisionId" } } }, { "$ref": "#/$defs/medicationDeviationRevisionValue" }], "unevaluatedProperties": false },
+    "deviationWithdraw": { "allOf": [{ "$ref": "#/$defs/base" }, { "properties": { "type": { "const": "revise_medication_deviation" } } }, { "$ref": "#/$defs/withdraw" }], "unevaluatedProperties": false },
+    "deviationRestore": { "allOf": [{ "$ref": "#/$defs/base" }, { "required": ["logical_id", "expected_revision_id"], "properties": { "type": { "const": "revise_medication_deviation" }, "intent": { "const": "restore" }, "logical_id": { "$ref": "#/$defs/logicalId" }, "expected_revision_id": { "$ref": "#/$defs/revisionId" } } }, { "$ref": "#/$defs/medicationDeviationRevisionValue" }], "unevaluatedProperties": false },
+    "asNeededIntake": { "oneOf": [{ "$ref": "#/$defs/intakeCreate" }, { "$ref": "#/$defs/intakeRevise" }, { "$ref": "#/$defs/intakeWithdraw" }, { "$ref": "#/$defs/intakeRestore" }] },
+    "intakeCreate": { "allOf": [{ "$ref": "#/$defs/base" }, { "properties": { "type": { "const": "revise_as_needed_intake" }, "intent": { "const": "create" } } }, { "$ref": "#/$defs/asNeededIntakeCreateValue" }], "unevaluatedProperties": false },
+    "intakeRevise": { "allOf": [{ "$ref": "#/$defs/base" }, { "required": ["logical_id", "expected_revision_id"], "properties": { "type": { "const": "revise_as_needed_intake" }, "intent": { "const": "revise" }, "logical_id": { "$ref": "#/$defs/logicalId" }, "expected_revision_id": { "$ref": "#/$defs/revisionId" } } }, { "$ref": "#/$defs/asNeededIntakeRevisionValue" }], "unevaluatedProperties": false },
+    "intakeWithdraw": { "allOf": [{ "$ref": "#/$defs/base" }, { "properties": { "type": { "const": "revise_as_needed_intake" } } }, { "$ref": "#/$defs/withdraw" }], "unevaluatedProperties": false },
+    "intakeRestore": { "allOf": [{ "$ref": "#/$defs/base" }, { "required": ["logical_id", "expected_revision_id"], "properties": { "type": { "const": "revise_as_needed_intake" }, "intent": { "const": "restore" }, "logical_id": { "$ref": "#/$defs/logicalId" }, "expected_revision_id": { "$ref": "#/$defs/revisionId" } } }, { "$ref": "#/$defs/asNeededIntakeRevisionValue" }], "unevaluatedProperties": false },
+    "intakeReasonCategory": { "oneOf": [{ "$ref": "#/$defs/reasonCreate" }, { "$ref": "#/$defs/reasonRevise" }, { "$ref": "#/$defs/reasonWithdraw" }, { "$ref": "#/$defs/reasonRestore" }] },
+    "reasonCreate": { "allOf": [{ "$ref": "#/$defs/base" }, { "properties": { "type": { "const": "revise_intake_reason_category" }, "intent": { "const": "create" } } }, { "$ref": "#/$defs/nameValue" }], "unevaluatedProperties": false },
+    "reasonRevise": { "allOf": [{ "$ref": "#/$defs/base" }, { "required": ["logical_id", "expected_revision_id"], "properties": { "type": { "const": "revise_intake_reason_category" }, "intent": { "const": "revise" }, "logical_id": { "$ref": "#/$defs/logicalId" }, "expected_revision_id": { "$ref": "#/$defs/revisionId" } } }, { "$ref": "#/$defs/nameValue" }], "unevaluatedProperties": false },
+    "reasonWithdraw": { "allOf": [{ "$ref": "#/$defs/base" }, { "properties": { "type": { "const": "revise_intake_reason_category" } } }, { "$ref": "#/$defs/withdraw" }], "unevaluatedProperties": false },
+    "reasonRestore": { "allOf": [{ "$ref": "#/$defs/base" }, { "required": ["logical_id", "expected_revision_id"], "properties": { "type": { "const": "revise_intake_reason_category" }, "intent": { "const": "restore" }, "logical_id": { "$ref": "#/$defs/logicalId" }, "expected_revision_id": { "$ref": "#/$defs/revisionId" } } }, { "$ref": "#/$defs/nameValue" }], "unevaluatedProperties": false },
+    "activityDerivation": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "required": ["coverage_gap_minutes"],
+          "properties": {
+            "type": { "const": "create_activity_derivation_version" },
+            "intent": { "const": "create" },
+            "coverage_gap_minutes": { "type": "integer", "minimum": 1, "maximum": 1440 }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    }
+  }
+}

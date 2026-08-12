@@ -1,0 +1,1904 @@
+schema_version = 1
+release = "v0.3-delta"
+write_requests = ["ReviseContextCoverageStart", "ReviseIllnessCategory", "ReviseCustomContextLabel", "ReviseIllnessPeriod", "ReviseDailyStress", "ReviseCustomContextPeriod", "ReviseMedicationRegime", "ReviseMedicationDeviation", "ReviseAsNeededIntake", "ReviseIntakeReasonCategory", "CreateActivityDerivationVersion"]
+read_operations = ["load_import_details", "load_weight_nutrition", "load_sleep_days", "load_activity_days", "load_workouts", "load_activity_settings", "load_daily_context", "load_context_records", "load_context_audit", "load_medication_days", "load_medication_plan", "load_medication_audit"]
+plan_variants = ["ManualContextRevisionPlan", "MedicationRevisionPlan", "ActivityDerivationPlan"]
+receipt_variants = ["ManualContextRevisionReceipt", "MedicationRevisionReceipt", "ActivityDerivationReceipt"]
+intent_variants = ["ContextCoverageStartCreate", "ContextCoverageStartRevise", "ContextCoverageStartWithdraw", "ContextCoverageStartRestore", "IllnessCategoryCreate", "IllnessCategoryRevise", "IllnessCategoryWithdraw", "IllnessCategoryRestore", "CustomContextLabelCreate", "CustomContextLabelRevise", "CustomContextLabelWithdraw", "CustomContextLabelRestore", "IllnessPeriodCreate", "IllnessPeriodRevise", "IllnessPeriodWithdraw", "IllnessPeriodRestore", "DailyStressCreate", "DailyStressRevise", "DailyStressWithdraw", "DailyStressRestore", "CustomContextPeriodCreate", "CustomContextPeriodRevise", "CustomContextPeriodWithdraw", "CustomContextPeriodRestore", "MedicationRegimeCreate", "MedicationRegimeRevise", "MedicationRegimeWithdraw", "MedicationRegimeRestore", "MedicationDeviationCreate", "MedicationDeviationRevise", "MedicationDeviationWithdraw", "MedicationDeviationRestore", "AsNeededIntakeCreate", "AsNeededIntakeRevise", "AsNeededIntakeWithdraw", "AsNeededIntakeRestore", "IntakeReasonCategoryCreate", "IntakeReasonCategoryRevise", "IntakeReasonCategoryWithdraw", "IntakeReasonCategoryRestore"]
+projection_variants = ["ImportDetails", "WeightNutrition", "SleepDays", "ActivityDays", "Workouts", "ActivitySettings", "DailyContext", "ContextRecords", "ContextAudit", "MedicationDays", "MedicationPlan", "MedicationAudit"]
+resolution_variants = ["WorkoutCorrection", "LocalWorkoutExclusion"]
+terminal_states = ["no_change", "plan_changed", "blocked", "store_busy"]
+
+[[contract]]
+id = "V03-C-RELEASE-SEAM-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/87"
+statement = "The V0.3 release has one closed application seam, JSON 3.0 input and output boundaries, behaviorally equivalent CLI and Streamlit tracers, a self-validating delta matrix, and commit-pinned evidence without personal values."
+evidence = ["positive", "negative", "parity", "security", "reproducibility"]
+
+[[contract]]
+id = "V03-C-CONTEXT-COVERAGE-START-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/77"
+statement = "A coverage-start revision binds its normalized input, active snapshot, local context day, immutable revision, audit event, and new snapshot; days before it stay unknown while later gaps use only the two context baselines."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V03-C-MEDICATION-REGIME-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/80"
+statement = "A medication regime is an immutable, snapshot-bound local IANA timeline with validated scheduled doses; DST gaps move forward, folds use the first occurrence, and a missing deviation is assumed as planned."
+evidence = ["positive", "boundary", "transition"]
+
+[[contract]]
+id = "V03-C-MEDICATION-DEVIATION-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/81"
+statement = "One immutable deviation binds one scheduled occurrence; omitted, changed-time or changed-dose, and multiple actual intakes share one model, while identical intake is no_change and invalidating regime corrections are blocked."
+evidence = ["positive", "negative", "transition", "boundary"]
+
+[[contract]]
+id = "V03-C-AS-NEEDED-INTAKE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/82"
+statement = "A snapshot-bound as-needed intake references the valid PRN entry at its actual instant, has a positive dose in that entry's unit, and may use one active globally normalized reason category; category revisions preserve old snapshot displays and active regime preferences block withdrawal."
+evidence = ["positive", "negative", "transition", "boundary"]
+
+[[contract]]
+id = "V03-C-DAILY-STRESS-CUSTOM-CONTEXT-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/79"
+statement = "One daily stress revision is active per local day, an observed average remains distinct from the baseline assumption, and normalized custom labels reserve their names while same-label periods cannot overlap."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V03-C-IMPORT-DETAILS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/69"
+statement = "Import details expose canonical counts and a typed unsupported-content catalog without parser or storage internals."
+evidence = ["positive", "negative"]
+
+[[contract]]
+id = "V03-C-IMPORT-REIMPORT-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/69"
+statement = "Identical and cumulative reimports persist reproducible unsupported-content counts per import."
+evidence = ["positive", "reproducibility"]
+
+[[contract]]
+id = "V03-C-IMPORT-ADAPTERS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/69"
+statement = "CLI, JSON 3.0, and Streamlit render import details loaded only through HealthLab."
+evidence = ["positive", "parity"]
+
+[[contract]]
+id = "V03-C-MATRIX-VALIDATION-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/69"
+statement = "The V0.3 delta matrix rejects open identifiers, runners, evidence, platforms, and fixture hashes."
+evidence = ["positive", "negative"]
+
+[[contract]]
+id = "V03-C-WEIGHT-SOURCE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/70"
+statement = "Body-mass imports canonicalize supported units to kilograms while preserving source values, units, timestamps, offsets, devices, and versions."
+evidence = ["positive", "reproducibility", "boundary"]
+
+[[contract]]
+id = "V03-C-WEIGHT-DAILY-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/70"
+statement = "Preferred daily weight uses the latest local-day instant, merges equal simultaneous values, exposes conflicts, and leaves absent days missing."
+evidence = ["positive", "negative", "boundary"]
+
+[[contract]]
+id = "V03-C-WEIGHT-REVIEW-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/70"
+statement = "V0.2 corrections and local exclusions resolve preferred-daily-weight conflicts without mutating source measurements."
+evidence = ["positive", "transition"]
+
+[[contract]]
+id = "V03-C-WEIGHT-RULE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/70"
+statement = "The delivered body-mass rule recommends at least one kilogram, no upper bound, and personal range only after explicit V0.2 adoption."
+evidence = ["positive", "transition"]
+
+[[contract]]
+id = "V03-C-WEIGHT-ADAPTERS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/70"
+statement = "HealthLab, human CLI, JSON 3.0, and Streamlit expose the same complete persisted weight projection."
+evidence = ["positive", "parity"]
+
+[[contract]]
+id = "V03-C-NUTRITION-SOURCE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/71"
+statement = "All 39 closed nutrition types and every allowed source unit traverse the real import path, normalize once, and preserve logical, version, original-value, timestamp, source, and device provenance."
+evidence = ["positive", "reproducibility", "boundary"]
+
+[[contract]]
+id = "V03-C-NUTRITION-DAILY-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/71"
+statement = "Energy, protein, carbohydrates, and total fat sum independently on the measurement-local start day; absent samples remain missing and cross-midnight intervals are not split."
+evidence = ["positive", "negative", "boundary"]
+
+[[contract]]
+id = "V03-C-NUTRITION-RULE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/71"
+statement = "Each nutrition type recommends a zero lower bound only through explicit adoption; a negative source value opens one review and daily derivation creates no second plausibility case."
+evidence = ["positive", "boundary", "transition"]
+
+[[contract]]
+id = "V03-C-NUTRITION-REVIEW-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/71"
+statement = "V0.2 corrections and local exclusions update nutrition projections without mutating HealthKit nutrition samples."
+evidence = ["positive", "transition"]
+
+[[contract]]
+id = "V03-C-NUTRITION-ADAPTERS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/71"
+statement = "HealthLab, human CLI, JSON 3.0, and Streamlit expose the same complete HealthKit nutrition samples and daily projections."
+evidence = ["positive", "parity"]
+
+[[fixture]]
+id = "V03-F-IMPORT-CATALOG-V1"
+kind = "parser_contract"
+artifact = "tests/fixtures/v03/unsupported-import-content.xml"
+platform = "all"
+sha256 = "5d55e2cb2a0c9c0bf01eec021fca4baf18aed4b2607a23b17a40a127c9fcfa44"
+
+[[fixture]]
+id = "V03-F-WEIGHT-NUTRITION-EDGES-V1"
+kind = "parser_contract"
+artifact = "tests/fixtures/v03/weight-edges.xml"
+platform = "all"
+sha256 = "0f8e7833b8d4678c3312a840fdfae2d924876dd83e2792cbb539c8dfea62ff1a"
+
+[[fixture]]
+id = "V03-F-NUTRITION-ALL-UNITS-V1"
+kind = "generated_parser_contract"
+generator = "tests.acceptance.test_v03_weight._nutrition_fixture_bundle"
+seed = 71
+options = { variants = ["baseline", "later-protein-version", "negative-protein", "zero-sugar", "negative-protein-carbohydrates"] }
+platform = "all"
+sha256 = "e341b6a4470745bf30cf5bda744b8121b566b720048e8fe6cf61dccc873f0d02"
+
+[[case]]
+id = "V03-A-CONTEXT-COVERAGE-START-V1"
+contracts = ["V03-C-CONTEXT-COVERAGE-START-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_context.py::test_context_coverage_start_publishes_an_immutable_snapshot_and_baseline"
+initial_state = "committed synthetic snapshot without manual context"
+operation = "create the context coverage start through the HealthLab write seam and load the daily, records, and audit projections"
+level = "application"
+platform = "all"
+expected_result = "one immutable context revision and one bound snapshot with unknown pre-coverage days and baseline-only later gaps"
+expected_effect = "one globally ordered audit event and one active snapshot"
+forbidden_side_effects = "no illness, stress, or personal context value is fabricated"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-REGIME-V1"
+contracts = ["V03-C-MEDICATION-REGIME-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_medication.py::test_medication_regime_projects_dst_and_keeps_old_snapshot_stable"
+initial_state = "committed synthetic snapshot"
+operation = "create and correct an IANA-zone medication regime, then project its DST dose occurrence through old and current snapshots"
+level = "application"
+platform = "all"
+expected_result = "the DST gap resolves forward and the old dose plan remains immutable after correction"
+expected_effect = "one revision, audit event, and snapshot per successful regime revision"
+forbidden_side_effects = "no deviation, PRN intake, or adherence score is fabricated"
+evidence = ["positive", "boundary", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-DEVIATION-V1"
+contracts = ["V03-C-MEDICATION-DEVIATION-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_medication.py::test_medication_deviation_binds_one_occurrence_and_keeps_old_snapshot_stable"
+initial_state = "committed synthetic snapshot with one Monday scheduled dose"
+operation = "record a next-day travel-zone intake, preview an identical no_change intake, block an invalidating regime correction, then withdraw the deviation"
+level = "application"
+platform = "all"
+expected_result = "the old snapshot remains deviated while withdrawal restores assumed_as_planned in the active snapshot"
+expected_effect = "one immutable deviation revision, audit event, and snapshot for each successful state change"
+forbidden_side_effects = "no second day occurrence, automatic reassignment, or lock for no_change"
+evidence = ["positive", "negative", "transition", "boundary"]
+
+[[case]]
+id = "V03-A-AS-NEEDED-INTAKE-V1"
+contracts = ["V03-C-AS-NEEDED-INTAKE-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_medication.py::test_as_needed_intakes_and_reason_categories_are_snapshot_bound"
+initial_state = "committed synthetic snapshot with one reason category and one PRN medication"
+operation = "record a travel-zone PRN intake, rename its category, block category withdrawal through a regime preference, then withdraw and restore the intake"
+level = "application"
+platform = "all"
+expected_result = "the old snapshot retains the old category name, the current snapshot projects the rename, and the audit ends active after restoration"
+expected_effect = "one immutable medication revision and one snapshot per successful request"
+forbidden_side_effects = "no deviation, regime mutation, category free text, or automatic category withdrawal"
+evidence = ["positive", "negative", "transition", "boundary"]
+
+[[case]]
+id = "V03-A-DAILY-STRESS-CUSTOM-CONTEXT-V1"
+contracts = ["V03-C-DAILY-STRESS-CUSTOM-CONTEXT-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_context.py::test_daily_stress_and_custom_contexts_share_the_revision_snapshot_contract"
+initial_state = "committed synthetic snapshot with context coverage"
+operation = "record confirmed average stress, create a normalized custom label and open period, then preview an overlapping same-label period"
+level = "application"
+platform = "all"
+expected_result = "the observed stress and open period project through the bound snapshot while the overlap is blocked"
+expected_effect = "one immutable revision and snapshot per successful request"
+forbidden_side_effects = "no duplicate active daily stress, overlapping same-label period, or note in a receipt"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-IMPORT-DETAILS-V1"
+contracts = ["V03-C-IMPORT-DETAILS-V1", "V03-C-IMPORT-REIMPORT-V1"]
+fixtures = ["V03-F-IMPORT-CATALOG-V1"]
+runner = "tests/acceptance/test_v03_import_details.py::test_import_details_catalog_unsupported_content_across_reimports"
+initial_state = "empty synthetic store"
+operation = "import the catalog fixture, then reimport it identically and cumulatively"
+level = "application"
+platform = "all"
+expected_result = "typed canonical counts and ordered unsupported-content entries for every import"
+expected_effect = "catalog rows remain bound to their import identities"
+forbidden_side_effects = "no parser or storage internals enter the public projection"
+evidence = ["positive", "negative", "reproducibility"]
+
+[[case]]
+id = "V03-A-IMPORT-CLI-V1"
+contracts = ["V03-C-IMPORT-ADAPTERS-V1"]
+fixtures = ["V03-F-IMPORT-CATALOG-V1"]
+runner = "tests/adapters/test_cli.py::test_cli_renders_import_details_as_human_text_and_json_3"
+initial_state = "committed catalog fixture"
+operation = "load import details through the human CLI and JSON 3.0"
+level = "adapter"
+platform = "all"
+expected_result = "complete human and schema-valid JSON projections"
+expected_effect = "none"
+forbidden_side_effects = "no adapter-side catalog interpretation"
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-IMPORT-STREAMLIT-V1"
+contracts = ["V03-C-IMPORT-ADAPTERS-V1"]
+fixtures = ["V03-F-IMPORT-CATALOG-V1"]
+runner = "tests/adapters/test_streamlit.py::test_streamlit_loads_import_details_through_the_application_seam"
+initial_state = "committed catalog fixture"
+operation = "select an import identity on the Kerndaten page"
+level = "adapter"
+platform = "all"
+expected_result = "canonical counts and the complete catalog table"
+expected_effect = "none"
+forbidden_side_effects = "no persistent state outside application"
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-MATRIX-VALID-V1"
+contracts = ["V03-C-MATRIX-VALIDATION-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix.py::test_v03_matrix_is_well_formed_and_fully_registered"
+initial_state = "repository V0.3 delta matrix"
+operation = "validate all closed matrix references and fixture hashes"
+level = "meta"
+platform = "all"
+expected_result = "matrix accepted"
+expected_effect = "none"
+forbidden_side_effects = "no domain logic interpreted"
+evidence = ["positive"]
+
+[[case]]
+id = "V03-A-MATRIX-REJECT-V1"
+contracts = ["V03-C-MATRIX-VALIDATION-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix.py::test_v03_matrix_rejects_open_references_and_hashes"
+initial_state = "mutated V0.3 delta matrices"
+operation = "validate duplicate IDs, short runners, missing evidence, unknown platforms, and hash drift"
+level = "meta"
+platform = "all"
+expected_result = "each invalid matrix is rejected"
+expected_effect = "none"
+forbidden_side_effects = "no invalid registry accepted"
+evidence = ["negative"]
+
+[[contract]]
+id = "V03-C-WRITE-CAPACITY-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/86"
+statement = "Every V0.3 writer, derivation, migration, backup, and restore form uses the shared hard capacity preflight with a versioned conservative output and scratch bound; unknown blocks, unchanged hard-linked artifacts are not recounted, and late ENOSPC cannot commit."
+evidence = ["positive", "negative", "boundary", "fault", "transition"]
+
+[[contract]]
+id = "V03-C-ATOMIC-FAULT-CUTPOINTS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/86"
+statement = "Named cutpoints before and after artifact publication, SQLite commit, migration, backup, every restore gate, and final activation leave only the old state or one fully valid new state active."
+evidence = ["fault", "transition", "security"]
+
+[[fixture]]
+id = "V03-F-ALLOC-MANUAL-NORMAL-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "manual-snapshot/v1", scale = "normal" }
+platform = "all"
+sha256 = "aff7bc8b37f8e5a6b7f0e5ee21050957baa42eb2031435860c62744f65d8429d"
+
+[[fixture]]
+id = "V03-F-ALLOC-MANUAL-STRESS-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "manual-snapshot/v1", scale = "stress" }
+platform = "all"
+sha256 = "ef1b4e3bcdc7175f65ae22b0e68ef8e074f1391c3488ce86b2e883781b7bb106"
+
+[[fixture]]
+id = "V03-F-ALLOC-DERIVATION-NORMAL-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "activity-derivation/v1", scale = "normal" }
+platform = "all"
+sha256 = "e6b19780b895c3f5333d5389fb170bce77b43e2be74aff6dbaff33c77ec23c18"
+
+[[fixture]]
+id = "V03-F-ALLOC-DERIVATION-STRESS-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "activity-derivation/v1", scale = "stress" }
+platform = "all"
+sha256 = "38513fd2861447fee0adaf83a30977a184ce1f7426ace751c9430ac1be251026"
+
+[[fixture]]
+id = "V03-F-FAULT-CUTPOINTS-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { family = "artifact-sqlite-migration-backup-restore-activation" }
+platform = "all"
+sha256 = "ddc0b4a764312aec0f75c94232b21720d1392cc08d46c6e102d22ee8fd6ddce0"
+
+[[fixture]]
+id = "V03-F-ALLOC-IMPORT-NORMAL-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "full-snapshot-import/v1", scale = "normal" }
+platform = "all"
+sha256 = "ef3a969aafa179373166504526e7ef6e05f91d7357436338aa1bd95662f4e1b1"
+
+[[fixture]]
+id = "V03-F-ALLOC-IMPORT-STRESS-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "full-snapshot-import/v1", scale = "stress" }
+platform = "all"
+sha256 = "315ac6c900cd288839135431f725c7084e20424123aa024de9f97620675535f9"
+
+[[fixture]]
+id = "V03-F-ALLOC-MIGRATION-NORMAL-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "cow-migration/v1", scale = "normal" }
+platform = "all"
+sha256 = "e22a1e3bd4eda490150125eeb8d46aa59ae6ad1090c9feaf8b5dd4900cf6cd2e"
+
+[[fixture]]
+id = "V03-F-ALLOC-MIGRATION-STRESS-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "cow-migration/v1", scale = "stress" }
+platform = "all"
+sha256 = "b457626d0906e4c532885d66e8e2bad2b51e50580a336a6d595adf63b6efb00c"
+
+[[fixture]]
+id = "V03-F-ALLOC-BACKUP-NORMAL-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "metadata-backup/v1", scale = "normal" }
+platform = "all"
+sha256 = "152a7ad9bf45669624a7402814bcfd884ed556a5e21c5ede2d7a37a435151a56"
+
+[[fixture]]
+id = "V03-F-ALLOC-BACKUP-STRESS-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "metadata-backup/v1", scale = "stress" }
+platform = "all"
+sha256 = "570ce9255b2774b3ae781cc33128210fdb843bc2d32e295481f6fb253eff7b3e"
+
+[[fixture]]
+id = "V03-F-ALLOC-RESTORE-START-NORMAL-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "restore-start/v1", scale = "normal" }
+platform = "all"
+sha256 = "78904119d08b9251cecf6a37485a80a706cad8dedcf869f0731fc990eba068c2"
+
+[[fixture]]
+id = "V03-F-ALLOC-RESTORE-START-STRESS-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "restore-start/v1", scale = "stress" }
+platform = "all"
+sha256 = "ec9297dfa65957a979fb0657763c63ff6a841c46ce823297db00a5e3a9d5adae"
+
+[[fixture]]
+id = "V03-F-ALLOC-RESTORE-SOURCE-NORMAL-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "restore-source-import/v1", scale = "normal" }
+platform = "all"
+sha256 = "b499eef5177febf4f6cb676078f55f6ee9a3c0dde7a6d5383f6eaad42b1e3eaa"
+
+[[fixture]]
+id = "V03-F-ALLOC-RESTORE-SOURCE-STRESS-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "restore-source-import/v1", scale = "stress" }
+platform = "all"
+sha256 = "66155863b93f8162b3a54202401bdce47dd45d6a3f9c1e9fb7254ff093cfee43"
+
+[[fixture]]
+id = "V03-F-ALLOC-RESTORE-ACTIVATE-NORMAL-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "restore-activate/v1", scale = "normal" }
+platform = "all"
+sha256 = "80f1e9f9db1619d89c2376408267988104675ff10d722917c1da12e923a6539f"
+
+[[fixture]]
+id = "V03-F-ALLOC-RESTORE-ACTIVATE-STRESS-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "restore-activate/v1", scale = "stress" }
+platform = "all"
+sha256 = "ea0d133e884bf1336a452e037a0f328bb8ba8e0d5b6c9787d7df3aedb728e831"
+
+[[case]]
+id = "V03-A-WRITE-CAPACITY-BOUNDS-V1"
+contracts = ["V03-C-WRITE-CAPACITY-V1"]
+fixtures = ["V03-F-ALLOC-MANUAL-NORMAL-V1", "V03-F-ALLOC-MANUAL-STRESS-V1", "V03-F-ALLOC-DERIVATION-NORMAL-V1", "V03-F-ALLOC-DERIVATION-STRESS-V1"]
+runner = "tests/acceptance/test_v03_capacity_faults.py::test_v03_snapshot_methods_bound_normal_and_stress_fixtures"
+initial_state = "normal and stress snapshots with immutable hard-linked source artifacts"
+operation = "measure additional live allocation at each real manual and derivation writer phase"
+level = "application"
+platform = "all"
+expected_result = "manual-snapshot/v1 and activity-derivation/v1 conservatively bound st_blocks times 512"
+expected_effect = "one complete new snapshot"
+forbidden_side_effects = "no immutable source recount or APFS copy-on-write credit"
+evidence = ["positive", "boundary"]
+
+[[case]]
+id = "V03-A-IMPORT-CAPACITY-BOUNDS-V1"
+contracts = ["V03-C-WRITE-CAPACITY-V1"]
+fixtures = ["V03-F-ALLOC-IMPORT-NORMAL-V1", "V03-F-ALLOC-IMPORT-STRESS-V1"]
+runner = "tests/acceptance/test_v02_write_plan.py::test_full_snapshot_import_v1_measures_real_writer_phases"
+initial_state = "normal and stress populated snapshots"
+operation = "measure every full snapshot import writer phase"
+level = "application"
+platform = "all"
+expected_result = "full-snapshot-import/v1 bounds st_blocks times 512"
+expected_effect = "one complete imported snapshot"
+forbidden_side_effects = "no unbounded output or scratch"
+evidence = ["positive", "boundary"]
+
+[[case]]
+id = "V03-A-MIGRATION-CAPACITY-BOUNDS-V1"
+contracts = ["V03-C-WRITE-CAPACITY-V1"]
+fixtures = ["V03-F-ALLOC-MIGRATION-NORMAL-V1", "V03-F-ALLOC-MIGRATION-STRESS-V1"]
+runner = "tests/acceptance/test_v02_migration.py::test_cow_migration_v1_bounds_normal_and_stress_fixtures"
+initial_state = "normal and stress V0.2 stores"
+operation = "measure backup, staging, move, and activation allocation"
+level = "application"
+platform = "all"
+expected_result = "cow-migration/v1 bounds st_blocks times 512 without copy-on-write credit"
+expected_effect = "one complete migrated store"
+forbidden_side_effects = "no mixed schema or APFS copy-on-write credit"
+evidence = ["positive", "boundary"]
+
+[[case]]
+id = "V03-A-BACKUP-CAPACITY-BOUNDS-V1"
+contracts = ["V03-C-WRITE-CAPACITY-V1"]
+fixtures = ["V03-F-ALLOC-BACKUP-NORMAL-V1", "V03-F-ALLOC-BACKUP-STRESS-V1"]
+runner = "tests/acceptance/test_v02_metadata_backup.py::test_metadata_backup_v1_measures_populated_writer_phases"
+initial_state = "normal and stress populated stores"
+operation = "measure temporary and published metadata backup allocation"
+level = "application"
+platform = "all"
+expected_result = "metadata-backup/v1 bounds st_blocks times 512"
+expected_effect = "one complete portable backup"
+forbidden_side_effects = "no partial backup target"
+evidence = ["positive", "boundary"]
+
+[[case]]
+id = "V03-A-RESTORE-START-CAPACITY-BOUNDS-V1"
+contracts = ["V03-C-WRITE-CAPACITY-V1"]
+fixtures = ["V03-F-ALLOC-RESTORE-START-NORMAL-V1", "V03-F-ALLOC-RESTORE-START-STRESS-V1"]
+runner = "tests/acceptance/test_v02_metadata_restore.py::test_restore_start_v1_bounds_normal_and_stress_fixtures"
+initial_state = "new empty stores and normal or stress metadata backups"
+operation = "measure restore working-copy and pending-catalog gates"
+level = "application"
+platform = "all"
+expected_result = "restore-start/v1 bounds st_blocks times 512"
+expected_effect = "one complete restore-pending session"
+forbidden_side_effects = "no active or partial restore"
+evidence = ["positive", "boundary"]
+
+[[case]]
+id = "V03-A-RESTORE-SOURCE-CAPACITY-BOUNDS-V1"
+contracts = ["V03-C-WRITE-CAPACITY-V1"]
+fixtures = ["V03-F-ALLOC-RESTORE-SOURCE-NORMAL-V1", "V03-F-ALLOC-RESTORE-SOURCE-STRESS-V1"]
+runner = "tests/acceptance/test_v02_metadata_restore.py::test_restore_source_import_v1_bounds_normal_and_stress_fixtures"
+initial_state = "restore-pending stores with normal or stress source packages"
+operation = "measure durable restore-source package allocation"
+level = "application"
+platform = "all"
+expected_result = "restore-source-import/v1 bounds st_blocks times 512"
+expected_effect = "one complete source package"
+forbidden_side_effects = "no partial source package or activation"
+evidence = ["positive", "boundary"]
+
+[[case]]
+id = "V03-A-RESTORE-ACTIVATE-CAPACITY-BOUNDS-V1"
+contracts = ["V03-C-WRITE-CAPACITY-V1"]
+fixtures = ["V03-F-ALLOC-RESTORE-ACTIVATE-NORMAL-V1", "V03-F-ALLOC-RESTORE-ACTIVATE-STRESS-V1"]
+runner = "tests/acceptance/test_v02_metadata_restore.py::test_restore_activate_v1_bounds_snapshot_and_overlay_allocation"
+initial_state = "restore-pending stores with normal or stress overlays"
+operation = "measure complete snapshot materialization and overlay activation"
+level = "application"
+platform = "all"
+expected_result = "restore-activate/v1 bounds st_blocks times 512"
+expected_effect = "one completely activated restored snapshot"
+forbidden_side_effects = "no partial overlay or mixed snapshot"
+evidence = ["positive", "boundary"]
+
+[[case]]
+id = "V03-A-WRITE-CAPACITY-UNKNOWN-V1"
+contracts = ["V03-C-WRITE-CAPACITY-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_capacity_faults.py::test_unknown_manual_snapshot_bound_blocks_the_public_plan"
+initial_state = "snapshot writer without a closed output or scratch bound"
+operation = "preview the shared application write"
+level = "application"
+platform = "all"
+expected_result = "blocked capacity_estimate_unknown"
+expected_effect = "none"
+forbidden_side_effects = "no best-effort estimate or publication"
+evidence = ["negative"]
+
+[[case]]
+id = "V03-A-WRITE-CAPACITY-RECHECK-V1"
+contracts = ["V03-C-WRITE-CAPACITY-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_capacity_faults.py::test_manual_snapshot_capacity_is_rechecked_under_the_writer_lock"
+initial_state = "ready preview whose target becomes insufficient before execution"
+operation = "execute the confirmed write under the common writer lock"
+level = "application"
+platform = "all"
+expected_result = "blocked capacity_insufficient"
+expected_effect = "old snapshot remains active"
+forbidden_side_effects = "no revision, audit event, or partial snapshot"
+evidence = ["negative", "transition"]
+
+[[case]]
+id = "V03-A-WRITE-CAPACITY-ENOSPC-V1"
+contracts = ["V03-C-WRITE-CAPACITY-V1"]
+fixtures = ["V03-F-FAULT-CUTPOINTS-V1"]
+runner = "tests/acceptance/test_v03_capacity_faults.py::test_late_manual_snapshot_enospc_never_reaches_the_commit_point"
+initial_state = "positive final preflight followed by late ENOSPC"
+operation = "fail after snapshot materialization and before SQLite commit"
+level = "application"
+platform = "all"
+expected_result = "old snapshot remains active"
+expected_effect = "none"
+forbidden_side_effects = "no revision, audit event, or active partial snapshot"
+evidence = ["fault", "transition"]
+
+[[case]]
+id = "V03-A-ATOMIC-SNAPSHOT-CUTPOINTS-V1"
+contracts = ["V03-C-ATOMIC-FAULT-CUTPOINTS-V1"]
+fixtures = ["V03-F-FAULT-CUTPOINTS-V1"]
+runner = "tests/acceptance/test_v03_capacity_faults.py::test_v03_fault_cutpoints_leave_only_old_or_complete_new_state"
+initial_state = "active snapshot before a manual or derivation write"
+operation = "inject before and after artifact publication and SQLite commit"
+level = "application"
+platform = "all"
+expected_result = "old state before commit or complete new state after commit"
+expected_effect = "at most one fully valid active snapshot"
+forbidden_side_effects = "no partial revision, audit, derivation, or mixed snapshot"
+evidence = ["fault", "transition", "security"]
+
+[[case]]
+id = "V03-A-ATOMIC-IMPORT-CUTPOINTS-V1"
+contracts = ["V03-C-ATOMIC-FAULT-CUTPOINTS-V1"]
+fixtures = ["V03-F-FAULT-CUTPOINTS-V1"]
+runner = "tests/acceptance/test_v02_snapshot_publication.py::test_publication_fault_keeps_old_snapshot_active_and_quarantines_remainder"
+initial_state = "one active snapshot and a second staged import"
+operation = "inject before and after artifact publication and SQLite commit"
+level = "application"
+platform = "all"
+expected_result = "old state before commit or complete imported state after commit"
+expected_effect = "uncataloged pre-commit output is quarantined"
+forbidden_side_effects = "no mixed snapshot or partial audit"
+evidence = ["fault", "transition"]
+
+[[case]]
+id = "V03-A-ATOMIC-MIGRATION-CUTPOINTS-V1"
+contracts = ["V03-C-ATOMIC-FAULT-CUTPOINTS-V1"]
+fixtures = ["V03-F-FAULT-CUTPOINTS-V1"]
+runner = "tests/acceptance/test_v02_migration.py::test_migration_fault_keeps_old_snapshot_and_retry_starts_fresh"
+initial_state = "V0.2 store ready for V0.3 copy-on-write migration"
+operation = "inject before and after backup, snapshot publication, and SQLite commit"
+level = "application"
+platform = "all"
+expected_result = "retryable old state before commit or complete V0.3 state after commit"
+expected_effect = "one complete migrated snapshot at most"
+forbidden_side_effects = "no mixed schema, partial audit, or resumed staging"
+evidence = ["fault", "transition"]
+
+[[case]]
+id = "V03-A-ATOMIC-BACKUP-CUTPOINTS-V1"
+contracts = ["V03-C-ATOMIC-FAULT-CUTPOINTS-V1"]
+fixtures = ["V03-F-FAULT-CUTPOINTS-V1"]
+runner = "tests/acceptance/test_v03_capacity_faults.py::test_v03_backup_fault_cutpoints_leave_no_file_or_one_complete_backup"
+initial_state = "validated metadata backup temporary file"
+operation = "inject immediately before and after durable publication"
+level = "application"
+platform = "all"
+expected_result = "no target before publication or one integrity-valid target after publication"
+expected_effect = "none on the source store"
+forbidden_side_effects = "no partial target or source mutation"
+evidence = ["fault", "transition"]
+
+[[case]]
+id = "V03-A-ATOMIC-RESTORE-GATES-V1"
+contracts = ["V03-C-ATOMIC-FAULT-CUTPOINTS-V1"]
+fixtures = ["V03-F-FAULT-CUTPOINTS-V1"]
+runner = "tests/acceptance/test_v02_metadata_restore.py::test_restore_faults_leave_empty_or_complete_pending_state"
+initial_state = "new empty real store and valid metadata backup"
+operation = "inject before and after working-copy, publication, and pending-catalog gates"
+level = "application"
+platform = "all"
+expected_result = "empty retryable store or one complete restore-pending session"
+expected_effect = "no active domain snapshot"
+forbidden_side_effects = "no partial restore session or overlay"
+evidence = ["fault", "transition"]
+
+[[case]]
+id = "V03-A-ATOMIC-RESTORE-SOURCE-V1"
+contracts = ["V03-C-ATOMIC-FAULT-CUTPOINTS-V1"]
+fixtures = ["V03-F-FAULT-CUTPOINTS-V1"]
+runner = "tests/acceptance/test_v02_metadata_restore.py::test_restore_source_publish_fault_is_retryable"
+initial_state = "restore-pending store awaiting an exact source package"
+operation = "inject before and after durable restore-source publication"
+level = "application"
+platform = "all"
+expected_result = "no source before publication or one complete retryable source after publication"
+expected_effect = "restore remains pending"
+forbidden_side_effects = "no partial package or early activation"
+evidence = ["fault", "transition"]
+
+[[case]]
+id = "V03-A-ATOMIC-RESTORE-ACTIVATION-V1"
+contracts = ["V03-C-ATOMIC-FAULT-CUTPOINTS-V1"]
+fixtures = ["V03-F-FAULT-CUTPOINTS-V1"]
+runner = "tests/acceptance/test_v02_metadata_restore.py::test_restore_activation_fault_rolls_back_overlay_and_retries"
+initial_state = "restore-pending store with all exact source references"
+operation = "inject immediately before and after final SQLite activation"
+level = "application"
+platform = "all"
+expected_result = "complete pending state before commit or complete ready state after commit"
+expected_effect = "one fully bound restored snapshot"
+forbidden_side_effects = "no partial overlay, audit, person binding, or mixed snapshot"
+evidence = ["fault", "transition"]
+
+[[case]]
+id = "V03-A-WEIGHT-PROJECTION-V1"
+contracts = ["V03-C-WEIGHT-SOURCE-V1", "V03-C-WEIGHT-DAILY-V1"]
+fixtures = ["V03-F-WEIGHT-NUTRITION-EDGES-V1"]
+runner = "tests/acceptance/test_v03_weight.py::test_weight_import_projects_units_versions_missingness_and_daily_preference"
+initial_state = "empty synthetic store"
+operation = "import versioned kilogram, gram, pound, equal, conflicting, and absent-day measurements"
+level = "application"
+platform = "all"
+expected_result = "complete source lineage and explicit observed, missing, and ambiguous daily values"
+expected_effect = "one immutable snapshot per committed import"
+forbidden_side_effects = "no carry-forward, interpolation, or source-value mutation"
+evidence = ["positive", "negative", "boundary", "reproducibility"]
+
+[[case]]
+id = "V03-A-NUTRITION-PROJECTION-V1"
+contracts = ["V03-C-NUTRITION-SOURCE-V1", "V03-C-NUTRITION-DAILY-V1"]
+fixtures = ["V03-F-NUTRITION-ALL-UNITS-V1"]
+runner = "tests/acceptance/test_v03_weight.py::test_nutrition_imports_every_type_and_unit_and_projects_independent_days"
+initial_state = "empty synthetic store"
+operation = "import all closed nutrition type-unit combinations, then a cumulative protein version"
+level = "application"
+platform = "all"
+expected_result = "complete immutable measurements and four independently missing daily features"
+expected_effect = "one immutable snapshot per committed import"
+forbidden_side_effects = "no unit reinterpretation, interval splitting, imputation, or source mutation"
+evidence = ["positive", "negative", "boundary", "reproducibility"]
+
+[[case]]
+id = "V03-A-NUTRITION-RULE-V1"
+contracts = ["V03-C-NUTRITION-RULE-V1"]
+fixtures = ["V03-F-NUTRITION-ALL-UNITS-V1"]
+runner = "tests/acceptance/test_v03_weight.py::test_negative_nutrition_opens_one_source_review_without_derived_recheck"
+initial_state = "nutrition recommendations with no adopted versions"
+operation = "adopt the protein recommendation and import one negative protein source sample"
+level = "application"
+platform = "all"
+expected_result = "one source plausibility case inherited by the daily protein feature"
+expected_effect = "rule version and reviewed snapshot are persisted"
+forbidden_side_effects = "no recommendation-only activation, source mutation, or derived second review"
+evidence = ["positive", "transition"]
+
+[[case]]
+id = "V03-A-NUTRITION-ZERO-V1"
+contracts = ["V03-C-NUTRITION-RULE-V1"]
+fixtures = ["V03-F-NUTRITION-ALL-UNITS-V1"]
+runner = "tests/acceptance/test_v03_weight.py::test_zero_nutrition_value_is_a_valid_observed_boundary"
+initial_state = "an explicitly adopted zero-lower-bound sugar rule"
+operation = "import a zero-valued dietary sugar source sample"
+level = "application"
+platform = "all"
+expected_result = "zero remains an observed effective value without a plausibility review"
+expected_effect = "the source sample is persisted unchanged"
+forbidden_side_effects = "no zero-to-missing coercion or review case"
+evidence = ["positive", "boundary"]
+
+[[case]]
+id = "V03-A-NUTRITION-REVIEW-V1"
+contracts = ["V03-C-NUTRITION-REVIEW-V1"]
+fixtures = ["V03-F-NUTRITION-ALL-UNITS-V1"]
+runner = "tests/acceptance/test_v03_weight.py::test_nutrition_correction_and_exclusion_preserve_source_samples"
+initial_state = "negative protein and carbohydrate samples with open plausibility reviews"
+operation = "correct the protein sample and locally exclude the carbohydrate sample"
+level = "application"
+platform = "all"
+expected_result = "daily features reflect the correction and exclusion"
+expected_effect = "new immutable effective decisions are projected"
+forbidden_side_effects = "no HealthKit nutrition sample mutation"
+evidence = ["positive", "transition"]
+
+[[case]]
+id = "V03-A-WEIGHT-CORRECTION-V1"
+contracts = ["V03-C-WEIGHT-REVIEW-V1"]
+fixtures = ["V03-F-WEIGHT-NUTRITION-EDGES-V1"]
+runner = "tests/acceptance/test_v03_weight.py::test_weight_correction_resolves_an_ambiguous_preferred_daily_weight"
+initial_state = "weight conflict with an open review case"
+operation = "correct one conflicting latest measurement through the V0.2 review workflow"
+level = "application"
+platform = "all"
+expected_result = "one observed preferred daily weight"
+expected_effect = "correction is projected in a new immutable snapshot"
+forbidden_side_effects = "no source measurement mutation"
+evidence = ["positive", "transition"]
+
+[[case]]
+id = "V03-A-WEIGHT-EXCLUSION-V1"
+contracts = ["V03-C-WEIGHT-REVIEW-V1"]
+fixtures = ["V03-F-WEIGHT-NUTRITION-EDGES-V1"]
+runner = "tests/acceptance/test_v03_weight.py::test_weight_exclusion_resolves_an_ambiguous_preferred_daily_weight"
+initial_state = "weight conflict with an open review case"
+operation = "exclude one conflicting latest measurement through the V0.2 review workflow"
+level = "application"
+platform = "all"
+expected_result = "the remaining measurement becomes the observed preferred daily weight"
+expected_effect = "exclusion is projected in a new immutable snapshot"
+forbidden_side_effects = "no source measurement mutation"
+evidence = ["positive", "transition"]
+
+[[case]]
+id = "V03-A-WEIGHT-RULE-V1"
+contracts = ["V03-C-WEIGHT-RULE-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_weight.py::test_weight_plausibility_recommendation_is_adopted_through_the_v02_workflow"
+initial_state = "body-mass recommendation with no adopted version"
+operation = "adopt the recommendation and import a sub-kilogram measurement"
+level = "application"
+platform = "all"
+expected_result = "an explicitly adopted lower-bound rule opens a plausibility case"
+expected_effect = "rule version and reviewed snapshot are persisted"
+forbidden_side_effects = "no recommendation-only rule is silently activated"
+evidence = ["positive", "transition"]
+
+[[case]]
+id = "V03-A-WEIGHT-CLI-V1"
+contracts = ["V03-C-WEIGHT-ADAPTERS-V1", "V03-C-NUTRITION-ADAPTERS-V1"]
+fixtures = ["V03-F-WEIGHT-NUTRITION-EDGES-V1"]
+runner = "tests/adapters/test_cli.py::test_cli_renders_the_complete_weight_projection_as_human_text_and_json_3"
+initial_state = "committed weight edge fixture"
+operation = "load weight nutrition through human CLI and JSON 3.0"
+level = "adapter"
+platform = "all"
+expected_result = "complete human and schema-valid JSON projections"
+expected_effect = "none"
+forbidden_side_effects = "no adapter-side weight selection logic"
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-WEIGHT-STREAMLIT-V1"
+contracts = ["V03-C-WEIGHT-ADAPTERS-V1", "V03-C-NUTRITION-ADAPTERS-V1"]
+fixtures = ["V03-F-WEIGHT-NUTRITION-EDGES-V1"]
+runner = "tests/adapters/test_streamlit.py::test_streamlit_renders_the_complete_weight_projection"
+initial_state = "committed weight edge fixture"
+operation = "select a date range on the Kerndaten page"
+level = "adapter"
+platform = "all"
+expected_result = "complete daily and source-measurement tables"
+expected_effect = "none"
+forbidden_side_effects = "no persistent state outside application"
+evidence = ["positive", "parity"]
+
+[[contract]]
+id = "V03-C-SLEEP-SOURCE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/72"
+statement = "Supported SleepAnalysis intervals preserve their exact aware endpoints, offsets, original and canonical categories, provenance, identity, and versions while classifying sources through the shipped contract."
+evidence = ["positive", "boundary", "reproducibility"]
+
+[[contract]]
+id = "V03-C-SLEEP-PROJECTION-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/72"
+statement = "Only selected Watch intervals derive sleep episodes; rejected source classes remain visible, and overlap remains evidence with explicit partial quality."
+evidence = ["positive", "boundary"]
+
+[[contract]]
+id = "V03-C-SLEEP-ADAPTERS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/72"
+statement = "CLI JSON and Streamlit forward the same SnapshotDateSelection to HealthLab.load_sleep_days and render the complete sleep projection."
+evidence = ["positive", "parity"]
+
+[[fixture]]
+id = "V03-F-SLEEP-EDGES-V1"
+kind = "parser_contract"
+artifact = "tests/fixtures/v03/sleep-edges.xml"
+platform = "all"
+sha256 = "adef3fbb2344bf4aafbda5584bbb0bf768be169efd0537344c0aac66d6ce2896"
+
+[[case]]
+id = "V03-A-SLEEP-PROJECTION-V1"
+contracts = ["V03-C-SLEEP-SOURCE-V1", "V03-C-SLEEP-PROJECTION-V1"]
+fixtures = ["V03-F-SLEEP-EDGES-V1"]
+runner = "tests/acceptance/test_v03_sleep.py::test_sleep_import_preserves_categories_offsets_overlap_and_source_eligibility"
+initial_state = "empty synthetic store"
+operation = "import versioned Watch, iPhone, and manual sleep intervals including deprecated Asleep and overlap"
+level = "application"
+platform = "all"
+expected_result = "preserved canonical intervals plus a partial Watch sleep night with explicit conflict evidence"
+expected_effect = "one immutable snapshot is published"
+forbidden_side_effects = "no overlap deduplication, source fusion, or category rewrite"
+evidence = ["positive", "boundary", "reproducibility"]
+
+[[case]]
+id = "V03-A-SLEEP-CLI-V1"
+contracts = ["V03-C-SLEEP-ADAPTERS-V1"]
+fixtures = ["V03-F-SLEEP-EDGES-V1"]
+runner = "tests/acceptance/test_v03_sleep.py::test_sleep_days_cli_uses_the_shared_selection"
+initial_state = "committed Watch sleep fixture"
+operation = "load selected sleep days through human CLI and JSON 3.0"
+level = "adapter"
+platform = "all"
+expected_result = "complete selected sleep projection"
+expected_effect = "none"
+forbidden_side_effects = "no CLI source classification or derivation"
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-SLEEP-REIMPORT-V1"
+contracts = ["V03-C-SLEEP-SOURCE-V1", "V03-C-SLEEP-PROJECTION-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_sleep.py::test_sleep_reimport_versions_stages_and_catalogs_invalid_forms"
+initial_state = "one committed Watch sleep interval"
+operation = "reimport the same natural interval with a corrected stage and catalog unsupported sleep forms"
+level = "application"
+platform = "all"
+expected_result = "both versions remain inspectable, only the corrected version is selected, and invalid forms are catalogued"
+expected_effect = "two immutable snapshots are published"
+forbidden_side_effects = "no stage-specific logical identity and no unsupported value coercion"
+evidence = ["positive", "negative", "reproducibility"]
+
+[[case]]
+id = "V03-A-SLEEP-STREAMLIT-V1"
+contracts = ["V03-C-SLEEP-ADAPTERS-V1"]
+fixtures = ["V03-F-SLEEP-EDGES-V1"]
+runner = "tests/adapters/test_streamlit.py::test_streamlit_loads_sleep_days_through_the_application_seam"
+initial_state = "committed Watch sleep fixture"
+operation = "load sleep on the Kerndaten page"
+level = "adapter"
+platform = "all"
+expected_result = "day and canonical interval tables"
+expected_effect = "none"
+forbidden_side_effects = "no persistent UI state outside application"
+evidence = ["positive", "parity"]
+
+[[contract]]
+id = "V03-C-ACTIVITY-SOURCE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/74"
+statement = "Apple exercise time, steps, walking/running distance, and active energy preserve typed canonical values, units, timestamps, provenance, identity, and versions."
+evidence = ["positive", "boundary", "reproducibility"]
+
+[[contract]]
+id = "V03-C-ACTIVITY-PROJECTION-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/74"
+statement = "Activity days aggregate each metric independently on the measurement-local start day; cross-midnight quantities are not split and missing metrics remain null."
+evidence = ["positive", "boundary"]
+
+[[contract]]
+id = "V03-C-ACTIVITY-REVIEW-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/74"
+statement = "Same-metric same-source-class positive overlaps and negative activity values remain canonical, contribute until resolved, and open review cases; cross-metric overlap remains valid."
+evidence = ["positive", "negative", "boundary"]
+
+[[contract]]
+id = "V03-C-ACTIVITY-ADAPTERS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/74"
+statement = "CLI JSON and Streamlit forward the same SnapshotDateSelection to HealthLab.load_activity_days and render the complete activity projection."
+evidence = ["positive", "parity"]
+
+[[contract]]
+id = "V03-C-WORKOUTS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/75"
+statement = "Immutable workouts preserve their original type, local start day, aware times, full source provenance, reported-or-elapsed duration, and optional distance and energy."
+evidence = ["positive", "boundary", "reproducibility"]
+
+[[contract]]
+id = "V03-C-WORKOUT-REVIEW-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/75"
+statement = "Invalid workout totals and positive overlap persist data-review cases; correction and local exclusion update only the effective workout projection."
+evidence = ["positive", "negative", "transition"]
+
+[[contract]]
+id = "V03-C-WORKOUT-ADAPTERS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/75"
+statement = "HealthLab, CLI JSON, and Streamlit use the shared workout projection without merging it into activity-day totals."
+evidence = ["positive", "parity"]
+
+[[contract]]
+id = "V03-C-SNAPSHOT-LINEAGE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/83"
+statement = "Every V0.3 snapshot binds its cutoff, context, source versions, effective manual revisions, contracts, and parent; validates exact flat derivation lineage; reuses immutable canonical sources; and activates only after durable staging in one SQLite commit."
+evidence = ["positive", "negative", "fault", "reproducibility", "transition"]
+
+[[case]]
+id = "V03-A-SNAPSHOT-LINEAGE-V1"
+contracts = ["V03-C-SNAPSHOT-LINEAGE-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_medication.py::test_snapshot_lineage_is_flat_validated_and_reuses_immutable_sources"
+initial_state = "committed synthetic source snapshot"
+operation = "activate a manual intake-reason-category revision and inspect the published snapshot artifact"
+level = "application"
+platform = "all"
+expected_result = "flat source lineage for each resolved record and reused immutable canonical source files"
+expected_effect = "one fully validated child snapshot"
+forbidden_side_effects = "no copied canonical source artifact or unreferenced lineage row"
+evidence = ["positive", "reproducibility", "transition"]
+
+[[case]]
+id = "V03-A-SNAPSHOT-BINDINGS-V1"
+contracts = ["V03-C-SNAPSHOT-LINEAGE-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_medication.py::test_import_carries_every_effective_manual_revision_binding_forward"
+initial_state = "snapshot with all supported effective manual revision families"
+operation = "publish a cumulative import and inspect its SQLite and manifest bindings"
+level = "application"
+platform = "all"
+expected_result = "the child snapshot carries every effective manual revision binding"
+expected_effect = "manifest and SQLite bindings are identical"
+forbidden_side_effects = "no dropped medication deviation, reason category, or as-needed intake"
+evidence = ["positive", "transition"]
+
+[[case]]
+id = "V03-A-SNAPSHOT-BINDING-NEGATIVE-V1"
+contracts = ["V03-C-SNAPSHOT-LINEAGE-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_medication.py::test_manifest_manual_revision_binding_must_match_sqlite"
+initial_state = "committed snapshot with one effective manual revision"
+operation = "remove the revision from the manifest while preserving the catalog hash"
+level = "application"
+platform = "all"
+expected_result = "store validation rejects the unclosed revision binding"
+expected_effect = "the corrupt store does not open"
+forbidden_side_effects = "no acceptance of a manifest and SQLite binding mismatch"
+evidence = ["negative"]
+
+[[case]]
+id = "V03-A-SNAPSHOT-FAULT-V1"
+contracts = ["V03-C-SNAPSHOT-LINEAGE-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_medication.py::test_manual_snapshot_fault_keeps_revision_audit_and_activation_atomic"
+initial_state = "one committed source snapshot"
+operation = "inject faults immediately before and after moving a staged manual snapshot"
+level = "application"
+platform = "all"
+expected_result = "the previous snapshot remains active after either fault"
+expected_effect = "manual revision, audit event, and activation roll back together"
+forbidden_side_effects = "no partial revision, audit, or active snapshot state"
+evidence = ["fault", "transition"]
+
+[[case]]
+id = "V03-A-ACTIVITY-OVERLAP-V1"
+contracts = ["V03-C-ACTIVITY-REVIEW-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_activity.py::test_same_metric_same_source_class_overlap_opens_a_review_case"
+initial_state = "empty synthetic store"
+operation = "import overlapping same-metric Watch samples and a cross-metric overlap"
+level = "application"
+platform = "all"
+expected_result = "one source-conflict review while all canonical values remain effective"
+expected_effect = "one immutable snapshot is published"
+forbidden_side_effects = "no overlap deduplication or cross-metric review"
+evidence = ["positive", "boundary"]
+
+[[case]]
+id = "V03-A-ACTIVITY-NEGATIVE-V1"
+contracts = ["V03-C-ACTIVITY-REVIEW-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_activity.py::test_negative_activity_value_remains_canonical_and_opens_plausibility_review"
+initial_state = "empty synthetic store"
+operation = "import a negative step-count sample"
+level = "application"
+platform = "all"
+expected_result = "the negative canonical value remains visible with one plausibility review"
+expected_effect = "one immutable snapshot is published"
+forbidden_side_effects = "no value coercion or automatic exclusion"
+evidence = ["negative"]
+
+[[case]]
+id = "V03-A-ACTIVITY-PROJECTION-V1"
+contracts = ["V03-C-ACTIVITY-SOURCE-V1", "V03-C-ACTIVITY-PROJECTION-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_activity.py::test_activity_import_preserves_typed_samples_and_assigns_cross_midnight_value_to_start_day"
+initial_state = "empty synthetic store"
+operation = "import all supported numeric activity types including a cross-midnight exercise sample"
+level = "application"
+platform = "all"
+expected_result = "typed samples and independent daily totals assigned to their measurement-local start day"
+expected_effect = "one immutable snapshot is published"
+forbidden_side_effects = "no quantity prorating or cross-metric aggregation"
+evidence = ["positive", "boundary", "reproducibility"]
+
+[[case]]
+id = "V03-A-ACTIVITY-CLI-V1"
+contracts = ["V03-C-ACTIVITY-ADAPTERS-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_activity.py::test_activity_days_cli_projects_the_shared_selection"
+initial_state = "committed activity sample"
+operation = "load selected activity days through human CLI and JSON 3.0"
+level = "adapter"
+platform = "all"
+expected_result = "complete selected activity projection with observed zero and missing metrics distinguished"
+expected_effect = "none"
+forbidden_side_effects = "no CLI derivation or source classification"
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-ACTIVITY-STREAMLIT-V1"
+contracts = ["V03-C-ACTIVITY-ADAPTERS-V1"]
+fixtures = []
+runner = "tests/adapters/test_streamlit.py::test_streamlit_loads_activity_days_through_the_application_seam"
+initial_state = "committed activity sample"
+operation = "load activity on the Kerndaten page"
+level = "adapter"
+platform = "all"
+expected_result = "daily activity and canonical measurement tables"
+expected_effect = "none"
+forbidden_side_effects = "no persistent UI state outside application"
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-WORKOUT-PROJECTION-V1"
+contracts = ["V03-C-WORKOUTS-V1", "V03-C-WORKOUT-REVIEW-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_workouts.py::test_workouts_keep_types_durations_and_overlap_status"
+initial_state = "empty synthetic store"
+operation = "import known and unknown overlapping workouts"
+level = "application"
+platform = "all"
+expected_result = "both workouts remain canonical with their shared persisted overlap review"
+expected_effect = "one immutable snapshot is published"
+forbidden_side_effects = "no activity-day aggregation or overlap deduplication"
+evidence = ["positive", "boundary", "reproducibility", "negative"]
+
+[[case]]
+id = "V03-A-WORKOUT-CORRECTION-V1"
+contracts = ["V03-C-WORKOUT-REVIEW-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_workouts.py::test_workout_correction_persists_through_data_review"
+initial_state = "committed workout plausibility review"
+operation = "correct an impossible reported workout duration"
+level = "application"
+platform = "all"
+expected_result = "the raw workout remains while its effective duration is corrected"
+expected_effect = "one data-review snapshot is published"
+forbidden_side_effects = "no source workout mutation"
+evidence = ["positive", "transition"]
+
+[[case]]
+id = "V03-A-WORKOUT-CLI-V1"
+contracts = ["V03-C-WORKOUT-ADAPTERS-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_workouts.py::test_workouts_cli_serializes_the_shared_projection"
+initial_state = "committed workout"
+operation = "load workouts through CLI JSON"
+level = "adapter"
+platform = "all"
+expected_result = "complete shared workout projection"
+expected_effect = "none"
+forbidden_side_effects = "no adapter-side duration or aggregate derivation"
+evidence = ["positive", "parity"]
+
+[[contract]]
+id = "V03-C-MIGRATION-SCHEMAS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/84"
+statement = "Registered adjacent store, snapshot, and backup schema steps upgrade V0.2 into one complete validated V0.3 copy-on-write snapshot and reject newer or missing steps."
+evidence = ["positive", "negative", "reproducibility", "transition"]
+
+[[contract]]
+id = "V03-C-MIGRATION-ATOMICITY-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/84"
+statement = "A migration activates once, quarantines failed attempts, retries from the unchanged source, and permits rollback only before a later successful write."
+evidence = ["positive", "negative", "fault", "transition"]
+
+[[contract]]
+id = "V03-C-MIGRATION-ADAPTERS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/84"
+statement = "CLI JSON, human CLI, and Streamlit expose the shared migration plan and execute only through HealthLab."
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-MIGRATION-COW-V1"
+contracts = ["V03-C-MIGRATION-SCHEMAS-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_migration.py::test_v02_store_migrates_to_one_complete_v03_snapshot"
+initial_state = "V0.2 store with one four-file active snapshot"
+operation = "execute the registered V0.2 to V0.3 migration"
+level = "application"
+platform = "all"
+expected_result = "store schema 11 and one complete validated snapshot schema 7"
+expected_effect = "one metadata backup and one child snapshot activate together"
+forbidden_side_effects = "no source snapshot mutation, partial snapshot, or populated manual ledger"
+evidence = ["positive", "reproducibility", "transition"]
+
+[[case]]
+id = "V03-A-MIGRATION-REJECTION-V1"
+contracts = ["V03-C-MIGRATION-SCHEMAS-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_migration.py::test_v03_migration_rejects_newer_and_missing_registered_steps"
+initial_state = "newer or unregistered store, snapshot, and backup schema versions"
+operation = "plan schema migration"
+level = "application"
+platform = "all"
+expected_result = "explicit newer-schema or missing-step diagnosis"
+expected_effect = "none"
+forbidden_side_effects = "no downgrade, skipped step, or best-effort open"
+evidence = ["negative"]
+
+[[case]]
+id = "V03-A-MIGRATION-RETRY-V1"
+contracts = ["V03-C-MIGRATION-SCHEMAS-V1", "V03-C-MIGRATION-ATOMICITY-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_migration.py::test_v03_migration_fault_quarantines_attempt_and_retry_starts_fresh"
+initial_state = "V0.2 store with one four-file active snapshot"
+operation = "interrupt before SQLite commit, reopen, and retry"
+level = "application"
+platform = "all"
+expected_result = "failed target is quarantined and a fresh retry completes"
+expected_effect = "only the retry activates a target snapshot"
+forbidden_side_effects = "no source snapshot mutation or partial activation"
+evidence = ["fault", "transition"]
+
+[[case]]
+id = "V03-A-MIGRATION-ROLLBACK-V1"
+contracts = ["V03-C-MIGRATION-ATOMICITY-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v02_migration.py::test_direct_migration_rollback_restores_backup_and_old_snapshot"
+initial_state = "just-completed store migration"
+operation = "execute immediate migration rollback"
+level = "application"
+platform = "all"
+expected_result = "metadata backup and previous active snapshot are restored"
+expected_effect = "migrated snapshot becomes unreferenced"
+forbidden_side_effects = "no reverse migration or deletion of immutable snapshot files"
+evidence = ["positive", "transition"]
+
+[[case]]
+id = "V03-A-MIGRATION-ROLLBACK-LATE-V1"
+contracts = ["V03-C-MIGRATION-ATOMICITY-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v02_migration.py::test_later_successful_state_change_blocks_migration_rollback"
+initial_state = "completed migration followed by another successful write"
+operation = "preview migration rollback"
+level = "application"
+platform = "all"
+expected_result = "rollback is unavailable"
+expected_effect = "none"
+forbidden_side_effects = "no restoration over later committed state"
+evidence = ["negative", "transition"]
+
+[[case]]
+id = "V03-A-MIGRATION-ADAPTERS-V1"
+contracts = ["V03-C-MIGRATION-ADAPTERS-V1"]
+fixtures = []
+runner = "tests/adapters/test_cli.py::test_cli_maps_store_migration_plan_and_receipt"
+initial_state = "store requiring a registered migration"
+operation = "preview and execute through human and JSON CLI"
+level = "adapter"
+platform = "all"
+expected_result = "shared store and snapshot migration steps and receipt"
+expected_effect = "one application-owned migration execution"
+forbidden_side_effects = "no adapter-owned migration or hidden version coercion"
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-MIGRATION-STREAMLIT-V1"
+contracts = ["V03-C-MIGRATION-ADAPTERS-V1"]
+fixtures = []
+runner = "tests/adapters/test_streamlit.py::test_streamlit_focuses_migration_in_restricted_session"
+initial_state = "workspace restricted by a required store migration"
+operation = "render and execute the migration in Streamlit"
+level = "adapter"
+platform = "all"
+expected_result = "shared migration steps, backup, capacity, and confirmation UI"
+expected_effect = "one application-owned migration execution"
+forbidden_side_effects = "no unrelated page access or UI-owned migration state"
+evidence = ["positive", "parity"]
+
+[[contract]]
+id = "V03-C-METADATA-BACKUP-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/85"
+statement = "A V0.3 metadata-only backup positively lists every revision ledger, catalog, audit event, contract binding, cutoff, source reference, and content hash while excluding health data and operational artifacts."
+evidence = ["positive", "negative", "reproducibility"]
+
+[[contract]]
+id = "V03-C-METADATA-RESTORE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/85"
+statement = "A two-phase restore validates manifest counts, references, identifiers, chains, and hashes before deterministically rebuilding one new physical snapshot in an empty real store with stable logical revisions and explicit source-snapshot provenance."
+evidence = ["positive", "negative", "transition", "reproducibility"]
+
+[[case]]
+id = "V03-A-METADATA-BACKUP-V1"
+contracts = ["V03-C-METADATA-BACKUP-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v02_metadata_backup.py::test_metadata_backup_is_one_redacted_portable_sqlite_file"
+initial_state = "empty real store with the complete V0.3 metadata schema"
+operation = "create a metadata backup through HealthLab and inspect its manifest and closed table set"
+level = "application"
+platform = "all"
+expected_result = "one portable SQLite file with canonical hash and exact row counts for every positively listed metadata table"
+expected_effect = "none"
+forbidden_side_effects = "no health rows, Parquet, analyses, pointers, caches, logs, staging data, paths, or secrets"
+evidence = ["positive", "negative", "reproducibility"]
+
+[[case]]
+id = "V03-A-METADATA-RESTORE-V1"
+contracts = ["V03-C-METADATA-BACKUP-V1", "V03-C-METADATA-RESTORE-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v02_metadata_restore.py::test_v03_restore_preserves_manual_revisions_and_rebinds_one_new_snapshot"
+initial_state = "backup from a real store with one imported snapshot and active context and medication-category revisions"
+operation = "begin restore into a new empty real store and reconstruct the source data through the normal import seam"
+level = "application"
+platform = "all"
+expected_result = "stable logical and revision identities bind to one new physical snapshot with the original cutoffs and source-snapshot provenance"
+expected_effect = "the restore stays pending until reconstruction completes, then activates exactly one complete snapshot"
+forbidden_side_effects = "no heuristic relinking, source snapshot reuse, overlay on an existing store, or partial activation"
+evidence = ["positive", "transition", "reproducibility"]
+
+[[case]]
+id = "V03-A-METADATA-RESTORE-REJECTION-V1"
+contracts = ["V03-C-METADATA-RESTORE-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v02_metadata_restore.py::test_v03_restore_rejects_broken_manual_revision_binding"
+initial_state = "metadata backup whose canonical hash is recomputed after replacing a bound revision identity"
+operation = "preview the first restore phase"
+level = "application"
+platform = "all"
+expected_result = "backup_integrity_conflict"
+expected_effect = "the new real store remains ready and no restore session activates"
+forbidden_side_effects = "no best-effort chain repair, missing revision fabrication, or partial snapshot"
+evidence = ["negative"]
+
+[[case]]
+id = "V03-A-RELEASE-SURFACE-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_release_gate.py::test_v03_public_application_surface_is_exact_and_closed"
+initial_state = "final public application module"
+operation = "enumerate every public write request, plan, receipt, and required read"
+level = "meta"
+platform = "all"
+expected_result = "the closed final V0.3 variant sets match the normative issue"
+expected_effect = "none"
+forbidden_side_effects = "no unknown or adapter-owned application variant"
+evidence = ["positive", "negative"]
+
+[[case]]
+id = "V03-A-JSON-BOUNDARY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/adapters/test_cli.py::test_json_3_input_rejects_unknown_and_mismatched_documents"
+initial_state = "fresh synthetic workspace"
+operation = "submit unknown and route-mismatched JSON 3.0 write documents"
+level = "adapter"
+platform = "all"
+expected_result = "both documents terminate with usage exit code 2"
+expected_effect = "none"
+forbidden_side_effects = "no store mutation, fallback schema, or technical traceback"
+evidence = ["negative", "security", "parity"]
+
+[[case]]
+id = "V03-A-CLI-BOUNDARY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/adapters/test_cli.py::test_cli_traces_activity_settings_and_structured_write"
+initial_state = "fresh synthetic workspace"
+operation = "load activity settings and preview a typed JSON 3.0 write through the production CLI"
+level = "adapter"
+platform = "all"
+expected_result = "schema-valid complete activity settings and write-plan documents"
+expected_effect = "none before explicit execution"
+forbidden_side_effects = "no adapter-owned write model, fallback schema, or truncated plan"
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-STREAMLIT-BOUNDARY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/adapters/test_streamlit.py::test_streamlit_traces_activity_settings_and_structured_write"
+initial_state = "fresh synthetic workspace"
+operation = "load activity settings and preview a typed JSON 3.0 write through Streamlit"
+level = "adapter"
+platform = "all"
+expected_result = "the same application projection and plan fingerprint are rendered"
+expected_effect = "none before explicit execution"
+forbidden_side_effects = "no UI-owned write model or truncated plan"
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-EVIDENCE-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_evidence.py::test_v03_evidence_pins_release_inputs_without_personal_values"
+initial_state = "checked-out release commit"
+operation = "build the V0.3 evidence document twice"
+level = "meta"
+platform = "all"
+expected_result = "commit, environment, matrix, fixtures, methods, and gate hashes are stable"
+expected_effect = "none"
+forbidden_side_effects = "no personal values, local store paths, or open evidence references"
+evidence = ["positive", "reproducibility", "security"]
+
+[[fixture]]
+id = "V03-F-CORE-JOURNEY-V1"
+kind = "generated_domain_journey"
+generator = "scripts.v03_fixture_catalog.fixture_recipe"
+seed = 87
+options = { family = "core-journey", version = 1 }
+platform = "all"
+sha256 = "863e58dbbee7cbc5072b68eb6a21ce89242d1d0e52ea6a4af0b5f1f66244a22e"
+
+[[fixture]]
+id = "V03-F-ACTIVITY-COVERAGE-EDGES-V1"
+kind = "generated_domain_journey"
+generator = "scripts.v03_fixture_catalog.fixture_recipe"
+seed = 87
+options = { family = "activity-coverage-edges", version = 1 }
+platform = "all"
+sha256 = "b58b1dfd864a58123f5fbf58b3c5cc296cedd167784e6daca2f57629bfb83170"
+
+[[fixture]]
+id = "V03-F-CONTEXT-WORKFLOW-V1"
+kind = "typed_application_workflow"
+generator = "scripts.v03_fixture_catalog.fixture_recipe"
+seed = 87
+options = { family = "context-workflow", version = 1 }
+platform = "all"
+sha256 = "ace63e5d7ef6f6607f7cb02a5d146c831603efc47afd14cfa8751467cd8452ea"
+
+[[fixture]]
+id = "V03-F-MEDICATION-WORKFLOW-V1"
+kind = "typed_application_workflow"
+generator = "scripts.v03_fixture_catalog.fixture_recipe"
+seed = 87
+options = { family = "medication-workflow", version = 1 }
+platform = "all"
+sha256 = "461ba5688c2554ae187fe98fdbffd199f2ab08e44db1dd9879561fe091a54258"
+
+[[fixture]]
+id = "V03-F-PERSISTENCE-LIFECYCLE-V1"
+kind = "typed_persistence_workflow"
+generator = "scripts.v03_fixture_catalog.fixture_recipe"
+seed = 87
+options = { family = "persistence-lifecycle", version = 1 }
+platform = "all"
+sha256 = "6c6bc0b4406d5d126900ab61906f4395c7456733e804432448e173cfc317dbb7"
+
+[[fixture]]
+id = "V03-F-SECURITY-BOUNDARIES-V1"
+kind = "security_boundary"
+generator = "scripts.v03_fixture_catalog.fixture_recipe"
+seed = 87
+options = { family = "security-boundaries", version = 1 }
+platform = "all"
+sha256 = "99911c67526420aeb608293a58daf18b63869a56fe27ac41bdd0e1191840f1e5"
+
+[[case]]
+id = "V03-A-CORE-JOURNEY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = ["V03-F-CORE-JOURNEY-V1"]
+runner = "tests/acceptance/test_v03_fixture_families.py::test_core_journey_fixture_is_consumed_by_the_import_path"
+initial_state = "empty synthetic store and one deterministic cross-domain Golden Journey"
+operation = "run initial, identical-repeat, and cumulative Golden Journey imports"
+level = "application"
+platform = "all"
+expected_result = "one reproducible cross-domain projection after each effective import"
+expected_effect = "one atomic snapshot publication for initial and cumulative imports"
+forbidden_side_effects = "no adapter-owned or personal fixture data"
+evidence = ["positive", "reproducibility"]
+
+[[case]]
+id = "V03-A-ACTIVITY-COVERAGE-FAMILY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = ["V03-F-ACTIVITY-COVERAGE-EDGES-V1"]
+runner = "tests/acceptance/test_v03_fixture_families.py::test_activity_coverage_fixture_is_consumed_by_the_import_path"
+initial_state = "activity coverage edge fixture"
+operation = "materialize shared Watch coverage and iPhone fallback"
+level = "application"
+platform = "all"
+expected_result = "Watch coverage, iPhone fallback, suppression, and incomplete-day states remain explicit"
+expected_effect = "derived activity rows are snapshot bound"
+forbidden_side_effects = "no cross-metric duplication or partial quantity split"
+evidence = ["positive", "boundary"]
+
+[[case]]
+id = "V03-A-CONTEXT-WORKFLOW-FAMILY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = ["V03-F-CONTEXT-WORKFLOW-V1"]
+runner = "tests/acceptance/test_v03_fixture_families.py::test_context_workflow_fixture_drives_a_typed_revision"
+initial_state = "active snapshot and deterministic context workflow"
+operation = "create categories and colliding illness periods"
+level = "application"
+platform = "all"
+expected_result = "valid context commits and collisions block atomically"
+expected_effect = "revision, audit, and snapshot advance together"
+forbidden_side_effects = "no overlapping duplicate period or partial revision"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-WORKFLOW-FAMILY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = ["V03-F-MEDICATION-WORKFLOW-V1"]
+runner = "tests/acceptance/test_v03_fixture_families.py::test_medication_workflow_fixture_drives_a_typed_revision"
+initial_state = "deterministic medication workflow"
+operation = "validate closed medication entry identities and references"
+level = "application"
+platform = "all"
+expected_result = "only explicit unique typed entries are accepted"
+expected_effect = "none for invalid plans"
+forbidden_side_effects = "no fabricated entry identity or partial regime"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-PERSISTENCE-LIFECYCLE-FAMILY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = ["V03-F-PERSISTENCE-LIFECYCLE-V1"]
+runner = "tests/acceptance/test_v03_fixture_families.py::test_persistence_lifecycle_fixture_pins_the_target_version"
+initial_state = "V0.2 store with a complete source snapshot"
+operation = "plan the registered V0.3 copy-on-write lifecycle"
+level = "application"
+platform = "all"
+expected_result = "store and snapshot transitions remain independently versioned"
+expected_effect = "none before execution"
+forbidden_side_effects = "no in-place migration or mixed active state"
+evidence = ["positive", "transition", "reproducibility"]
+
+[[case]]
+id = "V03-A-SECURITY-BOUNDARIES-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = ["V03-F-SECURITY-BOUNDARIES-V1"]
+runner = "tests/acceptance/test_v03_fixture_families.py::test_security_boundary_fixture_is_rejected_without_publication"
+initial_state = "empty store and deterministic XXE archive"
+operation = "submit an external-entity attack archive"
+level = "application"
+platform = "all"
+expected_result = "the attack is rejected at the untrusted-input boundary"
+expected_effect = "active snapshot remains unchanged and staging is removed"
+forbidden_side_effects = "no network access, path escape, or personal-value log"
+evidence = ["negative", "security"]
+
+[[case]]
+id = "V03-A-MACOS-PLATFORM-PROBES-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/platform/test_macos_probes.py::test_real_macos_platform_probes_succeed_and_redact"
+initial_state = "macOS runner with real platform probe APIs"
+operation = "probe FileVault, filesystem identity, allocation accounting, and controlled storage"
+level = "platform"
+platform = "macos"
+expected_result = "all platform-specific probes succeed with closed typed results"
+expected_effect = "none"
+forbidden_side_effects = "no full-suite duplication, personal path, or health value"
+evidence = ["positive", "security", "reproducibility"]
+
+[[case]]
+id = "V03-A-WRITE-ADAPTER-PARITY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/adapters/test_streamlit.py::test_cli_and_streamlit_preview_the_same_v03_write"
+initial_state = "the same deterministic active snapshot and all eleven JSON 3.0 create requests"
+operation = "preview every request through CLI and headless Streamlit"
+level = "adapter"
+platform = "all"
+expected_result = "identical typed requests, fingerprints, approvals, diagnostics, and complete plans"
+expected_effect = "none before explicit execution"
+forbidden_side_effects = "no adapter-owned model, stale request, truncated plan, or implicit write"
+evidence = ["positive", "negative", "parity"]
+
+[[case]]
+id = "V03-A-CONTEXT-ADAPTER-PARITY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/adapters/test_streamlit.py::test_cli_and_streamlit_load_identical_context_projections"
+initial_state = "one active context revision"
+operation = "load daily context, records, and audit through both adapters"
+level = "adapter"
+platform = "all"
+expected_result = "identical selections, IDs, and full application projections"
+expected_effect = "none"
+forbidden_side_effects = "no adapter-side reconstruction, paging, or truncation"
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-MEDICATION-CLI-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/adapters/test_cli.py::test_cli_runs_intake_reason_category_lifecycle"
+initial_state = "active medication plan"
+operation = "load all medication projections and execute create, revise, withdraw, and restore"
+level = "adapter"
+platform = "all"
+expected_result = "complete typed plans, audits, days, and committed receipts"
+expected_effect = "each confirmed revision publishes atomically"
+forbidden_side_effects = "no personal values in receipts or implicit revision"
+evidence = ["positive", "transition", "parity"]
+
+[[case]]
+id = "V03-A-MEDICATION-STREAMLIT-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/adapters/test_streamlit.py::test_streamlit_exposes_as_needed_write_lifecycles"
+initial_state = "the same active medication plan"
+operation = "load all medication projections and execute the typed lifecycle through AppTest"
+level = "adapter"
+platform = "all"
+expected_result = "the same plan states, full projections, audit, and committed result"
+expected_effect = "each confirmed revision publishes atomically"
+forbidden_side_effects = "no stale request, UI-owned state, or truncated projection"
+evidence = ["positive", "transition", "parity"]
+
+[[case]]
+id = "V03-A-NO-CHANGE-ADAPTERS-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/adapters/test_streamlit.py::test_cli_and_streamlit_treat_no_change_as_terminal_without_a_receipt"
+initial_state = "an active context value and an identical normalized revision"
+operation = "preview and request execution through CLI and Streamlit"
+level = "adapter"
+platform = "all"
+expected_result = "both adapters show terminal no_change and exit successfully"
+expected_effect = "none"
+forbidden_side_effects = "no writer lock, receipt, operation ID, audit, or snapshot"
+evidence = ["positive", "negative", "parity", "transition"]
+
+[[case]]
+id = "V03-A-CONTEXT-NO-SNAPSHOT-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_context_matrix_contract[NO-SNAPSHOT]"
+initial_state = "deterministic context workflow fixture"
+operation = "blocked write without snapshot"
+level = "application"
+platform = "all"
+expected_result = "blocked write without snapshot"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-CONTEXT-COVERAGE-BASELINE-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_context_matrix_contract[COVERAGE-BASELINE]"
+initial_state = "deterministic context workflow fixture"
+operation = "coverage baseline and unknown earlier days"
+level = "application"
+platform = "all"
+expected_result = "coverage baseline and unknown earlier days"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-CONTEXT-OBSERVED-STRESS-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_context_matrix_contract[OBSERVED-STRESS]"
+initial_state = "deterministic context workflow fixture"
+operation = "observed average stress remains explicit"
+level = "application"
+platform = "all"
+expected_result = "observed average stress remains explicit"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-CONTEXT-ILLNESS-COLLISION-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_context_matrix_contract[ILLNESS-COLLISION]"
+initial_state = "deterministic context workflow fixture"
+operation = "same-category illness overlap is blocked"
+level = "application"
+platform = "all"
+expected_result = "same-category illness overlap is blocked"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-CONTEXT-OPEN-PERIOD-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_context_matrix_contract[OPEN-PERIOD]"
+initial_state = "deterministic context workflow fixture"
+operation = "open periods bind the snapshot date"
+level = "application"
+platform = "all"
+expected_result = "open periods bind the snapshot date"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-CONTEXT-CATALOG-RENAME-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_context_matrix_contract[CATALOG-RENAME]"
+initial_state = "deterministic context workflow fixture"
+operation = "custom catalog revisions preserve projections"
+level = "application"
+platform = "all"
+expected_result = "custom catalog revisions preserve projections"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-CONTEXT-WITHDRAW-RESTORE-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_context_matrix_contract[WITHDRAW-RESTORE]"
+initial_state = "deterministic context workflow fixture"
+operation = "withdrawal and restoration use revision checks"
+level = "application"
+platform = "all"
+expected_result = "withdrawal and restoration use revision checks"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-CONTEXT-CUSTOM-OVERLAP-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_context_matrix_contract[CUSTOM-OVERLAP]"
+initial_state = "deterministic context workflow fixture"
+operation = "same-label custom periods cannot overlap"
+level = "application"
+platform = "all"
+expected_result = "same-label custom periods cannot overlap"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-CONTEXT-ATOMIC-FAULT-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_context_matrix_contract[ATOMIC-FAULT]"
+initial_state = "deterministic context workflow fixture"
+operation = "context revision has no partial writer effect"
+level = "application"
+platform = "all"
+expected_result = "context revision has no partial writer effect"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-NO-SNAPSHOT-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[NO-SNAPSHOT]"
+initial_state = "deterministic medication workflow fixture"
+operation = "blocked medication write without snapshot"
+level = "application"
+platform = "all"
+expected_result = "blocked medication write without snapshot"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-EMPTY-PLAN-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[EMPTY-PLAN]"
+initial_state = "deterministic medication workflow fixture"
+operation = "unknown before first plan and explicit empty plan"
+level = "application"
+platform = "all"
+expected_result = "unknown before first plan and explicit empty plan"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-REGIME-REVISION-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[REGIME-REVISION]"
+initial_state = "deterministic medication workflow fixture"
+operation = "regime replacement and correction remain distinct"
+level = "application"
+platform = "all"
+expected_result = "regime replacement and correction remain distinct"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-DST-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[DST]"
+initial_state = "deterministic medication workflow fixture"
+operation = "weekday and DST schedule resolution is deterministic"
+level = "application"
+platform = "all"
+expected_result = "weekday and DST schedule resolution is deterministic"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-DEVIATION-FAMILY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[DEVIATION]"
+initial_state = "deterministic medication workflow fixture"
+operation = "all deviation forms and no_change share one model"
+level = "application"
+platform = "all"
+expected_result = "all deviation forms and no_change share one model"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-TIMEZONE-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[TIMEZONE]"
+initial_state = "deterministic medication workflow fixture"
+operation = "actual intake binds its instant and timezone"
+level = "application"
+platform = "all"
+expected_result = "actual intake binds its instant and timezone"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-AS-NEEDED-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[AS-NEEDED]"
+initial_state = "deterministic medication workflow fixture"
+operation = "as-needed intake uses explicit plan entry identity"
+level = "application"
+platform = "all"
+expected_result = "as-needed intake uses explicit plan entry identity"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-CATEGORY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[CATEGORY]"
+initial_state = "deterministic medication workflow fixture"
+operation = "reason category revisions remain snapshot bound"
+level = "application"
+platform = "all"
+expected_result = "reason category revisions remain snapshot bound"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-REFERENCES-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[REFERENCES]"
+initial_state = "deterministic medication workflow fixture"
+operation = "invalid medication references block atomically"
+level = "application"
+platform = "all"
+expected_result = "invalid medication references block atomically"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-WITHDRAWALS-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[WITHDRAWALS]"
+initial_state = "deterministic medication workflow fixture"
+operation = "withdrawal and restoration preserve audit history"
+level = "application"
+platform = "all"
+expected_result = "withdrawal and restoration preserve audit history"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-AS-OF-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[AS-OF]"
+initial_state = "deterministic medication workflow fixture"
+operation = "medication as-of advances while old snapshots remain stable"
+level = "application"
+platform = "all"
+expected_result = "medication as-of advances while old snapshots remain stable"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-ATOMIC-FAULT-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[ATOMIC-FAULT]"
+initial_state = "deterministic medication workflow fixture"
+operation = "medication plan changes and faults have no partial effect"
+level = "application"
+platform = "all"
+expected_result = "medication plan changes and faults have no partial effect"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+
+[[case]]
+id = "V03-A-STREAMLIT-PREVIEW-INVALIDATION-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/adapters/test_streamlit.py::test_streamlit_page_change_discards_pending_preview"
+initial_state = "a visible pending preview with locked inputs"
+operation = "change the active page"
+level = "adapter"
+platform = "all"
+expected_result = "request and preview are discarded before the next render"
+expected_effect = "none"
+forbidden_side_effects = "no stale or invisible execution target"
+evidence = ["negative", "transition", "parity"]

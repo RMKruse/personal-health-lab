@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<HealthData>
+  <ExportDate value="2024-01-02 12:00:00 +0100"/>
+  <Record type="HKQuantityTypeIdentifierActiveEnergyBurned" sourceName="Test Watch"
+          sourceVersion="1" device="Test Device" unit="kcal" value="100"
+          creationDate="2024-01-01 08:00:00 +0100"
+          startDate="2024-01-01 07:00:00 +0100"
+          endDate="2024-01-01 08:00:00 +0100"/>
+  <Record type="HKQuantityTypeIdentifierActiveEnergyBurned" sourceName="Test Watch"
+          unit="J" value="10" startDate="2024-01-01 08:00:00 +0100"
+          endDate="2024-01-01 09:00:00 +0100"/>
+  <Record type="HKQuantityTypeIdentifierMystery" sourceName="Test Watch" unit="count"
+          value="1" startDate="2024-01-01 09:00:00 +0100"
+          endDate="2024-01-01 10:00:00 +0100"/>
+  <Record type="HKCategoryTypeIdentifierSleepAnalysis" sourceName="Test Watch"
+          value="HKCategoryValueSleepAnalysisDreaming"
+          startDate="2024-01-01 22:00:00 +0100"
+          endDate="2024-01-02 06:00:00 +0100"/>
+  <Workout workoutActivityType="HKWorkoutActivityTypeMoonWalking" sourceName="Test Watch"
+           startDate="2024-01-01 10:00:00 +0100"
+           endDate="2024-01-01 11:00:00 +0100">
+    <MetadataEntry key="HKMetadataKeyIndoorWorkout" value="1"/>
+    <WorkoutEvent type="pause"/>
+    <WorkoutEvent type="resume"/>
+  </Workout>
+  <ActivitySummary dateComponents="2024-01-01"/>
+  <ClinicalRecord/>
+</HealthData>

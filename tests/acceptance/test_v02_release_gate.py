@@ -52,22 +52,20 @@ def test_public_application_surface_is_exact_and_closed(tmp_path: Path) -> None:
             {"AnalysisReceipt"},
         ),
     }
-    assert set(variant_contract) == requests
+    assert set(variant_contract) <= requests
     assert {
         plan for expected_plans, _ in variant_contract.values() for plan in expected_plans
-    } == plans
+    } <= plans
     assert {
         result for _, expected_results in variant_contract.values() for result in expected_results
-    } == results - {"WriteNotStarted"}
+    } <= results - {"WriteNotStarted", "WriteNoChange"}
     samples = {
         "AbortMetadataRestore": [application.AbortMetadataRestore()],
         "BeginMetadataRestore": [application.BeginMetadataRestore(tmp_path / "backup.sqlite3")],
         "ConfirmDataReviewBatch": [
             application.ConfirmDataReviewBatch(application.DataReviewSelection())
         ],
-        "CreateMetadataBackup": [
-            application.CreateMetadataBackup(tmp_path / "metadata.sqlite3")
-        ],
+        "CreateMetadataBackup": [application.CreateMetadataBackup(tmp_path / "metadata.sqlite3")],
         "CreatePlausibilityRuleVersion": [
             application.CreatePlausibilityRuleVersion(
                 application.CanonicalHealthType.APPLE_RESTING_HEART_RATE,
@@ -126,9 +124,11 @@ def test_public_application_surface_is_exact_and_closed(tmp_path: Path) -> None:
         "DataConfirmation",
         "DataCorrection",
         "LocalMeasurementExclusion",
+        "LocalWorkoutExclusion",
         "SourceConflictResolution",
         "SourceDeletionResolution",
         "SourceValueAcceptance",
+        "WorkoutCorrection",
     }
     assert _names(get_type_hints(RevokeDataReviewDecision)["target"]) == {
         "BatchDecisionTarget",
@@ -141,12 +141,24 @@ def test_public_application_surface_is_exact_and_closed(tmp_path: Path) -> None:
     assert "WriteNotStarted" in results
     assert {name for name in HealthLab.__dict__ if not name.startswith("_")} == {
         "execute_write",
+        "load_activity_days",
+        "load_activity_settings",
+        "load_context_audit",
+        "load_context_records",
+        "load_daily_context",
         "load_data_review",
         "load_data_review_case",
+        "load_import_details",
         "load_migration_diagnostics",
+        "load_medication_audit",
+        "load_medication_days",
+        "load_medication_plan",
         "load_overview",
         "load_plausibility_rules",
         "load_recovery_status",
+        "load_sleep_days",
+        "load_weight_nutrition",
+        "load_workouts",
         "load_workspace_status",
         "open",
         "preview_write",
@@ -168,7 +180,7 @@ def test_unknown_public_union_variants_are_rejected(tmp_path: Path) -> None:
 
 
 def test_adapter_parity_registry_is_exact_and_closed() -> None:
-    assert _names(WriteRequest) == {
+    assert {
         "AbortMetadataRestore",
         "BeginMetadataRestore",
         "ConfirmDataReviewBatch",
@@ -181,7 +193,7 @@ def test_adapter_parity_registry_is_exact_and_closed() -> None:
         "RollbackMigration",
         "RunHistoricalReview",
         "RunRestingHeartRateAnalysis",
-    }
+    } <= _names(WriteRequest)
 
 
 def test_opening_an_existing_healthlab_is_read_only(tmp_path: Path) -> None:

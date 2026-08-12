@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import json
 import shutil
-from datetime import datetime
+from dataclasses import asdict, is_dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import Any, cast
 from urllib.parse import quote
 
 import streamlit as st
 
 from personal_health_lab.adapters._config import load_runtime_config
+from personal_health_lab.adapters.cli._v03_json import decode_write_request
 from personal_health_lab.application import (
     AbortMetadataRestore,
     AnalysisDefinitionId,
@@ -22,6 +25,7 @@ from personal_health_lab.application import (
     ConfirmDataReviewBatch,
     CreateMetadataBackup,
     CreatePlausibilityRuleVersion,
+    DailyNutritionFeature,
     DataConfirmation,
     DataCorrection,
     DataReviewBatchActionId,
@@ -31,11 +35,15 @@ from personal_health_lab.application import (
     DataReviewSelection,
     HealthLab,
     HealthLabError,
+    ImportDetails,
     ImportHealthExport,
+    ImportId,
     ImportReceipt,
     ImportStatus,
     LocalMeasurementExclusion,
+    LocalWorkoutExclusion,
     MeasurementVersionId,
+    MedicationLogicalId,
     MetadataBackupReceipt,
     MetadataRestorePlan,
     MetadataRestoreReceipt,
@@ -51,20 +59,334 @@ from personal_health_lab.application import (
     RunRestingHeartRateAnalysis,
     RuntimeConfig,
     SingleDecisionTarget,
+    SleepEpisode,
+    SnapshotDateSelection,
+    SnapshotRef,
+    SnapshotSelection,
     SourceConflictResolution,
     SourceConflictStrategy,
     SourceDeletionResolution,
     SourceDeletionVerdict,
     SourceValueAcceptance,
     StoreMigrationPlan,
+    WeightNutrition,
+    WorkoutCorrection,
     WorkspaceState,
     WriteApprovalStatus,
     WriteNotStarted,
+    WriteNotStartedStatus,
 )
 
 
 def _chart_data(values: object) -> str:
     return f"data:application/json,{quote(json.dumps(values, separators=(',', ':')))}"
+
+
+def _projection_json(value: object) -> object:
+    data = asdict(cast(Any, value)) if is_dataclass(value) else vars(value)
+    return json.loads(json.dumps(data, default=str))
+
+
+def _write_is_executable(status: WriteApprovalStatus) -> bool:
+    return status in {
+        WriteApprovalStatus.READY,
+        WriteApprovalStatus.CONFIRMATION_REQUIRED,
+    }
+
+
+def _v03_form_document(request_type: str, *, disabled: bool) -> dict[str, object]:
+    intent = (
+        "create"
+        if request_type == "create_activity_derivation_version"
+        else st.selectbox(
+            "Revisionsabsicht", ("create", "revise", "withdraw", "restore"), disabled=disabled
+        )
+    )
+    document: dict[str, object] = {
+        "schema_version": "3.0",
+        "type": request_type,
+        "intent": intent,
+    }
+    records = st.session_state.get("context_records")
+    medication_plan = st.session_state.get("medication_plan")
+    context_groups = (
+        {}
+        if records is None
+        else {
+            "revise_context_coverage_start": (
+                () if records.coverage_start is None else (records.coverage_start,)
+            ),
+            "revise_illness_category": records.illness_categories,
+            "revise_illness_period": records.illness_periods,
+            "revise_daily_stress": records.daily_stress,
+            "revise_custom_context_label": records.custom_labels,
+            "revise_custom_context_period": records.custom_periods,
+        }
+    )
+    medication_groups = (
+        {}
+        if medication_plan is None
+        else {
+            "revise_medication_regime": medication_plan.regimes,
+            "revise_intake_reason_category": medication_plan.intake_reason_categories,
+        }
+    )
+    context_audit = st.session_state.get("context_audit")
+    medication_audit = st.session_state.get("medication_audit")
+    targets = tuple(context_groups.get(request_type, medication_groups.get(request_type, ())))
+    if intent == "restore" and context_audit is not None:
+        context_kind = {
+            "revise_context_coverage_start": "context_coverage_start",
+            "revise_illness_category": "illness_category",
+            "revise_illness_period": "illness_period",
+            "revise_daily_stress": "daily_stress",
+            "revise_custom_context_label": "custom_context_label",
+            "revise_custom_context_period": "custom_context_period",
+        }.get(request_type)
+        revision = context_audit.revisions[-1]
+        if revision.object_kind == context_kind and revision.state == "withdrawn":
+            targets = ((context_audit.logical_id, revision.revision_id),)
+    if intent == "restore" and medication_audit is not None:
+        revision = medication_audit.revisions[-1]
+        medication_match = {
+            "revise_medication_regime": hasattr(revision, "starts_at")
+            and not hasattr(revision, "regime_logical_id"),
+            "revise_medication_deviation": hasattr(revision, "scheduled_at"),
+            "revise_as_needed_intake": hasattr(revision, "entry_id"),
+            "revise_intake_reason_category": hasattr(revision, "name")
+            and not hasattr(revision, "starts_at"),
+        }.get(request_type, False)
+        if medication_match and revision.state == "withdrawn":
+            targets = ((medication_audit.logical_id, revision.revision_id),)
+    if (
+        not targets
+        and medication_audit is not None
+        and request_type
+        in {
+            "revise_medication_deviation",
+            "revise_as_needed_intake",
+        }
+    ):
+        revision = medication_audit.revisions[-1]
+        targets = ((medication_audit.logical_id, revision.revision_id),)
+    if intent != "create":
+        selected = (
+            st.selectbox(
+                "Ziel aus aktiver Projektion",
+                targets,
+                format_func=lambda item: str(
+                    item[0] if isinstance(item, tuple) else item.logical_id
+                ),
+                disabled=disabled or not targets,
+            )
+            if targets
+            else None
+        )
+        document["logical_id"] = (
+            ""
+            if selected is None
+            else str(selected[0] if isinstance(selected, tuple) else selected.logical_id)
+        )
+        document["expected_revision_id"] = (
+            ""
+            if selected is None
+            else str(selected[1] if isinstance(selected, tuple) else selected.revision_id)
+        )
+    if intent == "withdraw":
+        document["reason"] = st.text_input("Rücknahmegrund", disabled=disabled)
+        return document
+    if request_type == "create_activity_derivation_version":
+        document["coverage_gap_minutes"] = st.number_input(
+            "Abdeckungsschwelle (Minuten)",
+            min_value=1,
+            max_value=1440,
+            value=240,
+            disabled=disabled,
+        )
+    elif request_type == "revise_context_coverage_start":
+        document["start_date"] = st.date_input("Abdeckungsbeginn", disabled=disabled).isoformat()
+    elif request_type in {
+        "revise_illness_category",
+        "revise_custom_context_label",
+        "revise_intake_reason_category",
+    }:
+        document["name"] = st.text_input("Name", disabled=disabled)
+    elif request_type == "revise_daily_stress":
+        document["day"] = st.date_input("Tag", disabled=disabled).isoformat()
+        document["level"] = st.selectbox(
+            "Stressstufe",
+            ("very_low", "low", "average", "high", "very_high"),
+            disabled=disabled,
+        )
+    elif request_type in {"revise_illness_period", "revise_custom_context_period"}:
+        catalog = (
+            []
+            if records is None
+            else (
+                records.illness_categories
+                if request_type == "revise_illness_period"
+                else records.custom_labels
+            )
+        )
+        selected = (
+            st.selectbox(
+                "Katalogeintrag aus aktiver Projektion",
+                catalog,
+                format_func=lambda item: item.name,
+                disabled=disabled or not catalog,
+            )
+            if catalog
+            else None
+        )
+        document[
+            "category_logical_id" if request_type == "revise_illness_period" else "label_logical_id"
+        ] = "" if selected is None else str(selected.logical_id)
+        document["start_date"] = st.date_input("Beginn", disabled=disabled).isoformat()
+        open_end = st.checkbox("Offenes Ende", value=True, disabled=disabled)
+        document["end_date"] = (
+            None if open_end else st.date_input("Ende", disabled=disabled).isoformat()
+        )
+        if request_type == "revise_illness_period":
+            document["severity"] = st.selectbox(
+                "Schwere", ("mild", "moderate", "severe"), disabled=disabled
+            )
+        else:
+            document["note"] = st.text_input("Notiz", disabled=disabled) or None
+    elif request_type == "revise_medication_regime":
+        document["starts_at"] = st.text_input(
+            "Regimebeginn (ISO 8601)", "2024-01-01T00:00:00+01:00", disabled=disabled
+        )
+        document["timezone"] = st.text_input("IANA-Zeitzone", "Europe/Berlin", disabled=disabled)
+        dose_count = int(
+            st.number_input(
+                "Anzahl geplanter Dosen", min_value=0, max_value=32, disabled=disabled
+            )
+        )
+        document["scheduled_doses"] = [
+            {
+                "medication_name": st.text_input(
+                    f"Medikament {index + 1}", disabled=disabled
+                ),
+                "amount": st.text_input(f"Dosis {index + 1}", "1", disabled=disabled),
+                "unit": st.text_input(f"Dosiseinheit {index + 1}", disabled=disabled),
+                "local_time": st.time_input(
+                    f"Lokale Einnahmezeit {index + 1}", disabled=disabled
+                ).isoformat(),
+                "weekdays": st.multiselect(
+                    f"Wochentage {index + 1}",
+                    (
+                        "monday",
+                        "tuesday",
+                        "wednesday",
+                        "thursday",
+                        "friday",
+                        "saturday",
+                        "sunday",
+                    ),
+                    disabled=disabled,
+                ),
+            }
+            for index in range(dose_count)
+        ]
+        as_needed_count = int(
+            st.number_input(
+                "Anzahl Bedarfsmedikationen", min_value=0, max_value=32, disabled=disabled
+            )
+        )
+        reason_categories = (
+            () if medication_plan is None else medication_plan.intake_reason_categories
+        )
+        document["as_needed_medications"] = [
+            {
+                "medication_name": st.text_input(
+                    f"Bedarfsmedikament {index + 1}", disabled=disabled
+                ),
+                "amount": st.text_input(
+                    f"Bedarfsdosis {index + 1}", "1", disabled=disabled
+                ),
+                "unit": st.text_input(f"Bedarfseinheit {index + 1}", disabled=disabled),
+                "preferred_reason_category_ids": [
+                    str(item.logical_id)
+                    for item in st.multiselect(
+                        f"Bevorzugte Einnahmegründe {index + 1}",
+                        reason_categories,
+                        format_func=lambda item: item.name,
+                        disabled=disabled,
+                    )
+                ],
+                "entry_id": None,
+            }
+            for index in range(as_needed_count)
+        ]
+    elif request_type == "revise_medication_deviation":
+        regimes = () if medication_plan is None else medication_plan.regimes
+        regime = (
+            st.selectbox(
+                "Regime aus aktivem Plan",
+                regimes,
+                format_func=lambda item: str(item.logical_id),
+                disabled=disabled or not regimes,
+            )
+            if regimes
+            else None
+        )
+        document["regime_logical_id"] = "" if regime is None else str(regime.logical_id)
+        document["scheduled_at"] = st.text_input(
+            "Geplanter Zeitpunkt (ISO 8601)", "2024-01-01T08:00:00+01:00", disabled=disabled
+        )
+        intake_count = int(
+            st.number_input(
+                "Anzahl tatsächlicher Einnahmen", min_value=0, max_value=32, disabled=disabled
+            )
+        )
+        document["actual_intakes"] = [
+            {
+                "taken_at": st.text_input(
+                    f"Tatsächlicher Einnahmezeitpunkt {index + 1} (ISO 8601)",
+                    "2024-01-01T08:00:00+01:00",
+                    disabled=disabled,
+                ),
+                "amount": st.text_input(
+                    f"Tatsächliche Menge {index + 1}", "1", disabled=disabled
+                ),
+            }
+            for index in range(intake_count)
+        ]
+    elif request_type == "revise_as_needed_intake":
+        regimes = () if medication_plan is None else medication_plan.regimes
+        regime = (
+            st.selectbox(
+                "Regime aus aktivem Plan",
+                regimes,
+                format_func=lambda item: str(item.logical_id),
+                disabled=disabled or not regimes,
+            )
+            if regimes
+            else None
+        )
+        entries = () if regime is None else regime.as_needed_medications
+        entry = (
+            st.selectbox(
+                "Bedarfsmedikation aus aktivem Plan",
+                entries,
+                format_func=lambda item: item.name,
+                disabled=disabled or not entries,
+            )
+            if entries
+            else None
+        )
+        document.update(
+            regime_logical_id="" if regime is None else str(regime.logical_id),
+            entry_id="" if entry is None else str(entry.entry_id),
+            taken_at=st.text_input(
+                "Einnahmezeitpunkt (ISO 8601)",
+                "2024-01-01T08:00:00+01:00",
+                disabled=disabled,
+            ),
+            amount=st.text_input("Menge", "1", disabled=disabled),
+            reason_category_logical_id=None,
+        )
+    return document
 
 
 def _render_health_import(config: RuntimeConfig) -> None:
@@ -138,7 +460,7 @@ def _render_health_import(config: RuntimeConfig) -> None:
     )
     if st.button(
         execute_label,
-        disabled=import_plan.approval.status is WriteApprovalStatus.BLOCKED,
+        disabled=not _write_is_executable(import_plan.approval.status),
     ):
         import_failed = False
         try:
@@ -149,13 +471,15 @@ def _render_health_import(config: RuntimeConfig) -> None:
                 )
             import_result = write_receipt.result
             st.session_state["last_import_status"] = import_result.status
+            if isinstance(import_result, ImportReceipt):
+                st.session_state["last_import_id"] = str(import_result.import_id)
             st.session_state["last_import_snapshot"] = (
                 str(import_result.snapshot_ref or "-")
                 if isinstance(import_result, ImportReceipt)
                 else "-"
             )
             st.session_state["last_import_diagnostics"] = (
-                ", ".join(import_result.diagnostics) or "-"
+                ", ".join(getattr(import_result, "diagnostics", write_receipt.diagnostics)) or "-"
             )
         except (OSError, HealthLabError):
             import_failed = True
@@ -173,11 +497,781 @@ def _render_health_import(config: RuntimeConfig) -> None:
         st.rerun()
 
 
+def _render_import_details(config: RuntimeConfig) -> None:
+    st.subheader("Importdetails")
+    import_id = st.text_input("Import-ID", value=st.session_state.get("last_import_id", ""))
+    if st.button("Importdetails laden", disabled=not import_id):
+        try:
+            with HealthLab.open(config) as health_lab:
+                st.session_state["import_details"] = health_lab.load_import_details(
+                    ImportId(import_id)
+                )
+        except (ValueError, ConfigurationError, HealthLabError):
+            st.error("Importdetails konnten nicht geladen werden.")
+    details = st.session_state.get("import_details")
+    if not isinstance(details, ImportDetails):
+        return
+    counts = details.canonical_counts
+    st.caption(f"Kanonische Records im Paket: {counts.package_record_count}")
+    st.caption(f"Neu importierte Records: {counts.record_count}")
+    st.caption(
+        f"Logische Messungen: {counts.logical_measurement_count} · "
+        f"Messungsversionen: {counts.measurement_version_count} · "
+        f"Quellvorkommen: {counts.source_occurrence_count} · "
+        f"Anomalien: {counts.anomaly_count}"
+    )
+    st.dataframe(
+        [
+            {
+                "Kategorie": item.category.value,
+                "Externer Bezeichner": item.external_identifier,
+                "Anzahl": item.count,
+            }
+            for item in details.unsupported_content
+        ],
+        width="stretch",
+    )
+
+
+def _render_weight_nutrition(config: RuntimeConfig) -> None:
+    st.subheader("Gewicht")
+    snapshot = st.text_input("Gewichts-Snapshot-ID (optional)")
+    start = st.date_input("Gewicht von", value=None)
+    end = st.date_input("Gewicht bis", value=None)
+    if st.button("Gewicht laden"):
+        try:
+            assert start is None or isinstance(start, date)
+            assert end is None or isinstance(end, date)
+            selection = SnapshotDateSelection(
+                snapshot_ref=SnapshotRef(snapshot) if snapshot else None,
+                start_date=start,
+                end_date=end,
+            )
+            with HealthLab.open(config) as health_lab:
+                st.session_state["weight_nutrition"] = health_lab.load_weight_nutrition(selection)
+        except (ValueError, ConfigurationError, HealthLabError):
+            st.error("Gewichtsdaten konnten nicht geladen werden.")
+    projection = st.session_state.get("weight_nutrition")
+    if not isinstance(projection, WeightNutrition):
+        return
+    st.caption(f"Snapshot: {projection.snapshot_ref or '-'} · Status: {projection.status.value}")
+    st.dataframe(
+        [
+            {
+                "Tag": item.day.isoformat(),
+                "Status": item.status.value,
+                "Gewicht (kg)": item.value_kg,
+                "Datenstatus": item.quality_status.value,
+                "Logische Messungen": [str(value) for value in item.logical_measurement_ids],
+                "Messungsversionen": [str(value) for value in item.measurement_version_ids],
+                "Prüffälle": [str(value) for value in item.review_case_ids],
+            }
+            for item in projection.days
+        ],
+        width="stretch",
+    )
+    st.dataframe(
+        [
+            {
+                "Logische Messung": str(item.logical_measurement_id),
+                "Messungsversion": str(item.measurement_version_id),
+                "Ausgewählt": item.is_selected,
+                "Disposition": item.disposition,
+                "Gewicht (kg)": item.value_kg,
+                "Effektives Gewicht (kg)": item.effective_value_kg,
+                "Originalwert": item.original_value,
+                "Originaleinheit": item.original_unit,
+                "Lokaler Tag": item.measurement_local_day.isoformat(),
+                "Quellbeginn": item.source_start.isoformat(),
+                "Quellende": item.source_end.isoformat(),
+                "Quellaktualisierung": (
+                    None if item.source_updated_at is None else item.source_updated_at.isoformat()
+                ),
+                "Quelle": item.source_name,
+                "Gerät": item.device,
+                "Quellversion": item.source_version,
+                "Prüffälle": [str(value) for value in item.review_case_ids],
+            }
+            for item in projection.weight_measurements
+        ],
+        width="stretch",
+    )
+    st.subheader("Ernährung")
+
+    def nutrition_feature_columns(label: str, feature: DailyNutritionFeature) -> dict[str, object]:
+        return {
+            f"{label} ({feature.unit.value})": feature.value,
+            f"{label}-Datentyp": feature.data_type.value,
+            f"{label}-Qualität": feature.quality_status.value,
+            f"{label}-Logische Messungen": [
+                str(value) for value in feature.logical_measurement_ids
+            ],
+            f"{label}-Messungsversionen": [str(value) for value in feature.measurement_version_ids],
+            f"{label}-Prüffälle": [str(value) for value in feature.review_case_ids],
+        }
+
+    st.dataframe(
+        [
+            {
+                "Tag": item.day.isoformat(),
+                **nutrition_feature_columns("Energie", item.energy),
+                **nutrition_feature_columns("Protein", item.protein),
+                **nutrition_feature_columns("Kohlenhydrate", item.carbohydrates),
+                **nutrition_feature_columns("Gesamtfett", item.total_fat),
+            }
+            for item in projection.nutrition_days
+        ],
+        width="stretch",
+    )
+    st.dataframe(
+        [
+            {
+                "Datentyp": item.data_type.value,
+                "Logische Messung": str(item.logical_measurement_id),
+                "Messungsversion": str(item.measurement_version_id),
+                "Ausgewählt": item.is_selected,
+                "Disposition": item.disposition,
+                "Kanonischer Wert": item.value,
+                "Effektiver Wert": item.effective_value,
+                "Kanonische Einheit": item.unit.value,
+                "Originalwert": item.original_value,
+                "Originaleinheit": item.original_unit,
+                "Lokaler Tag": item.measurement_local_day.isoformat(),
+                "Quellbeginn": item.source_start.isoformat(),
+                "Quellende": item.source_end.isoformat(),
+                "Quellaktualisierung": item.source_updated_at.isoformat(),
+                "Quelle": item.source_name,
+                "Gerät": item.device,
+                "Quellversion": item.source_version,
+                "Prüffälle": [str(value) for value in item.review_case_ids],
+            }
+            for item in projection.healthkit_nutrition_samples
+        ],
+        width="stretch",
+    )
+
+
+def _render_sleep_days(config: RuntimeConfig) -> None:
+    st.subheader("Schlaf")
+    snapshot = st.text_input("Schlaf-Snapshot-ID (optional)")
+    start = st.date_input("Schlaf von", value=None)
+    end = st.date_input("Schlaf bis", value=None)
+    if st.button("Schlaf laden"):
+        try:
+            assert start is None or isinstance(start, date)
+            assert end is None or isinstance(end, date)
+            selection = SnapshotDateSelection(
+                snapshot_ref=SnapshotRef(snapshot) if snapshot else None,
+                start_date=start,
+                end_date=end,
+            )
+            st.session_state["sleep_selection"] = selection
+        except (ValueError, ConfigurationError, HealthLabError):
+            st.error("Schlafdaten konnten nicht geladen werden.")
+    saved_selection = st.session_state.get("sleep_selection")
+    if not isinstance(saved_selection, SnapshotDateSelection):
+        return
+    try:
+        with HealthLab.open(config) as health_lab:
+            projection = health_lab.load_sleep_days(saved_selection)
+    except (ConfigurationError, HealthLabError):
+        st.error("Schlafdaten konnten nicht geladen werden.")
+        return
+
+    def episode_fields(episode: SleepEpisode) -> dict[str, object]:
+        def duration(value: timedelta) -> float:
+            return value.total_seconds()
+
+        return {
+            "Beginn": episode.start.isoformat(),
+            "Ende": episode.end.isoformat(),
+            "Erster Schlaf": None
+            if episode.first_observed_asleep is None
+            else episode.first_observed_asleep.isoformat(),
+            "Letzter Schlaf": None
+            if episode.last_observed_asleep is None
+            else episode.last_observed_asleep.isoformat(),
+            "Beobachteter Schlaf (s)": duration(episode.observed_sleep),
+            "Beobachtetes Wach (s)": duration(episode.observed_awake),
+            "Im Bett (s)": None if episode.in_bed is None else duration(episode.in_bed),
+            "Core (s)": duration(episode.asleep_core),
+            "Tief (s)": duration(episode.asleep_deep),
+            "REM (s)": duration(episode.asleep_rem),
+            "Unspezifiziert (s)": duration(episode.asleep_unspecified),
+            "Mehrdeutig (s)": duration(episode.stage_ambiguous),
+            "Unbeobachtete Lücke (s)": duration(episode.uncovered_gap),
+            "Entfernte Überlappung (s)": duration(episode.removed_same_state_overlap),
+            "Schlaf/Wach-Konflikt (s)": duration(episode.asleep_awake_conflict),
+            "Beobachtungsabdeckung": episode.observed_coverage_ratio,
+            "Detaillierte Stufenabdeckung": episode.detailed_stage_coverage_ratio,
+            "Intervallversionen": [str(value) for value in episode.interval_ids],
+        }
+
+    st.caption(f"Snapshot: {projection.snapshot_ref or '-'}")
+    st.json(_projection_json(projection))
+    st.dataframe(
+        [
+            {
+                "Tag": item.day.isoformat(),
+                "Status": item.status.value,
+                "Beobachteter Schlaf (s)": (
+                    None
+                    if item.primary_episode is None
+                    else item.primary_episode.observed_sleep.total_seconds()
+                ),
+                "Nickerchen": item.nap_count,
+                "Nickerchen-Schlaf (s)": item.nap_observed_sleep.total_seconds(),
+                "Akzeptierte Intervalle": item.quality.accepted_interval_count,
+                "Abgewiesene Intervalle": item.quality.rejected_interval_count,
+                "Beitragende Watch-Quellen": item.quality.contributing_watch_source_count,
+                "Quellenklassen": {
+                    value.source_class.value: {
+                        "akzeptiert": value.accepted_interval_count,
+                        "abgewiesen": value.rejected_interval_count,
+                    }
+                    for value in item.quality.source_counts
+                },
+                "Klassifikator": item.quality.source_classifier_version,
+                "Ableitung": item.quality.derivation_version,
+                "Primärauswahl mehrdeutig": item.quality.primary_selection_ambiguous,
+                **({} if item.primary_episode is None else episode_fields(item.primary_episode)),
+            }
+            for item in projection.days
+        ],
+        width="stretch",
+    )
+
+    st.dataframe(
+        [
+            {"Tag": day.day.isoformat(), **episode_fields(nap)}
+            for day in projection.days
+            for nap in day.naps
+        ],
+        width="stretch",
+    )
+    st.dataframe(
+        [
+            {
+                "Messungsversion": str(item.measurement_version_id),
+                "Originalkategorie": item.original_category,
+                "Kanonische Kategorie": item.canonical_category.value,
+                "Quellenklasse": item.source_class.value,
+                "Ausgewählt": item.is_selected,
+                "Quellbeginn": item.source_start.isoformat(),
+                "Quellende": item.source_end.isoformat(),
+                "Quelle": item.source_name,
+                "Quellversion": item.source_version,
+                "Quellaktualisierung": item.source_updated_at.isoformat(),
+                "Gerät": item.device,
+            }
+            for item in (*projection.accepted_intervals, *projection.rejected_intervals)
+        ],
+        width="stretch",
+    )
+
+
+def _render_activity_days(config: RuntimeConfig) -> None:
+    st.subheader("Aktivität")
+    snapshot = st.text_input("Aktivitäts-Snapshot-ID (optional)")
+    start = st.date_input("Aktivität von", value=None)
+    end = st.date_input("Aktivität bis", value=None)
+    if st.button("Aktivität laden"):
+        try:
+            assert start is None or isinstance(start, date)
+            assert end is None or isinstance(end, date)
+            st.session_state["activity_selection"] = SnapshotDateSelection(
+                snapshot_ref=SnapshotRef(snapshot) if snapshot else None,
+                start_date=start,
+                end_date=end,
+            )
+        except (ValueError, ConfigurationError, HealthLabError):
+            st.error("Aktivitätsdaten konnten nicht geladen werden.")
+    selection = st.session_state.get("activity_selection")
+    if not isinstance(selection, SnapshotDateSelection):
+        return
+    try:
+        with HealthLab.open(config) as health_lab:
+            projection = health_lab.load_activity_days(selection)
+    except (ConfigurationError, HealthLabError):
+        st.error("Aktivitätsdaten konnten nicht geladen werden.")
+        return
+    st.caption(
+        f"Snapshot: {projection.snapshot_ref or '-'} · Status: {projection.status.value} · "
+        f"Abdeckung: {projection.coverage_gap_minutes} min ({projection.derivation_version})"
+    )
+    st.json(_projection_json(projection))
+    st.dataframe(
+        [
+            {
+                "Tag": item.day.isoformat(),
+                "Trainingszeit (min)": item.exercise_time.value,
+                "Schritte": item.step_count.value,
+                "Geh-/Laufdistanz (km)": item.walking_running_distance.value,
+                "Aktive Energie (kcal)": item.active_energy.value,
+                "Watch-Anteil": {
+                    "Trainingszeit": item.exercise_time.watch_value,
+                    "Schritte": item.step_count.watch_value,
+                    "Distanz": item.walking_running_distance.watch_value,
+                    "Energie": item.active_energy.watch_value,
+                },
+                "iPhone-Anteil": {
+                    "Trainingszeit": item.exercise_time.iphone_value,
+                    "Schritte": item.step_count.iphone_value,
+                    "Distanz": item.walking_running_distance.iphone_value,
+                    "Energie": item.active_energy.iphone_value,
+                },
+                "Vollständig": item.is_complete,
+                "Unvollständigkeitsgründe": item.incomplete_reasons,
+                "Abdeckung": [
+                    f"{segment.kind.value}: {segment.source_start.isoformat()} - "
+                    f"{segment.source_end.isoformat()}"
+                    for segment in item.coverage_segments
+                ],
+                "Prüffälle": [
+                    str(case_id)
+                    for metric in (
+                        item.exercise_time,
+                        item.step_count,
+                        item.walking_running_distance,
+                        item.active_energy,
+                    )
+                    for case_id in metric.review_case_ids
+                ],
+            }
+            for item in projection.days
+        ],
+        width="stretch",
+    )
+    st.dataframe(
+        [
+            {
+                "Datentyp": item.data_type.value,
+                "Logische Messung": str(item.logical_measurement_id),
+                "Wert": item.value,
+                "Einheit": item.unit.value,
+                "Effektiver Wert": item.effective_value,
+                "Disposition": item.disposition,
+                "Ausgewählt": item.is_selected,
+                "Quellenklasse": item.source_class.value,
+                "Originalwert": item.original_value,
+                "Originaleinheit": item.original_unit,
+                "Lokaler Tag": item.measurement_local_day.isoformat(),
+                "Quellbeginn": item.source_start.isoformat(),
+                "Quellende": item.source_end.isoformat(),
+                "Quellaktualisierung": item.source_updated_at.isoformat(),
+                "Quelle": item.source_name,
+                "Quellversion": item.source_version,
+                "Gerät": item.device,
+                "Messungsversion": str(item.measurement_version_id),
+                "Prüffälle": [str(case_id) for case_id in item.review_case_ids],
+                "Unterdrückungsgrund": item.suppression_reason,
+            }
+            for item in projection.measurements
+        ],
+        width="stretch",
+    )
+
+
+def _render_workouts(config: RuntimeConfig) -> None:
+    st.subheader("Trainingseinheiten")
+    snapshot = st.text_input("Trainings-Snapshot-ID (optional)")
+    start = st.date_input("Training von", value=None)
+    end = st.date_input("Training bis", value=None)
+    if st.button("Training laden"):
+        try:
+            assert start is None or isinstance(start, date)
+            assert end is None or isinstance(end, date)
+            st.session_state["workout_selection"] = SnapshotDateSelection(
+                SnapshotRef(snapshot) if snapshot else None, start, end
+            )
+        except (ValueError, ConfigurationError, HealthLabError):
+            st.error("Trainingseinheiten konnten nicht geladen werden.")
+    selection = st.session_state.get("workout_selection")
+    if not isinstance(selection, SnapshotDateSelection):
+        return
+    try:
+        with HealthLab.open(config) as health_lab:
+            projection = health_lab.load_workouts(selection)
+    except (ConfigurationError, HealthLabError):
+        st.error("Trainingseinheiten konnten nicht geladen werden.")
+        return
+    st.caption(f"Snapshot: {projection.snapshot_ref or '-'} · Status: {projection.status.value}")
+    st.json(_projection_json(projection))
+    st.dataframe(
+        [
+            {
+                "Aktivitätstyp": item.original_activity_type,
+                "Beginn": item.source_start.isoformat(),
+                "Ende": item.source_end.isoformat(),
+                "Gemeldete Dauer (min)": item.reported_duration_minutes,
+                "Effektive Dauer (min)": item.effective_duration_minutes,
+                "Distanz (km)": item.distance_kilometers,
+                "Aktive Energie (kcal)": item.active_energy_kilocalories,
+                "Ausgewählt": item.is_selected,
+                "Prüffälle": [str(value) for value in item.review_case_ids],
+            }
+            for item in projection.workouts
+        ],
+        width="stretch",
+    )
+    st.dataframe(
+        [
+            {
+                "Tag": item.day.isoformat(),
+                "Aktivitätstyp": item.original_activity_type,
+                "Anzahl": item.workout_count,
+                "Dauer (min)": item.duration_minutes,
+                "Distanz (km)": item.distance_kilometers,
+                "Aktive Energie (kcal)": item.active_energy_kilocalories,
+                "Prüffälle": [str(value) for value in item.review_case_ids],
+            }
+            for item in projection.aggregates
+        ],
+        width="stretch",
+    )
+
+
+def _render_context(config: RuntimeConfig) -> None:
+    st.subheader("Kontext")
+    context_snapshot_id = st.text_input("Kontext-Snapshot-ID (optional)")
+    start = st.date_input("Kontext von", value=None)
+    end = st.date_input("Kontext bis", value=None)
+    if st.button("Kontext laden"):
+        try:
+            assert start is None or isinstance(start, date)
+            assert end is None or isinstance(end, date)
+            snapshot_ref = SnapshotRef(context_snapshot_id) if context_snapshot_id else None
+            selection = SnapshotDateSelection(snapshot_ref, start, end)
+            with HealthLab.open(config) as health_lab:
+                st.session_state["daily_context"] = health_lab.load_daily_context(selection)
+                st.session_state["context_records"] = health_lab.load_context_records(
+                    SnapshotSelection(snapshot_ref)
+                )
+                records = st.session_state["context_records"]
+                st.session_state["context_audit"] = (
+                    None
+                    if records.coverage_start is None
+                    else health_lab.load_context_audit(records.coverage_start.logical_id)
+                )
+        except (ValueError, ConfigurationError, HealthLabError):
+            st.error("Kontext konnte nicht geladen werden.")
+    projection = st.session_state.get("daily_context")
+    records = st.session_state.get("context_records")
+    audit = st.session_state.get("context_audit")
+    if projection is not None:
+        st.json(_projection_json(projection))
+        st.dataframe(
+            [
+                {
+                    "Tag": item.day.isoformat(),
+                    "Krankheit": item.illness_origin.value,
+                    "Höchste Schwere": (
+                        "-"
+                        if item.highest_illness_severity is None
+                        else item.highest_illness_severity.value
+                    ),
+                    "Stress": item.stress_origin.value,
+                    "Stressstufe": "-" if item.stress_level is None else item.stress_level.value,
+                    "Benutzerdefinierter Kontext": ", ".join(item.custom_context_labels) or "-",
+                }
+                for item in projection.days
+            ],
+            width="stretch",
+        )
+    if records is not None:
+        st.json(_projection_json(records))
+        st.caption(
+            "Abdeckungsbeginn: "
+            + (
+                "-"
+                if records.coverage_start is None
+                else records.coverage_start.start_date.isoformat()
+            )
+        )
+        st.dataframe(
+            [
+                {"Bezeichnung": item.name, "ID": str(item.logical_id)}
+                for item in records.custom_labels
+            ],
+            width="stretch",
+        )
+        context_targets = tuple(
+            item
+            for group in (
+                (() if records.coverage_start is None else (records.coverage_start,)),
+                records.illness_categories,
+                records.illness_periods,
+                records.daily_stress,
+                records.custom_labels,
+                records.custom_periods,
+            )
+            for item in group
+        )
+        context_target = (
+            st.selectbox(
+                "Kontext-Auditziel",
+                context_targets,
+                format_func=lambda item: str(item.logical_id),
+            )
+            if context_targets
+            else None
+        )
+        if st.button("Kontext-Audit laden", disabled=context_target is None):
+            try:
+                assert context_target is not None
+                with HealthLab.open(config) as health_lab:
+                    st.session_state["context_audit"] = health_lab.load_context_audit(
+                        context_target.logical_id
+                    )
+                st.rerun()
+            except (ConfigurationError, HealthLabError):
+                st.error("Kontext-Audit konnte nicht geladen werden.")
+    if audit is not None:
+        st.json(_projection_json(audit))
+        st.dataframe(
+            [
+                {
+                    "Revision": str(item.revision_id),
+                    "Vorgänger": ""
+                    if item.previous_revision_id is None
+                    else str(item.previous_revision_id),
+                    "Status": item.state,
+                    "Abdeckungsbeginn": ""
+                    if item.start_date is None
+                    else item.start_date.isoformat(),
+                }
+                for item in audit.revisions
+            ],
+            width="stretch",
+        )
+    st.subheader("Medikamente")
+    medication_snapshot_id = st.text_input("Medikamenten-Snapshot-ID (optional)")
+    if st.button("Medikamentenplan laden"):
+        try:
+            snapshot_ref = SnapshotRef(medication_snapshot_id) if medication_snapshot_id else None
+            with HealthLab.open(config) as health_lab:
+                st.session_state["medication_plan"] = health_lab.load_medication_plan(
+                    SnapshotSelection(snapshot_ref)
+                )
+                st.session_state["medication_days"] = health_lab.load_medication_days(
+                    SnapshotDateSelection(snapshot_ref)
+                )
+        except (ValueError, ConfigurationError, HealthLabError):
+            st.error("Medikamentenplan konnte nicht geladen werden.")
+    medication_plan = st.session_state.get("medication_plan")
+    medication_days = st.session_state.get("medication_days")
+    medication_targets: tuple[Any, ...] = ()
+    if medication_plan is not None:
+        st.json(_projection_json(medication_plan))
+        medication_targets += tuple(medication_plan.regimes)
+        medication_targets += tuple(medication_plan.intake_reason_categories)
+    if medication_days is not None:
+        medication_targets += tuple(
+            intake for day in medication_days.days for intake in day.as_needed_intakes
+        )
+    receipt = st.session_state.get("v03_write_receipt")
+    if (
+        receipt is not None
+        and hasattr(receipt.result, "logical_id")
+        and hasattr(receipt.result, "revision_id")
+    ):
+        medication_targets += ((receipt.result.logical_id, receipt.result.revision_id),)
+    medication_audit_target = (
+        st.selectbox(
+            "Medikamenten-Auditziel",
+            medication_targets,
+            format_func=lambda item: str(item[0] if isinstance(item, tuple) else item.logical_id),
+        )
+        if medication_targets
+        else None
+    )
+    if st.button("Medikamentenaudit laden", disabled=medication_audit_target is None):
+        try:
+            assert medication_audit_target is not None
+            with HealthLab.open(config) as health_lab:
+                st.session_state["medication_audit"] = health_lab.load_medication_audit(
+                    MedicationLogicalId(
+                        str(
+                            medication_audit_target[0]
+                            if isinstance(medication_audit_target, tuple)
+                            else medication_audit_target.logical_id
+                        )
+                    )
+                )
+        except (ValueError, ConfigurationError, HealthLabError):
+            st.error("Medikamentenaudit konnte nicht geladen werden.")
+    medication_audit = st.session_state.get("medication_audit")
+    if medication_plan is not None:
+        st.dataframe(
+            [
+                {
+                    "Beginn": regime.starts_at.isoformat(),
+                    "Zeitzone": regime.timezone,
+                    "Geplante Dosen": len(regime.scheduled_doses),
+                    "Bedarfsmedikationen": len(regime.as_needed_medications),
+                }
+                for regime in medication_plan.regimes
+            ],
+            width="stretch",
+        )
+    if medication_days is not None:
+        st.json(_projection_json(medication_days))
+        st.dataframe(
+            [
+                {
+                    "Tag": item.day.isoformat(),
+                    "Status": item.status,
+                    "Dosen": ", ".join(
+                        f"{dose.medication_name} {dose.amount} {dose.unit}"
+                        + (
+                            " → "
+                            + "; ".join(
+                                f"{intake.taken_at.isoformat()} · {intake.amount}"
+                                for intake in dose.actual_intakes
+                            )
+                            if dose.actual_intakes
+                            else ""
+                        )
+                        for dose in item.occurrences
+                    ),
+                    "Bedarfseinnahmen": ", ".join(
+                        f"{intake.medication_name} {intake.amount} {intake.unit}"
+                        + (
+                            f" ({intake.reason_category_name})"
+                            if intake.reason_category_name is not None
+                            else ""
+                        )
+                        for intake in item.as_needed_intakes
+                    ),
+                }
+                for item in medication_days.days
+            ],
+            width="stretch",
+        )
+    if medication_audit is not None:
+        st.json(_projection_json(medication_audit))
+        st.dataframe(
+            [
+                {
+                    "Revision": str(item.revision_id),
+                    "Vorgänger": ""
+                    if item.previous_revision_id is None
+                    else str(item.previous_revision_id),
+                    "Status": item.state,
+                }
+                for item in medication_audit.revisions
+            ],
+            width="stretch",
+        )
+    st.subheader("V0.3-Schreibaufträge")
+    pending_v03_plan = st.session_state.get("v03_write_plan")
+    request_type = st.selectbox(
+        "Schreibauftragsfamilie",
+        (
+            "revise_context_coverage_start",
+            "revise_illness_category",
+            "revise_custom_context_label",
+            "revise_illness_period",
+            "revise_daily_stress",
+            "revise_custom_context_period",
+            "revise_medication_regime",
+            "revise_medication_deviation",
+            "revise_as_needed_intake",
+            "revise_intake_reason_category",
+            "create_activity_derivation_version",
+        ),
+        disabled=pending_v03_plan is not None,
+    )
+    document = _v03_form_document(request_type, disabled=pending_v03_plan is not None)
+    if st.button("V0.3-Schreibauftrag prüfen", disabled=pending_v03_plan is not None):
+        try:
+            request = decode_write_request(document, expected_type=request_type)
+            with HealthLab.open(config) as health_lab:
+                st.session_state["v03_write_plan"] = health_lab.preview_write(request)
+            st.session_state["v03_write_request"] = request
+            st.rerun()
+        except (json.JSONDecodeError, ValueError, ConfigurationError, HealthLabError):
+            st.error("V0.3-Schreibauftrag ist ungültig.")
+    v03_plan = st.session_state.get("v03_write_plan")
+    if v03_plan is not None:
+        st.code(str(v03_plan.fingerprint))
+        st.caption(f"Freigabe: {v03_plan.approval.status.value}")
+        st.json({"details": str(v03_plan.details), "diagnostics": v03_plan.diagnostics})
+        if st.button(
+            "V0.3-Schreibauftrag ausführen",
+            disabled=not _write_is_executable(v03_plan.approval.status),
+        ):
+            try:
+                with HealthLab.open(config) as health_lab:
+                    receipt = health_lab.execute_write(
+                        st.session_state["v03_write_request"],
+                        expected_plan=v03_plan.fingerprint,
+                    )
+                if isinstance(receipt.result, WriteNotStarted):
+                    if receipt.result.status is WriteNotStartedStatus.PLAN_CHANGED:
+                        st.session_state.pop("v03_write_plan", None)
+                        st.session_state.pop("v03_write_request", None)
+                        st.session_state.pop("context_records", None)
+                        st.session_state.pop("medication_plan", None)
+                        st.warning("Der Stand hat sich geändert. Bitte Daten neu laden und prüfen.")
+                    elif receipt.result.status is WriteNotStartedStatus.STORE_BUSY:
+                        st.warning("Der Datenspeicher ist belegt. Bitte erneut ausführen.")
+                    else:
+                        st.warning("Der Schreibauftrag ist blockiert.")
+                    return
+                st.session_state["v03_write_receipt"] = receipt
+                st.session_state.pop("v03_write_plan", None)
+                st.session_state.pop("v03_write_request", None)
+                st.rerun()
+            except HealthLabError:
+                st.error("V0.3-Schreibauftrag konnte nicht ausgeführt werden.")
+        if st.button("V0.3-Vorschau verwerfen und bearbeiten"):
+            st.session_state.pop("v03_write_plan", None)
+            st.session_state.pop("v03_write_request", None)
+            st.rerun()
+    v03_receipt = st.session_state.get("v03_write_receipt")
+    if v03_receipt is not None:
+        st.success(f"V0.3-Schreibauftrag: {v03_receipt.result.status.value}")
+        st.code(str(v03_receipt.plan_fingerprint))
+        st.json(
+            {
+                "operation_id": str(v03_receipt.operation_id),
+                "result": str(v03_receipt.result),
+                "diagnostics": v03_receipt.diagnostics,
+            }
+        )
+    try:
+        with HealthLab.open(config) as health_lab:
+            activity_settings = health_lab.load_activity_settings()
+        st.subheader("Aktivitätsableitung")
+        st.caption(
+            f"Aktiv {activity_settings.active_version.version_id} · "
+            f"{activity_settings.active_version.coverage_gap_minutes} Minuten"
+        )
+        st.caption(
+            f"Empfohlen {activity_settings.recommended_version.version_id} · "
+            f"{activity_settings.recommended_version.coverage_gap_minutes} Minuten"
+        )
+        st.json(_projection_json(activity_settings))
+    except HealthLabError:
+        st.error("Aktivitätseinstellungen konnten nicht geladen werden.")
+
+
 def _discard_pending_previews() -> None:
     import_request = st.session_state.get("import_request")
     if isinstance(import_request, ImportHealthExport):
         import_request.package_path.unlink(missing_ok=True)
-    for prefix in ("import", "backup", "restore", "analysis", "review", "rule", "historical"):
+    for prefix in (
+        "import",
+        "backup",
+        "restore",
+        "analysis",
+        "review",
+        "rule",
+        "historical",
+        "medication_write",
+        "v03_write",
+    ):
         st.session_state.pop(f"{prefix}_request", None)
         st.session_state.pop(f"{prefix}_plan", None)
 
@@ -190,7 +1284,7 @@ except (KeyError, ValueError, ConfigurationError):
 
 st.radio(
     "Seite",
-    ("Übersicht", "Datenprüfung"),
+    ("Übersicht", "Datenprüfung", "Kerndaten", "Kontext & Medikamente"),
     key="active_page",
     horizontal=True,
     on_change=_discard_pending_previews,
@@ -220,14 +1314,30 @@ if workspace_status.state is WorkspaceState.MIGRATION_REQUIRED:
         st.stop()
     st.subheader("Datenspeichermigration")
     st.caption(
-        f"Schema: {migration_diagnostics.source_version} → "
-        f"{migration_diagnostics.target_version}"
+        f"Schema: {migration_diagnostics.source_version} → {migration_diagnostics.target_version}"
     )
     st.caption(
         "Schritte: "
         + (
             ", ".join(f"{source} → {target}" for source, target in migration_plan.details.steps)
             or "-"
+        )
+    )
+    st.caption(
+        "Snapshot-Schritte: "
+        + (
+            ", ".join(
+                f"{source} → {target}" for source, target in migration_plan.details.snapshot_steps
+            )
+            or "-"
+        )
+    )
+    st.caption(
+        "Snapshot-Stichtag: "
+        + (
+            migration_plan.details.snapshot_as_of.isoformat()
+            if migration_plan.details.snapshot_as_of is not None
+            else "-"
         )
     )
     st.caption(f"Migrationssicherung: {migration_plan.details.backup_file or '-'}")
@@ -293,10 +1403,7 @@ if workspace_status.state is WorkspaceState.RESTORE_PENDING:
     st.caption(
         "Migrationsschritte: "
         + (
-            ", ".join(
-                f"{source} → {target}"
-                for source, target in recovery_status.migration_steps
-            )
+            ", ".join(f"{source} → {target}" for source, target in recovery_status.migration_steps)
             or "-"
         )
     )
@@ -352,6 +1459,18 @@ if rollback_plan.details.migration_operation_id is not None:
         except HealthLabError:
             st.error("Migrationsrollback konnte nicht ausgeführt werden.")
 
+if st.session_state["active_page"] == "Kerndaten":
+    _render_weight_nutrition(config)
+    _render_sleep_days(config)
+    _render_activity_days(config)
+    _render_workouts(config)
+    _render_import_details(config)
+    st.stop()
+
+if st.session_state["active_page"] == "Kontext & Medikamente":
+    _render_context(config)
+    st.stop()
+
 _render_health_import(config)
 
 with st.expander("Sicherung & Wiederherstellung"):
@@ -381,8 +1500,7 @@ with st.expander("Sicherung & Wiederherstellung"):
             f"Zieldatei: {backup_plan.details.target_file}"
         )
         st.caption(
-            "Bestätigungen: "
-            + (", ".join(item.value for item in backup_plan.confirmations) or "-")
+            "Bestätigungen: " + (", ".join(item.value for item in backup_plan.confirmations) or "-")
         )
         if st.button(
             "Metadatensicherung ausführen",
@@ -517,7 +1635,7 @@ if analysis_plan is not None:
                 ).result
             st.session_state["last_analysis_status"] = analysis_result.status
             st.session_state["last_analysis_diagnostics"] = (
-                ", ".join(analysis_result.diagnostics) or "-"
+                ", ".join(getattr(analysis_result, "diagnostics", ())) or "-"
             )
             st.session_state.pop("analysis_plan", None)
             st.session_state.pop("analysis_request", None)
@@ -584,9 +1702,7 @@ if data_review.cases:
     batch_note = st.text_input("Optionale Sammelnotiz")
     if st.button("Sammelbestätigung prüfen"):
         assert batch_kind is not None
-        batch_request = ConfirmDataReviewBatch(
-            DataReviewSelection(batch_kind), batch_note or None
-        )
+        batch_request = ConfirmDataReviewBatch(DataReviewSelection(batch_kind), batch_note or None)
         with HealthLab.open(config) as health_lab:
             st.session_state["review_plan"] = health_lab.preview_write(batch_request)
         st.session_state["review_request"] = batch_request
@@ -686,17 +1802,61 @@ if data_review.cases:
                 assert case.measurement_version_id is not None
                 review_request_local = ResolveDataReviewCase(
                     case.case_id,
-                    SourceValueAcceptance(
-                        case.measurement_version_id, decision_note or None
-                    ),
+                    SourceValueAcceptance(case.measurement_version_id, decision_note or None),
                 )
                 with HealthLab.open(config) as health_lab:
-                    st.session_state["review_plan"] = health_lab.preview_write(
-                        review_request_local
-                    )
+                    st.session_state["review_plan"] = health_lab.preview_write(review_request_local)
                 st.session_state["review_request"] = review_request_local
                 st.rerun()
         if case.measurement_version_id is not None and case.kind.value in {
+            "workout_plausibility",
+            "workout_overlap",
+        }:
+            duration = st.number_input(
+                "Wirksame Dauer (Minuten)",
+                value=float(detail.effective_value or 0),
+                min_value=0.0,
+                key=f"workout-duration-{case.case_id}",
+            )
+            reason = st.text_input("Korrekturgrund", key=f"workout-reason-{case.case_id}")
+            if st.button("Training korrigieren", key=f"workout-correct-{case.case_id}"):
+                try:
+                    review_request_local = ResolveDataReviewCase(
+                        case.case_id,
+                        WorkoutCorrection(
+                            case.measurement_version_id,
+                            duration,
+                            None,
+                            None,
+                            reason,
+                            decision_note or None,
+                        ),
+                    )
+                    with HealthLab.open(config) as health_lab:
+                        st.session_state["review_plan"] = health_lab.preview_write(
+                            review_request_local
+                        )
+                    st.session_state["review_request"] = review_request_local
+                    st.rerun()
+                except ConfigurationError:
+                    st.error("Korrekturgrund fehlt.")
+            if st.button("Training lokal ausschließen", key=f"workout-exclude-{case.case_id}"):
+                try:
+                    review_request_local = ResolveDataReviewCase(
+                        case.case_id,
+                        LocalWorkoutExclusion(
+                            case.measurement_version_id, reason, decision_note or None
+                        ),
+                    )
+                    with HealthLab.open(config) as health_lab:
+                        st.session_state["review_plan"] = health_lab.preview_write(
+                            review_request_local
+                        )
+                    st.session_state["review_request"] = review_request_local
+                    st.rerun()
+                except ConfigurationError:
+                    st.error("Ausschlussgrund fehlt.")
+        elif case.measurement_version_id is not None and case.kind.value in {
             "plausibility",
             "continued_override",
         }:
@@ -829,6 +1989,9 @@ if overview.quarantined_import_count:
 
 with st.expander("Plausibilitätsregeln"):
     for rule in plausibility_rules.rules:
+        if not rule.versions:
+            st.caption(f"{rule.data_type.value}: keine übernommene Regelversion")
+            continue
         active = rule.active_version
         st.caption(
             f"{rule.data_type.value}: {active.version_id} · "
@@ -899,11 +2062,12 @@ with st.expander("Plausibilitätsregeln"):
         selected_rule.versions,
         format_func=lambda item: item.version_id,
     )
-    if st.button("Historische Prüfung planen"):
+    if st.button("Historische Prüfung planen", disabled=historical_version is None):
         if historical_start is None or historical_end is None:
             st.error("Historischer Prüfzeitraum fehlt.")
         else:
             try:
+                assert historical_version is not None
                 historical_request = RunHistoricalReview(
                     selected_type,
                     historical_start,

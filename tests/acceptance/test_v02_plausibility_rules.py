@@ -451,12 +451,12 @@ def test_unknown_source_type_is_cataloged_and_requests_a_rule_once(tmp_path: Pat
     config = _config(tmp_path)
     first = _package(
         tmp_path / "unknown-1.zip",
-        [("HKQuantityTypeIdentifierStepCount", "count", 1000, "steps-1")],
+        [("HKQuantityTypeIdentifierUVExposure", "count", 1000, "uv-1")],
         export_date=datetime(2024, 2, 1, tzinfo=UTC),
     )
     second = _package(
         tmp_path / "unknown-2.zip",
-        [("HKQuantityTypeIdentifierStepCount", "count", 2000, "steps-2")],
+        [("HKQuantityTypeIdentifierUVExposure", "count", 2000, "uv-2")],
         export_date=datetime(2024, 3, 1, tzinfo=UTC),
     )
 
@@ -470,7 +470,7 @@ def test_unknown_source_type_is_cataloged_and_requests_a_rule_once(tmp_path: Pat
     assert second_receipt.status.value == "committed"
     assert len(review.cases) == 1
     assert review.cases[0].kind is DataReviewCaseKind.RULE_DEFINITION
-    assert detail.source_type == "HKQuantityTypeIdentifierStepCount"
+    assert detail.source_type == "HKQuantityTypeIdentifierUVExposure"
     assert detail.reasons == ()
     assert [cycle.status for cycle in review.cycles] == [
         DataReviewCycleStatus.OPEN,

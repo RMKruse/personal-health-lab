@@ -1,0 +1,3353 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:personal-health-lab:cli-output:3.0",
+  "title": "HealthLab production CLI output 3.0",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/importDetailsOutput"
+    },
+    {
+      "$ref": "#/$defs/weightNutritionOutput"
+    },
+    {
+      "$ref": "#/$defs/sleepDaysOutput"
+    },
+    {
+      "$ref": "#/$defs/activityDaysOutput"
+    },
+    {
+      "$ref": "#/$defs/activitySettingsOutput"
+    },
+    {
+      "$ref": "#/$defs/workoutsOutput"
+    },
+    {
+      "$ref": "#/$defs/contextOutput"
+    },
+    {
+      "$ref": "#/$defs/medicationOutput"
+    },
+    {
+      "$ref": "#/$defs/writePlanOutput"
+    },
+    {
+      "$ref": "#/$defs/writeReceiptOutput"
+    },
+    {
+      "$ref": "#/$defs/dataReviewOutput"
+    },
+    {
+      "$ref": "#/$defs/plausibilityRulesOutput"
+    },
+    {
+      "$ref": "#/$defs/recoveryStatusOutput"
+    },
+    {
+      "$ref": "#/$defs/overviewOutput"
+    }
+  ],
+  "$defs": {
+    "activitySettingsOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["active_version", "kind", "recommended_version", "runtime_config", "schema_version"],
+      "properties": {
+        "active_version": { "type": "object" },
+        "kind": { "const": "activity_settings" },
+        "recommended_version": { "type": "object" },
+        "runtime_config": { "type": "object" },
+        "schema_version": { "const": "3.0" }
+      }
+    },
+    "medicationOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "runtime_config", "schema_version"],
+      "properties": {
+        "kind": { "enum": ["medication_days", "medication_plan", "medication_audit"] },
+        "runtime_config": { "type": "object" },
+        "schema_version": { "const": "3.0" },
+        "snapshot_ref": { "$ref": "#/$defs/nullableString" },
+        "medication_as_of": { "$ref": "#/$defs/nullableString" },
+        "days": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["as_needed_intakes", "day", "occurrences", "status"],
+            "properties": {
+              "as_needed_intakes": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["amount", "logical_id", "medication_name", "reason_category_name", "taken_at", "unit"],
+                  "properties": {
+                    "amount": { "type": "string" },
+                    "logical_id": { "type": "string" },
+                    "medication_name": { "type": "string" },
+                    "reason_category_name": { "$ref": "#/$defs/nullableString" },
+                    "taken_at": { "type": "string" },
+                    "unit": { "type": "string" }
+                  }
+                }
+              },
+              "day": { "type": "string" },
+              "occurrences": { "type": "array" },
+              "status": { "enum": ["unknown", "empty", "planned"] }
+            }
+          }
+        },
+        "regimes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["as_needed_medications", "logical_id", "revision_id", "scheduled_doses", "starts_at", "timezone"],
+            "properties": {
+              "as_needed_medications": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["amount", "entry_id", "medication_name", "preferred_reason_category_ids", "unit"],
+                  "properties": {
+                    "amount": { "type": "string" },
+                    "entry_id": { "type": "string" },
+                    "medication_name": { "type": "string" },
+                    "preferred_reason_category_ids": { "type": "array", "items": { "type": "string" } },
+                    "unit": { "type": "string" }
+                  }
+                }
+              },
+              "logical_id": { "type": "string" },
+              "revision_id": { "type": "string" },
+              "scheduled_doses": { "type": "array" },
+              "starts_at": { "type": "string" },
+              "timezone": { "type": "string" }
+            }
+          }
+        },
+        "intake_reason_categories": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["logical_id", "name", "revision_id"],
+            "properties": {
+              "logical_id": { "type": "string" },
+              "name": { "type": "string" },
+              "revision_id": { "type": "string" }
+            }
+          }
+        },
+        "logical_id": { "type": "string" },
+        "revisions": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "contextOutput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["context_as_of_date", "context_timezone", "days", "kind", "runtime_config", "schema_version", "selection", "snapshot_ref"],
+          "properties": {
+            "context_as_of_date": { "$ref": "#/$defs/nullableString" },
+            "context_timezone": { "type": "string" },
+            "days": { "type": "array", "items": { "type": "object" } },
+            "kind": { "const": "daily_context" },
+            "runtime_config": { "type": "object" },
+            "schema_version": { "const": "3.0" },
+            "selection": { "type": "object" },
+            "snapshot_ref": { "$ref": "#/$defs/nullableString" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["coverage_start", "illness_categories", "illness_periods", "daily_stress", "custom_labels", "custom_periods", "kind", "runtime_config", "schema_version", "snapshot_ref"],
+          "properties": {
+            "coverage_start": { "type": ["object", "null"] },
+            "illness_categories": { "type": "array", "items": { "type": "object" } },
+            "illness_periods": { "type": "array", "items": { "type": "object" } },
+            "daily_stress": { "type": "array", "items": { "type": "object" } },
+            "custom_labels": { "type": "array", "items": { "type": "object" } },
+            "custom_periods": { "type": "array", "items": { "type": "object" } },
+            "kind": { "const": "context_records" },
+            "runtime_config": { "type": "object" },
+            "schema_version": { "const": "3.0" },
+            "snapshot_ref": { "$ref": "#/$defs/nullableString" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "logical_id", "revisions", "runtime_config", "schema_version"],
+          "properties": {
+            "kind": { "const": "context_audit" },
+            "logical_id": { "type": "string" },
+            "revisions": { "type": "array", "items": { "type": "object" } },
+            "runtime_config": { "type": "object" },
+            "schema_version": { "const": "3.0" }
+          }
+        }
+      ]
+    },
+    "activityDaysOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "coverage_gap_minutes",
+        "days",
+        "derivation_version",
+        "kind",
+        "measurements",
+        "runtime_config",
+        "schema_version",
+        "selection",
+        "snapshot_ref",
+        "source_classifier_version",
+        "status"
+      ],
+      "properties": {
+        "coverage_gap_minutes": { "type": "integer", "minimum": 1 },
+        "days": { "type": "array", "items": { "type": "object" } },
+        "derivation_version": { "type": "string" },
+        "kind": { "const": "activity_days" },
+        "measurements": { "type": "array", "items": { "type": "object" } },
+        "runtime_config": { "type": "object" },
+        "schema_version": { "const": "3.0" },
+        "selection": { "type": "object" },
+        "snapshot_ref": { "$ref": "#/$defs/nullableString" },
+        "source_classifier_version": { "type": "string" },
+        "status": { "type": "string" }
+      }
+    },
+    "sleepDaysOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accepted_intervals",
+        "days",
+        "kind",
+        "rejected_intervals",
+        "runtime_config",
+        "schema_version",
+        "selection",
+        "snapshot_ref"
+      ],
+      "properties": {
+        "accepted_intervals": { "type": "array", "items": { "type": "object" } },
+        "days": { "type": "array", "items": { "type": "object" } },
+        "kind": { "const": "sleep_days" },
+        "rejected_intervals": { "type": "array", "items": { "type": "object" } },
+        "runtime_config": { "type": "object" },
+        "schema_version": { "const": "3.0" },
+        "selection": { "type": "object" },
+        "snapshot_ref": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "workoutsOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["aggregates", "kind", "runtime_config", "schema_version", "selection", "snapshot_ref", "status", "workouts"],
+      "properties": {
+        "aggregates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["active_energy_kilocalories", "day", "distance_kilometers", "duration_minutes", "original_activity_type", "review_case_ids", "workout_count"],
+            "properties": {
+              "active_energy_kilocalories": { "type": ["number", "null"] },
+              "day": { "type": "string", "format": "date" },
+              "distance_kilometers": { "type": ["number", "null"] },
+              "duration_minutes": { "type": "number" },
+              "original_activity_type": { "type": "string" },
+              "review_case_ids": { "type": "array", "items": { "type": "string", "pattern": "^[0-9a-f]{32}$" } },
+              "workout_count": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "kind": { "const": "workouts" },
+        "runtime_config": { "type": "object" },
+        "schema_version": { "const": "3.0" },
+        "selection": { "type": "object" },
+        "snapshot_ref": { "$ref": "#/$defs/nullableString" },
+        "status": { "type": "string" },
+        "workouts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["active_energy_kilocalories", "device", "distance_kilometers", "effective_duration_minutes", "is_selected", "logical_workout_id", "measurement_local_day", "original_activity_type", "reported_duration_minutes", "review_case_ids", "source_end", "source_name", "source_start", "source_updated_at", "source_version", "strong_source_id_hash", "workout_version_id"],
+            "properties": {
+              "active_energy_kilocalories": { "type": ["number", "null"] },
+              "device": { "type": "string" },
+              "distance_kilometers": { "type": ["number", "null"] },
+              "effective_duration_minutes": { "type": "number" },
+              "is_selected": { "type": "boolean" },
+              "logical_workout_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+              "measurement_local_day": { "type": "string", "format": "date" },
+              "original_activity_type": { "type": "string" },
+              "reported_duration_minutes": { "type": ["number", "null"] },
+              "review_case_ids": { "type": "array", "items": { "type": "string", "pattern": "^[0-9a-f]{32}$" } },
+              "source_end": { "type": "string", "format": "date-time" },
+              "source_name": { "type": "string" },
+              "source_start": { "type": "string", "format": "date-time" },
+              "source_updated_at": { "type": "string", "format": "date-time" },
+              "source_version": { "type": "string" },
+              "strong_source_id_hash": { "$ref": "#/$defs/nullableString" },
+              "workout_version_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+            }
+          }
+        }
+      }
+    },
+    "nullableString": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "recoveryStatusOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "recovery",
+        "runtime_config",
+        "schema_version",
+        "workspace"
+      ],
+      "properties": {
+        "kind": {
+          "const": "recovery_status"
+        },
+        "recovery": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "audit_max_position",
+            "backup_id",
+            "migration_steps",
+            "original_backup_sha256",
+            "restore_id",
+            "source_schema_version",
+            "status",
+            "target_schema_version",
+            "working_copy_sha256"
+          ],
+          "properties": {
+            "audit_max_position": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "backup_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$"
+            },
+            "migration_steps": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "integer"
+                  }
+                ],
+                "items": false
+              }
+            },
+            "original_backup_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "restore_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{32}$"
+            },
+            "source_schema_version": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "status": {
+              "const": "pending"
+            },
+            "target_schema_version": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "working_copy_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        },
+        "runtime_config": {
+          "$ref": "#/$defs/runtimeConfig"
+        },
+        "schema_version": {
+          "const": "3.0"
+        },
+        "workspace": {
+          "$ref": "#/$defs/workspace"
+        }
+      }
+    },
+    "plausibilityRulesOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rules",
+        "runtime_config",
+        "schema_version"
+      ],
+      "properties": {
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "runtime_config": {
+          "$ref": "#/$defs/runtimeConfig"
+        },
+        "schema_version": {
+          "const": "3.0"
+        }
+      }
+    },
+    "nutritionDataType": {
+      "enum": [
+        "dietary_biotin",
+        "dietary_caffeine",
+        "dietary_calcium",
+        "dietary_carbohydrates",
+        "dietary_chloride",
+        "dietary_cholesterol",
+        "dietary_chromium",
+        "dietary_copper",
+        "dietary_energy_consumed",
+        "dietary_fat_monounsaturated",
+        "dietary_fat_polyunsaturated",
+        "dietary_fat_saturated",
+        "dietary_fat_total",
+        "dietary_fiber",
+        "dietary_folate",
+        "dietary_iodine",
+        "dietary_iron",
+        "dietary_magnesium",
+        "dietary_manganese",
+        "dietary_molybdenum",
+        "dietary_niacin",
+        "dietary_pantothenic_acid",
+        "dietary_phosphorus",
+        "dietary_potassium",
+        "dietary_protein",
+        "dietary_riboflavin",
+        "dietary_selenium",
+        "dietary_sodium",
+        "dietary_sugar",
+        "dietary_thiamin",
+        "dietary_vitamin_a",
+        "dietary_vitamin_b12",
+        "dietary_vitamin_b6",
+        "dietary_vitamin_c",
+        "dietary_vitamin_d",
+        "dietary_vitamin_e",
+        "dietary_vitamin_k",
+        "dietary_water",
+        "dietary_zinc"
+      ]
+    },
+    "dailyNutritionFeature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "data_type",
+        "logical_measurement_ids",
+        "measurement_version_ids",
+        "quality_status",
+        "review_case_ids",
+        "unit",
+        "value"
+      ],
+      "properties": {
+        "data_type": {
+          "enum": [
+            "dietary_energy_consumed",
+            "dietary_protein",
+            "dietary_carbohydrates",
+            "dietary_fat_total"
+          ]
+        },
+        "logical_measurement_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        },
+        "measurement_version_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        },
+        "quality_status": {"enum": ["reviewed", "provisional"]},
+        "review_case_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[0-9a-f]{32}$"}
+        },
+        "unit": {"enum": ["kcal", "g"]},
+        "value": {"type": ["number", "null"]}
+      }
+    },
+    "healthKitNutritionSample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "data_type",
+        "device",
+        "disposition",
+        "effective_value",
+        "is_selected",
+        "logical_measurement_id",
+        "measurement_local_day",
+        "measurement_version_id",
+        "original_unit",
+        "original_value",
+        "review_case_ids",
+        "source_end",
+        "source_name",
+        "source_start",
+        "source_updated_at",
+        "source_version",
+        "unit",
+        "value"
+      ],
+      "properties": {
+        "data_type": {"$ref": "#/$defs/nutritionDataType"},
+        "device": {"$ref": "#/$defs/nullableString"},
+        "disposition": {
+          "enum": [
+            "included_source",
+            "included_correction",
+            "excluded_local",
+            "excluded_source_deletion",
+            null
+          ]
+        },
+        "effective_value": {"type": ["number", "null"]},
+        "is_selected": {"type": "boolean"},
+        "logical_measurement_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "measurement_local_day": {"type": "string", "format": "date"},
+        "measurement_version_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "original_unit": {"enum": ["kcal", "kJ", "mL", "L", "mcg", "mg", "g"]},
+        "original_value": {"type": "number"},
+        "review_case_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[0-9a-f]{32}$"}
+        },
+        "source_end": {"type": "string", "minLength": 1},
+        "source_name": {"$ref": "#/$defs/nullableString"},
+        "source_start": {"type": "string", "minLength": 1},
+        "source_updated_at": {"$ref": "#/$defs/nullableString"},
+        "source_version": {"$ref": "#/$defs/nullableString"},
+        "unit": {"enum": ["kcal", "mL", "g"]},
+        "value": {"type": "number"}
+      }
+    },
+    "weightNutritionOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "days",
+        "kind",
+        "nutrition_days",
+        "healthkit_nutrition_samples",
+        "runtime_config",
+        "schema_version",
+        "selection",
+        "snapshot_ref",
+        "status",
+        "weight_measurements"
+      ],
+      "properties": {
+        "days": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "day",
+              "logical_measurement_ids",
+              "measurement_version_ids",
+              "quality_status",
+              "review_case_ids",
+              "status",
+              "value_kg"
+            ],
+            "properties": {
+              "day": {"type": "string", "format": "date"},
+              "logical_measurement_ids": {
+                "type": "array",
+                "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+              },
+              "measurement_version_ids": {
+                "type": "array",
+                "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+              },
+              "quality_status": {"enum": ["reviewed", "provisional"]},
+              "review_case_ids": {
+                "type": "array",
+                "items": {"type": "string", "pattern": "^[0-9a-f]{32}$"}
+              },
+              "status": {"enum": ["observed", "missing", "ambiguous"]},
+              "value_kg": {"type": ["number", "null"]}
+            }
+          }
+        },
+        "kind": {"const": "weight_nutrition"},
+        "nutrition_days": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["carbohydrates", "day", "energy", "protein", "total_fat"],
+            "properties": {
+              "carbohydrates": {"$ref": "#/$defs/dailyNutritionFeature"},
+              "day": {"type": "string", "format": "date"},
+              "energy": {"$ref": "#/$defs/dailyNutritionFeature"},
+              "protein": {"$ref": "#/$defs/dailyNutritionFeature"},
+              "total_fat": {"$ref": "#/$defs/dailyNutritionFeature"}
+            }
+          }
+        },
+        "healthkit_nutrition_samples": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/healthKitNutritionSample"}
+        },
+        "runtime_config": {"$ref": "#/$defs/runtimeConfig"},
+        "schema_version": {"const": "3.0"},
+        "selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["end_date", "snapshot_ref", "start_date"],
+          "properties": {
+            "end_date": {"type": ["string", "null"], "format": "date"},
+            "snapshot_ref": {
+              "type": ["string", "null"],
+              "pattern": "^[0-9a-f]{32}$"
+            },
+            "start_date": {"type": ["string", "null"], "format": "date"}
+          }
+        },
+        "snapshot_ref": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "status": {"enum": ["reviewed", "provisional"]},
+        "weight_measurements": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "device",
+              "disposition",
+              "effective_value_kg",
+              "is_selected",
+              "logical_measurement_id",
+              "measurement_local_day",
+              "measurement_version_id",
+              "original_unit",
+              "original_value",
+              "review_case_ids",
+              "source_end",
+              "source_name",
+              "source_start",
+              "source_updated_at",
+              "source_version",
+              "value_kg"
+            ],
+            "properties": {
+              "device": {"$ref": "#/$defs/nullableString"},
+              "disposition": {
+                "enum": [
+                  "included_source",
+                  "included_correction",
+                  "excluded_local",
+                  "excluded_source_deletion",
+                  null
+                ]
+              },
+              "effective_value_kg": {"type": ["number", "null"]},
+              "is_selected": {"type": "boolean"},
+              "logical_measurement_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "measurement_local_day": {"type": "string", "format": "date"},
+              "measurement_version_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "original_unit": {"type": "string", "minLength": 1},
+              "original_value": {"type": "number"},
+              "review_case_ids": {
+                "type": "array",
+                "items": {"type": "string", "pattern": "^[0-9a-f]{32}$"}
+              },
+              "source_end": {"type": "string", "minLength": 1},
+              "source_name": {"$ref": "#/$defs/nullableString"},
+              "source_start": {"type": "string", "minLength": 1},
+              "source_updated_at": {"$ref": "#/$defs/nullableString"},
+              "source_version": {"$ref": "#/$defs/nullableString"},
+              "value_kg": {"type": "number"}
+            }
+          }
+        }
+      }
+    },
+    "runtimeConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_import_compression_ratio",
+        "max_import_entries",
+        "max_import_entry_bytes",
+        "max_import_package_bytes",
+        "max_import_uncompressed_bytes",
+        "mode",
+        "real_store",
+        "schema_version",
+        "synthetic_store"
+      ],
+      "properties": {
+        "max_import_compression_ratio": {
+          "type": "number",
+          "minimum": 1
+        },
+        "max_import_entries": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_import_entry_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_import_package_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_import_uncompressed_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "mode": {
+          "enum": [
+            "synthetic",
+            "real"
+          ]
+        },
+        "real_store": {
+          "const": "<redacted>"
+        },
+        "schema_version": {
+          "const": "1.0"
+        },
+        "synthetic_store": {
+          "const": "<redacted>"
+        }
+      }
+    },
+    "dataReviewOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cases",
+        "cycles",
+        "runtime_config",
+        "schema_version",
+        "selection",
+        "snapshot_ref",
+        "status"
+      ],
+      "properties": {
+        "cases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "allowed_actions",
+              "candidate_version_ids",
+              "case_id",
+              "detail",
+              "evidence_fingerprint",
+              "kind",
+              "logical_measurement_id",
+              "measurement_version_id",
+              "rule_version_id"
+            ],
+            "properties": {
+              "allowed_actions": {
+                "type": "array",
+                "items": {
+                  "enum": [
+                    "confirm",
+                    "correct",
+                    "exclude_local",
+                    "accept_source",
+                    "reject",
+                    "prefer",
+                    "split"
+                  ]
+                }
+              },
+              "candidate_version_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              },
+              "case_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$"
+              },
+              "detail": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "canonical_unit",
+                  "effective_value",
+                  "effective_value_source",
+                  "measured_at",
+                  "reasons",
+                  "source_type"
+                ],
+                "properties": {
+                  "canonical_unit": {
+                    "enum": [
+                      "kcal",
+                      "count/min",
+                      "kg",
+                      null
+                    ]
+                  },
+                  "effective_value": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "effective_value_source": {
+                    "enum": [
+                      "source",
+                      "correction",
+                      "none",
+                      null
+                    ]
+                  },
+                  "measured_at": {
+                    "$ref": "#/$defs/nullableString"
+                  },
+                  "reasons": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "code",
+                        "lower_bound",
+                        "upper_bound",
+                        "unit"
+                      ],
+                      "properties": {
+                        "code": {
+                          "enum": [
+                            "below_fixed_lower_bound",
+                            "above_fixed_upper_bound",
+                            "below_personal_lower_bound",
+                            "above_personal_upper_bound"
+                          ]
+                        },
+                        "lower_bound": {
+                          "type": "number"
+                        },
+                        "upper_bound": {
+                          "type": [
+                            "number",
+                            "null"
+                          ]
+                        },
+                        "unit": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  },
+                  "source_type": {
+                    "$ref": "#/$defs/nullableString"
+                  }
+                }
+              },
+              "evidence_fingerprint": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "kind": {
+                "enum": [
+                  "plausibility",
+                  "continued_override",
+                  "rule_definition",
+                  "suspected_source_deletion",
+                  "source_conflict",
+                  "preferred_daily_weight_conflict"
+                ]
+              },
+              "logical_measurement_id": {
+                "$ref": "#/$defs/nullableString"
+              },
+              "measurement_version_id": {
+                "$ref": "#/$defs/nullableString"
+              },
+              "rule_version_id": {
+                "$ref": "#/$defs/nullableString"
+              }
+            }
+          }
+        },
+        "cycles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "base_snapshot_ref",
+              "cycle_id",
+              "end_date",
+              "kind",
+              "open_case_count",
+              "rule_version_id",
+              "snapshot_ref",
+              "start_date",
+              "status"
+            ],
+            "properties": {
+              "base_snapshot_ref": {
+                "$ref": "#/$defs/nullableString"
+              },
+              "cycle_id": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{32}$"
+              },
+              "end_date": {
+                "$ref": "#/$defs/nullableString"
+              },
+              "kind": {
+                "enum": [
+                  "import",
+                  "rule_version",
+                  "historical"
+                ]
+              },
+              "open_case_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "rule_version_id": {
+                "$ref": "#/$defs/nullableString"
+              },
+              "snapshot_ref": {
+                "type": "string"
+              },
+              "start_date": {
+                "$ref": "#/$defs/nullableString"
+              },
+              "status": {
+                "enum": [
+                  "open",
+                  "closed"
+                ]
+              }
+            }
+          }
+        },
+        "runtime_config": {
+          "$ref": "#/$defs/runtimeConfig"
+        },
+        "schema_version": {
+          "const": "3.0"
+        },
+        "selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "snapshot_ref": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "status": {
+          "enum": [
+            "reviewed",
+            "provisional"
+          ]
+        }
+      }
+    },
+    "writeApproval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "ready",
+            "confirmation_required",
+            "blocked",
+            "no_change"
+          ]
+        }
+      }
+    },
+    "fileVaultCheck": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "reason",
+            "status",
+            "target_volume"
+          ],
+          "properties": {
+            "reason": {
+              "enum": [
+                null,
+                "unsupported_platform",
+                "mount_unresolved",
+                "disk_info_unavailable",
+                "volume_identity_missing",
+                "volume_locked",
+                "apfs_state_unavailable",
+                "filevault_state_unavailable",
+                "filevault_state_unreported",
+                "encryption_state_unconfirmed",
+                "probe_failed"
+              ]
+            },
+            "status": {
+              "enum": [
+                "protected",
+                "unprotected",
+                "transitioning",
+                "unknown"
+              ]
+            },
+            "target_volume": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "capacityCheck": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "available_bytes",
+            "estimate_bytes",
+            "fragment_size",
+            "method_id",
+            "minimum_remaining_bytes",
+            "reason",
+            "required_bytes",
+            "safety_margin_bytes",
+            "status",
+            "target_volume"
+          ],
+          "properties": {
+            "available_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "estimate_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "fragment_size": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "method_id": {
+              "enum": [
+                "activity-derivation/v1",
+                "cow-migration/v1",
+                "full-snapshot-import/v1",
+                "manual-snapshot/v1",
+                "metadata-backup/v1",
+                "restore-activate/v1",
+                "restore-source-import/v1",
+                "restore-start/v1"
+              ]
+            },
+            "minimum_remaining_bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "reason": {
+              "enum": [
+                null,
+                "estimate_unknown",
+                "space_unknown",
+                "target_read_only",
+                "target_unwritable"
+              ]
+            },
+            "required_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "safety_margin_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "status": {
+              "enum": [
+                "ready",
+                "insufficient",
+                "unknown",
+                "unwritable"
+              ]
+            },
+            "target_volume": {
+              "type": "string",
+              "pattern": "^(volume-[0-9a-f]{12}|unresolved)$"
+            }
+          }
+        }
+      ]
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "allowed_reads",
+        "allowed_writes",
+        "mode",
+        "person_binding",
+        "state",
+        "store_id"
+      ],
+      "properties": {
+        "allowed_reads": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowed_writes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mode": {
+          "enum": [
+            "synthetic",
+            "real"
+          ]
+        },
+        "person_binding": {
+          "enum": [
+            "unbound",
+            "bound",
+            "pending"
+          ]
+        },
+        "state": {
+          "enum": [
+            "ready",
+            "migration_required",
+            "restore_pending"
+          ]
+        },
+        "store_id": {
+          "$ref": "#/$defs/nullableString"
+        }
+      }
+    },
+    "importResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "anomaly_count",
+        "diagnostics",
+        "import_id",
+        "logical_measurement_count",
+        "measurement_version_count",
+        "source_occurrence_count",
+        "package_hash",
+        "package_record_count",
+        "record_count",
+        "snapshot_ref",
+        "status",
+        "type"
+      ],
+      "properties": {
+        "anomaly_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "import_id": {
+          "type": "string"
+        },
+        "logical_measurement_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "measurement_version_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source_occurrence_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "package_hash": {
+          "type": "string"
+        },
+        "package_record_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "record_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "snapshot_ref": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "status": {
+          "enum": [
+            "committed",
+            "duplicate",
+            "rejected",
+            "quarantined",
+            "restore_pending"
+          ]
+        },
+        "type": {
+          "const": "import_health_export"
+        }
+      }
+    },
+    "writeNotStarted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "diagnostics",
+        "status",
+        "type"
+      ],
+      "properties": {
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "status": {
+          "enum": [
+            "plan_changed",
+            "blocked",
+            "store_busy"
+          ]
+        },
+        "type": {
+          "const": "write_not_started"
+        }
+      }
+    },
+    "writeNoChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["diagnostics", "status", "type"],
+      "properties": {
+        "diagnostics": { "type": "array", "items": { "type": "string" } },
+        "status": { "const": "no_change" },
+        "type": { "const": "write_no_change" }
+      }
+    },
+    "plausibilityRuleResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "diagnostics",
+        "rule_version_id",
+        "snapshot_ref",
+        "status",
+        "type"
+      ],
+      "properties": {
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "rule_version_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "snapshot_ref": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "status": {
+          "const": "committed"
+        },
+        "type": {
+          "const": "create_plausibility_rule_version"
+        }
+      }
+    },
+    "dataReviewDecisionResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "decision_id",
+        "diagnostics",
+        "snapshot_ref",
+        "status",
+        "type"
+      ],
+      "properties": {
+        "decision_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "snapshot_ref": {
+          "type": "string"
+        },
+        "status": {
+          "const": "committed"
+        },
+        "type": {
+          "const": "data_review_decision"
+        }
+      }
+    },
+    "dataReviewBatchResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "batch_action_id",
+        "decision_ids",
+        "diagnostics",
+        "snapshot_ref",
+        "status",
+        "type"
+      ],
+      "properties": {
+        "batch_action_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "decision_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$"
+          }
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "snapshot_ref": {
+          "type": "string"
+        },
+        "status": {
+          "const": "committed"
+        },
+        "type": {
+          "const": "data_review_batch"
+        }
+      }
+    },
+    "historicalReviewResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cycle_id",
+        "diagnostics",
+        "open_case_count",
+        "snapshot_ref",
+        "status",
+        "type"
+      ],
+      "properties": {
+        "cycle_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "open_case_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "snapshot_ref": {
+          "type": "string"
+        },
+        "status": {
+          "const": "committed"
+        },
+        "type": {
+          "const": "run_historical_review"
+        }
+      }
+    },
+    "restingHeartRateAnalysisResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "analysis",
+        "analysis_definition_id",
+        "analysis_run_id",
+        "diagnostics",
+        "model_maturity",
+        "provenance",
+        "result_ref",
+        "snapshot_ref",
+        "status",
+        "type"
+      ],
+      "properties": {
+        "analysis": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "analysis_definition_id": {
+          "type": "string"
+        },
+        "analysis_run_id": {
+          "type": "string"
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "model_maturity": {
+          "enum": [
+            "exploratory",
+            "robust",
+            null
+          ]
+        },
+        "provenance": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "result_ref": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "snapshot_ref": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "status": {
+          "enum": [
+            "completed",
+            "reused",
+            "insufficient_data",
+            "unstable"
+          ]
+        },
+        "type": {
+          "const": "run_resting_heart_rate_analysis"
+        }
+      }
+    },
+    "storeMigrationResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backup_file",
+        "diagnostics",
+        "snapshot_as_of",
+        "snapshot_source_version",
+        "snapshot_steps",
+        "snapshot_target_version",
+        "source_version",
+        "status",
+        "steps",
+        "target_version",
+        "type"
+      ],
+      "properties": {
+        "backup_file": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "snapshot_as_of": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "snapshot_source_version": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "snapshot_steps": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "items": false
+          }
+        },
+        "snapshot_target_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "enum": [
+            "completed",
+            "no_op"
+          ]
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "items": false
+          }
+        },
+        "target_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "type": {
+          "const": "migrate_store"
+        }
+      }
+    },
+    "migrationRollbackResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backup_file",
+        "diagnostics",
+        "migration_operation_id",
+        "restored_snapshot_ref",
+        "source_version",
+        "status",
+        "target_version",
+        "type",
+        "unreferenced_snapshot_ref"
+      ],
+      "properties": {
+        "backup_file": {
+          "type": "string"
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "migration_operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "restored_snapshot_ref": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "source_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "status": {
+          "const": "completed"
+        },
+        "target_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "type": {
+          "const": "rollback_migration"
+        },
+        "unreferenced_snapshot_ref": {
+          "$ref": "#/$defs/nullableString"
+        }
+      }
+    },
+    "metadataRestoreResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backup_id",
+        "diagnostics",
+        "original_backup_sha256",
+        "restore_id",
+        "status",
+        "type",
+        "working_copy_sha256"
+      ],
+      "properties": {
+        "backup_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "original_backup_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "restore_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "aborted",
+            "no_op"
+          ]
+        },
+        "type": {
+          "const": "metadata_restore"
+        },
+        "working_copy_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "v03ScheduledDose": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["medication_name", "amount", "unit", "local_time", "weekdays"],
+      "properties": {
+        "medication_name": { "type": "string" },
+        "amount": { "type": "string" },
+        "unit": { "type": "string" },
+        "local_time": { "type": "string", "format": "time" },
+        "weekdays": {
+          "type": "array",
+          "items": { "enum": ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"] }
+        }
+      }
+    },
+    "v03AsNeededMedication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["medication_name", "amount", "unit", "preferred_reason_category_ids", "entry_id"],
+      "properties": {
+        "medication_name": { "type": "string" },
+        "amount": { "type": "string" },
+        "unit": { "type": "string" },
+        "preferred_reason_category_ids": { "type": "array", "items": { "type": "string", "pattern": "^[0-9a-f]{32}$" } },
+        "entry_id": { "anyOf": [{ "type": "string", "pattern": "^[0-9a-f]{32}$" }, { "type": "null" }] }
+      }
+    },
+    "v03ActualIntake": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["taken_at", "amount"],
+      "properties": {
+        "taken_at": { "type": "string", "format": "date-time" },
+        "amount": { "type": "string" }
+      }
+    },
+    "manualContextRevisionPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "intent", "object_kind", "logical_id", "expected_revision_id", "name", "category_logical_id", "start_date", "end_date", "severity", "stress_level", "note", "withdrawal_reason", "base_snapshot_ref", "snapshot_as_of", "context_timezone", "context_as_of_date", "colliding_logical_ids", "referenced_logical_ids", "affected_start_date", "affected_end_date"],
+      "properties": {
+        "type": { "enum": ["revise_context_coverage_start", "revise_illness_category", "revise_custom_context_label", "revise_illness_period", "revise_daily_stress", "revise_custom_context_period"] },
+        "intent": { "enum": ["create", "revise", "withdraw", "restore"] },
+        "object_kind": { "enum": ["context_coverage_start", "illness_category", "custom_context_label", "illness_period", "daily_stress", "custom_context_period"] },
+        "logical_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "expected_revision_id": { "anyOf": [{ "type": "string", "pattern": "^[0-9a-f]{32}$" }, { "type": "null" }] },
+        "name": { "$ref": "#/$defs/nullableString" },
+        "category_logical_id": { "anyOf": [{ "type": "string", "pattern": "^[0-9a-f]{32}$" }, { "type": "null" }] },
+        "start_date": { "type": ["string", "null"], "format": "date" },
+        "end_date": { "type": ["string", "null"], "format": "date" },
+        "severity": { "enum": ["mild", "moderate", "severe", null] },
+        "stress_level": { "enum": ["very_low", "low", "average", "high", "very_high", null] },
+        "note": { "$ref": "#/$defs/nullableString" },
+        "withdrawal_reason": { "$ref": "#/$defs/nullableString" },
+        "base_snapshot_ref": { "$ref": "#/$defs/nullableString" },
+        "snapshot_as_of": { "type": "string", "format": "date-time" },
+        "context_timezone": { "type": "string" },
+        "context_as_of_date": { "type": "string", "format": "date" },
+        "colliding_logical_ids": { "type": "array", "items": { "type": "string", "pattern": "^[0-9a-f]{32}$" } },
+        "referenced_logical_ids": { "type": "array", "items": { "type": "string", "pattern": "^[0-9a-f]{32}$" } },
+        "affected_start_date": { "type": ["string", "null"], "format": "date" },
+        "affected_end_date": { "type": ["string", "null"], "format": "date" }
+      }
+    },
+    "medicationRevisionPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "intent", "object_kind", "logical_id", "expected_revision_id", "starts_at", "timezone", "scheduled_doses", "as_needed_medications", "regime_logical_id", "scheduled_at", "actual_intakes", "entry_id", "taken_at", "amount", "reason_category_logical_id", "name", "withdrawal_reason", "base_snapshot_ref", "medication_as_of", "colliding_logical_ids", "referenced_logical_ids", "affected_start_date", "affected_end_date"],
+      "properties": {
+        "type": { "enum": ["revise_medication_regime", "revise_medication_deviation", "revise_as_needed_intake", "revise_intake_reason_category"] },
+        "intent": { "enum": ["create", "revise", "withdraw", "restore"] },
+        "object_kind": { "enum": ["medication_regime", "medication_deviation", "as_needed_intake", "intake_reason_category"] },
+        "logical_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "expected_revision_id": { "anyOf": [{ "type": "string", "pattern": "^[0-9a-f]{32}$" }, { "type": "null" }] },
+        "starts_at": { "type": ["string", "null"], "format": "date-time" },
+        "timezone": { "$ref": "#/$defs/nullableString" },
+        "scheduled_doses": { "type": "array", "items": { "$ref": "#/$defs/v03ScheduledDose" } },
+        "as_needed_medications": { "type": "array", "items": { "$ref": "#/$defs/v03AsNeededMedication" } },
+        "regime_logical_id": { "anyOf": [{ "type": "string", "pattern": "^[0-9a-f]{32}$" }, { "type": "null" }] },
+        "scheduled_at": { "type": ["string", "null"], "format": "date-time" },
+        "actual_intakes": { "type": "array", "items": { "$ref": "#/$defs/v03ActualIntake" } },
+        "entry_id": { "anyOf": [{ "type": "string", "pattern": "^[0-9a-f]{32}$" }, { "type": "null" }] },
+        "taken_at": { "type": ["string", "null"], "format": "date-time" },
+        "amount": { "$ref": "#/$defs/nullableString" },
+        "reason_category_logical_id": { "anyOf": [{ "type": "string", "pattern": "^[0-9a-f]{32}$" }, { "type": "null" }] },
+        "name": { "$ref": "#/$defs/nullableString" },
+        "withdrawal_reason": { "$ref": "#/$defs/nullableString" },
+        "base_snapshot_ref": { "$ref": "#/$defs/nullableString" },
+        "medication_as_of": { "type": "string", "format": "date-time" },
+        "colliding_logical_ids": { "type": "array", "items": { "type": "string", "pattern": "^[0-9a-f]{32}$" } },
+        "referenced_logical_ids": { "type": "array", "items": { "type": "string", "pattern": "^[0-9a-f]{32}$" } },
+        "affected_start_date": { "type": ["string", "null"], "format": "date" },
+        "affected_end_date": { "type": ["string", "null"], "format": "date" }
+      }
+    },
+    "v03ActivityDerivationVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version_id", "coverage_gap_minutes", "source_classifier_version"],
+      "properties": {
+        "version_id": { "type": "string" },
+        "coverage_gap_minutes": { "type": "integer", "minimum": 1, "maximum": 1440 },
+        "source_classifier_version": { "type": "string" }
+      }
+    },
+    "activityDerivationPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "active_version", "proposed_version", "base_snapshot_ref", "affected_projections"],
+      "properties": {
+        "type": { "const": "create_activity_derivation_version" },
+        "active_version": { "$ref": "#/$defs/v03ActivityDerivationVersion" },
+        "proposed_version": { "$ref": "#/$defs/v03ActivityDerivationVersion" },
+        "base_snapshot_ref": { "$ref": "#/$defs/nullableString" },
+        "affected_projections": {
+          "type": "array",
+          "items": { "enum": ["activity_days", "workouts"] },
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true
+        }
+      }
+    },
+    "manualContextRevisionResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "status", "logical_id", "revision_id", "snapshot_ref"],
+      "properties": {
+        "type": { "const": "manual_context_revision" },
+        "status": { "const": "committed" },
+        "logical_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "revision_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "snapshot_ref": { "type": "string" }
+      }
+    },
+    "medicationRevisionResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "status", "logical_id", "revision_id", "snapshot_ref"],
+      "properties": {
+        "type": { "const": "medication_revision" },
+        "status": { "const": "committed" },
+        "logical_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "revision_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "snapshot_ref": { "type": "string" }
+      }
+    },
+    "activityDerivationResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "status", "version_id", "snapshot_ref"],
+      "properties": {
+        "type": { "const": "activity_derivation_version" },
+        "status": { "const": "committed" },
+        "version_id": { "type": "string" },
+        "snapshot_ref": { "type": "string" }
+      }
+    },
+    "writePlanOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approval",
+        "confirmations",
+        "details",
+        "diagnostics",
+        "fingerprint",
+        "kind",
+        "preflight",
+        "request",
+        "runtime_config",
+        "schema_version",
+        "workspace"
+      ],
+      "properties": {
+        "approval": {
+          "$ref": "#/$defs/writeApproval"
+        },
+        "confirmations": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "real_import_same_person",
+              "filevault_unprotected",
+              "filevault_transitioning",
+              "filevault_unknown",
+              "metadata_backup_point_in_time",
+              "metadata_restore",
+              "store_migration",
+              "migration_rollback"
+            ]
+          }
+        },
+        "details": {
+          "oneOf": [
+            { "$ref": "#/$defs/manualContextRevisionPlan" },
+            { "$ref": "#/$defs/medicationRevisionPlan" },
+            { "$ref": "#/$defs/activityDerivationPlan" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "package_hash",
+                "package_size",
+                "type"
+              ],
+              "properties": {
+                "package_hash": {
+                  "type": "string"
+                },
+                "package_size": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "type": {
+                  "const": "import_health_export"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "audit_max_position",
+                "backup_id",
+                "migration_steps",
+                "original_backup_sha256",
+                "restore_id",
+                "source_schema_version",
+                "source_store_id",
+                "target_schema_version",
+                "type",
+                "working_copy_sha256"
+              ],
+              "properties": {
+                "audit_max_position": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0
+                },
+                "backup_id": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "migration_steps": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "prefixItems": [
+                      {
+                        "type": "integer"
+                      },
+                      {
+                        "type": "integer"
+                      }
+                    ],
+                    "items": false
+                  }
+                },
+                "original_backup_sha256": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "restore_id": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "source_schema_version": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 1
+                },
+                "source_store_id": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "target_schema_version": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "type": {
+                  "const": "begin_metadata_restore"
+                },
+                "working_copy_sha256": {
+                  "$ref": "#/$defs/nullableString"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "backup_id",
+                "restore_id",
+                "type"
+              ],
+              "properties": {
+                "backup_id": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "restore_id": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "type": {
+                  "const": "abort_metadata_restore"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "active_snapshot_ref",
+                "previous_version_id",
+                "proposed_version_id",
+                "type"
+              ],
+              "properties": {
+                "active_snapshot_ref": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "previous_version_id": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "proposed_version_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "type": {
+                  "const": "create_plausibility_rule_version"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "active_snapshot_ref",
+                "case_id",
+                "type"
+              ],
+              "properties": {
+                "active_snapshot_ref": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "case_id": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "type": {
+                  "const": "data_review_decision"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "active_snapshot_ref",
+                "count",
+                "matches",
+                "selection",
+                "type"
+              ],
+              "properties": {
+                "active_snapshot_ref": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "matches": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "canonical_unit",
+                      "case_id",
+                      "effective_value",
+                      "evidence_fingerprint",
+                      "kind",
+                      "measurement_version_id",
+                      "rule_version_id"
+                    ],
+                    "properties": {
+                      "canonical_unit": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "case_id": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{32}$"
+                      },
+                      "effective_value": {
+                        "type": [
+                          "number",
+                          "null"
+                        ]
+                      },
+                      "evidence_fingerprint": {
+                        "type": "string"
+                      },
+                      "kind": {
+                        "type": "string"
+                      },
+                      "measurement_version_id": {
+                        "$ref": "#/$defs/nullableString"
+                      },
+                      "rule_version_id": {
+                        "$ref": "#/$defs/nullableString"
+                      }
+                    }
+                  }
+                },
+                "selection": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "kind"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
+                },
+                "type": {
+                  "const": "confirm_data_review_batch"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "active_snapshot_ref",
+                "batch_action_id",
+                "count",
+                "decision_ids",
+                "type"
+              ],
+              "properties": {
+                "active_snapshot_ref": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "batch_action_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{32}$"
+                },
+                "count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "decision_ids": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{32}$"
+                  }
+                },
+                "type": {
+                  "const": "revoke_data_review_batch"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "base_snapshot_ref",
+                "end_date",
+                "rule_version_id",
+                "start_date",
+                "type"
+              ],
+              "properties": {
+                "base_snapshot_ref": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "end_date": {
+                  "type": "string"
+                },
+                "rule_version_id": {
+                  "type": "string"
+                },
+                "start_date": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "run_historical_review"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "analysis_definition_id",
+                "base_snapshot_ref",
+                "end_date",
+                "schema_version",
+                "start_date",
+                "type"
+              ],
+              "properties": {
+                "analysis_definition_id": {
+                  "type": "string"
+                },
+                "base_snapshot_ref": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "end_date": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "schema_version": {
+                  "const": "1.0"
+                },
+                "start_date": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "type": {
+                  "const": "run_resting_heart_rate_analysis"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "affected_snapshot_refs",
+                "backup_file",
+                "existing_analyses_become_stale",
+                "snapshot_as_of",
+                "snapshot_source_version",
+                "snapshot_steps",
+                "snapshot_target_version",
+                "source_version",
+                "steps",
+                "target_version",
+                "type"
+              ],
+              "properties": {
+                "affected_snapshot_refs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "backup_file": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "existing_analyses_become_stale": {
+                  "type": "boolean"
+                },
+                "source_version": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "snapshot_as_of": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "snapshot_source_version": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "snapshot_steps": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "prefixItems": [
+                      {
+                        "type": "integer"
+                      },
+                      {
+                        "type": "integer"
+                      }
+                    ],
+                    "items": false
+                  }
+                },
+                "snapshot_target_version": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "steps": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "prefixItems": [
+                      {
+                        "type": "integer"
+                      },
+                      {
+                        "type": "integer"
+                      }
+                    ],
+                    "items": false
+                  }
+                },
+                "target_version": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "type": {
+                  "const": "migrate_store"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "backup_file",
+                "backup_sha256",
+                "current_snapshot_ref",
+                "migration_operation_id",
+                "restored_snapshot_ref",
+                "source_version",
+                "target_version",
+                "type"
+              ],
+              "properties": {
+                "backup_file": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "backup_sha256": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "current_snapshot_ref": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "migration_operation_id": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "restored_snapshot_ref": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "source_version": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "target_version": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "rollback_migration"
+                }
+              }
+            }
+          ]
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "fingerprint": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "kind": {
+          "const": "write_plan"
+        },
+        "preflight": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "capacity",
+            "filevault"
+          ],
+          "properties": {
+            "capacity": {
+              "$ref": "#/$defs/capacityCheck"
+            },
+            "filevault": {
+              "$ref": "#/$defs/fileVaultCheck"
+            }
+          }
+        },
+        "request": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["type"],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "revise_context_coverage_start",
+                    "revise_illness_category",
+                    "revise_custom_context_label",
+                    "revise_illness_period",
+                    "revise_daily_stress",
+                    "revise_custom_context_period",
+                    "revise_medication_regime",
+                    "revise_medication_deviation",
+                    "revise_as_needed_intake",
+                    "revise_intake_reason_category",
+                    "create_activity_derivation_version"
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "package",
+                "type"
+              ],
+              "properties": {
+                "package": {
+                  "const": "<redacted>"
+                },
+                "type": {
+                  "const": "import_health_export"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "backup",
+                "type"
+              ],
+              "properties": {
+                "backup": {
+                  "const": "<redacted>"
+                },
+                "type": {
+                  "const": "begin_metadata_restore"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "type"
+              ],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "abort_metadata_restore",
+                    "confirm_data_review_batch",
+                    "create_plausibility_rule_version",
+                    "data_review_decision",
+                    "migrate_store",
+                    "rollback_migration",
+                    "revoke_data_review_batch",
+                    "run_historical_review",
+                    "run_resting_heart_rate_analysis"
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        "runtime_config": {
+          "$ref": "#/$defs/runtimeConfig"
+        },
+        "schema_version": {
+          "const": "3.0"
+        },
+        "workspace": {
+          "$ref": "#/$defs/workspace"
+        }
+      }
+    },
+    "writeReceiptOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "diagnostics",
+        "final_preflight",
+        "kind",
+        "operation_id",
+        "plan_fingerprint",
+        "result",
+        "runtime_config",
+        "schema_version"
+      ],
+      "properties": {
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "final_preflight": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "approval",
+            "confirmations",
+            "capacity",
+            "diagnostics",
+            "filevault"
+          ],
+          "properties": {
+            "approval": {
+              "$ref": "#/$defs/writeApproval"
+            },
+            "confirmations": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "real_import_same_person",
+                  "filevault_unprotected",
+                  "filevault_transitioning",
+                  "filevault_unknown",
+                  "metadata_backup_point_in_time",
+                  "metadata_restore",
+                  "store_migration",
+                  "migration_rollback"
+                ]
+              }
+            },
+            "diagnostics": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "capacity": {
+              "$ref": "#/$defs/capacityCheck"
+            },
+            "filevault": {
+              "$ref": "#/$defs/fileVaultCheck"
+            }
+          }
+        },
+        "kind": {
+          "const": "write_receipt"
+        },
+        "operation_id": {
+          "type": "string"
+        },
+        "plan_fingerprint": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "result": {
+          "oneOf": [
+            { "$ref": "#/$defs/manualContextRevisionResult" },
+            { "$ref": "#/$defs/medicationRevisionResult" },
+            { "$ref": "#/$defs/activityDerivationResult" },
+            {
+              "$ref": "#/$defs/importResult"
+            },
+            {
+              "$ref": "#/$defs/writeNotStarted"
+            },
+            {
+              "$ref": "#/$defs/writeNoChange"
+            },
+            {
+              "$ref": "#/$defs/plausibilityRuleResult"
+            },
+            {
+              "$ref": "#/$defs/dataReviewDecisionResult"
+            },
+            {
+              "$ref": "#/$defs/dataReviewBatchResult"
+            },
+            {
+              "$ref": "#/$defs/historicalReviewResult"
+            },
+            {
+              "$ref": "#/$defs/restingHeartRateAnalysisResult"
+            },
+            {
+              "$ref": "#/$defs/storeMigrationResult"
+            },
+            {
+              "$ref": "#/$defs/migrationRollbackResult"
+            },
+            {
+              "$ref": "#/$defs/metadataRestoreResult"
+            }
+          ]
+        },
+        "runtime_config": {
+          "$ref": "#/$defs/runtimeConfig"
+        },
+        "schema_version": {
+          "const": "3.0"
+        }
+      }
+    },
+    "importDetailsOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "canonical_counts",
+        "import_id",
+        "kind",
+        "runtime_config",
+        "schema_version",
+        "unsupported_content"
+      ],
+      "properties": {
+        "canonical_counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "anomaly_count",
+            "logical_measurement_count",
+            "measurement_version_count",
+            "package_record_count",
+            "record_count",
+            "source_occurrence_count"
+          ],
+          "properties": {
+            "anomaly_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "logical_measurement_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "measurement_version_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "package_record_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "record_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "source_occurrence_count": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "import_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "kind": {
+          "const": "import_details"
+        },
+        "runtime_config": {
+          "$ref": "#/$defs/runtimeConfig"
+        },
+        "schema_version": {
+          "const": "3.0"
+        },
+        "unsupported_content": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "category",
+              "count",
+              "external_identifier"
+            ],
+            "properties": {
+              "category": {
+                "enum": [
+                  "record_type",
+                  "sleep_value",
+                  "top_level_element",
+                  "unit",
+                  "workout_activity_type",
+                  "workout_child"
+                ]
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "external_identifier": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "end_date",
+        "start_date"
+      ],
+      "properties": {
+        "end_date": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "start_date": {
+          "$ref": "#/$defs/nullableString"
+        }
+      }
+    },
+    "analysisProvenance": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "analysis_definition_id",
+        "analysis_run_id",
+        "code_commit",
+        "code_diff_hash",
+        "code_dirty",
+        "config_hash",
+        "config_schema_version",
+        "environment_lock_hash",
+        "result_ref",
+        "snapshot_ref"
+      ],
+      "properties": {
+        "analysis_definition_id": {
+          "type": "string"
+        },
+        "analysis_run_id": {
+          "type": "string"
+        },
+        "code_commit": {
+          "type": "string"
+        },
+        "code_diff_hash": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "code_dirty": {
+          "type": "boolean"
+        },
+        "config_hash": {
+          "type": "string"
+        },
+        "config_schema_version": {
+          "type": "string"
+        },
+        "environment_lock_hash": {
+          "type": "string"
+        },
+        "result_ref": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "snapshot_ref": {
+          "type": "string"
+        }
+      }
+    },
+    "interval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lower_per_100_kcal",
+        "lower_per_personal_standard_deviation",
+        "upper_per_100_kcal",
+        "upper_per_personal_standard_deviation"
+      ],
+      "properties": {
+        "lower_per_100_kcal": {
+          "type": "number"
+        },
+        "lower_per_personal_standard_deviation": {
+          "type": "number"
+        },
+        "upper_per_100_kcal": {
+          "type": "number"
+        },
+        "upper_per_personal_standard_deviation": {
+          "type": "number"
+        }
+      }
+    },
+    "analysisDiagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "association_guardrail",
+        "bootstrap_resamples",
+        "bootstrap_successes",
+        "complete_days",
+        "feature_dependency",
+        "input_completeness",
+        "maximum_time_series_gap_days",
+        "outcome_standard_deviation",
+        "model_readiness"
+      ],
+      "properties": {
+        "association_guardrail": {
+          "enum": [
+            "simultaneous_band_includes_zero",
+            "simultaneous_band_excludes_zero"
+          ]
+        },
+        "bootstrap_resamples": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "bootstrap_successes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "complete_days": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "feature_dependency": {
+          "enum": [
+            "acceptable",
+            "high"
+          ]
+        },
+        "input_completeness": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "maximum_time_series_gap_days": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "outcome_standard_deviation": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "exclusiveMinimum": 0
+        },
+        "model_readiness": {
+          "enum": [
+            "exploratory",
+            "robust"
+          ]
+        }
+      }
+    },
+    "methodology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "block_length_days",
+        "bootstrap_method",
+        "interval_level",
+        "max_feature_dependency",
+        "maximum_time_series_gap_days",
+        "minimum_bootstrap_success_rate",
+        "minimum_input_completeness",
+        "minimum_observations",
+        "minimum_outcome_standard_deviation",
+        "random_seed",
+        "resample_count",
+        "ridge_penalty",
+        "robust_observations"
+      ],
+      "properties": {
+        "block_length_days": {
+          "type": "integer"
+        },
+        "bootstrap_method": {
+          "const": "moving_block"
+        },
+        "interval_level": {
+          "type": "number"
+        },
+        "max_feature_dependency": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "maximum_time_series_gap_days": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "minimum_bootstrap_success_rate": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "minimum_input_completeness": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "minimum_observations": {
+          "type": "integer"
+        },
+        "minimum_outcome_standard_deviation": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "random_seed": {
+          "type": "integer"
+        },
+        "resample_count": {
+          "type": "integer"
+        },
+        "ridge_penalty": {
+          "type": "number"
+        },
+        "robust_observations": {
+          "type": "integer"
+        }
+      }
+    },
+    "cumulativeAssociation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "direction",
+        "estimate_per_100_kcal",
+        "estimate_per_personal_standard_deviation",
+        "pointwise_interval"
+      ],
+      "properties": {
+        "direction": {
+          "enum": [
+            "negative",
+            "zero",
+            "positive"
+          ]
+        },
+        "estimate_per_100_kcal": {
+          "type": "number"
+        },
+        "estimate_per_personal_standard_deviation": {
+          "type": "number"
+        },
+        "pointwise_interval": {
+          "$ref": "#/$defs/interval"
+        }
+      }
+    },
+    "lagAssociation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "direction",
+        "estimate_per_100_kcal",
+        "estimate_per_personal_standard_deviation",
+        "exposure_unit",
+        "lag_days",
+        "outcome_unit",
+        "pointwise_interval",
+        "simultaneous_band"
+      ],
+      "properties": {
+        "direction": {
+          "enum": [
+            "negative",
+            "zero",
+            "positive"
+          ]
+        },
+        "estimate_per_100_kcal": {
+          "type": "number"
+        },
+        "estimate_per_personal_standard_deviation": {
+          "type": "number"
+        },
+        "exposure_unit": {
+          "type": "string"
+        },
+        "lag_days": {
+          "type": "integer"
+        },
+        "outcome_unit": {
+          "type": "string"
+        },
+        "pointwise_interval": {
+          "$ref": "#/$defs/interval"
+        },
+        "simultaneous_band": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/interval"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "analysisResult": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "analysis_definition_id",
+        "completed_at",
+        "cumulative_association",
+        "data_status",
+        "data_status_reasons",
+        "status_facts_recorded",
+        "diagnostics",
+        "freshness",
+        "lag_associations",
+        "methodology",
+        "model_maturity",
+        "maturity_criteria",
+        "personal_standard_deviation_kcal",
+        "provenance",
+        "reproducibility",
+        "snapshot_ref"
+      ],
+      "properties": {
+        "analysis_definition_id": {
+          "type": "string"
+        },
+        "completed_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "cumulative_association": {
+          "$ref": "#/$defs/cumulativeAssociation"
+        },
+        "data_status": {
+          "enum": [
+            "provisional",
+            "reviewed"
+          ]
+        },
+        "data_status_reasons": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "evidence_ids"
+            ],
+            "properties": {
+              "code": {
+                "enum": [
+                  "open_review_case",
+                  "passive_coverage_gap"
+                ]
+              },
+              "evidence_ids": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "diagnostics": {
+          "$ref": "#/$defs/analysisDiagnostics"
+        },
+        "freshness": {
+          "enum": [
+            "current",
+            "stale"
+          ]
+        },
+        "lag_associations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/lagAssociation"
+          }
+        },
+        "methodology": {
+          "$ref": "#/$defs/methodology"
+        },
+        "model_maturity": {
+          "enum": [
+            "exploratory",
+            "robust"
+          ]
+        },
+        "maturity_criteria": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "observed_value",
+              "passed",
+              "threshold"
+            ],
+            "properties": {
+              "code": {
+                "enum": [
+                  "minimum_observations",
+                  "robust_observations",
+                  "input_completeness",
+                  "feature_dependency",
+                  "bootstrap_success_rate",
+                  "outcome_variation",
+                  "time_series_continuity"
+                ]
+              },
+              "observed_value": {
+                "type": [
+                  "number",
+                  "string"
+                ]
+              },
+              "passed": {
+                "type": "boolean"
+              },
+              "threshold": {
+                "type": [
+                  "number",
+                  "string"
+                ]
+              }
+            }
+          }
+        },
+        "personal_standard_deviation_kcal": {
+          "type": "number"
+        },
+        "provenance": {
+          "$ref": "#/$defs/analysisProvenance"
+        },
+        "reproducibility": {
+          "enum": [
+            "reproducible",
+            "local_development",
+            "not_recorded"
+          ]
+        },
+        "snapshot_ref": {
+          "type": "string"
+        },
+        "status_facts_recorded": {
+          "type": "boolean"
+        }
+      }
+    },
+    "dailyValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "day",
+        "measurement_version_ids",
+        "source_updated_ats",
+        "source_versions",
+        "value"
+      ],
+      "properties": {
+        "day": {
+          "type": "string",
+          "format": "date"
+        },
+        "measurement_version_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source_updated_ats": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "source_versions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "value": {
+          "type": "number"
+        }
+      }
+    },
+    "dailySeries": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "data_type",
+        "unit",
+        "values"
+      ],
+      "properties": {
+        "data_type": {
+          "type": "string"
+        },
+        "unit": {
+          "type": "string"
+        },
+        "values": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/dailyValue"
+          }
+        }
+      }
+    },
+    "overviewOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "analysis_history",
+        "daily_series",
+        "last_reviewed_analysis",
+        "message",
+        "provenance",
+        "resting_hr_analysis",
+        "runtime_config",
+        "schema_version",
+        "selection",
+        "status"
+      ],
+      "properties": {
+        "analysis_history": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/analysisResult"
+          }
+        },
+        "daily_series": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/dailySeries"
+          }
+        },
+        "message": {
+          "type": "string"
+        },
+        "last_reviewed_analysis": {
+          "$ref": "#/$defs/analysisResult"
+        },
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "import_count",
+            "logical_measurement_count",
+            "measurement_version_count",
+            "package_count",
+            "quarantined_import_count",
+            "snapshot_count"
+          ],
+          "properties": {
+            "import_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "logical_measurement_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "measurement_version_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "package_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "quarantined_import_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "snapshot_count": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "resting_hr_analysis": {
+          "$ref": "#/$defs/analysisResult"
+        },
+        "runtime_config": {
+          "$ref": "#/$defs/runtimeConfig"
+        },
+        "schema_version": {
+          "const": "3.0"
+        },
+        "selection": {
+          "$ref": "#/$defs/selection"
+        },
+        "status": {
+          "enum": [
+            "empty",
+            "ready",
+            "provisional"
+          ]
+        }
+      }
+    }
+  }
+}

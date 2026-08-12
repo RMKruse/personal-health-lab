@@ -9,7 +9,13 @@ from datetime import UTC, date, datetime, timedelta
 from statistics import median
 from typing import Literal
 
-from personal_health_lab.health_data import LogicalMeasurementId, MeasurementVersionId
+from personal_health_lab.health_data import (
+    CanonicalHealthType,
+    LogicalMeasurementId,
+    MeasurementVersionId,
+    canonical_unit_for,
+    classify_activity_source,
+)
 from personal_health_lab.storage import (
     ExportFact,
     HistoricalReviewPublication,
@@ -20,6 +26,7 @@ from personal_health_lab.storage import (
     OperationId,
     PlausibilityRuleRecord,
     ResolvedMeasurement,
+    ResolvedWorkout,
     ReviewCaseId,
     ReviewCycleRecord,
     ReviewCycleUpdate,
@@ -28,6 +35,8 @@ from personal_health_lab.storage import (
     SourceResolution,
     SourceTypeRuleRequest,
     StoredReviewCycleId,
+    WorkoutResolution,
+    WorkoutVersionFact,
 )
 
 
@@ -75,6 +84,38 @@ _FIXED_RULES = (
         None,
         datetime(1970, 1, 1, tzinfo=UTC),
     ),
+    *(
+        PlausibilityRuleRecord(
+            "fixed-plausibility/v1",
+            data_type.value,
+            canonical_unit_for(data_type).value,
+            0.0,
+            None,
+            False,
+            None,
+            datetime(1970, 1, 1, tzinfo=UTC),
+        )
+        for data_type in (
+            CanonicalHealthType.APPLE_EXERCISE_TIME,
+            CanonicalHealthType.STEP_COUNT,
+            CanonicalHealthType.WALKING_RUNNING_DISTANCE,
+        )
+    ),
+)
+_NUTRITION_RECOMMENDATIONS = tuple(
+    PlausibilityRuleRecord(
+        "fixed-plausibility/v1",
+        data_type.value,
+        canonical_unit_for(data_type).value,
+        0.0,
+        None,
+        False,
+        None,
+        datetime(1970, 1, 1, tzinfo=UTC),
+        "builtin-plausibility/v1",
+    )
+    for data_type in CanonicalHealthType
+    if data_type.value.startswith("dietary_")
 )
 
 
@@ -227,6 +268,108 @@ def select_governing_export(exports: tuple[ExportFact, ...]) -> str:
     ).export_id
 
 
+def resolve_workouts(
+    *,
+    versions: tuple[WorkoutVersionFact, ...],
+    previous_workouts: tuple[ResolvedWorkout, ...] = (),
+) -> WorkoutResolution:
+    """Resolve source versions and review evidence for immutable workouts."""
+    by_logical: dict[str, list[WorkoutVersionFact]] = defaultdict(list)
+    for version in versions:
+        by_logical[version.logical_workout_id].append(version)
+    previous = {item.logical_workout_id: item for item in previous_workouts}
+    resolved: list[ResolvedWorkout] = []
+    cases: list[OpenDataReviewCase] = []
+    links: list[tuple[str, str]] = []
+    selected: list[WorkoutVersionFact] = []
+    for logical_id, candidates in sorted(by_logical.items()):
+        source = max(
+            candidates,
+            key=lambda item: (
+                item.source_updated_at_utc,
+                item.source_version,
+                item.workout_version_id,
+            ),
+        )
+        prior = previous.get(logical_id)
+        if prior is not None and prior.selected_workout_version_id == source.workout_version_id:
+            resolution = prior
+        else:
+            elapsed = (
+                datetime.fromisoformat(source.source_end_utc)
+                - datetime.fromisoformat(source.source_start_utc)
+            ).total_seconds() / 60
+            resolution = ResolvedWorkout(
+                logical_id,
+                source.workout_version_id,
+                "included_source",
+                source.reported_duration_minutes
+                if source.reported_duration_minutes is not None
+                else elapsed,
+                source.distance_kilometers,
+                source.active_energy_kilocalories,
+                None,
+            )
+        resolved.append(resolution)
+        if resolution.disposition.startswith("included"):
+            selected.append(source)
+        elapsed = (
+            datetime.fromisoformat(source.source_end_utc)
+            - datetime.fromisoformat(source.source_start_utc)
+        ).total_seconds() / 60
+        if (
+            (
+                source.reported_duration_minutes is not None
+                and not 0 <= source.reported_duration_minutes <= elapsed
+            )
+            or (source.distance_kilometers is not None and source.distance_kilometers < 0)
+            or (
+                source.active_energy_kilocalories is not None
+                and source.active_energy_kilocalories < 0
+            )
+        ):
+            key = f"workout_plausibility:{source.workout_version_id}"
+            case = OpenDataReviewCase(
+                hashlib.sha256(key.encode()).hexdigest()[:32],
+                "workout_plausibility",
+                LogicalMeasurementId(source.logical_workout_id),
+                MeasurementVersionId(source.workout_version_id),
+                None,
+                hashlib.sha256(f"{key}:evidence".encode()).hexdigest(),
+            )
+            cases.append(case)
+            links.append((case.review_case_id, source.workout_version_id))
+    for index, first in enumerate(selected):
+        for second in selected[index + 1 :]:
+            if (
+                first.source_start_utc < second.source_end_utc
+                and second.source_start_utc < first.source_end_utc
+            ):
+                ids = sorted((first.logical_workout_id, second.logical_workout_id))
+                key = f"workout_overlap:{':'.join(ids)}"
+                case = OpenDataReviewCase(
+                    hashlib.sha256(key.encode()).hexdigest()[:32],
+                    "workout_overlap",
+                    LogicalMeasurementId(first.logical_workout_id),
+                    MeasurementVersionId(first.workout_version_id),
+                    None,
+                    hashlib.sha256(f"{key}:evidence".encode()).hexdigest(),
+                )
+                cases.append(case)
+                links.extend(
+                    (
+                        (case.review_case_id, first.workout_version_id),
+                        (case.review_case_id, second.workout_version_id),
+                    )
+                )
+    by_id = {item.review_case_id: item for item in cases}
+    return WorkoutResolution(
+        tuple(sorted(resolved, key=lambda item: item.logical_workout_id)),
+        tuple(by_id[key] for key in sorted(by_id)),
+        tuple(sorted(set(links))),
+    )
+
+
 def resolve_sources(
     *,
     occurrences: tuple[SourceOccurrenceFact, ...],
@@ -347,9 +490,7 @@ def resolve_sources(
         if source.logical_measurement_id == previous.logical_measurement_id
         and source.selected_measurement_version_id != previous.selected_measurement_version_id
     )
-    continued_version_ids = {
-        str(case.measurement_version_id) for case in continued_overrides
-    }
+    continued_version_ids = {str(case.measurement_version_id) for case in continued_overrides}
     plausibility_cases = tuple(
         case
         for case in _plausibility_cases(
@@ -363,6 +504,7 @@ def resolve_sources(
 
     generated_cases = (
         *_source_conflicts(occurrences, version_by_id, conflict_keys),
+        *_activity_overlap_conflicts(version_by_id, measurements),
         *_source_deletions(
             occurrences,
             version_by_id,
@@ -373,16 +515,15 @@ def resolve_sources(
         ),
         *continued_overrides,
         *plausibility_cases,
+        *_preferred_daily_weight_conflicts(version_by_id, measurements),
         *(_unknown_rule_case(source_type) for source_type in sorted(set(unknown_source_types))),
     )
     previous_case_ids = {item.review_case_id for item in previous_review_cases}
-    continued_logical_ids = {
-        str(case.logical_measurement_id) for case in continued_overrides
-    }
+    continued_logical_ids = {str(case.logical_measurement_id) for case in continued_overrides}
     cases_by_id = {
         item.review_case_id: item
         for item in previous_review_cases
-        if item.kind != "suspected_source_deletion"
+        if item.kind not in {"suspected_source_deletion", "preferred_daily_weight_conflict"}
         and not (
             item.kind == "continued_override"
             and str(item.logical_measurement_id) in continued_logical_ids
@@ -464,10 +605,7 @@ def _plausibility_cases(
             else measurement.effective_value
         )
         reasons = list(_plausibility_reasons(rule, effective_value, version.canonical_unit))
-        if (
-            rule.personal_range_enabled
-            and version.canonical_type == "apple_resting_heart_rate"
-        ):
+        if rule.personal_range_enabled and version.canonical_type == "apple_resting_heart_rate":
             personal_bounds = _personal_bounds(
                 rule,
                 version.measurement_local_date,
@@ -508,6 +646,61 @@ def _plausibility_cases(
     return tuple(cases)
 
 
+def _preferred_daily_weight_conflicts(
+    version_by_id: dict[str, MeasurementVersionFact],
+    measurements: tuple[ResolvedMeasurement, ...],
+) -> tuple[OpenDataReviewCase, ...]:
+    by_day: dict[date, list[tuple[MeasurementVersionFact, ResolvedMeasurement]]] = defaultdict(list)
+    for measurement in measurements:
+        if measurement.effective_value is None:
+            continue
+        version = version_by_id[measurement.selected_measurement_version_id]
+        if version.canonical_type == "body_mass":
+            by_day[version.measurement_local_date].append((version, measurement))
+    cases = []
+    for day, candidates in sorted(by_day.items()):
+        latest_at = max(
+            datetime.fromisoformat(version.source_start_utc) for version, _ in candidates
+        )
+        latest = tuple(
+            (version, measurement)
+            for version, measurement in candidates
+            if datetime.fromisoformat(version.source_start_utc) == latest_at
+        )
+        if len({measurement.effective_value for _, measurement in latest}) < 2:
+            continue
+        evidence = hashlib.sha256(
+            repr(
+                tuple(
+                    sorted(
+                        (version.measurement_version_id, measurement.effective_value)
+                        for version, measurement in latest
+                    )
+                )
+            ).encode()
+        ).hexdigest()
+        version, _ = min(
+            latest,
+            key=lambda item: (
+                item[1].effective_value,
+                item[0].measurement_version_id,
+            ),
+        )
+        cases.append(
+            OpenDataReviewCase(
+                review_case_id=hashlib.sha256(
+                    f"preferred_daily_weight:{day}:{evidence}".encode()
+                ).hexdigest()[:32],
+                kind="preferred_daily_weight_conflict",
+                logical_measurement_id=LogicalMeasurementId(version.logical_measurement_id),
+                measurement_version_id=MeasurementVersionId(version.measurement_version_id),
+                rule_version_id=None,
+                evidence_fingerprint=evidence,
+            )
+        )
+    return tuple(cases)
+
+
 def evaluate_plausibility_cases(
     versions: tuple[MeasurementVersionFact, ...],
     measurements: tuple[ResolvedMeasurement, ...],
@@ -523,8 +716,20 @@ def evaluate_plausibility_cases(
 
 
 def plausibility_rule_recommendations() -> tuple[PlausibilityRuleRecord, ...]:
-    return tuple(
-        replace(rule, recommendation_id="builtin-plausibility/v1") for rule in _FIXED_RULES
+    return (
+        *(replace(rule, recommendation_id="builtin-plausibility/v1") for rule in _FIXED_RULES),
+        *_NUTRITION_RECOMMENDATIONS,
+        PlausibilityRuleRecord(
+            "fixed-plausibility/v1",
+            "body_mass",
+            "kg",
+            1.0,
+            None,
+            True,
+            None,
+            datetime(1970, 1, 1, tzinfo=UTC),
+            "builtin-plausibility/v1",
+        ),
     )
 
 
@@ -832,6 +1037,68 @@ def _source_deletions(
     return tuple(missing)
 
 
+def _activity_overlap_conflicts(
+    version_by_id: dict[str, MeasurementVersionFact],
+    measurements: tuple[ResolvedMeasurement, ...],
+) -> tuple[OpenDataReviewCase, ...]:
+    activity_types = {
+        "apple_exercise_time",
+        "step_count",
+        "walking_running_distance",
+        "active_energy",
+    }
+    grouped: dict[tuple[str, str], list[MeasurementVersionFact]] = defaultdict(list)
+    for measurement in measurements:
+        if measurement.effective_value is None:
+            continue
+        version = version_by_id[measurement.selected_measurement_version_id]
+        if version.canonical_type not in activity_types:
+            continue
+        source_class = classify_activity_source(version.source_name, version.device).value
+        grouped[(version.canonical_type, source_class)].append(version)
+    cases = []
+    for (data_type, source_class), versions in sorted(grouped.items()):
+        active: MeasurementVersionFact | None = None
+        active_end: datetime | None = None
+        for version in sorted(
+            versions,
+            key=lambda item: (
+                item.source_start_utc,
+                item.source_end_utc,
+                item.measurement_version_id,
+            ),
+        ):
+            start = datetime.fromisoformat(version.source_start_utc)
+            end = datetime.fromisoformat(version.source_end_utc)
+            if start >= end:
+                continue
+            if (
+                active is not None
+                and active_end is not None
+                and start < active_end
+                and active.logical_measurement_id != version.logical_measurement_id
+            ):
+                logical_ids = tuple(
+                    sorted((active.logical_measurement_id, version.logical_measurement_id))
+                )
+                case_key = f"activity_overlap:{data_type}:{source_class}:{':'.join(logical_ids)}"
+                cases.append(
+                    OpenDataReviewCase(
+                        review_case_id=hashlib.sha256(case_key.encode()).hexdigest()[:32],
+                        kind="source_conflict",
+                        logical_measurement_id=LogicalMeasurementId(logical_ids[0]),
+                        measurement_version_id=None,
+                        rule_version_id=None,
+                        evidence_fingerprint=hashlib.sha256(
+                            f"{case_key}:evidence".encode()
+                        ).hexdigest(),
+                    )
+                )
+            if active_end is None or end > active_end:
+                active, active_end = version, end
+    return tuple(cases)
+
+
 def _source_conflicts(
     occurrences: tuple[SourceOccurrenceFact, ...],
     version_by_id: dict[str, MeasurementVersionFact],
@@ -925,6 +1192,26 @@ def load_review_case_detail(store: LocalStore, review_case_id: str) -> ReviewCas
             reasons=(),
             canonical_unit=None,
         )
+    if case.kind in {"workout_plausibility", "workout_overlap"}:
+        _, workouts = store.load_workouts(None, None, None)
+        workout = next(
+            (item for item in workouts if item.workout_version_id == case.measurement_version_id),
+            None,
+        )
+        if workout is None:
+            raise ValueError("Trainingsversion des Datenprüffalls fehlt.")
+        return ReviewCaseDetail(
+            source_type="workout",
+            measured_at=workout.source_start,
+            effective_value=workout.effective_duration_minutes,
+            effective_value_source=(
+                None
+                if workout.disposition is None
+                else workout.disposition.removeprefix("included_")
+            ),
+            reasons=(),
+            canonical_unit="min",
+        )
     if case.kind == "continued_override" and case.measurement_version_id is not None:
         version = store.load_measurement_version_fact(case.measurement_version_id)
         if version is None:
@@ -938,11 +1225,7 @@ def load_review_case_detail(store: LocalStore, review_case_id: str) -> ReviewCas
         reasons = (
             []
             if rule is None
-            else list(
-                _plausibility_reasons(
-                    rule, version.canonical_value, version.canonical_unit
-                )
-            )
+            else list(_plausibility_reasons(rule, version.canonical_value, version.canonical_unit))
         )
         if rule is not None and version.canonical_type == "apple_resting_heart_rate":
             series = next(
@@ -959,9 +1242,7 @@ def load_review_case_detail(store: LocalStore, review_case_id: str) -> ReviewCas
             personal_bounds = _personal_bounds(
                 rule,
                 version.measurement_local_date,
-                ()
-                if series is None
-                else tuple((item.day, item.value) for item in series.values),
+                () if series is None else tuple((item.day, item.value) for item in series.values),
                 version.canonical_unit,
             )
             reasons.extend(
@@ -972,7 +1253,8 @@ def load_review_case_detail(store: LocalStore, review_case_id: str) -> ReviewCas
                     version.canonical_unit,
                     personal_bounds,
                 )
-                if reason.code in {
+                if reason.code
+                in {
                     "below_personal_lower_bound",
                     "above_personal_upper_bound",
                 }
@@ -981,9 +1263,7 @@ def load_review_case_detail(store: LocalStore, review_case_id: str) -> ReviewCas
             source_type=version.canonical_type,
             measured_at=datetime.fromisoformat(version.source_start_utc),
             effective_value=None if resolved is None else resolved.effective_value,
-            effective_value_source=(
-                None if resolved is None else resolved.effective_value_source
-            ),
+            effective_value_source=(None if resolved is None else resolved.effective_value_source),
             reasons=tuple(reasons),
             canonical_unit=version.canonical_unit,
         )
@@ -1118,8 +1398,7 @@ def _snapshot_review_detail(
         selected_on_day = daily.get(version.measurement_local_date)
         eligible = case.kind == "continued_override" or (
             selected_on_day is not None
-            and selected_on_day[1].selected_measurement_version_id
-            == version.measurement_version_id
+            and selected_on_day[1].selected_measurement_version_id == version.measurement_version_id
         )
         if eligible:
             personal_bounds = _personal_bounds(
@@ -1133,8 +1412,7 @@ def _snapshot_review_detail(
                 for reason in _plausibility_reasons(
                     rule, reason_value, version.canonical_unit, personal_bounds
                 )
-                if reason.code
-                in {"below_personal_lower_bound", "above_personal_upper_bound"}
+                if reason.code in {"below_personal_lower_bound", "above_personal_upper_bound"}
             )
     return ReviewCaseDetail(
         version.canonical_type,
@@ -1168,9 +1446,7 @@ def load_review_backup_facts(store: LocalStore) -> tuple[ReviewBackupFact, ...]:
         for snapshot in store.load_review_snapshot_facts()
         for case in sorted(snapshot.cases, key=lambda item: item.review_case_id)
         for detail in (
-            _snapshot_review_detail(
-                store, case, snapshot.versions, snapshot.measurements, rules
-            ),
+            _snapshot_review_detail(store, case, snapshot.versions, snapshot.measurements, rules),
         )
     )
 
@@ -1183,5 +1459,6 @@ __all__ = [
     "load_review_case_detail",
     "load_review_state",
     "resolve_sources",
+    "resolve_workouts",
     "select_governing_export",
 ]

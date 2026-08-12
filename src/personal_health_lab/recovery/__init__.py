@@ -7,21 +7,25 @@ import json
 import os
 import shutil
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal, cast
+from zoneinfo import ZoneInfo
 
 from personal_health_lab.data_quality import load_review_backup_facts
 from personal_health_lab.health_data import (
     CanonicalHealthRecord,
+    CanonicalSleepInterval,
+    CanonicalWorkout,
     LogicalMeasurementId,
     MeasurementVersionId,
 )
 from personal_health_lab.migration import plan_backup_migration
 from personal_health_lab.storage import (
     CapacityCheck,
+    CapacityMethodId,
     DataMode,
     ExportFact,
     LocalStore,
@@ -39,13 +43,19 @@ from personal_health_lab.storage import (
     probe_capacity,
 )
 
-_BACKUP_SCHEMA_VERSION = 3
-_METHOD_ID = "metadata-backup/v1"
-_RESTORE_START_METHOD_ID = "restore-start/v1"
-_RESTORE_SOURCE_METHOD_ID = "restore-source-import/v1"
-_RESTORE_ACTIVATE_METHOD_ID = "restore-activate/v1"
-_IDENTITY_RULE_VERSION = "healthkit-natural/v2"
-_MAPPING_RULE_VERSION = "healthkit-canonical/v1"
+_BACKUP_SCHEMA_VERSION = 4
+_METHOD_ID = CapacityMethodId.METADATA_BACKUP
+_RESTORE_START_METHOD_ID = CapacityMethodId.RESTORE_START
+_RESTORE_SOURCE_METHOD_ID = CapacityMethodId.RESTORE_SOURCE_IMPORT
+_RESTORE_ACTIVATE_METHOD_ID = CapacityMethodId.RESTORE_ACTIVATE
+_IDENTITY_RULE_VERSION = "healthkit-identity/v3"
+_SUPPORTED_IDENTITY_RULE_VERSIONS = {"healthkit-natural/v2", _IDENTITY_RULE_VERSION}
+_MAPPING_RULE_VERSION = "healthkit-canonical/v3"
+_SUPPORTED_MAPPING_RULE_VERSIONS = {
+    "healthkit-canonical/v1",
+    "healthkit-canonical/v2",
+    _MAPPING_RULE_VERSION,
+}
 _DIRECTORY_OVERHEAD = 64 * 1024
 _MINIMUM_ESTIMATE = 2 * 1024**2
 _RESTORE_DIRECTORY = "recovery"
@@ -56,7 +66,7 @@ _EMPTY_RESTORE_STORE_PATHS = {
     "query.duckdb",
 }
 
-_METADATA_TABLES = (
+_V3_METADATA_TABLES = (
     "write_operations",
     "exports",
     "decision_refs",
@@ -76,6 +86,44 @@ _METADATA_TABLES = (
     "source_absence_suppressions",
     "restored_publications",
 )
+_MANUAL_BACKUP_TABLES = (
+    "activity_derivation_versions",
+    "manual_context_revisions",
+    "context_coverage_start_values",
+    "illness_category_values",
+    "daily_stress_values",
+    "custom_context_label_values",
+    "custom_context_period_values",
+    "illness_period_values",
+    "manual_context_publications",
+    "medication_regime_revisions",
+    "medication_regime_values",
+    "medication_scheduled_doses",
+    "medication_as_needed_entries",
+    "medication_publications",
+    "medication_deviation_revisions",
+    "medication_deviation_values",
+    "medication_deviation_intakes",
+    "medication_deviation_publications",
+    "intake_reason_category_revisions",
+    "intake_reason_category_values",
+    "intake_reason_category_publications",
+    "as_needed_intake_revisions",
+    "as_needed_intake_values",
+    "as_needed_intake_publications",
+    "manual_revision_intents",
+)
+_METADATA_TABLES = (*_V3_METADATA_TABLES, *_MANUAL_BACKUP_TABLES)
+_V3_CONTENT_TABLES = (
+    *_V3_METADATA_TABLES,
+    "import_refs",
+    "snapshot_refs",
+    "review_case_facts",
+    "review_case_reasons",
+    "required_source_refs",
+    "resolved_overlay_facts",
+    "open_review_overlay_facts",
+)
 _CONTENT_TABLES = (
     *_METADATA_TABLES,
     "import_refs",
@@ -85,10 +133,12 @@ _CONTENT_TABLES = (
     "required_source_refs",
     "resolved_overlay_facts",
     "open_review_overlay_facts",
+    "snapshot_origin",
+    "manual_revision_bindings",
 )
 _LEGACY_CONTENT_TABLES = tuple(
     table
-    for table in _CONTENT_TABLES
+    for table in _V3_CONTENT_TABLES
     if table
     not in {
         "source_absence_suppressions",
@@ -237,43 +287,54 @@ def _canonical_hash(
         for row in connection.execute(
             f"SELECT {order} FROM {_quoted(table)} ORDER BY {order}"
         ).fetchall():
-            digest.update(
-                json.dumps(row, separators=(",", ":"), ensure_ascii=False).encode()
-            )
+            digest.update(json.dumps(row, separators=(",", ":"), ensure_ascii=False).encode())
     return digest.hexdigest()
+
+
+def _table_row_counts(connection: sqlite3.Connection, tables: tuple[str, ...]) -> str:
+    return json.dumps(
+        {
+            table: int(connection.execute(f"SELECT count(*) FROM {_quoted(table)}").fetchone()[0])
+            for table in tables
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 def _audit_is_valid(connection: sqlite3.Connection, audit_max: int) -> bool:
     tables = {
         str(row[0])
-        for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-        )
+        for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
-    restored_count = (
-        "+ count(restored_publications.audit_event_id) "
-        if "restored_publications" in tables
-        else ""
+    publication_tables = tuple(
+        table
+        for table in (
+            "import_publications",
+            "data_review_decisions",
+            "metadata_tombstones",
+            "migration_publications",
+            "restored_publications",
+            "manual_context_publications",
+            "medication_publications",
+            "medication_deviation_publications",
+            "intake_reason_category_publications",
+            "as_needed_intake_publications",
+        )
+        if table in tables
     )
-    restored_join = (
-        "LEFT JOIN restored_publications USING (audit_event_id)"
-        if "restored_publications" in tables
-        else ""
+    payload_count = (
+        " + ".join(f"count({table}.audit_event_id)" for table in publication_tables) or "0"
+    )
+    publication_joins = " ".join(
+        f"LEFT JOIN {table} USING (audit_event_id)" for table in publication_tables
     )
     audit_query = (
         "SELECT count(*), COALESCE(MIN(audit_position), 1), "
         "COALESCE(MAX(audit_position), 0), "
-        "count(import_publications.audit_event_id) "
-        "+ count(data_review_decisions.audit_event_id) "
-        "+ count(metadata_tombstones.audit_event_id) "
-        "+ count(migration_publications.audit_event_id) "
-        + restored_count
-        + "FROM audit_events "
-        "LEFT JOIN import_publications USING (audit_event_id) "
-        "LEFT JOIN data_review_decisions USING (audit_event_id) "
-        "LEFT JOIN metadata_tombstones USING (audit_event_id) "
-        "LEFT JOIN migration_publications USING (audit_event_id) "
-        + restored_join
+        + payload_count
+        + " FROM audit_events "
+        + publication_joins
     )
     audit = connection.execute(audit_query).fetchone()
     if audit is None or tuple(map(int, audit)) != (audit_max, 1, audit_max, audit_max):
@@ -307,6 +368,532 @@ def _audit_is_valid(connection: sqlite3.Connection, audit_max: int) -> bool:
         "WHERE fact.review_case_id IS NULL LIMIT 1"
     ).fetchone()
     return invalid_tombstone is None and missing_reference is None
+
+
+def _content_tables(connection: sqlite3.Connection) -> tuple[str, ...]:
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    for candidate in (_CONTENT_TABLES, _V3_CONTENT_TABLES, _LEGACY_CONTENT_TABLES):
+        if set(candidate) <= tables:
+            return candidate
+    return ()
+
+
+def _manual_payloads_are_valid(connection: sqlite3.Connection) -> bool:
+    revision_rows = tuple(
+        row
+        for table in (
+            "manual_context_revisions",
+            "medication_regime_revisions",
+            "medication_deviation_revisions",
+            "intake_reason_category_revisions",
+            "as_needed_intake_revisions",
+        )
+        for row in connection.execute(
+            f"SELECT revision_id, payload_sha256 FROM {table}"
+        )
+    )
+    expected_hashes = {str(row[0]): str(row[1]) for row in revision_rows}
+    intents = {
+        str(row[0]): (str(row[1]), None if row[2] is None else str(row[2]))
+        for row in connection.execute(
+            "SELECT revision_id, intent, withdrawal_reason FROM manual_revision_intents"
+        )
+    }
+    if len(revision_rows) != len(expected_hashes) or set(intents) != set(expected_hashes):
+        return False
+
+    def payload_is_valid(revision_id: str, payload: dict[str, object]) -> bool:
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode()).hexdigest() == expected_hashes[revision_id]
+
+    context_rows = connection.execute(
+        "SELECT revision_id, logical_id, object_kind, previous_revision_id, state "
+        "FROM manual_context_revisions ORDER BY rowid"
+    ).fetchall()
+    context_states = {str(row[0]): str(row[4]) for row in context_rows}
+    for revision_id, logical_id, kind, previous_id, state in context_rows:
+        revision_id, kind, state = str(revision_id), str(kind), str(state)
+        intent = (
+            "create"
+            if previous_id is None
+            else "withdraw"
+            if state == "withdrawn"
+            else "restore"
+            if context_states[str(previous_id)] == "withdrawn"
+            else "revise"
+        )
+        stored_intent, withdrawal_reason = intents[revision_id]
+        if stored_intent != intent:
+            return False
+        if kind == "context_coverage_start":
+            value = connection.execute(
+                "SELECT start_date FROM context_coverage_start_values WHERE revision_id = ?",
+                (revision_id,),
+            ).fetchone()
+            if not payload_is_valid(
+                revision_id,
+                {
+                    "intent": intent,
+                    "logical_id": str(logical_id),
+                    "start_date": None if value is None else str(value[0]),
+                    "withdrawal_reason": withdrawal_reason,
+                },
+            ):
+                return False
+            continue
+        values: dict[str, object] = {
+            "intent": intent,
+            "kind": kind,
+            "name": None,
+            "category": None,
+            "start": None,
+            "end": None,
+            "severity": None,
+            "stress": None,
+            "note": None,
+            "reason": withdrawal_reason,
+        }
+        if state == "active":
+            table_columns = {
+                "illness_category": ("illness_category_values", "name"),
+                "daily_stress": ("daily_stress_values", "stress"),
+                "custom_context_label": ("custom_context_label_values", "name"),
+            }
+            if kind in table_columns:
+                table, key = table_columns[kind]
+                column = "level" if kind == "daily_stress" else "name"
+                row = connection.execute(
+                    f"SELECT {column} FROM {table} WHERE revision_id = ?", (revision_id,)
+                ).fetchone()
+                values[key] = None if row is None else row[0]
+            elif kind == "illness_period":
+                row = connection.execute(
+                    "SELECT category_logical_id, start_date, end_date, severity "
+                    "FROM illness_period_values WHERE revision_id = ?",
+                    (revision_id,),
+                ).fetchone()
+                if row is not None:
+                    values.update(
+                        category=row[0], start=row[1], end=row[2], severity=row[3]
+                    )
+            elif kind == "custom_context_period":
+                row = connection.execute(
+                    "SELECT label_logical_id, start_date, end_date, note "
+                    "FROM custom_context_period_values WHERE revision_id = ?",
+                    (revision_id,),
+                ).fetchone()
+                if row is not None:
+                    values.update(category=row[0], start=row[1], end=row[2], note=row[3])
+        if not payload_is_valid(revision_id, values):
+            return False
+
+    revision_specs = (
+        (
+            "intake_reason_category_revisions",
+            "intake_reason_category_values",
+            ("name",),
+        ),
+        (
+            "medication_deviation_revisions",
+            "medication_deviation_values",
+            ("regime_logical_id", "scheduled_at", "withdrawal_reason"),
+        ),
+        (
+            "as_needed_intake_revisions",
+            "as_needed_intake_values",
+            (
+                "regime_logical_id",
+                "entry_id",
+                "taken_at",
+                "amount",
+                "reason_category_logical_id",
+                "withdrawal_reason",
+            ),
+        ),
+    )
+    for revision_table, value_table, columns in revision_specs:
+        rows = connection.execute(
+            "SELECT revision.revision_id, revision.previous_revision_id, revision.state, "
+            + ", ".join(f"value.{column}" for column in columns)
+            + f" FROM {revision_table} revision JOIN {value_table} value USING (revision_id) "
+            "ORDER BY revision.rowid"
+        ).fetchall()
+        states = {str(row[0]): str(row[2]) for row in rows}
+        for row in rows:
+            revision_id, previous_id, state = str(row[0]), row[1], str(row[2])
+            intent = (
+                "create"
+                if previous_id is None
+                else "withdraw"
+                if state == "withdrawn"
+                else "restore"
+                if states[str(previous_id)] == "withdrawn"
+                else "revise"
+            )
+            stored_intent, withdrawal_reason = intents[revision_id]
+            payload: dict[str, object] = {
+                "intent": intent,
+                **dict(zip(columns, row[3:], strict=True)),
+            }
+            if revision_table == "intake_reason_category_revisions":
+                payload["withdrawal_reason"] = withdrawal_reason
+            elif payload.get("withdrawal_reason") != withdrawal_reason:
+                return False
+            if revision_table == "medication_deviation_revisions":
+                actual = [
+                    [str(item[0]), str(item[1])]
+                    for item in connection.execute(
+                        "SELECT taken_at, amount FROM medication_deviation_intakes "
+                        "WHERE revision_id = ? ORDER BY rowid",
+                        (revision_id,),
+                    )
+                ]
+                payload["actual_intakes"] = actual
+            if stored_intent != intent or not payload_is_valid(revision_id, payload):
+                return False
+
+    regime_intents: dict[str, str] = {}
+    for revision_id, previous_id, starts_at, timezone_name in connection.execute(
+        "SELECT revision.revision_id, revision.previous_revision_id, value.starts_at, "
+        "value.timezone FROM medication_regime_revisions revision "
+        "JOIN medication_regime_values value USING (revision_id) ORDER BY revision.rowid"
+    ):
+        revision_id = str(revision_id)
+        doses = [
+            [str(row[0]), str(row[1]), str(row[2]), str(row[3]), json.loads(str(row[4]))]
+            for row in connection.execute(
+                "SELECT medication_name, amount, unit, local_time, weekdays "
+                "FROM medication_scheduled_doses WHERE revision_id = ? ORDER BY rowid",
+                (revision_id,),
+            )
+        ]
+        as_needed = [
+            [str(row[0]), str(row[1]), str(row[2]), json.loads(str(row[3])), str(row[4])]
+            for row in connection.execute(
+                "SELECT medication_name, amount, unit, preferred_reason_category_ids, entry_id "
+                "FROM medication_as_needed_entries WHERE revision_id = ? ORDER BY rowid",
+                (revision_id,),
+            )
+        ]
+        intent, withdrawal_reason = intents[revision_id]
+        previous_intent = None if previous_id is None else regime_intents.get(str(previous_id))
+        if (
+            (previous_id is None) != (intent == "create")
+            or (previous_id is not None and previous_intent is None)
+            or (intent == "restore" and previous_intent != "withdraw")
+            or (intent in {"revise", "withdraw"} and previous_intent == "withdraw")
+            or (intent == "withdraw") != (withdrawal_reason is not None)
+        ):
+            return False
+        regime_payload: dict[str, object] = {
+            "intent": intent,
+            "starts_at": str(starts_at),
+            "timezone": str(timezone_name),
+            "doses": doses,
+            "as_needed": as_needed,
+        }
+        if withdrawal_reason is not None:
+            regime_payload["withdrawal_reason"] = withdrawal_reason
+        if not payload_is_valid(revision_id, regime_payload):
+            return False
+        regime_intents[revision_id] = intent
+    return True
+
+
+def _manual_backup_is_valid(connection: sqlite3.Connection) -> bool:
+    tables = {
+        str(row[0])
+        for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    if "snapshot_origin" not in tables:
+        return True
+
+    origins = connection.execute("SELECT * FROM snapshot_origin").fetchall()
+    if len(origins) > 1:
+        return False
+    bindings = {
+        (str(row[0]), str(row[1]))
+        for row in connection.execute(
+            "SELECT revision_kind, revision_id FROM manual_revision_bindings"
+        )
+    }
+    if not origins:
+        return not bindings and all(
+            connection.execute(f'SELECT count(*) FROM "{table}"').fetchone() == (0,)
+            for table in _MANUAL_BACKUP_TABLES
+            if table != "activity_derivation_versions"
+        )
+
+    origin = origins[0]
+    try:
+        snapshot_as_of = datetime.fromisoformat(str(origin[3]))
+        context_date = (
+            datetime.fromisoformat(str(origin[3])).astimezone(ZoneInfo(str(origin[4]))).date()
+        )
+        medication_as_of = datetime.fromisoformat(str(origin[6]))
+    except (KeyError, TypeError, ValueError):
+        return False
+    if (
+        snapshot_as_of.tzinfo is None
+        or medication_as_of != snapshot_as_of
+        or str(origin[5]) != context_date.isoformat()
+        or int(origin[1]) <= 0
+        or len(str(origin[2])) != 64
+        or not set(str(origin[2])) <= set("0123456789abcdef")
+        or connection.execute(
+            "SELECT 1 FROM snapshot_refs WHERE snapshot_id = ?", (str(origin[0]),)
+        ).fetchone()
+        is None
+        or connection.execute(
+            "SELECT 1 FROM activity_derivation_versions WHERE version_id = ?",
+            (str(origin[7]),),
+        ).fetchone()
+        is None
+    ):
+        return False
+
+    revision_tables = {
+        "context": ("manual_context_revisions", True),
+        "medication_regime": ("medication_regime_revisions", False),
+        "medication_deviation": ("medication_deviation_revisions", True),
+        "intake_reason_category": ("intake_reason_category_revisions", True),
+        "as_needed_intake": ("as_needed_intake_revisions", True),
+    }
+    expected_bindings: set[tuple[str, str]] = set()
+    for kind, (table, has_state) in revision_tables.items():
+        state = (
+            "AND current.state = 'active'"
+            if has_state
+            else "AND NOT EXISTS (SELECT 1 FROM manual_revision_intents intent "
+            "WHERE intent.revision_id = current.revision_id AND intent.intent = 'withdraw')"
+        )
+        if has_state and connection.execute(
+            f"SELECT 1 FROM {table} WHERE state IS NULL "
+            "OR state NOT IN ('active', 'withdrawn') LIMIT 1"
+        ).fetchone() is not None:
+            return False
+        if table == "manual_context_revisions" and connection.execute(
+            "SELECT 1 FROM manual_context_revisions WHERE object_kind IS NULL OR "
+            "object_kind NOT IN ("
+            "'context_coverage_start', 'illness_category', 'illness_period', "
+            "'daily_stress', 'custom_context_label', 'custom_context_period') LIMIT 1"
+        ).fetchone() is not None:
+            return False
+        expected_bindings.update(
+            (kind, str(row[0]))
+            for row in connection.execute(
+                f"SELECT current.revision_id FROM {table} current "
+                f"WHERE NOT EXISTS (SELECT 1 FROM {table} next "
+                f"WHERE next.previous_revision_id = current.revision_id) {state}"
+            )
+        )
+        if (
+            connection.execute(
+                f"SELECT 1 FROM {table} current LEFT JOIN {table} previous "
+                "ON previous.revision_id = current.previous_revision_id "
+                "WHERE current.previous_revision_id IS NOT NULL AND "
+                "(previous.revision_id IS NULL OR current.logical_id != previous.logical_id) "
+                "LIMIT 1"
+            ).fetchone()
+            is not None
+            or connection.execute(
+                f"SELECT 1 FROM {table} WHERE previous_revision_id IS NOT NULL "
+                "GROUP BY previous_revision_id HAVING count(*) != 1 LIMIT 1"
+            ).fetchone()
+            is not None
+            or connection.execute(
+                f"SELECT 1 FROM {table} GROUP BY logical_id "
+                "HAVING sum(previous_revision_id IS NULL) != 1 LIMIT 1"
+            ).fetchone()
+            is not None
+            or connection.execute(
+                f"WITH RECURSIVE reachable(revision_id) AS ("
+                f"SELECT revision_id FROM {table} WHERE previous_revision_id IS NULL "
+                f"UNION ALL SELECT next.revision_id FROM {table} next "
+                "JOIN reachable ON next.previous_revision_id = reachable.revision_id) "
+                f"SELECT 1 WHERE (SELECT count(*) FROM reachable) != "
+                f"(SELECT count(*) FROM {table})"
+            ).fetchone()
+            is not None
+        ):
+            return False
+        if (
+            table == "manual_context_revisions"
+            and connection.execute(
+                "SELECT 1 FROM manual_context_revisions current "
+                "JOIN manual_context_revisions previous "
+                "ON previous.revision_id = current.previous_revision_id "
+                "WHERE current.object_kind != previous.object_kind LIMIT 1"
+            ).fetchone()
+            is not None
+        ):
+            return False
+        if (
+            connection.execute(
+                f"SELECT 1 FROM {table} WHERE revision_id IS NULL OR logical_id IS NULL "
+                "OR payload_sha256 IS NULL OR length(revision_id) != 32 "
+                "OR revision_id GLOB '*[^0-9a-f]*' OR length(logical_id) != 32 "
+                "OR logical_id GLOB '*[^0-9a-f]*' OR length(payload_sha256) != 64 "
+                "OR payload_sha256 GLOB '*[^0-9a-f]*' LIMIT 1"
+            ).fetchone()
+            is not None
+        ):
+            return False
+    if bindings != expected_bindings or not _manual_payloads_are_valid(connection):
+        return False
+
+    publications = {
+        "manual_context_revisions": "manual_context_publications",
+        "medication_regime_revisions": "medication_publications",
+        "medication_deviation_revisions": "medication_deviation_publications",
+        "intake_reason_category_revisions": "intake_reason_category_publications",
+        "as_needed_intake_revisions": "as_needed_intake_publications",
+    }
+    for revisions, publication in publications.items():
+        if (
+            connection.execute(
+                f"SELECT 1 FROM {revisions} revision LEFT JOIN write_operations operation "
+                "USING (operation_id) WHERE operation.operation_id IS NULL LIMIT 1"
+            ).fetchone()
+            is not None
+            or connection.execute(
+                f"SELECT 1 FROM {publication} item "
+                f"LEFT JOIN {revisions} revision USING (revision_id) "
+                "LEFT JOIN audit_events audit USING (audit_event_id) "
+                "LEFT JOIN snapshot_refs snapshot USING (snapshot_id) "
+                "WHERE revision.revision_id IS NULL OR audit.audit_event_id IS NULL "
+                "OR audit.operation_id != revision.operation_id "
+                "OR snapshot.snapshot_id IS NULL LIMIT 1"
+            ).fetchone()
+            is not None
+            or connection.execute(
+                f"SELECT 1 FROM {revisions} revision "
+                f"LEFT JOIN {publication} original USING (revision_id) "
+                "LEFT JOIN audit_events audit ON audit.operation_id = revision.operation_id "
+                "LEFT JOIN restored_publications restored "
+                "ON restored.audit_event_id = audit.audit_event_id "
+                "WHERE original.revision_id IS NULL "
+                "AND restored.audit_event_id IS NULL LIMIT 1"
+            ).fetchone()
+            is not None
+        ):
+            return False
+
+    required_values = {
+        "medication_regime_revisions": "medication_regime_values",
+        "medication_deviation_revisions": "medication_deviation_values",
+        "intake_reason_category_revisions": "intake_reason_category_values",
+        "as_needed_intake_revisions": "as_needed_intake_values",
+    }
+    if any(
+        connection.execute(
+            f"SELECT 1 FROM {revision} LEFT JOIN {value} USING (revision_id) "
+            f"WHERE {value}.revision_id IS NULL LIMIT 1"
+        ).fetchone()
+        is not None
+        for revision, value in required_values.items()
+    ):
+        return False
+    context_values = {
+        "context_coverage_start": "context_coverage_start_values",
+        "illness_category": "illness_category_values",
+        "illness_period": "illness_period_values",
+        "daily_stress": "daily_stress_values",
+        "custom_context_label": "custom_context_label_values",
+        "custom_context_period": "custom_context_period_values",
+    }
+    for kind, table in context_values.items():
+        if (
+            connection.execute(
+                f"SELECT 1 FROM manual_context_revisions revision LEFT JOIN {table} value "
+                "USING (revision_id) WHERE revision.object_kind = ? "
+                "AND ((revision.state = 'active' AND value.revision_id IS NULL) "
+                "OR (revision.state = 'withdrawn' AND value.revision_id IS NOT NULL)) LIMIT 1",
+                (kind,),
+            ).fetchone()
+            is not None
+            or connection.execute(
+                f"SELECT 1 FROM {table} value LEFT JOIN manual_context_revisions revision "
+                "USING (revision_id) WHERE revision.revision_id IS NULL "
+                "OR revision.object_kind != ? OR revision.state != 'active' LIMIT 1",
+                (kind,),
+            ).fetchone()
+            is not None
+        ):
+            return False
+
+    reference_checks = (
+        "SELECT 1 FROM illness_period_values value WHERE NOT EXISTS ("
+        "SELECT 1 FROM manual_context_revisions revision WHERE "
+        "revision.logical_id = value.category_logical_id "
+        "AND revision.object_kind = 'illness_category') LIMIT 1",
+        "SELECT 1 FROM custom_context_period_values value WHERE NOT EXISTS ("
+        "SELECT 1 FROM manual_context_revisions revision WHERE "
+        "revision.logical_id = value.label_logical_id "
+        "AND revision.object_kind = 'custom_context_label') LIMIT 1",
+        "SELECT 1 FROM medication_deviation_values value WHERE NOT EXISTS ("
+        "SELECT 1 FROM medication_regime_revisions revision "
+        "WHERE revision.logical_id = value.regime_logical_id) LIMIT 1",
+        "SELECT 1 FROM as_needed_intake_values value WHERE NOT EXISTS ("
+        "SELECT 1 FROM medication_regime_revisions regime "
+        "JOIN medication_as_needed_entries entry USING (revision_id) "
+        "WHERE regime.logical_id = value.regime_logical_id "
+        "AND entry.entry_id = value.entry_id) LIMIT 1",
+        "SELECT 1 FROM as_needed_intake_values value "
+        "WHERE value.reason_category_logical_id IS NOT NULL AND NOT EXISTS ("
+        "SELECT 1 FROM intake_reason_category_revisions category "
+        "WHERE category.logical_id = value.reason_category_logical_id) LIMIT 1",
+    )
+    if any(connection.execute(query).fetchone() is not None for query in reference_checks):
+        return False
+    category_ids = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT DISTINCT logical_id FROM intake_reason_category_revisions"
+        )
+    }
+    try:
+        preferred_category_sets = tuple(
+            json.loads(str(row[0]))
+            for row in connection.execute(
+                "SELECT preferred_reason_category_ids FROM medication_as_needed_entries"
+            )
+        )
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if any(
+        not isinstance(preferred, list)
+        or any(not isinstance(item, str) or item not in category_ids for item in preferred)
+        for preferred in preferred_category_sets
+    ):
+        return False
+    for table, identifier in (
+        ("medication_scheduled_doses", "dose_id"),
+        ("medication_as_needed_entries", "entry_id"),
+    ):
+        if (
+            connection.execute(
+                f"SELECT 1 FROM {table} item LEFT JOIN medication_regime_revisions revision "
+                "USING (revision_id) WHERE revision.revision_id IS NULL "
+                f"OR length(item.{identifier}) != 32 "
+                f"OR item.{identifier} GLOB '*[^0-9a-f]*' LIMIT 1"
+            ).fetchone()
+            is not None
+        ):
+            return False
+    return (
+        connection.execute(
+            "SELECT 1 FROM medication_deviation_intakes item "
+            "LEFT JOIN medication_deviation_revisions revision USING (revision_id) "
+            "WHERE revision.revision_id IS NULL LIMIT 1"
+        ).fetchone()
+        is None
+    )
 
 
 def _source(store: LocalStore) -> sqlite3.Connection:
@@ -347,16 +934,42 @@ def _source(store: LocalStore) -> sqlite3.Connection:
                     str(fact.snapshot_id),
                     fact.schema_version,
                     str(fact.created_by_operation_id),
-                    (
-                        None
-                        if fact.parent_snapshot_id is None
-                        else str(fact.parent_snapshot_id)
-                    ),
+                    (None if fact.parent_snapshot_id is None else str(fact.parent_snapshot_id)),
                     fact.created_at_utc.isoformat(),
                 )
                 for fact in store.load_backup_snapshot_facts()
             ),
         )
+        source.execute(
+            "CREATE TABLE snapshot_origin ("
+            "source_snapshot_id TEXT PRIMARY KEY, snapshot_schema_version INTEGER NOT NULL, "
+            "manifest_sha256 TEXT NOT NULL, snapshot_as_of TEXT NOT NULL, "
+            "context_timezone TEXT NOT NULL, context_as_of_date TEXT NOT NULL, "
+            "medication_as_of TEXT NOT NULL, activity_derivation_version_id TEXT NOT NULL) STRICT"
+        )
+        source.execute(
+            "CREATE TABLE manual_revision_bindings ("
+            "revision_kind TEXT NOT NULL, revision_id TEXT PRIMARY KEY) STRICT"
+        )
+        origin = store.load_backup_snapshot_origin()
+        if origin is not None:
+            source.execute(
+                "INSERT INTO snapshot_origin VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(origin.snapshot_id),
+                    origin.schema_version,
+                    origin.manifest_sha256,
+                    origin.snapshot_as_of.isoformat(),
+                    origin.context_timezone,
+                    origin.context_as_of_date.isoformat(),
+                    origin.medication_as_of.isoformat(),
+                    origin.activity_derivation_version_id,
+                ),
+            )
+            source.executemany(
+                "INSERT INTO manual_revision_bindings VALUES (?, ?)",
+                origin.manual_revision_bindings,
+            )
 
         source.execute(
             "CREATE TABLE review_case_facts ("
@@ -397,11 +1010,7 @@ def _source(store: LocalStore) -> sqlite3.Connection:
                     fact.rule_version_id,
                     fact.evidence_fingerprint,
                     fact.source_type,
-                    (
-                        None
-                        if fact.measured_at_utc is None
-                        else fact.measured_at_utc.isoformat()
-                    ),
+                    (None if fact.measured_at_utc is None else fact.measured_at_utc.isoformat()),
                     fact.effective_value,
                     fact.effective_value_source,
                     fact.canonical_unit,
@@ -427,7 +1036,8 @@ def _source(store: LocalStore) -> sqlite3.Connection:
         )
         source.execute(
             "CREATE TABLE required_source_refs ("
-            "logical_measurement_id TEXT NOT NULL, measurement_version_id TEXT PRIMARY KEY, "
+            "source_family TEXT NOT NULL, logical_measurement_id TEXT NOT NULL, "
+            "measurement_version_id TEXT PRIMARY KEY, "
             "payload_sha256 TEXT NOT NULL) STRICT"
         )
         source.execute(
@@ -456,7 +1066,7 @@ def _source(store: LocalStore) -> sqlite3.Connection:
         )
         if active_facts is not None:
             source.executemany(
-                "INSERT INTO required_source_refs VALUES (?, ?, ?)",
+                "INSERT INTO required_source_refs VALUES ('measurement', ?, ?, ?)",
                 (
                     (
                         version.logical_measurement_id,
@@ -464,6 +1074,13 @@ def _source(store: LocalStore) -> sqlite3.Connection:
                         _fact_payload_sha256(version),
                     )
                     for version in active_facts.versions
+                ),
+            )
+            source.executemany(
+                "INSERT INTO required_source_refs VALUES (?, ?, ?, ?)",
+                (
+                    (family, logical_id, version_id, version_id)
+                    for family, logical_id, version_id in store.load_backup_interval_source_refs()
                 ),
             )
             source.executemany(
@@ -599,13 +1216,27 @@ def _restore_fault_point(target_root: Path, fault_point_id: str) -> None:
     """Private fault-injection seam for durable restore transitions."""
 
 
+def _backup_fault_point(target_root: Path, fault_point_id: str) -> None:
+    """Private fault-injection seam for durable backup publication."""
+
+
 def _read_restore_backup(path: Path) -> tuple[BackupId, StoreId, str, int, int]:
     try:
         with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True) as backup:
+            manifest_columns = {
+                str(item[1]) for item in backup.execute("PRAGMA table_info(backup_manifest)")
+            }
+            v4_fields = (
+                "source_snapshot_id, table_row_counts"
+                if {"source_snapshot_id", "table_row_counts"} <= manifest_columns
+                else "NULL, NULL"
+            )
             row = backup.execute(
                 "SELECT backup_id, store_id, canonical_content_sha256, "
                 "audit_max_position, backup_schema_version, source_store_schema_version, "
-                "created_at_utc, identity_rule_version_id, mapping_rule_version_id "
+                "created_at_utc, identity_rule_version_id, mapping_rule_version_id, "
+                + v4_fields
+                + " "
                 "FROM backup_manifest "
                 "WHERE singleton = 1"
             ).fetchone()
@@ -626,11 +1257,7 @@ def _read_restore_backup(path: Path) -> tuple[BackupId, StoreId, str, int, int]:
                     "AND name NOT LIKE 'sqlite_%'"
                 )
             }
-            content_tables = (
-                _CONTENT_TABLES
-                if set(_CONTENT_TABLES) <= tables
-                else _LEGACY_CONTENT_TABLES
-            )
+            content_tables = _content_tables(backup)
             expected_tables = {*content_tables, "backup_manifest"}
             if schema_version >= 2:
                 expected_tables.add("backup_migration_provenance")
@@ -639,16 +1266,39 @@ def _read_restore_backup(path: Path) -> tuple[BackupId, StoreId, str, int, int]:
                 or source_store_schema <= 0
                 or source_store_schema > current_store_schema_version()
                 or not _is_timestamp(str(row[6]))
-                or str(row[7]) != _IDENTITY_RULE_VERSION
-                or str(row[8]) != _MAPPING_RULE_VERSION
+                or str(row[7]) not in _SUPPORTED_IDENTITY_RULE_VERSIONS
+                or str(row[8]) not in _SUPPORTED_MAPPING_RULE_VERSIONS
+                or (
+                    schema_version >= 4
+                    and (
+                        (row[9] is None)
+                        != (
+                            backup.execute("SELECT count(*) FROM snapshot_origin").fetchone()
+                            == (0,)
+                        )
+                        or (
+                            row[9] is not None
+                            and backup.execute(
+                                "SELECT source_snapshot_id FROM snapshot_origin"
+                            ).fetchone()
+                            != (str(row[9]),)
+                        )
+                    )
+                )
+                or (
+                    schema_version >= 4
+                    and str(row[10]) != _table_row_counts(backup, content_tables)
+                )
                 or len(canonical_hash) != 64
                 or not set(canonical_hash) <= set("0123456789abcdef")
                 or audit_max < 0
+                or not content_tables
                 or tables != expected_tables
                 or backup.execute("PRAGMA integrity_check").fetchone() != ("ok",)
                 or backup.execute("PRAGMA foreign_key_check").fetchall()
                 or _canonical_hash(backup, content_tables) != canonical_hash
                 or not _audit_is_valid(backup, audit_max)
+                or not _manual_backup_is_valid(backup)
             ):
                 raise StoreError("backup_integrity_conflict")
             if schema_version >= 2:
@@ -661,7 +1311,7 @@ def _read_restore_backup(path: Path) -> tuple[BackupId, StoreId, str, int, int]:
                     provenance is None
                     or str(provenance[0]) != str(backup_id)
                     or str(provenance[1]) != canonical_hash
-                    or int(provenance[2]) not in {1, 2, 3}
+                    or int(provenance[2]) not in {1, 2, 3, 4}
                     or int(provenance[3]) != schema_version
                 ):
                     raise StoreError("backup_integrity_conflict")
@@ -798,24 +1448,57 @@ def inspect_restore_sources(
     store: LocalStore,
     target_root: Path,
     records: tuple[CanonicalHealthRecord, ...],
+    sleep_intervals: tuple[CanonicalSleepInterval, ...] = (),
+    workouts: tuple[CanonicalWorkout, ...] = (),
 ) -> RestoreSourceInspection:
     working = load_restore_working_copy(store, target_root)
     with sqlite3.connect(f"{working.resolve().as_uri()}?mode=ro", uri=True) as backup:
+        columns = {
+            str(row[1]) for row in backup.execute("PRAGMA table_info(required_source_refs)")
+        }
+        family = "source_family" if "source_family" in columns else "'measurement'"
         required = {
-            (str(row[0]), str(row[1]), str(row[2]))
+            tuple(map(str, row))
             for row in backup.execute(
-                "SELECT logical_measurement_id, measurement_version_id, payload_sha256 "
-                "FROM required_source_refs"
+                f"SELECT {family}, logical_measurement_id, measurement_version_id, "
+                "payload_sha256 FROM required_source_refs"
             )
         }
     available = {
         (
+            "measurement",
             str(record.logical_measurement_id),
-            str(record.measurement_version_id),
+            str(version_id),
             _record_payload_sha256(record),
         )
         for record in records
+        for version_id in (
+            record.measurement_version_id,
+            *(
+                ()
+                if record.legacy_measurement_version_id is None
+                else (record.legacy_measurement_version_id,)
+            ),
+        )
     }
+    available.update(
+        (
+            "sleep",
+            str(item.logical_measurement_id),
+            str(item.measurement_version_id),
+            str(item.measurement_version_id),
+        )
+        for item in sleep_intervals
+    )
+    available.update(
+        (
+            "workout",
+            str(item.logical_workout_id),
+            str(item.workout_version_id),
+            str(item.workout_version_id),
+        )
+        for item in workouts
+    )
     matched = required & available
     state_hash = hashlib.sha256(
         json.dumps(
@@ -828,6 +1511,84 @@ def inspect_restore_sources(
         state_hash=state_hash,
         required_count=len(required),
         matched_count=len(matched),
+    )
+
+
+def select_restore_source_versions(
+    store: LocalStore,
+    target_root: Path,
+    records: tuple[CanonicalHealthRecord, ...],
+    sleep_intervals: tuple[CanonicalSleepInterval, ...],
+    workouts: tuple[CanonicalWorkout, ...],
+) -> tuple[
+    tuple[CanonicalHealthRecord, ...],
+    tuple[CanonicalSleepInterval, ...],
+    tuple[CanonicalWorkout, ...],
+]:
+    working = load_restore_working_copy(store, target_root)
+    with sqlite3.connect(f"{working.resolve().as_uri()}?mode=ro", uri=True) as backup:
+        columns = {
+            str(row[1]) for row in backup.execute("PRAGMA table_info(required_source_refs)")
+        }
+        family = "source_family" if "source_family" in columns else "'measurement'"
+        required = {
+            tuple(map(str, row))
+            for row in backup.execute(
+                f"SELECT {family}, logical_measurement_id, measurement_version_id, "
+                "payload_sha256 FROM required_source_refs"
+            )
+        }
+    selected = []
+    for record in records:
+        payload = _record_payload_sha256(record)
+        candidates = (
+            record.measurement_version_id,
+            *(
+                ()
+                if record.legacy_measurement_version_id is None
+                else (record.legacy_measurement_version_id,)
+            ),
+        )
+        version_id = next(
+            (
+                candidate
+                for candidate in candidates
+                if (
+                    "measurement",
+                    str(record.logical_measurement_id),
+                    str(candidate),
+                    payload,
+                )
+                in required
+            ),
+            None,
+        )
+        if version_id is not None:
+            selected.append(replace(record, measurement_version_id=version_id))
+    return (
+        tuple(selected),
+        tuple(
+            item
+            for item in sleep_intervals
+            if (
+                "sleep",
+                str(item.logical_measurement_id),
+                str(item.measurement_version_id),
+                str(item.measurement_version_id),
+            )
+            in required
+        ),
+        tuple(
+            item
+            for item in workouts
+            if (
+                "workout",
+                str(item.logical_workout_id),
+                str(item.workout_version_id),
+                str(item.workout_version_id),
+            )
+            in required
+        ),
     )
 
 
@@ -849,9 +1610,7 @@ def preflight_restore_source_import(
                 None
                 if snapshot.estimate_bytes is None
                 else _round_up(
-                    snapshot.estimate_bytes
-                    + overlay_allocation
-                    + _DIRECTORY_OVERHEAD,
+                    snapshot.estimate_bytes + overlay_allocation + _DIRECTORY_OVERHEAD,
                     fragment_size,
                 )
             )
@@ -935,6 +1694,7 @@ def restore_source_resolver(path: Path) -> SourceResolver:
             )
             for row in backup.execute("SELECT * FROM open_review_overlay_facts").fetchall()
         )
+
     def resolve_restored_sources(
         *,
         occurrences: tuple[SourceOccurrenceFact, ...],
@@ -1032,14 +1792,23 @@ def _migrate_restore_working_copy(path: Path, inspection: MetadataRestoreInspect
                             "!",
                         ),
                     )
-                migrated_hash = _canonical_hash(working)
+                migrated_hash = _canonical_hash(working, _content_tables(working))
                 working.execute(
-                    "UPDATE backup_manifest SET canonical_content_sha256 = ? "
-                    "WHERE singleton = 1",
+                    "UPDATE backup_manifest SET canonical_content_sha256 = ? WHERE singleton = 1",
                     (migrated_hash,),
                 )
                 working.execute(
                     "UPDATE backup_migration_provenance SET target_schema_version = 3 "
+                    "WHERE singleton = 1"
+                )
+            elif (source, target) == (3, 4):
+                migrated_hash = _canonical_hash(working, _content_tables(working))
+                working.execute(
+                    "UPDATE backup_manifest SET canonical_content_sha256 = ? WHERE singleton = 1",
+                    (migrated_hash,),
+                )
+                working.execute(
+                    "UPDATE backup_migration_provenance SET target_schema_version = 4 "
                     "WHERE singleton = 1"
                 )
             else:
@@ -1076,6 +1845,7 @@ def begin_metadata_restore(
     working_directory.mkdir(parents=True)
     session_started = False
     try:
+        _restore_fault_point(target_root, "restore.before_working_copy/v1")
         shutil.copyfile(backup_path, temporary)
         if _backup_file_sha256(temporary) != current.original_backup_sha256:
             raise StoreError("restore_plan_changed")
@@ -1085,6 +1855,7 @@ def begin_metadata_restore(
         _restore_allocation_checkpoint(target_root, "migrated_copy")
         with temporary.open("rb") as file:
             os.fsync(file.fileno())
+        _restore_fault_point(target_root, "restore.before_working_copy_publish/v1")
         os.replace(temporary, working)
         directory = os.open(working_directory, os.O_RDONLY)
         try:
@@ -1111,7 +1882,8 @@ def begin_metadata_restore(
                 or str(provenance[1]) != current.canonical_content_sha256
                 or int(provenance[2]) != _BACKUP_SCHEMA_VERSION
                 or migrated.execute("PRAGMA integrity_check").fetchone() != ("ok",)
-                or _canonical_hash(migrated) != str(manifest[1])
+                or _canonical_hash(migrated, _content_tables(migrated)) != str(manifest[1])
+                or not _manual_backup_is_valid(migrated)
             ):
                 raise StoreError("backup_migration_invalid")
         completed = MetadataRestoreInspection(
@@ -1126,6 +1898,7 @@ def begin_metadata_restore(
             current.target_schema_version,
             current.migration_steps,
         )
+        _restore_fault_point(target_root, "restore.before_pending_catalog/v1")
         store.start_restore_session(
             RestoreSessionFacts(
                 str(completed.restore_id),
@@ -1229,10 +2002,18 @@ def create_metadata_backup(store: LocalStore, target_path: Path) -> MetadataBack
                 with sqlite3.connect(
                     f"{target_path.resolve().as_uri()}?mode=ro", uri=True
                 ) as existing:
+                    existing_tables = {
+                        str(item[0])
+                        for item in existing.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table' "
+                            "AND name NOT LIKE 'sqlite_%'"
+                        )
+                    }
                     row = existing.execute(
                         "SELECT backup_id, canonical_content_sha256, audit_max_position, "
                         "created_at_utc, backup_schema_version, source_store_schema_version, "
-                        "store_id, identity_rule_version_id, mapping_rule_version_id "
+                        "store_id, identity_rule_version_id, mapping_rule_version_id, "
+                        "source_snapshot_id, table_row_counts "
                         "FROM backup_manifest WHERE singleton = 1"
                     ).fetchone()
                     valid = (
@@ -1243,9 +2024,28 @@ def create_metadata_backup(store: LocalStore, target_path: Path) -> MetadataBack
                         and str(row[6]) == str(identity.store_id)
                         and str(row[7]) == _IDENTITY_RULE_VERSION
                         and str(row[8]) == _MAPPING_RULE_VERSION
+                        and row[9]
+                        == (
+                            None
+                            if (
+                                origin := source.execute(
+                                    "SELECT source_snapshot_id FROM snapshot_origin"
+                                ).fetchone()
+                            )
+                            is None
+                            else str(origin[0])
+                        )
+                        and str(row[10]) == _table_row_counts(existing, _CONTENT_TABLES)
+                        and existing_tables
+                        == {
+                            *_CONTENT_TABLES,
+                            "backup_manifest",
+                            "backup_migration_provenance",
+                        }
                         and existing.execute("PRAGMA integrity_check").fetchone() == ("ok",)
                         and _canonical_hash(existing) == source_hash
                         and _audit_is_valid(existing, int(row[2]))
+                        and _manual_backup_is_valid(existing)
                     )
                     if valid:
                         assert row is not None
@@ -1290,6 +2090,7 @@ def create_metadata_backup(store: LocalStore, target_path: Path) -> MetadataBack
                     "created_at_utc TEXT NOT NULL, audit_max_position INTEGER NOT NULL, "
                     "identity_rule_version_id TEXT NOT NULL, "
                     "mapping_rule_version_id TEXT NOT NULL, "
+                    "source_snapshot_id TEXT, table_row_counts TEXT NOT NULL, "
                     "canonical_content_sha256 TEXT NOT NULL) STRICT"
                 )
                 backup.execute(
@@ -1303,7 +2104,7 @@ def create_metadata_backup(store: LocalStore, target_path: Path) -> MetadataBack
                 if _canonical_hash(backup) != source_hash:
                     raise StoreError("Kanonischer Sicherungsinhalt ist unvollständig.")
                 backup.execute(
-                    "INSERT INTO backup_manifest VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO backup_manifest VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         backup_id,
                         _BACKUP_SCHEMA_VERSION,
@@ -1313,6 +2114,17 @@ def create_metadata_backup(store: LocalStore, target_path: Path) -> MetadataBack
                         description.audit_max_position,
                         _IDENTITY_RULE_VERSION,
                         _MAPPING_RULE_VERSION,
+                        (
+                            None
+                            if (
+                                origin := source.execute(
+                                    "SELECT source_snapshot_id FROM snapshot_origin"
+                                ).fetchone()
+                            )
+                            is None
+                            else str(origin[0])
+                        ),
+                        _table_row_counts(source, _CONTENT_TABLES),
                         source_hash,
                     ),
                 )
@@ -1325,6 +2137,7 @@ def create_metadata_backup(store: LocalStore, target_path: Path) -> MetadataBack
             with temporary.open("rb") as file:
                 os.fsync(file.fileno())
             _allocation_checkpoint(target_path.parent, "temporary")
+            _backup_fault_point(target_path.parent, "backup.before_publish/v1")
             os.replace(temporary, target_path)
             directory = os.open(target_path.parent, os.O_RDONLY)
             try:
@@ -1332,6 +2145,7 @@ def create_metadata_backup(store: LocalStore, target_path: Path) -> MetadataBack
             finally:
                 os.close(directory)
             _allocation_checkpoint(target_path.parent, "published")
+            _backup_fault_point(target_path.parent, "backup.after_publish/v1")
         except (OSError, sqlite3.Error, StoreError):
             temporary.unlink(missing_ok=True)
             raise
@@ -1367,6 +2181,7 @@ __all__ = [
     "preflight_metadata_restore_start",
     "preflight_restore_source_import",
     "restore_source_resolver",
+    "select_restore_source_versions",
     "stage_metadata_restore_abort",
     "stage_restore_source_package",
     "validate_metadata_restore_abort",

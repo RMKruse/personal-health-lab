@@ -36,16 +36,12 @@ def main(args: Sequence[str] | None = None) -> int:
     parsed = parser.parse_args(args)
     try:
         options = GenerationOptions(
-            active_energy_noise_standard_deviation=(
-                parsed.active_energy_noise_standard_deviation
-            ),
+            active_energy_noise_standard_deviation=(parsed.active_energy_noise_standard_deviation),
             resting_heart_rate_noise_standard_deviation=(
                 parsed.resting_heart_rate_noise_standard_deviation
             ),
             missing_active_energy_probability=parsed.missing_active_energy_probability,
-            missing_resting_heart_rate_probability=(
-                parsed.missing_resting_heart_rate_probability
-            ),
+            missing_resting_heart_rate_probability=(parsed.missing_resting_heart_rate_probability),
         )
         fixture = generate_export(
             parsed.scenario,

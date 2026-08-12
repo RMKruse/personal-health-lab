@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -64,11 +65,7 @@ def _health_package(path: Path, record_count: int) -> Path:
 
 
 def _allocated_tree(root: Path) -> int:
-    return sum(
-        path.stat().st_blocks * 512
-        for path in (root, *root.rglob("*"))
-        if path.exists()
-    )
+    return sum(path.stat().st_blocks * 512 for path in (root, *root.rglob("*")) if path.exists())
 
 
 def test_metadata_backup_is_one_redacted_portable_sqlite_file(tmp_path: Path) -> None:
@@ -89,18 +86,42 @@ def test_metadata_backup_is_one_redacted_portable_sqlite_file(tmp_path: Path) ->
         assert backup.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         tables = {
             str(row[0])
-            for row in backup.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
+            for row in backup.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
         assert "backup_manifest" in tables
         assert {
+            "activity_derivation_versions",
             "audit_events",
+            "as_needed_intake_publications",
+            "as_needed_intake_revisions",
+            "as_needed_intake_values",
+            "context_coverage_start_values",
+            "custom_context_label_values",
+            "custom_context_period_values",
             "data_review_batch_actions",
             "data_review_batch_members",
             "data_review_decisions",
+            "daily_stress_values",
             "historical_review_cycles",
+            "illness_category_values",
+            "illness_period_values",
             "import_refs",
+            "intake_reason_category_publications",
+            "intake_reason_category_revisions",
+            "intake_reason_category_values",
+            "manual_context_publications",
+            "manual_context_revisions",
+            "manual_revision_intents",
+            "manual_revision_bindings",
+            "medication_as_needed_entries",
+            "medication_deviation_intakes",
+            "medication_deviation_publications",
+            "medication_deviation_revisions",
+            "medication_deviation_values",
+            "medication_publications",
+            "medication_regime_revisions",
+            "medication_regime_values",
+            "medication_scheduled_doses",
             "metadata_tombstones",
             "plausibility_rule_versions",
             "review_case_reasons",
@@ -109,6 +130,7 @@ def test_metadata_backup_is_one_redacted_portable_sqlite_file(tmp_path: Path) ->
             "review_cycles",
             "rule_version_refs",
             "snapshot_refs",
+            "snapshot_origin",
             "write_operations",
         } <= tables
         assert not tables.intersection(
@@ -122,9 +144,15 @@ def test_metadata_backup_is_one_redacted_portable_sqlite_file(tmp_path: Path) ->
             }
         )
         manifest = backup.execute(
-            "SELECT canonical_content_sha256, audit_max_position FROM backup_manifest"
+            "SELECT canonical_content_sha256, audit_max_position, table_row_counts "
+            "FROM backup_manifest"
         ).fetchone()
-    assert manifest == (receipt.result.canonical_content_sha256, 0)
+        assert manifest is not None
+        assert json.loads(str(manifest[2])) == {
+            table: backup.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0]
+            for table in tables - {"backup_manifest", "backup_migration_provenance"}
+        }
+    assert manifest[:2] == (receipt.result.canonical_content_sha256, 0)
     assert receipt.final_preflight.capacity is not None
     assert receipt.final_preflight.capacity.method_id == "metadata-backup/v1"
     assert receipt.final_preflight.capacity.estimate_bytes is not None
@@ -151,13 +179,11 @@ def test_metadata_backup_hash_survives_vacuum_and_same_target_is_no_op(
         first = health_lab.execute_write(request, expected_plan=plan.fingerprint)
     assert isinstance(first.result, MetadataBackupReceipt)
     with sqlite3.connect(target) as backup:
-        before = backup.execute(
-            "SELECT canonical_content_sha256 FROM backup_manifest"
-        ).fetchone()[0]
+        before = backup.execute("SELECT canonical_content_sha256 FROM backup_manifest").fetchone()[
+            0
+        ]
         backup.execute("VACUUM")
-        after = backup.execute(
-            "SELECT canonical_content_sha256 FROM backup_manifest"
-        ).fetchone()[0]
+        after = backup.execute("SELECT canonical_content_sha256 FROM backup_manifest").fetchone()[0]
     assert before == after == first.result.canonical_content_sha256
 
     with HealthLab.open(config) as health_lab:
@@ -179,7 +205,7 @@ def test_metadata_backup_conflict_blocks_without_overwriting(tmp_path: Path) -> 
     with sqlite3.connect(target) as backup:
         backup.execute(
             "UPDATE rule_version_refs SET rule_kind = 'identity' "
-            "WHERE rule_version_id = 'healthkit-canonical/v1'"
+            "WHERE rule_version_id = 'healthkit-canonical/v3'"
         )
     conflicted = target.read_bytes()
 
@@ -218,38 +244,34 @@ def test_metadata_backup_closes_import_and_historical_review_references(
         package = _health_package(tmp_path / "review.zip", 3)
         import_request = ImportHealthExport(package)
         import_plan = health_lab.preview_write(import_request)
-        imported = health_lab.execute_write(
-            import_request, expected_plan=import_plan.fingerprint
-        )
+        imported = health_lab.execute_write(import_request, expected_plan=import_plan.fingerprint)
         assert isinstance(imported.result, ImportReceipt)
 
         decision_request = ConfirmDataReviewBatch(
             DataReviewSelection(DataReviewCaseKind.PLAUSIBILITY), "historisch geprüft"
         )
         decision_plan = health_lab.preview_write(decision_request)
-        health_lab.execute_write(
-            decision_request, expected_plan=decision_plan.fingerprint
-        )
+        health_lab.execute_write(decision_request, expected_plan=decision_plan.fingerprint)
 
         backup_request = CreateMetadataBackup(target)
         backup_plan = health_lab.preview_write(backup_request)
-        backed_up = health_lab.execute_write(
-            backup_request, expected_plan=backup_plan.fingerprint
-        )
+        backed_up = health_lab.execute_write(backup_request, expected_plan=backup_plan.fingerprint)
 
     assert isinstance(backed_up.result, MetadataBackupReceipt)
     with sqlite3.connect(target) as backup:
-        assert backup.execute(
-            "SELECT count(*) FROM import_publications"
-        ).fetchone() == backup.execute("SELECT count(*) FROM import_refs").fetchone()
-        assert backup.execute(
-            "SELECT count(*) FROM review_cycle_cases cycle_case "
-            "JOIN review_cycles cycle USING (cycle_id) "
-            "JOIN review_case_facts fact ON fact.snapshot_id = cycle.snapshot_id "
-            "AND fact.review_case_id = cycle_case.review_case_id"
-        ).fetchone() == backup.execute(
-            "SELECT count(*) FROM review_cycle_cases"
-        ).fetchone()
+        assert (
+            backup.execute("SELECT count(*) FROM import_publications").fetchone()
+            == backup.execute("SELECT count(*) FROM import_refs").fetchone()
+        )
+        assert (
+            backup.execute(
+                "SELECT count(*) FROM review_cycle_cases cycle_case "
+                "JOIN review_cycles cycle USING (cycle_id) "
+                "JOIN review_case_facts fact ON fact.snapshot_id = cycle.snapshot_id "
+                "AND fact.review_case_id = cycle_case.review_case_id"
+            ).fetchone()
+            == backup.execute("SELECT count(*) FROM review_cycle_cases").fetchone()
+        )
 
 
 def test_metadata_backup_capacity_is_rechecked_under_the_writer_lock(
@@ -273,9 +295,7 @@ def test_metadata_backup_capacity_is_rechecked_under_the_writer_lock(
             4096,
         )
 
-    monkeypatch.setattr(
-        "personal_health_lab.recovery._probe_metadata_backup_capacity", probe
-    )
+    monkeypatch.setattr("personal_health_lab.recovery._probe_metadata_backup_capacity", probe)
     target = tmp_path / "backup.sqlite3"
     with HealthLab.open(_config(tmp_path, DataMode.REAL)) as health_lab:
         request = CreateMetadataBackup(target)
@@ -306,9 +326,7 @@ def test_metadata_backup_v1_measures_populated_writer_phases(
         package = _health_package(tmp_path / "health.zip", record_count)
         import_request = ImportHealthExport(package)
         import_plan = health_lab.preview_write(import_request)
-        imported = health_lab.execute_write(
-            import_request, expected_plan=import_plan.fingerprint
-        )
+        imported = health_lab.execute_write(import_request, expected_plan=import_plan.fingerprint)
         assert isinstance(imported.result, ImportReceipt)
 
         request = CreateMetadataBackup(target)
@@ -319,9 +337,7 @@ def test_metadata_backup_v1_measures_populated_writer_phases(
             assert root == target_directory
             phases[phase] = max(0, _allocated_tree(root) - baseline)
 
-        monkeypatch.setattr(
-            "personal_health_lab.recovery._allocation_checkpoint", measure
-        )
+        monkeypatch.setattr("personal_health_lab.recovery._allocation_checkpoint", measure)
         receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
 
     assert isinstance(receipt.result, MetadataBackupReceipt)
@@ -353,9 +369,7 @@ def test_metadata_backup_filevault_improvement_may_continue(
             "volume-backup",
         )
 
-    monkeypatch.setattr(
-        "personal_health_lab.application._application.probe_filevault", probe
-    )
+    monkeypatch.setattr("personal_health_lab.application._application.probe_filevault", probe)
     target = tmp_path / "backup.sqlite3"
     with HealthLab.open(_config(tmp_path, DataMode.REAL)) as health_lab:
         request = CreateMetadataBackup(target)

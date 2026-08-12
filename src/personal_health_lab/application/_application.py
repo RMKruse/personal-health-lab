@@ -5,13 +5,16 @@ import json
 import logging
 import math
 import shutil
-from dataclasses import dataclass
-from datetime import date, datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal
 from enum import StrEnum
+from itertools import pairwise
 from pathlib import Path
 from types import TracebackType
-from typing import Literal, Self, get_args
+from typing import Literal, Self, cast, get_args
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from personal_health_lab import DataMode
 from personal_health_lab.data_quality import (
@@ -28,7 +31,14 @@ from personal_health_lab.data_quality import (
     reopen_decision_cycle_updates,
     run_historical_review,
 )
-from personal_health_lab.health_data import DataQualityStatus, ModelMaturityStatus
+from personal_health_lab.health_data import (
+    ActivitySourceClass,
+    CanonicalSleepCategory,
+    DataQualityStatus,
+    ModelMaturityStatus,
+    canonical_unit_for,
+    classify_activity_source,
+)
 from personal_health_lab.health_import import (
     CanonicalHealthType,
     CanonicalUnit,
@@ -43,7 +53,11 @@ from personal_health_lab.health_import import (
     import_health_export,
     inspect_restore_health_export,
 )
-from personal_health_lab.migration import plan_migration_rollback, plan_store_migration
+from personal_health_lab.migration import (
+    plan_migration_rollback,
+    plan_snapshot_migration,
+    plan_store_migration,
+)
 from personal_health_lab.overview import Overview, OverviewReader, OverviewSelection
 from personal_health_lab.recovery import (
     BackupId,
@@ -73,20 +87,42 @@ from personal_health_lab.resting_hr_analysis import (
     run_resting_hr_analysis as execute_analysis,
 )
 from personal_health_lab.storage import (
+    AsNeededIntakePublication,
     CapacityCheck,
+    CapacityMethodId,
     CapacityStatus,
+    ContextCoverageStartPublication,
     FileVaultCheck,
     FileVaultReason,
     FileVaultStatus,
+    IllnessPublication,
+    IntakeReasonCategoryPublication,
     LocalStore,
+    MedicationDeviationPublication,
+    MedicationRegimePublication,
     OpenDataReviewCase,
     PersonBindingStatus,
     PublishBatchDecisionResult,
     PublishDecisionResult,
     StoreBusyError,
+    StoredContextCoverageStart,
+    StoredMeasurement,
     StoreError,
     StoreId,
+    current_snapshot_schema_version,
     probe_filevault,
+)
+from personal_health_lab.storage import (
+    ContextLogicalId as StoredContextLogicalId,
+)
+from personal_health_lab.storage import (
+    ContextRevisionId as StoredContextRevisionId,
+)
+from personal_health_lab.storage import (
+    MedicationLogicalId as StoredMedicationLogicalId,
+)
+from personal_health_lab.storage import (
+    MedicationRevisionId as StoredMedicationRevisionId,
 )
 
 logger = logging.getLogger("personal_health_lab")
@@ -134,6 +170,8 @@ _READY_READS = (
     "data_review_case",
     "plausibility_rules",
     "migration_diagnostics",
+    "weight_nutrition",
+    "sleep_days",
 )
 
 
@@ -201,6 +239,1404 @@ class ImportStatus(StrEnum):
     QUARANTINED = "quarantined"
     RESTORE_PENDING = "restore_pending"
     STORE_BUSY = "store_busy"
+
+
+class UnsupportedContentCategory(StrEnum):
+    RECORD_TYPE = "record_type"
+    SLEEP_VALUE = "sleep_value"
+    TOP_LEVEL_ELEMENT = "top_level_element"
+    UNIT = "unit"
+    WORKOUT_ACTIVITY_TYPE = "workout_activity_type"
+    WORKOUT_CHILD = "workout_child"
+
+
+@dataclass(frozen=True, slots=True)
+class ImportCanonicalCounts:
+    package_record_count: int
+    record_count: int
+    logical_measurement_count: int
+    measurement_version_count: int
+    source_occurrence_count: int
+    anomaly_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ImportContentCount:
+    category: UnsupportedContentCategory
+    external_identifier: str
+    count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ImportDetails:
+    import_id: ImportId
+    canonical_counts: ImportCanonicalCounts
+    unsupported_content: tuple[ImportContentCount, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotDateSelection:
+    snapshot_ref: SnapshotRef | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+
+    def __post_init__(self) -> None:
+        if (self.start_date is None) != (self.end_date is None):
+            raise ConfigurationError("Datumsbereich verlangt Start und Ende.")
+        if (
+            self.start_date is not None
+            and self.end_date is not None
+            and self.start_date > self.end_date
+        ):
+            raise ConfigurationError("Startdatum darf nicht nach dem Enddatum liegen.")
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotSelection:
+    snapshot_ref: SnapshotRef | None = None
+
+
+_ACTIVE_SNAPSHOT_SELECTION = SnapshotSelection()
+
+
+def _resolve_medication_local_datetime(day: date, local_time: time, timezone: str) -> datetime:
+    zone = ZoneInfo(timezone)
+    local = datetime.combine(day, local_time)
+    candidate = local.replace(tzinfo=zone, fold=0)
+    if candidate.astimezone(UTC).astimezone(zone).replace(tzinfo=None) == local:
+        return candidate
+    for minute in range(1, 181):
+        candidate = (local + timedelta(minutes=minute)).replace(tzinfo=zone, fold=0)
+        if candidate.astimezone(UTC).astimezone(zone).replace(tzinfo=None) == local + timedelta(
+            minutes=minute
+        ):
+            return candidate
+    raise ConfigurationError("Lokale Dosiszeit konnte nicht aufgelöst werden.")
+
+
+@dataclass(frozen=True, slots=True)
+class ContextLogicalId:
+    _value: str
+
+    def __post_init__(self) -> None:
+        if len(self._value) != 32 or not set(self._value) <= set("0123456789abcdef"):
+            raise ValueError("Kontext-ID muss ein 32-stelliger Hex-Wert sein.")
+
+    def __str__(self) -> str:
+        return self._value
+
+
+@dataclass(frozen=True, slots=True)
+class ContextRevisionId:
+    _value: str
+
+    def __post_init__(self) -> None:
+        if len(self._value) != 32 or not set(self._value) <= set("0123456789abcdef"):
+            raise ValueError("Kontextrevisions-ID muss ein 32-stelliger Hex-Wert sein.")
+
+    def __str__(self) -> str:
+        return self._value
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationLogicalId:
+    _value: str
+
+    def __post_init__(self) -> None:
+        if len(self._value) != 32 or not set(self._value) <= set("0123456789abcdef"):
+            raise ValueError("Medikamenten-ID muss ein 32-stelliger Hex-Wert sein.")
+
+    def __str__(self) -> str:
+        return self._value
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRevisionId:
+    _value: str
+
+    def __post_init__(self) -> None:
+        if len(self._value) != 32 or not set(self._value) <= set("0123456789abcdef"):
+            raise ValueError("Medikamentenrevisions-ID muss ein 32-stelliger Hex-Wert sein.")
+
+    def __str__(self) -> str:
+        return self._value
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationPlanEntryId:
+    _value: str
+
+    def __post_init__(self) -> None:
+        if len(self._value) != 32 or not set(self._value) <= set("0123456789abcdef"):
+            raise ValueError("Medikamentenplaneintrags-ID muss ein 32-stelliger Hex-Wert sein.")
+
+    def __str__(self) -> str:
+        return self._value
+
+
+class Weekday(StrEnum):
+    MONDAY = "monday"
+    TUESDAY = "tuesday"
+    WEDNESDAY = "wednesday"
+    THURSDAY = "thursday"
+    FRIDAY = "friday"
+    SATURDAY = "saturday"
+    SUNDAY = "sunday"
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduledDose:
+    medication_name: str
+    amount: Decimal
+    unit: str
+    local_time: time
+    weekdays: frozenset[Weekday]
+
+    def __post_init__(self) -> None:
+        name = " ".join(self.medication_name.split())
+        unit = " ".join(self.unit.split())
+        if not (1 <= len(name) <= 120 and 1 <= len(unit) <= 32):
+            raise ConfigurationError("Medikamentenname oder Einheit ist ungültig.")
+        if any(ord(char) < 32 for char in name + unit) or self.amount <= 0 or not self.weekdays:
+            raise ConfigurationError("Geplante Dosis ist ungültig.")
+        if not all(isinstance(day, Weekday) for day in self.weekdays):
+            raise ConfigurationError("Wochentage sind ungültig.")
+        object.__setattr__(self, "medication_name", name)
+        object.__setattr__(self, "unit", unit)
+
+
+@dataclass(frozen=True, slots=True)
+class AsNeededMedication:
+    medication_name: str
+    amount: Decimal
+    unit: str
+    preferred_reason_category_ids: tuple[MedicationLogicalId, ...] = ()
+    entry_id: MedicationPlanEntryId | None = None
+
+    def __post_init__(self) -> None:
+        name = " ".join(self.medication_name.split())
+        unit = " ".join(self.unit.split())
+        if (
+            not (1 <= len(name) <= 120 and 1 <= len(unit) <= 32)
+            or any(ord(char) < 32 for char in name + unit)
+            or self.amount <= 0
+            or not all(
+                isinstance(item, MedicationLogicalId) for item in self.preferred_reason_category_ids
+            )
+            or len(set(self.preferred_reason_category_ids))
+            != len(self.preferred_reason_category_ids)
+            or (self.entry_id is not None and not isinstance(self.entry_id, MedicationPlanEntryId))
+        ):
+            raise ConfigurationError("Bedarfsmedikation ist ungültig.")
+        object.__setattr__(self, "medication_name", name)
+        object.__setattr__(self, "unit", unit)
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRegimeCreate:
+    starts_at: datetime
+    timezone: str
+    scheduled_doses: tuple[ScheduledDose, ...]
+    as_needed_medications: tuple[AsNeededMedication, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRegimeRevise:
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId
+    starts_at: datetime
+    timezone: str
+    scheduled_doses: tuple[ScheduledDose, ...]
+    as_needed_medications: tuple[AsNeededMedication, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRegimeWithdraw:
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ConfigurationError("Regimerücknahme verlangt einen Grund.")
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRegimeRestore:
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId
+    starts_at: datetime
+    timezone: str
+    scheduled_doses: tuple[ScheduledDose, ...]
+    as_needed_medications: tuple[AsNeededMedication, ...] = ()
+
+
+MedicationRegimeIntent = (
+    MedicationRegimeCreate
+    | MedicationRegimeRevise
+    | MedicationRegimeWithdraw
+    | MedicationRegimeRestore
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseMedicationRegime:
+    intent: MedicationRegimeIntent
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.intent, get_args(MedicationRegimeIntent)):
+            raise ConfigurationError("Unbekannte Medikamentenregimeabsicht.")
+        if isinstance(self.intent, MedicationRegimeWithdraw):
+            return
+        try:
+            ZoneInfo(self.intent.timezone)
+        except Exception as error:
+            raise ConfigurationError("Medikamentenzeitzone ist ungültig.") from error
+        if self.intent.starts_at.tzinfo is None:
+            raise ConfigurationError("Regimebeginn muss zeitzonenbewusst sein.")
+        if len(set(self.intent.scheduled_doses)) != len(self.intent.scheduled_doses):
+            raise ConfigurationError("Identische Planeinträge sind nicht zulässig.")
+        entry_ids = tuple(
+            item.entry_id for item in self.intent.as_needed_medications if item.entry_id is not None
+        )
+        if len(set(entry_ids)) != len(entry_ids):
+            raise ConfigurationError("Bedarfsplaneintrags-IDs müssen eindeutig sein.")
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationActualIntake:
+    taken_at: datetime
+    amount: Decimal
+
+    def __post_init__(self) -> None:
+        if self.taken_at.tzinfo is None or self.amount <= 0:
+            raise ConfigurationError("Tatsächliche Einnahme ist ungültig.")
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationDeviationCreate:
+    regime_logical_id: MedicationLogicalId
+    scheduled_at: datetime
+    actual_intakes: tuple[MedicationActualIntake, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationDeviationRevise:
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId
+    regime_logical_id: MedicationLogicalId
+    scheduled_at: datetime
+    actual_intakes: tuple[MedicationActualIntake, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationDeviationWithdraw:
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ConfigurationError("Rücknahme verlangt einen Grund.")
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationDeviationRestore:
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId
+    regime_logical_id: MedicationLogicalId
+    scheduled_at: datetime
+    actual_intakes: tuple[MedicationActualIntake, ...]
+
+
+MedicationDeviationIntent = (
+    MedicationDeviationCreate
+    | MedicationDeviationRevise
+    | MedicationDeviationWithdraw
+    | MedicationDeviationRestore
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseMedicationDeviation:
+    intent: MedicationDeviationIntent
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.intent, get_args(MedicationDeviationIntent)):
+            raise ConfigurationError("Unbekannte Einnahmeabweichungsabsicht.")
+        if (
+            not isinstance(self.intent, MedicationDeviationWithdraw)
+            and self.intent.scheduled_at.tzinfo is None
+        ):
+            raise ConfigurationError("Geplantes Dosisvorkommen muss zeitzonenbewusst sein.")
+
+
+@dataclass(frozen=True, slots=True)
+class IntakeReasonCategoryCreate:
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class IntakeReasonCategoryRevise:
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class IntakeReasonCategoryWithdraw:
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ConfigurationError("Rücknahme verlangt einen Grund.")
+
+
+@dataclass(frozen=True, slots=True)
+class IntakeReasonCategoryRestore(IntakeReasonCategoryRevise):
+    pass
+
+
+IntakeReasonCategoryIntent = (
+    IntakeReasonCategoryCreate
+    | IntakeReasonCategoryRevise
+    | IntakeReasonCategoryWithdraw
+    | IntakeReasonCategoryRestore
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseIntakeReasonCategory:
+    intent: IntakeReasonCategoryIntent
+
+
+@dataclass(frozen=True, slots=True)
+class AsNeededIntakeCreate:
+    regime_logical_id: MedicationLogicalId
+    entry_id: MedicationPlanEntryId
+    taken_at: datetime
+    amount: Decimal
+    reason_category_logical_id: MedicationLogicalId | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AsNeededIntakeRevise:
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId
+    regime_logical_id: MedicationLogicalId
+    entry_id: MedicationPlanEntryId
+    taken_at: datetime
+    amount: Decimal
+    reason_category_logical_id: MedicationLogicalId | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AsNeededIntakeWithdraw:
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ConfigurationError("Rücknahme verlangt einen Grund.")
+
+
+@dataclass(frozen=True, slots=True)
+class AsNeededIntakeRestore(AsNeededIntakeRevise):
+    pass
+
+
+AsNeededIntakeIntent = (
+    AsNeededIntakeCreate | AsNeededIntakeRevise | AsNeededIntakeWithdraw | AsNeededIntakeRestore
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseAsNeededIntake:
+    intent: AsNeededIntakeIntent
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.intent, get_args(AsNeededIntakeIntent)):
+            raise ConfigurationError("Unbekannte Bedarfseinnahmeabsicht.")
+        if not isinstance(self.intent, AsNeededIntakeWithdraw) and (
+            self.intent.taken_at.tzinfo is None or self.intent.amount <= 0
+        ):
+            raise ConfigurationError("Bedarfseinnahme ist ungültig.")
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCoverageStartCreate:
+    start_date: date
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCoverageStartRevise:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    start_date: date
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCoverageStartWithdraw:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ConfigurationError("Rücknahme verlangt einen Grund.")
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCoverageStartRestore:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    start_date: date
+
+
+ContextCoverageStartIntent = (
+    ContextCoverageStartCreate
+    | ContextCoverageStartRevise
+    | ContextCoverageStartWithdraw
+    | ContextCoverageStartRestore
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseContextCoverageStart:
+    intent: ContextCoverageStartIntent
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.intent, get_args(ContextCoverageStartIntent)):
+            raise ConfigurationError("Unbekannte Kontextabdeckungsabsicht.")
+
+
+class IllnessSeverity(StrEnum):
+    MILD = "mild"
+    MODERATE = "moderate"
+    SEVERE = "severe"
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessCategoryCreate:
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessCategoryRevise:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessCategoryWithdraw:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessCategoryRestore:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    name: str
+
+
+IllnessCategoryIntent = (
+    IllnessCategoryCreate | IllnessCategoryRevise | IllnessCategoryWithdraw | IllnessCategoryRestore
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseIllnessCategory:
+    intent: IllnessCategoryIntent
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessPeriodCreate:
+    category_logical_id: ContextLogicalId
+    start_date: date
+    end_date: date | None
+    severity: IllnessSeverity
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessPeriodRevise:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    category_logical_id: ContextLogicalId
+    start_date: date
+    end_date: date | None
+    severity: IllnessSeverity
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessPeriodWithdraw:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessPeriodRestore:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    category_logical_id: ContextLogicalId
+    start_date: date
+    end_date: date | None
+    severity: IllnessSeverity
+
+
+IllnessPeriodIntent = (
+    IllnessPeriodCreate | IllnessPeriodRevise | IllnessPeriodWithdraw | IllnessPeriodRestore
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseIllnessPeriod:
+    intent: IllnessPeriodIntent
+
+
+class StressLevel(StrEnum):
+    VERY_LOW = "very_low"
+    LOW = "low"
+    AVERAGE = "average"
+    HIGH = "high"
+    VERY_HIGH = "very_high"
+
+
+@dataclass(frozen=True, slots=True)
+class DailyStressCreate:
+    day: date
+    level: StressLevel
+
+
+@dataclass(frozen=True, slots=True)
+class DailyStressRevise:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    day: date
+    level: StressLevel
+
+
+@dataclass(frozen=True, slots=True)
+class DailyStressWithdraw:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class DailyStressRestore(DailyStressRevise):
+    pass
+
+
+DailyStressIntent = DailyStressCreate | DailyStressRevise | DailyStressWithdraw | DailyStressRestore
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseDailyStress:
+    intent: DailyStressIntent
+
+
+@dataclass(frozen=True, slots=True)
+class CustomContextLabelCreate:
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class CustomContextLabelRevise:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class CustomContextLabelWithdraw:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class CustomContextLabelRestore(CustomContextLabelRevise):
+    pass
+
+
+CustomContextLabelIntent = (
+    CustomContextLabelCreate
+    | CustomContextLabelRevise
+    | CustomContextLabelWithdraw
+    | CustomContextLabelRestore
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseCustomContextLabel:
+    intent: CustomContextLabelIntent
+
+
+@dataclass(frozen=True, slots=True)
+class CustomContextPeriodCreate:
+    label_logical_id: ContextLogicalId
+    start_date: date
+    end_date: date | None
+    note: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CustomContextPeriodRevise:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    label_logical_id: ContextLogicalId
+    start_date: date
+    end_date: date | None
+    note: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CustomContextPeriodWithdraw:
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class CustomContextPeriodRestore(CustomContextPeriodRevise):
+    pass
+
+
+CustomContextPeriodIntent = (
+    CustomContextPeriodCreate
+    | CustomContextPeriodRevise
+    | CustomContextPeriodWithdraw
+    | CustomContextPeriodRestore
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseCustomContextPeriod:
+    intent: CustomContextPeriodIntent
+
+
+class ContextIllnessOrigin(StrEnum):
+    UNKNOWN = "unknown"
+    ASSUMED_NONE = "assumed_none"
+    OBSERVED = "observed"
+
+
+class ContextStressOrigin(StrEnum):
+    UNKNOWN = "unknown"
+    ASSUMED_AVERAGE = "assumed_average"
+    OBSERVED = "observed"
+
+
+@dataclass(frozen=True, slots=True)
+class DailyContextDay:
+    day: date
+    illness_origin: ContextIllnessOrigin
+    stress_origin: ContextStressOrigin
+    highest_illness_severity: IllnessSeverity | None = None
+    stress_level: StressLevel | None = None
+    custom_context_labels: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DailyContext:
+    snapshot_ref: SnapshotRef | None
+    context_as_of_date: date | None
+    context_timezone: str
+    days: tuple[DailyContextDay, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCoverageStartRecord:
+    logical_id: ContextLogicalId
+    revision_id: ContextRevisionId
+    start_date: date
+
+
+@dataclass(frozen=True, slots=True)
+class CustomContextLabelRecord:
+    logical_id: ContextLogicalId
+    revision_id: ContextRevisionId
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class CustomContextPeriodRecord:
+    logical_id: ContextLogicalId
+    revision_id: ContextRevisionId
+    label_logical_id: ContextLogicalId
+    start_date: date
+    end_date: date | None
+    note: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessCategoryRecord:
+    logical_id: ContextLogicalId
+    revision_id: ContextRevisionId
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessPeriodRecord:
+    logical_id: ContextLogicalId
+    revision_id: ContextRevisionId
+    category_logical_id: ContextLogicalId
+    start_date: date
+    end_date: date | None
+    severity: IllnessSeverity
+
+
+@dataclass(frozen=True, slots=True)
+class DailyStressRecord:
+    logical_id: ContextLogicalId
+    revision_id: ContextRevisionId
+    day: date
+    level: StressLevel
+
+
+@dataclass(frozen=True, slots=True)
+class ContextRecords:
+    snapshot_ref: SnapshotRef | None
+    coverage_start: ContextCoverageStartRecord | None
+    illness_categories: tuple[IllnessCategoryRecord, ...] = ()
+    illness_periods: tuple[IllnessPeriodRecord, ...] = ()
+    daily_stress: tuple[DailyStressRecord, ...] = ()
+    custom_labels: tuple[CustomContextLabelRecord, ...] = ()
+    custom_periods: tuple[CustomContextPeriodRecord, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ContextAuditRevision:
+    revision_id: ContextRevisionId
+    previous_revision_id: ContextRevisionId | None
+    state: Literal["active", "withdrawn"]
+    object_kind: Literal[
+        "context_coverage_start",
+        "illness_category",
+        "illness_period",
+        "daily_stress",
+        "custom_context_label",
+        "custom_context_period",
+    ]
+    start_date: date | None
+    name: str | None = None
+    category_logical_id: ContextLogicalId | None = None
+    end_date: date | None = None
+    severity: IllnessSeverity | None = None
+    stress_level: StressLevel | None = None
+    note: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ContextAudit:
+    logical_id: ContextLogicalId
+    revisions: tuple[ContextAuditRevision, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationDoseOccurrence:
+    medication_name: str
+    amount: Decimal
+    unit: str
+    scheduled_at: datetime
+    status: Literal["assumed_as_planned", "deviated"] = "assumed_as_planned"
+    actual_intakes: tuple[MedicationActualIntake, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationAsNeededIntake:
+    logical_id: MedicationLogicalId
+    taken_at: datetime
+    medication_name: str
+    amount: Decimal
+    unit: str
+    reason_category_name: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationDay:
+    day: date
+    status: Literal["unknown", "empty", "planned"]
+    occurrences: tuple[MedicationDoseOccurrence, ...]
+    as_needed_intakes: tuple[MedicationAsNeededIntake, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationDays:
+    snapshot_ref: SnapshotRef | None
+    medication_as_of: datetime | None
+    timezone: str | None
+    days: tuple[MedicationDay, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRegimeRecord:
+    logical_id: MedicationLogicalId
+    revision_id: MedicationRevisionId
+    starts_at: datetime
+    timezone: str
+    scheduled_doses: tuple[ScheduledDose, ...]
+    as_needed_medications: tuple[AsNeededMedication, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class IntakeReasonCategoryRecord:
+    logical_id: MedicationLogicalId
+    revision_id: MedicationRevisionId
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationPlan:
+    snapshot_ref: SnapshotRef | None
+    medication_as_of: datetime | None
+    regimes: tuple[MedicationRegimeRecord, ...]
+    intake_reason_categories: tuple[IntakeReasonCategoryRecord, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationAuditRevision:
+    revision_id: MedicationRevisionId
+    previous_revision_id: MedicationRevisionId | None
+    state: Literal["active", "withdrawn"]
+    starts_at: datetime
+    timezone: str
+    scheduled_doses: tuple[ScheduledDose, ...]
+    as_needed_medications: tuple[AsNeededMedication, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationDeviationAuditRevision:
+    revision_id: MedicationRevisionId
+    previous_revision_id: MedicationRevisionId | None
+    state: Literal["active", "withdrawn"]
+    regime_logical_id: MedicationLogicalId
+    scheduled_at: datetime
+    actual_intakes: tuple[MedicationActualIntake, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AsNeededIntakeAuditRevision:
+    revision_id: MedicationRevisionId
+    previous_revision_id: MedicationRevisionId | None
+    state: Literal["active", "withdrawn"]
+    regime_logical_id: MedicationLogicalId
+    entry_id: MedicationPlanEntryId
+    taken_at: datetime
+    amount: Decimal
+    reason_category_logical_id: MedicationLogicalId | None
+
+
+@dataclass(frozen=True, slots=True)
+class IntakeReasonCategoryAuditRevision:
+    revision_id: MedicationRevisionId
+    previous_revision_id: MedicationRevisionId | None
+    state: Literal["active", "withdrawn"]
+    name: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationAudit:
+    logical_id: MedicationLogicalId
+    revisions: tuple[
+        MedicationAuditRevision
+        | MedicationDeviationAuditRevision
+        | AsNeededIntakeAuditRevision
+        | IntakeReasonCategoryAuditRevision,
+        ...,
+    ]
+
+
+class WeightDayStatus(StrEnum):
+    OBSERVED = "observed"
+    MISSING = "missing"
+    AMBIGUOUS = "ambiguous"
+
+
+@dataclass(frozen=True, slots=True)
+class WeightMeasurement:
+    logical_measurement_id: LogicalMeasurementId
+    measurement_version_id: MeasurementVersionId
+    value_kg: float
+    effective_value_kg: float | None
+    disposition: (
+        Literal[
+            "included_source",
+            "included_correction",
+            "excluded_local",
+            "excluded_source_deletion",
+        ]
+        | None
+    )
+    is_selected: bool
+    source_start: datetime
+    source_end: datetime
+    source_updated_at: datetime
+    measurement_local_day: date
+    source_name: str
+    source_version: str
+    device: str
+    original_value: float
+    original_unit: str
+    review_case_ids: tuple[DataReviewCaseId, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class HealthKitNutritionSample:
+    logical_measurement_id: LogicalMeasurementId
+    measurement_version_id: MeasurementVersionId
+    data_type: CanonicalHealthType
+    unit: CanonicalUnit
+    value: float
+    effective_value: float | None
+    disposition: (
+        Literal[
+            "included_source",
+            "included_correction",
+            "excluded_local",
+            "excluded_source_deletion",
+        ]
+        | None
+    )
+    is_selected: bool
+    source_start: datetime
+    source_end: datetime
+    source_updated_at: datetime
+    measurement_local_day: date
+    source_name: str
+    source_version: str
+    device: str
+    original_value: float
+    original_unit: str
+    review_case_ids: tuple[DataReviewCaseId, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PreferredDailyWeight:
+    day: date
+    status: WeightDayStatus
+    value_kg: float | None
+    logical_measurement_ids: tuple[LogicalMeasurementId, ...] = ()
+    measurement_version_ids: tuple[MeasurementVersionId, ...] = ()
+    review_case_ids: tuple[DataReviewCaseId, ...] = ()
+    quality_status: DataQualityStatus = DataQualityStatus.REVIEWED
+
+
+@dataclass(frozen=True, slots=True)
+class DailyNutritionFeature:
+    data_type: CanonicalHealthType
+    unit: CanonicalUnit
+    value: float | None
+    logical_measurement_ids: tuple[LogicalMeasurementId, ...] = ()
+    measurement_version_ids: tuple[MeasurementVersionId, ...] = ()
+    review_case_ids: tuple[DataReviewCaseId, ...] = ()
+    quality_status: DataQualityStatus = DataQualityStatus.REVIEWED
+
+
+@dataclass(frozen=True, slots=True)
+class DailyNutrition:
+    day: date
+    energy: DailyNutritionFeature
+    protein: DailyNutritionFeature
+    carbohydrates: DailyNutritionFeature
+    total_fat: DailyNutritionFeature
+
+
+@dataclass(frozen=True, slots=True)
+class WeightNutrition:
+    snapshot_ref: SnapshotRef | None
+    status: DataQualityStatus
+    days: tuple[PreferredDailyWeight, ...]
+    weight_measurements: tuple[WeightMeasurement, ...]
+    nutrition_days: tuple[DailyNutrition, ...]
+    healthkit_nutrition_samples: tuple[HealthKitNutritionSample, ...]
+
+
+class SleepCategory(StrEnum):
+    IN_BED = "in_bed"
+    AWAKE = "awake"
+    ASLEEP_UNSPECIFIED = "asleep_unspecified"
+    ASLEEP_CORE = "asleep_core"
+    ASLEEP_DEEP = "asleep_deep"
+    ASLEEP_REM = "asleep_rem"
+
+
+class SleepSourceClass(StrEnum):
+    WATCH = "watch"
+    IPHONE = "iphone"
+    MANUAL = "manual"
+    OTHER = "other"
+    UNKNOWN = "unknown"
+
+
+class SleepObservationStatus(StrEnum):
+    UNOBSERVED = "unobserved"
+    PARTIAL = "partial"
+    OBSERVED = "observed"
+
+
+@dataclass(frozen=True, slots=True)
+class SleepInterval:
+    logical_measurement_id: LogicalMeasurementId
+    measurement_version_id: MeasurementVersionId
+    original_category: str
+    canonical_category: SleepCategory
+    source_class: SleepSourceClass
+    is_selected: bool
+    source_start: datetime
+    source_end: datetime
+    source_updated_at: datetime
+    source_name: str
+    source_version: str
+    device: str
+
+
+@dataclass(frozen=True, slots=True)
+class SleepEpisode:
+    start: datetime
+    end: datetime
+    first_observed_asleep: datetime | None
+    last_observed_asleep: datetime | None
+    observed_sleep: timedelta
+    observed_awake: timedelta
+    in_bed: timedelta | None
+    asleep_core: timedelta
+    asleep_deep: timedelta
+    asleep_rem: timedelta
+    asleep_unspecified: timedelta
+    stage_ambiguous: timedelta
+    uncovered_gap: timedelta
+    removed_same_state_overlap: timedelta
+    asleep_awake_conflict: timedelta
+    observed_coverage_ratio: float | None
+    detailed_stage_coverage_ratio: float | None
+    interval_ids: tuple[MeasurementVersionId, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SleepSourceCount:
+    source_class: SleepSourceClass
+    accepted_interval_count: int
+    rejected_interval_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class SleepQuality:
+    source_classifier_version: str
+    derivation_version: str
+    accepted_interval_count: int
+    rejected_interval_count: int
+    contributing_watch_source_count: int
+    source_counts: tuple[SleepSourceCount, ...]
+    primary_selection_ambiguous: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SleepDay:
+    day: date
+    status: SleepObservationStatus
+    primary_episode: SleepEpisode | None
+    naps: tuple[SleepEpisode, ...]
+    quality: SleepQuality
+
+    @property
+    def nap_count(self) -> int:
+        return len(self.naps)
+
+    @property
+    def nap_observed_sleep(self) -> timedelta:
+        return sum((item.observed_sleep for item in self.naps), timedelta())
+
+
+@dataclass(frozen=True, slots=True)
+class SleepDays:
+    snapshot_ref: SnapshotRef | None
+    days: tuple[SleepDay, ...]
+    accepted_intervals: tuple[SleepInterval, ...]
+    rejected_intervals: tuple[SleepInterval, ...]
+
+
+class ActivityMetric(StrEnum):
+    EXERCISE_TIME = "apple_exercise_time"
+    STEP_COUNT = "step_count"
+    WALKING_RUNNING_DISTANCE = "walking_running_distance"
+    ACTIVE_ENERGY = "active_energy"
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityMeasurement:
+    logical_measurement_id: LogicalMeasurementId
+    measurement_version_id: MeasurementVersionId
+    data_type: ActivityMetric
+    unit: CanonicalUnit
+    value: float
+    effective_value: float | None
+    disposition: (
+        Literal[
+            "included_source",
+            "included_correction",
+            "excluded_local",
+            "excluded_source_deletion",
+        ]
+        | None
+    )
+    is_selected: bool
+    source_class: ActivitySourceClass
+    source_start: datetime
+    source_end: datetime
+    source_updated_at: datetime
+    measurement_local_day: date
+    source_name: str
+    source_version: str
+    device: str
+    original_value: float
+    original_unit: str
+    review_case_ids: tuple[DataReviewCaseId, ...]
+    suppression_reason: str | None = None
+
+
+class ActivityCoverageKind(StrEnum):
+    WATCH = "watch"
+    IPHONE_FALLBACK = "iphone_fallback"
+    UNOBSERVED = "unobserved"
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityCoverageSegment:
+    kind: ActivityCoverageKind
+    source_start: datetime
+    source_end: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityDerivationVersion:
+    version_id: str
+    coverage_gap_minutes: int
+    source_classifier_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class ActivitySettings:
+    active_version: ActivityDerivationVersion
+    recommended_version: ActivityDerivationVersion
+
+
+@dataclass(frozen=True, slots=True)
+class CreateActivityDerivationVersion:
+    coverage_gap_minutes: int = 240
+
+    def __post_init__(self) -> None:
+        if type(self.coverage_gap_minutes) is not int or not 1 <= self.coverage_gap_minutes <= 1440:
+            raise ConfigurationError("Abdeckungsschwelle muss eine ganze Zahl von 1 bis 1440 sein.")
+
+
+@dataclass(frozen=True, slots=True)
+class DailyActivityMetric:
+    data_type: ActivityMetric
+    unit: CanonicalUnit
+    value: float | None
+    logical_measurement_ids: tuple[LogicalMeasurementId, ...] = ()
+    measurement_version_ids: tuple[MeasurementVersionId, ...] = ()
+    review_case_ids: tuple[DataReviewCaseId, ...] = ()
+    quality_status: DataQualityStatus = DataQualityStatus.REVIEWED
+    watch_value: float | None = None
+    iphone_value: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityDay:
+    day: date
+    exercise_time: DailyActivityMetric
+    step_count: DailyActivityMetric
+    walking_running_distance: DailyActivityMetric
+    active_energy: DailyActivityMetric
+    coverage_segments: tuple[ActivityCoverageSegment, ...] = ()
+    is_complete: bool = True
+    incomplete_reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityDays:
+    snapshot_ref: SnapshotRef | None
+    status: DataQualityStatus
+    days: tuple[ActivityDay, ...]
+    measurements: tuple[ActivityMeasurement, ...]
+    source_classifier_version: str = "activity-source-classification/v1"
+    derivation_version: str = "activity-derivation/v1"
+    coverage_gap_minutes: int = 240
+
+
+@dataclass(frozen=True, slots=True)
+class Workout:
+    logical_workout_id: LogicalMeasurementId
+    workout_version_id: MeasurementVersionId
+    original_activity_type: str
+    source_start: datetime
+    source_end: datetime
+    source_updated_at: datetime
+    measurement_local_day: date
+    source_name: str
+    source_version: str
+    device: str
+    strong_source_id_hash: str | None
+    reported_duration_minutes: float | None
+    effective_duration_minutes: float
+    distance_kilometers: float | None
+    active_energy_kilocalories: float | None
+    is_selected: bool
+    review_case_ids: tuple[DataReviewCaseId, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkoutAggregate:
+    day: date
+    original_activity_type: str
+    workout_count: int
+    duration_minutes: float
+    distance_kilometers: float | None
+    active_energy_kilocalories: float | None
+    review_case_ids: tuple[DataReviewCaseId, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Workouts:
+    snapshot_ref: SnapshotRef | None
+    status: DataQualityStatus
+    workouts: tuple[Workout, ...]
+    aggregates: tuple[WorkoutAggregate, ...]
+
+
+_ACTIVITY_TYPES = {CanonicalHealthType(item.value): item for item in ActivityMetric}
+_ACTIVITY_SOURCE_CLASSIFIER_VERSION = "activity-source-classification/v1"
+_ACTIVITY_DERIVATION_VERSION = "activity-derivation/v1"
+_ACTIVITY_COVERAGE_GAP_MINUTES = 240
+
+
+_SLEEP_SOURCE_CLASSIFIER_VERSION = "sleep-source-classification/v1"
+_SLEEP_DERIVATION_VERSION = "sleep-derivation/v1"
+_SLEEP_CATEGORIES = {item: SleepCategory(item.value) for item in CanonicalSleepCategory}
+_SLEEP_SOURCE_RULES = {
+    ("Apple Watch", "Apple Watch"): SleepSourceClass.WATCH,
+    ("iPhone", "iPhone"): SleepSourceClass.IPHONE,
+    ("Manual entry", ""): SleepSourceClass.MANUAL,
+    ("Pillow", ""): SleepSourceClass.OTHER,
+}
+
+
+def _classify_sleep_source(source_name: str, device: str) -> SleepSourceClass:
+    if (source_class := _SLEEP_SOURCE_RULES.get((source_name, device))) is not None:
+        return source_class
+    return SleepSourceClass.UNKNOWN
+
+
+def _sleep_episode(intervals: tuple[SleepInterval, ...]) -> SleepEpisode:
+    intervals = tuple(item for item in intervals if item.source_end > item.source_start)
+    starts_and_ends = sorted(
+        {timestamp for item in intervals for timestamp in (item.source_start, item.source_end)}
+    )
+    durations = {category: timedelta() for category in SleepCategory}
+    stage_ambiguous = timedelta()
+    asleep_awake_conflict = timedelta()
+    first_asleep: datetime | None = None
+    last_asleep: datetime | None = None
+    asleep_categories = {
+        SleepCategory.ASLEEP_UNSPECIFIED,
+        SleepCategory.ASLEEP_CORE,
+        SleepCategory.ASLEEP_DEEP,
+        SleepCategory.ASLEEP_REM,
+    }
+    for start, end in pairwise(starts_and_ends):
+        active = {
+            item.canonical_category
+            for item in intervals
+            if item.source_start <= start and item.source_end >= end
+        }
+        span = end - start
+        asleep = active & asleep_categories
+        if asleep and SleepCategory.AWAKE in active:
+            asleep_awake_conflict += span
+        elif len(asleep) > 1:
+            stage_ambiguous += span
+            first_asleep = start if first_asleep is None else first_asleep
+            last_asleep = end
+        elif asleep:
+            category = next(iter(asleep))
+            durations[category] += span
+            first_asleep = start if first_asleep is None else first_asleep
+            last_asleep = end
+        elif SleepCategory.AWAKE in active:
+            durations[SleepCategory.AWAKE] += span
+        if SleepCategory.IN_BED in active:
+            durations[SleepCategory.IN_BED] += span
+
+    def union_duration(items: list[SleepInterval]) -> timedelta:
+        covered = timedelta()
+        end: datetime | None = None
+        for item in sorted(items, key=lambda value: (value.source_start, value.source_end)):
+            if end is None or item.source_start >= end:
+                covered += item.source_end - item.source_start
+                end = item.source_end
+            elif item.source_end > end:
+                covered += item.source_end - end
+                end = item.source_end
+        return covered
+
+    removed_same_state_overlap = sum(
+        (
+            sum((item.source_end - item.source_start for item in items), timedelta())
+            - union_duration(items)
+            for category in SleepCategory
+            if (items := [item for item in intervals if item.canonical_category is category])
+        ),
+        timedelta(),
+    )
+    known_intervals = tuple(
+        item for item in intervals if item.canonical_category is not SleepCategory.IN_BED
+    )
+    covered_until: datetime | None = None
+    uncovered_gap = timedelta()
+    for item in sorted(known_intervals, key=lambda value: (value.source_start, value.source_end)):
+        if covered_until is not None and item.source_start > covered_until:
+            uncovered_gap += item.source_start - covered_until
+        if covered_until is None or item.source_end > covered_until:
+            covered_until = item.source_end
+    observed_sleep = sum((durations[category] for category in asleep_categories), stage_ambiguous)
+    known = observed_sleep + durations[SleepCategory.AWAKE]
+    span = max(item.source_end for item in known_intervals) - min(
+        item.source_start for item in known_intervals
+    )
+    detailed = (
+        durations[SleepCategory.ASLEEP_CORE]
+        + durations[SleepCategory.ASLEEP_DEEP]
+        + durations[SleepCategory.ASLEEP_REM]
+    )
+    return SleepEpisode(
+        start=min(item.source_start for item in known_intervals),
+        end=max(item.source_end for item in known_intervals),
+        first_observed_asleep=first_asleep,
+        last_observed_asleep=last_asleep,
+        observed_sleep=observed_sleep,
+        observed_awake=durations[SleepCategory.AWAKE],
+        in_bed=durations[SleepCategory.IN_BED] or None,
+        asleep_core=durations[SleepCategory.ASLEEP_CORE],
+        asleep_deep=durations[SleepCategory.ASLEEP_DEEP],
+        asleep_rem=durations[SleepCategory.ASLEEP_REM],
+        asleep_unspecified=durations[SleepCategory.ASLEEP_UNSPECIFIED],
+        stage_ambiguous=stage_ambiguous,
+        uncovered_gap=uncovered_gap,
+        removed_same_state_overlap=removed_same_state_overlap,
+        asleep_awake_conflict=asleep_awake_conflict,
+        observed_coverage_ratio=None if not span else known / span,
+        detailed_stage_coverage_ratio=None if not observed_sleep else detailed / observed_sleep,
+        interval_ids=tuple(item.measurement_version_id for item in intervals),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +1714,9 @@ class MigrationDiagnostics:
     source_version: int | None
     target_version: int
     steps: tuple[tuple[int, int], ...]
+    snapshot_source_version: int | None
+    snapshot_target_version: int
+    snapshot_steps: tuple[tuple[int, int], ...]
     diagnostics: tuple[str, ...] = ()
 
 
@@ -320,10 +1759,7 @@ class CreatePlausibilityRuleVersion:
     def __post_init__(self) -> None:
         if not isinstance(self.data_type, CanonicalHealthType):
             raise ConfigurationError("Plausibilitätsregeltyp hat einen ungültigen Typ.")
-        expected_unit = {
-            CanonicalHealthType.ACTIVE_ENERGY: CanonicalUnit.KILOCALORIE,
-            CanonicalHealthType.APPLE_RESTING_HEART_RATE: CanonicalUnit.BEATS_PER_MINUTE,
-        }[self.data_type]
+        expected_unit = canonical_unit_for(self.data_type)
         if self.specification.unit is not expected_unit:
             raise ConfigurationError("Plausibilitätsregel verwendet nicht die kanonische Einheit.")
         if self.effective_from is not None and (
@@ -463,6 +1899,40 @@ class LocalMeasurementExclusion:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkoutCorrection:
+    workout_version_id: MeasurementVersionId
+    effective_duration_minutes: float
+    distance_kilometers: float | None
+    active_energy_kilocalories: float | None
+    reason: str
+    note: str | None = None
+
+    def __post_init__(self) -> None:
+        values = (
+            self.effective_duration_minutes,
+            self.distance_kilometers,
+            self.active_energy_kilocalories,
+        )
+        if any(value is not None and (not math.isfinite(value) or value < 0) for value in values):
+            raise ConfigurationError(
+                "Korrigierte Trainingswerte müssen endlich und nichtnegativ sein."
+            )
+        if not self.reason.strip():
+            raise ConfigurationError("Trainingskorrektur verlangt einen Grund.")
+
+
+@dataclass(frozen=True, slots=True)
+class LocalWorkoutExclusion:
+    workout_version_id: MeasurementVersionId
+    reason: str
+    note: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ConfigurationError("Lokaler Trainingsausschluss verlangt einen Grund.")
+
+
+@dataclass(frozen=True, slots=True)
 class SourceValueAcceptance:
     measurement_version_id: MeasurementVersionId
     note: str | None = None
@@ -472,6 +1942,8 @@ DataReviewResolution = (
     DataConfirmation
     | DataCorrection
     | LocalMeasurementExclusion
+    | WorkoutCorrection
+    | LocalWorkoutExclusion
     | SourceValueAcceptance
     | SourceDeletionResolution
     | SourceConflictResolution
@@ -558,6 +2030,17 @@ WriteRequest = (
     | CreatePlausibilityRuleVersion
     | RunHistoricalReview
     | RunRestingHeartRateAnalysis
+    | CreateActivityDerivationVersion
+    | ReviseContextCoverageStart
+    | ReviseIllnessCategory
+    | ReviseIllnessPeriod
+    | ReviseDailyStress
+    | ReviseCustomContextLabel
+    | ReviseCustomContextPeriod
+    | ReviseMedicationRegime
+    | ReviseMedicationDeviation
+    | ReviseAsNeededIntake
+    | ReviseIntakeReasonCategory
 )
 
 
@@ -565,6 +2048,7 @@ class WriteApprovalStatus(StrEnum):
     READY = "ready"
     CONFIRMATION_REQUIRED = "confirmation_required"
     BLOCKED = "blocked"
+    NO_CHANGE = "no_change"
 
 
 class WriteConfirmation(StrEnum):
@@ -624,6 +2108,10 @@ class StoreMigrationPlan:
     source_version: int | None
     target_version: int
     steps: tuple[tuple[int, int], ...]
+    snapshot_source_version: int | None
+    snapshot_target_version: int
+    snapshot_steps: tuple[tuple[int, int], ...]
+    snapshot_as_of: datetime | None
     backup_file: str | None
     affected_snapshot_refs: tuple[SnapshotRef, ...]
     existing_analyses_become_stale: bool
@@ -678,9 +2166,7 @@ def _data_review_batch_match_payload(match: DataReviewBatchMatch) -> dict[str, o
         "case_id": str(match.case_id),
         "kind": match.kind.value,
         "measurement_version_id": (
-            None
-            if match.measurement_version_id is None
-            else str(match.measurement_version_id)
+            None if match.measurement_version_id is None else str(match.measurement_version_id)
         ),
         "rule_version_id": match.rule_version_id,
         "evidence_fingerprint": match.evidence_fingerprint,
@@ -705,6 +2191,100 @@ class HistoricalReviewPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class ManualContextRevisionPlan:
+    intent: Literal["create", "revise", "withdraw", "restore"]
+    object_kind: Literal[
+        "context_coverage_start",
+        "illness_category",
+        "illness_period",
+        "daily_stress",
+        "custom_context_label",
+        "custom_context_period",
+    ]
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId | None
+    name: str | None
+    category_logical_id: ContextLogicalId | None
+    start_date: date | None
+    end_date: date | None
+    severity: IllnessSeverity | None
+    stress_level: StressLevel | None
+    note: str | None
+    withdrawal_reason: str | None
+    base_snapshot_ref: SnapshotRef | None
+    snapshot_as_of: datetime
+    context_timezone: str
+    context_as_of_date: date
+    colliding_logical_ids: tuple[ContextLogicalId, ...]
+    referenced_logical_ids: tuple[ContextLogicalId, ...]
+    affected_start_date: date | None
+    affected_end_date: date | None
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRevisionPlan:
+    intent: Literal["create", "revise", "withdraw", "restore"]
+    object_kind: Literal[
+        "medication_regime",
+        "medication_deviation",
+        "as_needed_intake",
+        "intake_reason_category",
+    ]
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId | None
+    starts_at: datetime | None
+    timezone: str | None
+    scheduled_doses: tuple[ScheduledDose, ...]
+    as_needed_medications: tuple[AsNeededMedication, ...]
+    regime_logical_id: MedicationLogicalId | None
+    scheduled_at: datetime | None
+    actual_intakes: tuple[MedicationActualIntake, ...]
+    entry_id: MedicationPlanEntryId | None
+    taken_at: datetime | None
+    amount: Decimal | None
+    reason_category_logical_id: MedicationLogicalId | None
+    name: str | None
+    withdrawal_reason: str | None
+    base_snapshot_ref: SnapshotRef | None
+    medication_as_of: datetime
+    colliding_logical_ids: tuple[MedicationLogicalId, ...]
+    referenced_logical_ids: tuple[MedicationLogicalId, ...]
+    affected_start_date: date | None
+    affected_end_date: date | None
+
+
+MedicationRegimePlan = MedicationRevisionPlan
+MedicationDeviationPlan = MedicationRevisionPlan
+AsNeededIntakePlan = MedicationRevisionPlan
+IntakeReasonCategoryPlan = MedicationRevisionPlan
+IllnessRevisionPlan = ManualContextRevisionPlan
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityDerivationPlan:
+    active_version: ActivityDerivationVersion
+    proposed_version: ActivityDerivationVersion
+    base_snapshot_ref: SnapshotRef | None
+    affected_projections: tuple[Literal["activity_days", "workouts"], ...]
+
+    @property
+    def active_version_id(self) -> str:
+        return self.active_version.version_id
+
+    @property
+    def proposed_version_id(self) -> str:
+        return self.proposed_version.version_id
+
+    @property
+    def coverage_gap_minutes(self) -> int:
+        return self.proposed_version.coverage_gap_minutes
+
+    @property
+    def source_classifier_version(self) -> str:
+        return self.proposed_version.source_classifier_version
+
+
+@dataclass(frozen=True, slots=True)
 class RestingHeartRateAnalysisPlan:
     analysis_definition_id: AnalysisDefinitionId
     start_date: date | None
@@ -726,6 +2306,9 @@ WritePlanDetails = (
     | PlausibilityRuleVersionPlan
     | HistoricalReviewPlan
     | RestingHeartRateAnalysisPlan
+    | ManualContextRevisionPlan
+    | MedicationRevisionPlan
+    | ActivityDerivationPlan
 )
 
 
@@ -808,6 +2391,10 @@ class StoreMigrationReceipt:
     source_version: int
     target_version: int
     steps: tuple[tuple[int, int], ...]
+    snapshot_source_version: int | None
+    snapshot_target_version: int
+    snapshot_steps: tuple[tuple[int, int], ...]
+    snapshot_as_of: datetime | None
     backup_file: str | None
     diagnostics: tuple[str, ...] = ()
 
@@ -831,6 +2418,9 @@ class DataReviewCaseKind(StrEnum):
     RULE_DEFINITION = "rule_definition"
     SUSPECTED_SOURCE_DELETION = "suspected_source_deletion"
     SOURCE_CONFLICT = "source_conflict"
+    PREFERRED_DAILY_WEIGHT_CONFLICT = "preferred_daily_weight_conflict"
+    WORKOUT_PLAUSIBILITY = "workout_plausibility"
+    WORKOUT_OVERLAP = "workout_overlap"
 
 
 class DataReviewAction(StrEnum):
@@ -958,6 +2548,10 @@ class WriteNotStartedStatus(StrEnum):
     STORE_BUSY = "store_busy"
 
 
+class NoChangeStatus(StrEnum):
+    NO_CHANGE = "no_change"
+
+
 @dataclass(frozen=True, slots=True)
 class WriteNotStarted:
     status: WriteNotStartedStatus
@@ -1002,6 +2596,41 @@ class HistoricalReviewReceipt:
     diagnostics: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class ManualContextRevisionReceipt:
+    logical_id: ContextLogicalId
+    revision_id: ContextRevisionId
+    snapshot_ref: SnapshotRef
+    status: ImportStatus = ImportStatus.COMMITTED
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRevisionReceipt:
+    logical_id: MedicationLogicalId
+    revision_id: MedicationRevisionId
+    snapshot_ref: SnapshotRef
+    status: ImportStatus = ImportStatus.COMMITTED
+
+
+MedicationRegimeReceipt = MedicationRevisionReceipt
+MedicationDeviationReceipt = MedicationRevisionReceipt
+AsNeededIntakeReceipt = MedicationRevisionReceipt
+IntakeReasonCategoryReceipt = MedicationRevisionReceipt
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityDerivationReceipt:
+    version_id: str
+    snapshot_ref: SnapshotRef
+    status: ImportStatus = ImportStatus.COMMITTED
+
+
+@dataclass(frozen=True, slots=True)
+class WriteNoChange:
+    status: NoChangeStatus = NoChangeStatus.NO_CHANGE
+    diagnostics: tuple[str, ...] = ()
+
+
 class AnalysisStatus(StrEnum):
     COMPLETED = "completed"
     REUSED = "reused"
@@ -1032,7 +2661,11 @@ WriteResult = (
     | WriteBatchDecisionReceipt
     | PlausibilityRuleVersionReceipt
     | HistoricalReviewReceipt
+    | ManualContextRevisionReceipt
+    | MedicationRevisionReceipt
+    | ActivityDerivationReceipt
     | AnalysisReceipt
+    | WriteNoChange
     | WriteNotStarted
 )
 
@@ -1088,7 +2721,7 @@ class HealthLab:
 
     def preview_write(self, request: WriteRequest) -> WritePlan:
         self._require_open()
-        if not isinstance(request, get_args(WriteRequest)):
+        if not isinstance(request, (*get_args(WriteRequest), CreateActivityDerivationVersion)):
             raise ConfigurationError("Unbekannter Schreibauftrag.")
         if isinstance(request, BeginMetadataRestore):
             return self._build_metadata_restore_plan(request)
@@ -1104,12 +2737,50 @@ class HealthLab:
             return self._build_migration_rollback_plan()
         if isinstance(request, CreateMetadataBackup):
             return self._build_metadata_backup_plan(request)
+        if isinstance(request, ReviseContextCoverageStart):
+            return self._with_snapshot_capacity(
+                self._build_context_coverage_start_plan(request), CapacityMethodId.MANUAL_SNAPSHOT
+            )
+        if isinstance(request, ReviseMedicationRegime):
+            return self._with_snapshot_capacity(
+                self._build_medication_regime_plan(request), CapacityMethodId.MANUAL_SNAPSHOT
+            )
+        if isinstance(request, ReviseMedicationDeviation):
+            return self._with_snapshot_capacity(
+                self._build_medication_deviation_plan(request), CapacityMethodId.MANUAL_SNAPSHOT
+            )
+        if isinstance(request, ReviseAsNeededIntake):
+            return self._with_snapshot_capacity(
+                self._build_as_needed_intake_plan(request), CapacityMethodId.MANUAL_SNAPSHOT
+            )
+        if isinstance(request, ReviseIntakeReasonCategory):
+            return self._with_snapshot_capacity(
+                self._build_intake_reason_category_plan(request), CapacityMethodId.MANUAL_SNAPSHOT
+            )
+        if isinstance(
+            request,
+            (
+                ReviseIllnessCategory,
+                ReviseIllnessPeriod,
+                ReviseDailyStress,
+                ReviseCustomContextLabel,
+                ReviseCustomContextPeriod,
+            ),
+        ):
+            return self._with_snapshot_capacity(
+                self._build_illness_plan(request), CapacityMethodId.MANUAL_SNAPSHOT
+            )
         if isinstance(request, RunRestingHeartRateAnalysis):
             return self._build_resting_heart_rate_analysis_plan(request)
         if isinstance(request, RunHistoricalReview):
             return self._build_historical_review_plan(request)
         if isinstance(request, CreatePlausibilityRuleVersion):
             return self._build_plausibility_rule_plan(request)
+        if isinstance(request, CreateActivityDerivationVersion):
+            return self._with_snapshot_capacity(
+                self._build_activity_derivation_plan(request),
+                CapacityMethodId.ACTIVITY_DERIVATION,
+            )
         if isinstance(
             request, (ResolveDataReviewCase, ConfirmDataReviewBatch, RevokeDataReviewDecision)
         ):
@@ -1269,8 +2940,9 @@ class HealthLab:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
         diagnostics = self.load_migration_diagnostics()
         source = diagnostics.source_version
+        migration_needed = bool(diagnostics.steps or diagnostics.snapshot_steps)
         backup_file = None
-        if source is not None and diagnostics.steps:
+        if source is not None and migration_needed:
             stem = f"metadata-v{source}-to-v{diagnostics.target_version}"
             backup_directory = self._config.active_store / "migration-backups"
             sequence = 1
@@ -1285,31 +2957,31 @@ class HealthLab:
             if filevault_override is not None
             else (
                 probe_filevault(self._config.active_store)
-                if self._config.mode is DataMode.REAL and diagnostics.steps
+                if self._config.mode is DataMode.REAL and migration_needed
                 else None
             )
         )
         capacity = (
             capacity_override
             if capacity_override is not None
-            else (self._store.preflight_store_migration() if diagnostics.steps else None)
+            else (self._store.preflight_store_migration() if migration_needed else None)
         )
         blocked = bool(diagnostics.diagnostics) or (
             capacity is not None and capacity.status is not CapacityStatus.READY
         )
         confirmations: tuple[WriteConfirmation, ...] = (
-            () if not diagnostics.steps else (WriteConfirmation.STORE_MIGRATION,)
+            () if not migration_needed else (WriteConfirmation.STORE_MIGRATION,)
         )
         if filevault is not None and filevault.status is not FileVaultStatus.PROTECTED:
             confirmations += (WriteConfirmation("filevault_" + filevault.status.value),)
         plan_diagnostics = diagnostics.diagnostics
         if capacity is not None and capacity.status is not CapacityStatus.READY:
             plan_diagnostics += (
-                "capacity_" + (
-                    capacity.reason.value if capacity.reason is not None else capacity.status.value
-                ),
+                "capacity_"
+                + (capacity.reason.value if capacity.reason is not None else capacity.status.value),
             )
         active_snapshot = self._store.load_active_snapshot_id()
+        snapshot_as_of = self._store.load_active_snapshot_as_of()
         affected_snapshot_refs = () if active_snapshot is None else (active_snapshot,)
         payload = {
             "affected_snapshot_refs": tuple(map(str, affected_snapshot_refs)),
@@ -1333,6 +3005,10 @@ class HealthLab:
             "source_version": source,
             "steps": diagnostics.steps,
             "target_version": diagnostics.target_version,
+            "snapshot_source_version": diagnostics.snapshot_source_version,
+            "snapshot_as_of": (None if snapshot_as_of is None else snapshot_as_of.isoformat()),
+            "snapshot_steps": diagnostics.snapshot_steps,
+            "snapshot_target_version": diagnostics.snapshot_target_version,
             "existing_analyses_become_stale": active_snapshot is not None,
             "version": 1,
         }
@@ -1346,6 +3022,10 @@ class HealthLab:
                 source,
                 diagnostics.target_version,
                 diagnostics.steps,
+                diagnostics.snapshot_source_version,
+                diagnostics.snapshot_target_version,
+                diagnostics.snapshot_steps,
+                snapshot_as_of,
                 backup_file,
                 affected_snapshot_refs,
                 active_snapshot is not None,
@@ -1356,7 +3036,7 @@ class HealthLab:
                     if blocked
                     else (
                         WriteApprovalStatus.CONFIRMATION_REQUIRED
-                        if diagnostics.steps
+                        if migration_needed
                         else WriteApprovalStatus.READY
                     )
                 ),
@@ -1373,9 +3053,7 @@ class HealthLab:
         facts = self._store.load_migration_rollback_facts()
         diagnostics = plan_migration_rollback(facts)
         details = RollbackMigrationPlan(
-            migration_operation_id=(
-                None if facts is None else facts.migration_operation_id
-            ),
+            migration_operation_id=(None if facts is None else facts.migration_operation_id),
             source_version=None if facts is None else facts.post_migration_version,
             target_version=None if facts is None else facts.pre_migration_version,
             backup_file=None if facts is None else facts.backup_file,
@@ -1387,9 +3065,7 @@ class HealthLab:
             "backup_file": details.backup_file,
             "backup_sha256": details.backup_sha256,
             "current_snapshot_ref": (
-                None
-                if details.current_snapshot_ref is None
-                else str(details.current_snapshot_ref)
+                None if details.current_snapshot_ref is None else str(details.current_snapshot_ref)
             ),
             "diagnostics": diagnostics,
             "migration_operation_id": (
@@ -1473,8 +3149,7 @@ class HealthLab:
             description = describe_metadata_backup(self._store, request.target_path)
             filevault = filevault_override or probe_filevault(request.target_path.parent)
             capacity = capacity_override or preflight_metadata_backup(
-                self._store,
-                request.target_path
+                self._store, request.target_path
             )
         except StoreError as error:
             raise HealthLabError("Metadatensicherung konnte nicht geplant werden.") from error
@@ -1485,8 +3160,7 @@ class HealthLab:
             ()
             if capacity.status is CapacityStatus.READY
             else (
-                "capacity_"
-                + (capacity.reason.value if capacity.reason else capacity.status.value),
+                "capacity_" + (capacity.reason.value if capacity.reason else capacity.status.value),
             )
         )
         blocked = capacity.status is not CapacityStatus.READY
@@ -1632,6 +3306,1165 @@ class HealthLab:
             ),
         )
 
+    def _build_activity_derivation_plan(
+        self, request: CreateActivityDerivationVersion
+    ) -> WritePlan:
+        settings = self.load_activity_settings()
+        snapshot = self._store.load_active_snapshot_id() if self._store is not None else None
+        payload = {
+            "base_snapshot_ref": None if snapshot is None else str(snapshot),
+            "coverage_gap_minutes": request.coverage_gap_minutes,
+            "previous_version_id": settings.active_version.version_id,
+            "source_classifier_version": _ACTIVITY_SOURCE_CLASSIFIER_VERSION,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return WritePlan(
+            PlanFingerprint(hashlib.sha256(b"plan:" + encoded).hexdigest()),
+            ActivityDerivationPlan(
+                settings.active_version,
+                ActivityDerivationVersion(
+                    hashlib.sha256(b"activity-derivation:" + encoded).hexdigest(),
+                    request.coverage_gap_minutes,
+                    _ACTIVITY_SOURCE_CLASSIFIER_VERSION,
+                ),
+                snapshot,
+                ("activity_days", "workouts"),
+            ),
+            WritePreflight(WriteApproval(WriteApprovalStatus.READY)),
+        )
+
+    def _with_snapshot_capacity(self, plan: WritePlan, method_id: CapacityMethodId) -> WritePlan:
+        assert self._store is not None
+        capacity = self._store.preflight_snapshot_write(
+            method_id=method_id,
+            requested_start=self._snapshot_capacity_start(plan),
+            requested_end=self._snapshot_capacity_end(plan),
+        )
+        diagnostics = plan.diagnostics
+        approval = plan.approval
+        if (
+            approval.status is WriteApprovalStatus.READY
+            and capacity.status is not CapacityStatus.READY
+        ):
+            approval = WriteApproval(WriteApprovalStatus.BLOCKED)
+            diagnostics = (
+                "capacity_"
+                + (capacity.reason.value if capacity.reason is not None else capacity.status.value),
+            )
+        fingerprint = PlanFingerprint(
+            hashlib.sha256(
+                f"{plan.fingerprint}:{capacity.target_volume}:{capacity.method_id}:"
+                f"{capacity.estimate_bytes}:{capacity.status.value}".encode()
+            ).hexdigest()
+        )
+        return replace(
+            plan,
+            fingerprint=fingerprint,
+            preflight=replace(
+                plan.preflight,
+                approval=approval,
+                diagnostics=diagnostics,
+                capacity=capacity,
+            ),
+        )
+
+    def _build_context_coverage_start_plan(self, request: ReviseContextCoverageStart) -> WritePlan:
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        snapshot = self._store.load_active_snapshot_id()
+        intent = request.intent
+        kind: Literal["create", "revise", "withdraw", "restore"]
+        start_date: date | None
+        expected_revision_id: ContextRevisionId | None
+        withdrawal_reason: str | None
+        if isinstance(intent, ContextCoverageStartCreate):
+            kind, start_date, expected_revision_id = "create", intent.start_date, None
+            withdrawal_reason = None
+            logical_id = ContextLogicalId(
+                hashlib.sha256(b"context_coverage_start").hexdigest()[:32]
+            )
+        elif isinstance(intent, ContextCoverageStartRevise):
+            kind, logical_id, start_date, expected_revision_id = (
+                "revise",
+                intent.logical_id,
+                intent.start_date,
+                intent.expected_revision_id,
+            )
+            withdrawal_reason = None
+        elif isinstance(intent, ContextCoverageStartWithdraw):
+            kind, logical_id, start_date, expected_revision_id = (
+                "withdraw",
+                intent.logical_id,
+                None,
+                intent.expected_revision_id,
+            )
+            withdrawal_reason = intent.reason.strip()
+        else:
+            assert isinstance(intent, ContextCoverageStartRestore)
+            kind, logical_id, start_date, expected_revision_id = (
+                "restore",
+                intent.logical_id,
+                intent.start_date,
+                intent.expected_revision_id,
+            )
+            withdrawal_reason = None
+        timezone = "Europe/Berlin"
+        snapshot_as_of = datetime.combine(
+            datetime.now(ZoneInfo(timezone)).date(), time.min, ZoneInfo(timezone)
+        )
+        current = None if snapshot is None else self._store.load_context_coverage_start(snapshot)
+        blocked = snapshot is None or (
+            start_date is not None and start_date > snapshot_as_of.date()
+        )
+        diagnostics = (
+            ("context_requires_snapshot",)
+            if snapshot is None
+            else (("context_date_in_future",) if blocked else ())
+        )
+        if not blocked:
+            if kind == "create":
+                blocked = current is not None or bool(
+                    self._store.load_context_coverage_audit(str(logical_id))
+                )
+            elif (
+                (current is None and kind != "restore")
+                or (current is not None and kind == "restore")
+                or (
+                    current is not None
+                    and (
+                        current.logical_id != str(logical_id)
+                        or current.revision_id != str(expected_revision_id)
+                    )
+                )
+            ):
+                blocked = True
+            if blocked and not diagnostics:
+                diagnostics = ("context_revision_changed",)
+        no_change = (
+            not blocked
+            and kind == "revise"
+            and current is not None
+            and current.start_date == start_date
+        )
+        payload = {
+            "intent": kind,
+            "logical_id": str(logical_id),
+            "expected_revision_id": None
+            if expected_revision_id is None
+            else str(expected_revision_id),
+            "start_date": None if start_date is None else start_date.isoformat(),
+            "withdrawal_reason": withdrawal_reason,
+            "base_snapshot_ref": None if snapshot is None else str(snapshot),
+            "snapshot_as_of": snapshot_as_of.isoformat(),
+            "context_timezone": timezone,
+            "context_as_of_date": snapshot_as_of.date().isoformat(),
+            "collisions": (),
+            "references": (),
+            "affected_start_date": None
+            if start_date is None
+            else start_date.isoformat(),
+            "affected_end_date": snapshot_as_of.date().isoformat(),
+            "preflight": {
+                "approval": "blocked" if blocked else ("no_change" if no_change else "ready"),
+                "diagnostics": diagnostics,
+            },
+        }
+        return WritePlan(
+            PlanFingerprint(
+                hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+            ),
+            ManualContextRevisionPlan(
+                kind,
+                "context_coverage_start",
+                logical_id,
+                expected_revision_id,
+                None,
+                None,
+                start_date,
+                None,
+                None,
+                None,
+                None,
+                withdrawal_reason,
+                snapshot,
+                snapshot_as_of,
+                timezone,
+                snapshot_as_of.date(),
+                (),
+                (),
+                start_date if start_date is not None else getattr(current, "start_date", None),
+                snapshot_as_of.date(),
+            ),
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED
+                    if blocked
+                    else (WriteApprovalStatus.NO_CHANGE if no_change else WriteApprovalStatus.READY)
+                ),
+                diagnostics=diagnostics,
+            ),
+        )
+
+    def _build_medication_regime_plan(self, request: ReviseMedicationRegime) -> WritePlan:
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        snapshot = self._store.load_active_snapshot_id()
+        intent = request.intent
+        if isinstance(intent, MedicationRegimeCreate):
+            kind: Literal["create", "revise", "withdraw", "restore"] = "create"
+            expected = None
+            logical_id = MedicationLogicalId(
+                hashlib.sha256(
+                    repr((intent.starts_at, intent.timezone, intent.scheduled_doses)).encode()
+                ).hexdigest()[:32]
+            )
+        elif isinstance(intent, MedicationRegimeRestore):
+            kind, logical_id, expected = "restore", intent.logical_id, intent.expected_revision_id
+        elif isinstance(intent, MedicationRegimeWithdraw):
+            kind, logical_id, expected = "withdraw", intent.logical_id, intent.expected_revision_id
+        else:
+            kind, logical_id, expected = "revise", intent.logical_id, intent.expected_revision_id
+        medication_as_of = self._store.load_medication_as_of(snapshot)
+        current = self._store.load_medication_regime(snapshot, str(logical_id))
+        audit = self._store.load_medication_regime_audit(str(logical_id))
+        if isinstance(intent, MedicationRegimeWithdraw):
+            starts_at = current.starts_at if current is not None else medication_as_of
+            timezone = current.timezone if current is not None else "UTC"
+            scheduled_doses = (
+                ()
+                if current is None
+                else tuple(
+                    ScheduledDose(
+                        name,
+                        Decimal(amount),
+                        unit,
+                        local_time,
+                        frozenset(map(Weekday, days)),
+                    )
+                    for name, amount, unit, local_time, days in current.scheduled_doses
+                )
+            )
+            requested_as_needed = (
+                ()
+                if current is None
+                else tuple(
+                    AsNeededMedication(
+                        name,
+                        Decimal(amount),
+                        unit,
+                        tuple(MedicationLogicalId(item) for item in reason_ids),
+                        MedicationPlanEntryId(entry_id),
+                    )
+                    for name, amount, unit, reason_ids, entry_id in current.as_needed_medications
+                )
+            )
+            withdrawal_reason = intent.reason.strip()
+        else:
+            starts_at = intent.starts_at
+            timezone = intent.timezone
+            scheduled_doses = intent.scheduled_doses
+            requested_as_needed = intent.as_needed_medications
+            withdrawal_reason = None
+        as_needed_medications = tuple(
+            item
+            if item.entry_id is not None
+            else replace(
+                item,
+                entry_id=MedicationPlanEntryId(
+                    hashlib.sha256(repr((logical_id, index, item)).encode()).hexdigest()[:32]
+                ),
+            )
+            for index, item in enumerate(requested_as_needed)
+        )
+        active_regimes = self._store.load_active_medication_regimes(snapshot)
+        blocked = snapshot is None or (
+            kind != "withdraw" and starts_at.astimezone(UTC) > medication_as_of.astimezone(UTC)
+        )
+        diagnostics = ("medication_requires_snapshot",) if snapshot is None else ()
+        if not blocked and (
+            (kind == "create" and (current is not None or audit))
+            or (
+                kind in {"revise", "withdraw"}
+                and (current is None or current.revision_id != str(expected))
+            )
+            or (
+                kind == "restore"
+                and (
+                    current is not None
+                    or not audit
+                    or audit[-1].revision_id != str(expected)
+                    or audit[-1].state != "withdrawn"
+                )
+            )
+        ):
+            blocked, diagnostics = True, ("medication_revision_changed",)
+        if (
+            not blocked
+            and kind == "create"
+            and any(regime.starts_at == starts_at for regime in active_regimes)
+        ):
+            blocked, diagnostics = True, ("medication_start_exists",)
+        if not blocked and kind in {"revise", "withdraw"}:
+            referenced_deviations = tuple(
+                deviation
+                for deviation in self._store.load_active_medication_deviations(snapshot)
+                if deviation.regime_logical_id == str(logical_id)
+            )
+            referenced_intakes = tuple(
+                intake
+                for intake in self._store.load_active_as_needed_intakes(snapshot)
+                if intake.regime_logical_id == str(logical_id)
+            )
+            invalid_reference = (
+                (kind == "withdraw" and bool(referenced_deviations or referenced_intakes))
+                or any(
+                    not any(
+                        _resolve_medication_local_datetime(
+                            deviation.scheduled_at.astimezone(ZoneInfo(timezone)).date(),
+                            dose.local_time,
+                            timezone,
+                        )
+                        == deviation.scheduled_at
+                        for dose in scheduled_doses
+                        if Weekday(
+                            deviation.scheduled_at.astimezone(ZoneInfo(timezone))
+                            .strftime("%A")
+                            .lower()
+                        )
+                        in dose.weekdays
+                    )
+                    for deviation in referenced_deviations
+                )
+                or any(
+                    not any(str(item.entry_id) == intake.entry_id for item in as_needed_medications)
+                    for intake in referenced_intakes
+                )
+            )
+            if invalid_reference:
+                blocked, diagnostics = True, ("medication_reference_invalid",)
+        if not blocked and any(
+            self._store.load_intake_reason_category(snapshot, str(category_id)) is None
+            for medication in as_needed_medications
+            for category_id in medication.preferred_reason_category_ids
+        ):
+            blocked, diagnostics = True, ("intake_reason_category_not_active",)
+        no_change = (
+            not blocked
+            and kind == "revise"
+            and current is not None
+            and current.starts_at == starts_at
+            and current.timezone == timezone
+            and current.scheduled_doses
+            == tuple(
+                (
+                    dose.medication_name,
+                    str(dose.amount),
+                    dose.unit,
+                    dose.local_time,
+                    tuple(sorted(day.value for day in dose.weekdays)),
+                )
+                for dose in scheduled_doses
+            )
+            and current.as_needed_medications
+            == tuple(
+                (
+                    item.medication_name,
+                    str(item.amount),
+                    item.unit,
+                    tuple(str(category_id) for category_id in item.preferred_reason_category_ids),
+                    str(item.entry_id),
+                )
+                for item in as_needed_medications
+            )
+        )
+        payload = {
+            "intent": kind,
+            "logical_id": str(logical_id),
+            "expected_revision_id": None if expected is None else str(expected),
+            "starts_at": starts_at.isoformat(),
+            "timezone": timezone,
+            "doses": [
+                (
+                    dose.medication_name,
+                    str(dose.amount),
+                    dose.unit,
+                    dose.local_time.isoformat(),
+                    sorted(dose.weekdays),
+                )
+                for dose in scheduled_doses
+            ],
+            "as_needed": [
+                (
+                    item.medication_name,
+                    str(item.amount),
+                    item.unit,
+                    tuple(str(category_id) for category_id in item.preferred_reason_category_ids),
+                    str(item.entry_id),
+                )
+                for item in as_needed_medications
+            ],
+            "withdrawal_reason": withdrawal_reason,
+            "base_snapshot_ref": None if snapshot is None else str(snapshot),
+            "medication_as_of": medication_as_of.isoformat(),
+            "references": tuple(
+                str(category_id)
+                for item in as_needed_medications
+                for category_id in item.preferred_reason_category_ids
+            ),
+            "diagnostics": diagnostics,
+            "approval": "no_change" if no_change else ("blocked" if blocked else "ready"),
+        }
+        return WritePlan(
+            PlanFingerprint(
+                hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, default=str).encode()
+                ).hexdigest()
+            ),
+            MedicationRevisionPlan(
+                kind,
+                "medication_regime",
+                logical_id,
+                expected,
+                starts_at,
+                timezone,
+                scheduled_doses,
+                as_needed_medications,
+                None,
+                None,
+                (),
+                None,
+                None,
+                None,
+                None,
+                None,
+                withdrawal_reason,
+                snapshot,
+                medication_as_of,
+                (),
+                tuple(
+                    category_id
+                    for item in as_needed_medications
+                    for category_id in item.preferred_reason_category_ids
+                ),
+                None if starts_at is None else starts_at.date(),
+                medication_as_of.date(),
+            ),
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED
+                    if blocked
+                    else (WriteApprovalStatus.NO_CHANGE if no_change else WriteApprovalStatus.READY)
+                ),
+                diagnostics=diagnostics,
+            ),
+        )
+
+    def _build_medication_deviation_plan(self, request: ReviseMedicationDeviation) -> WritePlan:
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        snapshot = self._store.load_active_snapshot_id()
+        as_of = self._store.load_medication_as_of(snapshot)
+        intent = request.intent
+        if isinstance(intent, MedicationDeviationCreate):
+            kind, expected = "create", None
+            logical_id = MedicationLogicalId(
+                hashlib.sha256(
+                    repr((intent.regime_logical_id, intent.scheduled_at)).encode()
+                ).hexdigest()[:32]
+            )
+            regime_id, scheduled_at, actual_intakes = (
+                intent.regime_logical_id,
+                intent.scheduled_at,
+                intent.actual_intakes,
+            )
+            withdrawal_reason = None
+        else:
+            kind = (
+                "revise"
+                if isinstance(intent, MedicationDeviationRevise)
+                else "withdraw"
+                if isinstance(intent, MedicationDeviationWithdraw)
+                else "restore"
+            )
+            logical_id, expected = intent.logical_id, intent.expected_revision_id
+            current = self._store.load_medication_deviation(snapshot, str(logical_id))
+            if current is None and isinstance(intent, MedicationDeviationRestore):
+                audit = self._store.load_medication_deviation_audit(str(logical_id))
+                current = audit[-1] if audit else None
+            if isinstance(intent, MedicationDeviationWithdraw):
+                regime_id = (
+                    MedicationLogicalId(current.regime_logical_id) if current else logical_id
+                )
+                scheduled_at = current.scheduled_at if current else as_of
+                actual_intakes = ()
+            else:
+                regime_id = intent.regime_logical_id
+                scheduled_at = intent.scheduled_at
+                actual_intakes = intent.actual_intakes
+            withdrawal_reason = (
+                intent.reason if isinstance(intent, MedicationDeviationWithdraw) else None
+            )
+        current = self._store.load_medication_deviation(snapshot, str(logical_id))
+        if current is None and isinstance(intent, MedicationDeviationRestore):
+            audit = self._store.load_medication_deviation_audit(str(logical_id))
+            current = audit[-1] if audit else None
+        regimes = self._store.load_active_medication_regimes(snapshot)
+        regime = next((item for item in regimes if item.logical_id == str(regime_id)), None)
+        occurrence = (
+            None
+            if regime is None
+            else next(
+                (
+                    (Decimal(amount), unit)
+                    for _, amount, unit, local_time, weekdays in regime.scheduled_doses
+                    if Weekday(
+                        scheduled_at.astimezone(ZoneInfo(regime.timezone)).strftime("%A").lower()
+                    )
+                    in {Weekday(day) for day in weekdays}
+                    and _resolve_medication_local_datetime(
+                        scheduled_at.astimezone(ZoneInfo(regime.timezone)).date(),
+                        local_time,
+                        regime.timezone,
+                    )
+                    == scheduled_at
+                ),
+                None,
+            )
+        )
+        blocked = (
+            snapshot is None
+            or occurrence is None
+            or any(
+                intake.taken_at.astimezone(UTC) > as_of.astimezone(UTC) for intake in actual_intakes
+            )
+        )
+        identical_intake = (
+            occurrence is not None
+            and len(actual_intakes) == 1
+            and actual_intakes[0].taken_at == scheduled_at
+            and actual_intakes[0].amount == occurrence[0]
+        )
+        diagnostics = ("medication_requires_snapshot",) if snapshot is None else ()
+        if not blocked and (
+            (kind == "create" and current is not None and not identical_intake)
+            or (kind != "create" and (current is None or current.revision_id != str(expected)))
+        ):
+            blocked, diagnostics = True, ("medication_revision_changed",)
+        if (
+            not blocked
+            and kind == "create"
+            and not identical_intake
+            and self._store.load_medication_deviation(snapshot, str(logical_id))
+        ):
+            blocked, diagnostics = True, ("medication_deviation_exists",)
+        no_change = not blocked and kind != "withdraw" and identical_intake
+        payload = {
+            "intent": kind,
+            "logical_id": str(logical_id),
+            "expected_revision_id": None if expected is None else str(expected),
+            "regime_logical_id": str(regime_id),
+            "scheduled_at": scheduled_at.isoformat(),
+            "actual_intakes": [
+                (item.taken_at.isoformat(), str(item.amount)) for item in actual_intakes
+            ],
+            "base_snapshot_ref": None if snapshot is None else str(snapshot),
+            "medication_as_of": as_of.isoformat(),
+            "references": (str(regime_id),),
+            "diagnostics": diagnostics,
+            "approval": "no_change" if no_change else ("blocked" if blocked else "ready"),
+        }
+        return WritePlan(
+            PlanFingerprint(
+                hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+            ),
+            MedicationRevisionPlan(
+                cast(Literal["create", "revise", "withdraw", "restore"], kind),
+                "medication_deviation",
+                logical_id,
+                expected,
+                None,
+                None,
+                (),
+                (),
+                regime_id,
+                scheduled_at,
+                actual_intakes,
+                None,
+                None,
+                None,
+                None,
+                None,
+                withdrawal_reason,
+                snapshot,
+                as_of,
+                (),
+                (regime_id,),
+                scheduled_at.date(),
+                scheduled_at.date(),
+            ),
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED
+                    if blocked
+                    else (WriteApprovalStatus.NO_CHANGE if no_change else WriteApprovalStatus.READY)
+                ),
+                diagnostics=diagnostics,
+            ),
+        )
+
+    def _build_intake_reason_category_plan(self, request: ReviseIntakeReasonCategory) -> WritePlan:
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        snapshot = self._store.load_active_snapshot_id()
+        as_of = self._store.load_medication_as_of(snapshot)
+        intent = request.intent
+        name: str | None
+        if isinstance(intent, IntakeReasonCategoryCreate):
+            kind: Literal["create", "revise", "withdraw", "restore"] = "create"
+            name = " ".join(intent.name.split())
+            logical_id = MedicationLogicalId(
+                hashlib.sha256(name.casefold().encode()).hexdigest()[:32]
+            )
+            expected, withdrawal_reason = None, None
+        else:
+            kind = (
+                "restore"
+                if isinstance(intent, IntakeReasonCategoryRestore)
+                else "withdraw"
+                if isinstance(intent, IntakeReasonCategoryWithdraw)
+                else "revise"
+            )
+            logical_id, expected = intent.logical_id, intent.expected_revision_id
+            current = self._store.load_intake_reason_category(snapshot, str(logical_id))
+            audit = self._store.load_intake_reason_category_audit(str(logical_id))
+            name = (
+                " ".join(intent.name.split())
+                if not isinstance(intent, IntakeReasonCategoryWithdraw)
+                else (current.name if current is not None else (audit[-1].name if audit else None))
+            )
+            withdrawal_reason = (
+                intent.reason.strip() if isinstance(intent, IntakeReasonCategoryWithdraw) else None
+            )
+        current = self._store.load_intake_reason_category(snapshot, str(logical_id))
+        audit = self._store.load_intake_reason_category_audit(str(logical_id))
+        invalid_name = (
+            name is None
+            or not 1 <= len(name) <= 80
+            or any(ord(char) < 32 for char in name)
+            or name.casefold() == "sonstige"
+        )
+        blocked = snapshot is None or invalid_name
+        diagnostics = (
+            ("medication_requires_snapshot",)
+            if snapshot is None
+            else (("invalid_intake_reason_category_name",) if invalid_name else ())
+        )
+        if not blocked and (
+            (kind == "create" and (current is not None or audit))
+            or (
+                kind == "restore"
+                and (
+                    not audit
+                    or audit[-1].revision_id != str(expected)
+                    or audit[-1].state != "withdrawn"
+                )
+            )
+            or (
+                kind in {"revise", "withdraw"}
+                and (current is None or current.revision_id != str(expected))
+            )
+        ):
+            blocked, diagnostics = True, ("medication_revision_changed",)
+        if (
+            not blocked
+            and kind != "withdraw"
+            and name is not None
+            and self._store.is_intake_reason_category_name_reserved(
+                name, excluding_logical_id=None if kind == "create" else str(logical_id)
+            )
+        ):
+            blocked, diagnostics = True, ("intake_reason_category_reserved",)
+        if (
+            not blocked
+            and kind == "withdraw"
+            and any(
+                str(logical_id) in entry[3]
+                for regime in self._store.load_active_medication_regimes(snapshot)
+                for entry in regime.as_needed_medications
+            )
+        ):
+            blocked, diagnostics = True, ("intake_reason_category_preferred",)
+        no_change = (
+            not blocked and kind == "revise" and current is not None and current.name == name
+        )
+        payload = {
+            "intent": kind,
+            "logical_id": str(logical_id),
+            "expected_revision_id": None if expected is None else str(expected),
+            "name": name,
+            "withdrawal_reason": withdrawal_reason,
+            "base_snapshot_ref": None if snapshot is None else str(snapshot),
+            "medication_as_of": as_of.isoformat(),
+            "references": (),
+            "diagnostics": diagnostics,
+            "approval": "no_change" if no_change else ("blocked" if blocked else "ready"),
+        }
+        return WritePlan(
+            PlanFingerprint(
+                hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+            ),
+            MedicationRevisionPlan(
+                kind,
+                "intake_reason_category",
+                logical_id,
+                expected,
+                None,
+                None,
+                (),
+                (),
+                None,
+                None,
+                (),
+                None,
+                None,
+                None,
+                None,
+                name,
+                withdrawal_reason,
+                snapshot,
+                as_of,
+                (),
+                (),
+                None,
+                as_of.date(),
+            ),
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED
+                    if blocked
+                    else (WriteApprovalStatus.NO_CHANGE if no_change else WriteApprovalStatus.READY)
+                ),
+                diagnostics=diagnostics,
+            ),
+        )
+
+    def _build_as_needed_intake_plan(self, request: ReviseAsNeededIntake) -> WritePlan:
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        snapshot = self._store.load_active_snapshot_id()
+        as_of = self._store.load_medication_as_of(snapshot)
+        intent = request.intent
+        if isinstance(intent, AsNeededIntakeCreate):
+            kind: Literal["create", "revise", "withdraw", "restore"] = "create"
+            logical_id = MedicationLogicalId(
+                hashlib.sha256(
+                    repr((intent.regime_logical_id, intent.entry_id, intent.taken_at)).encode()
+                ).hexdigest()[:32]
+            )
+            regime_id, entry_id, taken_at, amount, category_id = (
+                intent.regime_logical_id,
+                intent.entry_id,
+                intent.taken_at,
+                intent.amount,
+                intent.reason_category_logical_id,
+            )
+            expected, withdrawal_reason = None, None
+        else:
+            kind = (
+                "restore"
+                if isinstance(intent, AsNeededIntakeRestore)
+                else "withdraw"
+                if isinstance(intent, AsNeededIntakeWithdraw)
+                else "revise"
+            )
+            logical_id, expected = intent.logical_id, intent.expected_revision_id
+            current = self._store.load_as_needed_intake(snapshot, str(logical_id))
+            audit = self._store.load_as_needed_intake_audit(str(logical_id))
+            source = current if current is not None else (audit[-1] if audit else None)
+            if isinstance(intent, AsNeededIntakeWithdraw):
+                regime_id = (
+                    MedicationLogicalId(source.regime_logical_id)
+                    if source is not None
+                    else logical_id
+                )
+                entry_id = (
+                    MedicationPlanEntryId(source.entry_id)
+                    if source is not None
+                    else MedicationPlanEntryId(str(logical_id))
+                )
+                taken_at = source.taken_at if source is not None else as_of
+                amount = Decimal(source.amount) if source is not None else Decimal("1")
+                category_id = (
+                    None
+                    if source is None or source.reason_category_logical_id is None
+                    else MedicationLogicalId(source.reason_category_logical_id)
+                )
+                withdrawal_reason = intent.reason.strip()
+            else:
+                regime_id, entry_id = intent.regime_logical_id, intent.entry_id
+                taken_at, amount, category_id = (
+                    intent.taken_at,
+                    intent.amount,
+                    intent.reason_category_logical_id,
+                )
+                withdrawal_reason = None
+        current = self._store.load_as_needed_intake(snapshot, str(logical_id))
+        audit = self._store.load_as_needed_intake_audit(str(logical_id))
+        regimes = self._store.load_active_medication_regimes(snapshot)
+        regime = next((item for item in regimes if item.logical_id == str(regime_id)), None)
+        next_regime = (
+            None
+            if regime is None
+            else next((item for item in regimes if item.starts_at > regime.starts_at), None)
+        )
+        entry = (
+            None
+            if regime is None
+            else next(
+                (item for item in regime.as_needed_medications if item[4] == str(entry_id)), None
+            )
+        )
+        reference_invalid = (
+            regime is None
+            or entry is None
+            or taken_at < regime.starts_at
+            or (next_regime is not None and taken_at >= next_regime.starts_at)
+            or (
+                category_id is not None
+                and self._store.load_intake_reason_category(snapshot, str(category_id)) is None
+            )
+        )
+        blocked = (
+            snapshot is None
+            or reference_invalid
+            or taken_at.astimezone(UTC) > as_of.astimezone(UTC)
+        )
+        diagnostics = (
+            ("medication_requires_snapshot",)
+            if snapshot is None
+            else (("as_needed_intake_reference_invalid",) if reference_invalid else ())
+        )
+        if not blocked and (
+            (kind == "create" and (current is not None or audit))
+            or (
+                kind == "restore"
+                and (
+                    not audit
+                    or audit[-1].revision_id != str(expected)
+                    or audit[-1].state != "withdrawn"
+                )
+            )
+            or (
+                kind in {"revise", "withdraw"}
+                and (current is None or current.revision_id != str(expected))
+            )
+        ):
+            blocked, diagnostics = True, ("medication_revision_changed",)
+        no_change = (
+            not blocked
+            and kind == "revise"
+            and current is not None
+            and current.taken_at == taken_at
+            and current.amount == str(amount)
+            and current.reason_category_logical_id
+            == (None if category_id is None else str(category_id))
+        )
+        payload = {
+            "intent": kind,
+            "logical_id": str(logical_id),
+            "expected_revision_id": None if expected is None else str(expected),
+            "regime_logical_id": str(regime_id),
+            "entry_id": str(entry_id),
+            "taken_at": taken_at.isoformat(),
+            "amount": str(amount),
+            "reason_category_logical_id": None if category_id is None else str(category_id),
+            "withdrawal_reason": withdrawal_reason,
+            "base_snapshot_ref": None if snapshot is None else str(snapshot),
+            "medication_as_of": as_of.isoformat(),
+            "references": (str(regime_id),)
+            + (() if category_id is None else (str(category_id),)),
+            "diagnostics": diagnostics,
+            "approval": "no_change" if no_change else ("blocked" if blocked else "ready"),
+        }
+        return WritePlan(
+            PlanFingerprint(
+                hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+            ),
+            MedicationRevisionPlan(
+                kind,
+                "as_needed_intake",
+                logical_id,
+                expected,
+                None,
+                None,
+                (),
+                (),
+                regime_id,
+                None,
+                (),
+                entry_id,
+                taken_at,
+                amount,
+                category_id,
+                None,
+                withdrawal_reason,
+                snapshot,
+                as_of,
+                (),
+                (regime_id,) + (() if category_id is None else (category_id,)),
+                taken_at.date(),
+                taken_at.date(),
+            ),
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED
+                    if blocked
+                    else (WriteApprovalStatus.NO_CHANGE if no_change else WriteApprovalStatus.READY)
+                ),
+                diagnostics=diagnostics,
+            ),
+        )
+
+    def _build_illness_plan(
+        self,
+        request: ReviseIllnessCategory
+        | ReviseIllnessPeriod
+        | ReviseDailyStress
+        | ReviseCustomContextLabel
+        | ReviseCustomContextPeriod,
+    ) -> WritePlan:
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        intent = request.intent
+        object_kind = (
+            "illness_category"
+            if isinstance(request, ReviseIllnessCategory)
+            else "illness_period"
+            if isinstance(request, ReviseIllnessPeriod)
+            else "daily_stress"
+            if isinstance(request, ReviseDailyStress)
+            else "custom_context_label"
+            if isinstance(request, ReviseCustomContextLabel)
+            else "custom_context_period"
+        )
+        kind: Literal["create", "revise", "withdraw", "restore"] = (
+            "create"
+            if type(intent).__name__.endswith("Create")
+            else "revise"
+            if type(intent).__name__.endswith("Revise")
+            else "withdraw"
+            if type(intent).__name__.endswith("Withdraw")
+            else "restore"
+        )
+        expected_revision_id = getattr(intent, "expected_revision_id", None)
+        name = getattr(intent, "name", None)
+        category_logical_id = getattr(
+            intent, "category_logical_id", getattr(intent, "label_logical_id", None)
+        )
+        start_date = getattr(intent, "start_date", getattr(intent, "day", None))
+        end_date = getattr(intent, "end_date", None)
+        severity = getattr(intent, "severity", None)
+        stress_level = getattr(intent, "level", None)
+        note = getattr(intent, "note", None)
+        withdrawal_reason = getattr(intent, "reason", None)
+        if name is not None:
+            name = " ".join(name.split())
+        if note is not None:
+            note = note.strip()
+        snapshot = self._store.load_active_snapshot_id()
+        timezone = "Europe/Berlin"
+        snapshot_as_of = datetime.combine(
+            datetime.now(ZoneInfo(timezone)).date(), time.min, ZoneInfo(timezone)
+        )
+        identity = json.dumps(
+            [
+                object_kind,
+                name,
+                None if category_logical_id is None else str(category_logical_id),
+                None if start_date is None else start_date.isoformat(),
+                None if end_date is None else end_date.isoformat(),
+                None if severity is None else severity.value,
+                None if stress_level is None else stress_level.value,
+                note,
+            ],
+            sort_keys=True,
+        )
+        logical_id = getattr(intent, "logical_id", None) or ContextLogicalId(
+            hashlib.sha256(identity.encode()).hexdigest()[:32]
+        )
+        active = self._store.load_active_illness(snapshot)
+        current = next((value for value in active if value.logical_id == str(logical_id)), None)
+        audit = self._store.load_illness_revisions(str(logical_id))
+        colliding_logical_ids: list[ContextLogicalId] = []
+        blocked = snapshot is None
+        diagnostics: tuple[str, ...] = ("context_requires_snapshot",) if blocked else ()
+        if name is not None and (
+            not name or len(name) > 80 or any(ord(char) < 32 for char in name)
+        ):
+            blocked, diagnostics = True, ("invalid_context_label_name",)
+        if note is not None and (len(note) > 1000 or any(ord(char) < 32 for char in note)):
+            blocked, diagnostics = True, ("invalid_context_note",)
+        if (
+            object_kind in {"illness_category", "custom_context_label"}
+            and name is not None
+            and (
+                self._store.is_illness_category_name_reserved
+                if object_kind == "illness_category"
+                else self._store.is_custom_context_label_name_reserved
+            )(name, excluding_logical_id=None if kind == "create" else str(logical_id))
+        ):
+            blocked, diagnostics = True, (f"{object_kind}_reserved",)
+        if start_date is not None and (
+            start_date > snapshot_as_of.date() or (end_date is not None and start_date > end_date)
+        ):
+            blocked, diagnostics = True, ("invalid_illness_period_dates",)
+        if object_kind in {"illness_period", "custom_context_period"} and not blocked:
+            categories = {
+                value.logical_id
+                for value in active
+                if value.object_kind
+                == (
+                    "illness_category"
+                    if object_kind == "illness_period"
+                    else "custom_context_label"
+                )
+            }
+            if category_logical_id is None or str(category_logical_id) not in categories:
+                blocked, diagnostics = True, ("context_label_not_active",)
+            elif start_date is not None:
+                requested_end = snapshot_as_of.date() if end_date is None else end_date
+                for value in active:
+                    if value.object_kind != object_kind or value.logical_id == str(logical_id):
+                        continue
+                    if (
+                        value.category_logical_id == str(category_logical_id)
+                        and value.start_date is not None
+                    ):
+                        value_end = (
+                            snapshot_as_of.date() if value.end_date is None else value.end_date
+                        )
+                        if value.start_date <= requested_end and start_date <= value_end:
+                            colliding_logical_ids.append(ContextLogicalId(value.logical_id))
+                            blocked, diagnostics = True, ("context_period_overlap",)
+                            break
+        if object_kind == "daily_stress" and not blocked:
+            if stress_level is None or start_date is None:
+                blocked, diagnostics = True, ("invalid_daily_stress",)
+            else:
+                colliding_logical_ids.extend(
+                    ContextLogicalId(value.logical_id)
+                    for value in active
+                    if value.object_kind == "daily_stress"
+                    and value.start_date == start_date
+                    and value.logical_id != str(logical_id)
+                )
+                if colliding_logical_ids:
+                    blocked, diagnostics = True, ("daily_stress_exists",)
+        if not blocked:
+            if kind == "create":
+                blocked = bool(audit)
+            elif not audit or audit[-1].revision_id != str(expected_revision_id):
+                blocked = True
+            elif kind == "withdraw" or kind == "revise":
+                blocked = current is None
+            else:
+                blocked = current is not None
+            if blocked and not diagnostics:
+                diagnostics = ("context_revision_changed",)
+        no_change = (
+            kind == "revise"
+            and current is not None
+            and (
+                (
+                    object_kind in {"illness_category", "custom_context_label"}
+                    and current.name == name
+                )
+                or (
+                    object_kind in {"illness_period", "custom_context_period"}
+                    and current.category_logical_id == str(category_logical_id)
+                    and current.start_date == start_date
+                    and current.end_date == end_date
+                    and current.severity == (None if severity is None else severity.value)
+                    and current.note == note
+                )
+                or (
+                    object_kind == "daily_stress"
+                    and current.start_date == start_date
+                    and current.stress_level
+                    == (None if stress_level is None else stress_level.value)
+                )
+            )
+        )
+        payload = {
+            "kind": object_kind,
+            "intent": kind,
+            "logical_id": str(logical_id),
+            "expected": None if expected_revision_id is None else str(expected_revision_id),
+            "name": name,
+            "category": None if category_logical_id is None else str(category_logical_id),
+            "start": None if start_date is None else start_date.isoformat(),
+            "end": None if end_date is None else end_date.isoformat(),
+            "severity": None if severity is None else severity.value,
+            "stress": None if stress_level is None else stress_level.value,
+            "note": note,
+            "withdrawal_reason": withdrawal_reason,
+            "snapshot": None if snapshot is None else str(snapshot),
+            "snapshot_as_of": snapshot_as_of.isoformat(),
+            "timezone": timezone,
+            "collisions": tuple(map(str, colliding_logical_ids)),
+            "references": ()
+            if category_logical_id is None
+            else (str(category_logical_id),),
+            "affected_from": None if start_date is None else start_date.isoformat(),
+            "affected_to": (
+                end_date.isoformat() if end_date is not None else snapshot_as_of.date().isoformat()
+            ),
+        }
+        return WritePlan(
+            PlanFingerprint(
+                hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+            ),
+            ManualContextRevisionPlan(
+                kind,
+                cast(
+                    Literal[
+                        "illness_category",
+                        "illness_period",
+                        "daily_stress",
+                        "custom_context_label",
+                        "custom_context_period",
+                    ],
+                    object_kind,
+                ),
+                logical_id,
+                expected_revision_id,
+                name,
+                category_logical_id,
+                start_date,
+                end_date,
+                severity,
+                stress_level,
+                note,
+                withdrawal_reason,
+                snapshot,
+                snapshot_as_of,
+                timezone,
+                snapshot_as_of.date(),
+                tuple(colliding_logical_ids),
+                () if category_logical_id is None else (category_logical_id,),
+                start_date,
+                end_date if end_date is not None else snapshot_as_of.date(),
+            ),
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED
+                    if blocked
+                    else (WriteApprovalStatus.NO_CHANGE if no_change else WriteApprovalStatus.READY)
+                ),
+                diagnostics=diagnostics,
+            ),
+        )
+
     def _build_plausibility_rule_plan(self, request: CreatePlausibilityRuleVersion) -> WritePlan:
         rules = self.load_plausibility_rules()
         versions = next(
@@ -1747,6 +4580,23 @@ class HealthLab:
                 resolution_payload = {
                     "type": "local_exclusion",
                     "measurement_version_id": str(resolution.measurement_version_id),
+                    "reason": resolution.reason,
+                    "note": resolution.note,
+                }
+            elif isinstance(resolution, WorkoutCorrection):
+                resolution_payload = {
+                    "type": "workout_correction",
+                    "workout_version_id": str(resolution.workout_version_id),
+                    "effective_duration_minutes": resolution.effective_duration_minutes,
+                    "distance_kilometers": resolution.distance_kilometers,
+                    "active_energy_kilocalories": resolution.active_energy_kilocalories,
+                    "reason": resolution.reason,
+                    "note": resolution.note,
+                }
+            elif isinstance(resolution, LocalWorkoutExclusion):
+                resolution_payload = {
+                    "type": "local_workout_exclusion",
+                    "workout_version_id": str(resolution.workout_version_id),
                     "reason": resolution.reason,
                     "note": resolution.note,
                 }
@@ -1873,10 +4723,7 @@ class HealthLab:
             with request.package_path.open("rb") as package:
                 package_hash = hashlib.file_digest(package, "sha256").hexdigest()
             unavailable = False
-            if (
-                workspace.state is WorkspaceState.RESTORE_PENDING
-                and self._store is not None
-            ):
+            if workspace.state is WorkspaceState.RESTORE_PENDING and self._store is not None:
                 restore = inspect_restore_health_export(
                     request.package_path,
                     store=self._store,
@@ -2200,6 +5047,8 @@ class HealthLab:
                 current_plan.diagnostics,
                 expected_plan,
             )
+        if current_plan.approval.status is WriteApprovalStatus.NO_CHANGE:
+            raise ConfigurationError("Unveränderte Schreibpläne werden nicht ausgeführt.")
         if isinstance(request, BeginMetadataRestore):
             return self._execute_metadata_restore(request, authorization_plan, expected_plan)
         if isinstance(request, AbortMetadataRestore):
@@ -2212,6 +5061,37 @@ class HealthLab:
             return self._execute_metadata_backup(request, authorization_plan, expected_plan)
         if isinstance(request, CreatePlausibilityRuleVersion):
             return self._execute_plausibility_rule_write(request, authorization_plan, expected_plan)
+        if isinstance(request, CreateActivityDerivationVersion):
+            return self._execute_activity_derivation_write(
+                request, authorization_plan, expected_plan
+            )
+        if isinstance(request, ReviseContextCoverageStart):
+            return self._execute_context_coverage_start_write(
+                request, authorization_plan, expected_plan
+            )
+        if isinstance(request, ReviseMedicationRegime):
+            return self._execute_medication_regime_write(request, authorization_plan, expected_plan)
+        if isinstance(request, ReviseMedicationDeviation):
+            return self._execute_medication_deviation_write(
+                request, authorization_plan, expected_plan
+            )
+        if isinstance(request, ReviseAsNeededIntake):
+            return self._execute_as_needed_intake_write(request, authorization_plan, expected_plan)
+        if isinstance(request, ReviseIntakeReasonCategory):
+            return self._execute_intake_reason_category_write(
+                request, authorization_plan, expected_plan
+            )
+        if isinstance(
+            request,
+            (
+                ReviseIllnessCategory,
+                ReviseIllnessPeriod,
+                ReviseDailyStress,
+                ReviseCustomContextLabel,
+                ReviseCustomContextPeriod,
+            ),
+        ):
+            return self._execute_illness_write(request, authorization_plan, expected_plan)
         if isinstance(request, RunHistoricalReview):
             return self._execute_historical_review_write(request, authorization_plan, expected_plan)
         if isinstance(request, RunRestingHeartRateAnalysis):
@@ -2311,10 +5191,7 @@ class HealthLab:
                     max_uncompressed_bytes=self._config.max_import_uncompressed_bytes,
                     max_compression_ratio=self._config.max_import_compression_ratio,
                 )
-                if (
-                    restore.sources.state_hash
-                    != authorization_plan.details.restore_state_hash
-                ):
+                if restore.sources.state_hash != authorization_plan.details.restore_state_hash:
                     return self._not_started_with_preflight(
                         authorization_plan,
                         WriteNotStartedStatus.PLAN_CHANGED,
@@ -2396,13 +5273,17 @@ class HealthLab:
                 plan, WriteNotStartedStatus.BLOCKED, plan.diagnostics, expected_plan
             )
         operation_id = OperationId(uuid4().hex)
-        if not plan.details.steps:
+        if not plan.details.steps and not plan.details.snapshot_steps:
             result = StoreMigrationReceipt(
                 operation_id,
                 MigrationStatus.NO_OP,
                 plan.details.source_version,
                 plan.details.target_version,
                 (),
+                plan.details.snapshot_source_version,
+                plan.details.snapshot_target_version,
+                (),
+                plan.details.snapshot_as_of,
                 None,
             )
             return WriteReceipt(operation_id, expected_plan, result, plan.preflight)
@@ -2448,7 +5329,11 @@ class HealthLab:
                 )
             assert plan.details.backup_file is not None
             writer.migrate_store_schema(
-                plan.details.steps, plan.details.backup_file, operation_id
+                plan.details.steps,
+                plan.details.snapshot_steps,
+                plan.details.snapshot_as_of,
+                plan.details.backup_file,
+                operation_id,
             )
         except StoreError as error:
             diagnostic = str(error)
@@ -2468,6 +5353,10 @@ class HealthLab:
             plan.details.source_version,
             plan.details.target_version,
             plan.details.steps,
+            plan.details.snapshot_source_version,
+            plan.details.snapshot_target_version,
+            plan.details.snapshot_steps,
+            plan.details.snapshot_as_of,
             plan.details.backup_file,
         )
         return WriteReceipt(
@@ -2533,9 +5422,7 @@ class HealthLab:
                 else WriteNotStartedStatus.BLOCKED
             )
             diagnostic = (
-                "plan_changed"
-                if status is WriteNotStartedStatus.PLAN_CHANGED
-                else str(error)
+                "plan_changed" if status is WriteNotStartedStatus.PLAN_CHANGED else str(error)
             )
             return self._not_started(plan, status, (diagnostic,), expected_plan)
         finally:
@@ -2602,8 +5489,7 @@ class HealthLab:
             current = describe_metadata_backup(writer, request.target_path)
             if (
                 current.backup_id != plan.details.backup_id
-                or current.canonical_content_sha256
-                != plan.details.canonical_content_sha256
+                or current.canonical_content_sha256 != plan.details.canonical_content_sha256
                 or current.audit_max_position != plan.details.audit_max_position
             ):
                 return self._not_started_with_preflight(
@@ -2816,6 +5702,462 @@ class HealthLab:
         )
         return WriteReceipt(operation_id, expected_plan, result, plan.preflight)
 
+    def _execute_activity_derivation_write(
+        self,
+        request: CreateActivityDerivationVersion,
+        plan: WritePlan,
+        expected_plan: PlanFingerprint,
+    ) -> WriteReceipt:
+        if not isinstance(plan.details, ActivityDerivationPlan):
+            return self._not_started(
+                plan,
+                WriteNotStartedStatus.PLAN_CHANGED,
+                ("plan_changed",),
+                expected_plan,
+            )
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        try:
+            blocked = self._recheck_snapshot_capacity(
+                writer, plan, expected_plan, CapacityMethodId.ACTIVITY_DERIVATION
+            )
+            if blocked is not None:
+                return blocked
+            operation_id = OperationId(uuid4().hex)
+            snapshot_ref = writer.create_activity_derivation_version(
+                operation_id=operation_id,
+                version_id=plan.details.proposed_version_id,
+                coverage_gap_minutes=request.coverage_gap_minutes,
+                source_classifier_version=_ACTIVITY_SOURCE_CLASSIFIER_VERSION,
+                expected_snapshot_id=plan.details.base_snapshot_ref,
+            )
+        except StoreError as error:
+            raise HealthLabError("Aktivitätsableitung konnte nicht gespeichert werden.") from error
+        finally:
+            writer.close()
+        assert snapshot_ref is not None
+        return WriteReceipt(
+            operation_id,
+            expected_plan,
+            ActivityDerivationReceipt(plan.details.proposed_version_id, snapshot_ref),
+            plan.preflight,
+        )
+
+    def _execute_context_coverage_start_write(
+        self,
+        request: ReviseContextCoverageStart,
+        plan: WritePlan,
+        expected_plan: PlanFingerprint,
+    ) -> WriteReceipt:
+        if not isinstance(plan.details, ManualContextRevisionPlan):
+            return self._not_started(
+                plan, WriteNotStartedStatus.PLAN_CHANGED, ("plan_changed",), expected_plan
+            )
+        if plan.details.base_snapshot_ref is None:
+            return self._not_started(
+                plan, WriteNotStartedStatus.BLOCKED, plan.diagnostics, expected_plan
+            )
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        try:
+            blocked = self._recheck_snapshot_capacity(
+                writer, plan, expected_plan, CapacityMethodId.MANUAL_SNAPSHOT
+            )
+            if blocked is not None:
+                return blocked
+            operation_id = OperationId(uuid4().hex)
+            publication = writer.publish_context_coverage_start(
+                publication=ContextCoverageStartPublication(
+                    operation_id,
+                    plan.details.intent,
+                    StoredContextLogicalId(str(plan.details.logical_id)),
+                    (
+                        None
+                        if plan.details.expected_revision_id is None
+                        else StoredContextRevisionId(str(plan.details.expected_revision_id))
+                    ),
+                    plan.details.start_date,
+                    plan.details.withdrawal_reason,
+                    plan.details.base_snapshot_ref,
+                    plan.details.snapshot_as_of,
+                    plan.details.snapshot_as_of.date(),
+                    plan.details.context_timezone,
+                )
+            )
+        except StoreError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.PLAN_CHANGED, ("plan_changed",), expected_plan
+            )
+        finally:
+            writer.close()
+        return WriteReceipt(
+            operation_id,
+            expected_plan,
+            ManualContextRevisionReceipt(
+                ContextLogicalId(str(publication.logical_id)),
+                ContextRevisionId(str(publication.revision_id)),
+                publication.snapshot_id,
+            ),
+            plan.preflight,
+        )
+
+    def _execute_medication_regime_write(
+        self, request: ReviseMedicationRegime, plan: WritePlan, expected_plan: PlanFingerprint
+    ) -> WriteReceipt:
+        if (
+            not isinstance(plan.details, MedicationRevisionPlan)
+            or plan.details.object_kind != "medication_regime"
+            or plan.details.base_snapshot_ref is None
+            or plan.details.starts_at is None
+            or plan.details.timezone is None
+        ):
+            return self._not_started(
+                plan, WriteNotStartedStatus.BLOCKED, plan.diagnostics, expected_plan
+            )
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        try:
+            blocked = self._recheck_snapshot_capacity(
+                writer, plan, expected_plan, CapacityMethodId.MANUAL_SNAPSHOT
+            )
+            if blocked is not None:
+                return blocked
+            operation_id = OperationId(uuid4().hex)
+            publication = writer.publish_medication_regime(
+                MedicationRegimePublication(
+                    operation_id,
+                    plan.details.intent,
+                    StoredMedicationLogicalId(str(plan.details.logical_id)),
+                    None
+                    if plan.details.expected_revision_id is None
+                    else StoredMedicationRevisionId(str(plan.details.expected_revision_id)),
+                    plan.details.starts_at,
+                    plan.details.timezone,
+                    tuple(
+                        (
+                            dose.medication_name,
+                            str(dose.amount),
+                            dose.unit,
+                            dose.local_time,
+                            tuple(sorted(day.value for day in dose.weekdays)),
+                        )
+                        for dose in plan.details.scheduled_doses
+                    ),
+                    tuple(
+                        (
+                            item.medication_name,
+                            str(item.amount),
+                            item.unit,
+                            tuple(
+                                str(category_id)
+                                for category_id in item.preferred_reason_category_ids
+                            ),
+                            str(item.entry_id),
+                        )
+                        for item in plan.details.as_needed_medications
+                    ),
+                    plan.details.withdrawal_reason,
+                    plan.details.base_snapshot_ref,
+                    plan.details.medication_as_of,
+                )
+            )
+        except StoreError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.PLAN_CHANGED, ("plan_changed",), expected_plan
+            )
+        finally:
+            writer.close()
+        return WriteReceipt(
+            operation_id,
+            expected_plan,
+            MedicationRegimeReceipt(
+                MedicationLogicalId(str(publication.logical_id)),
+                MedicationRevisionId(str(publication.revision_id)),
+                publication.snapshot_id,
+            ),
+            plan.preflight,
+        )
+
+    def _execute_medication_deviation_write(
+        self, request: ReviseMedicationDeviation, plan: WritePlan, expected_plan: PlanFingerprint
+    ) -> WriteReceipt:
+        if (
+            not isinstance(plan.details, MedicationRevisionPlan)
+            or plan.details.object_kind != "medication_deviation"
+            or plan.details.base_snapshot_ref is None
+            or plan.details.regime_logical_id is None
+            or plan.details.scheduled_at is None
+        ):
+            return self._not_started(
+                plan, WriteNotStartedStatus.BLOCKED, plan.diagnostics, expected_plan
+            )
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        try:
+            blocked = self._recheck_snapshot_capacity(
+                writer, plan, expected_plan, CapacityMethodId.MANUAL_SNAPSHOT
+            )
+            if blocked is not None:
+                return blocked
+            operation_id = OperationId(uuid4().hex)
+            publication = writer.publish_medication_deviation(
+                MedicationDeviationPublication(
+                    operation_id,
+                    plan.details.intent,
+                    StoredMedicationLogicalId(str(plan.details.logical_id)),
+                    None
+                    if plan.details.expected_revision_id is None
+                    else StoredMedicationRevisionId(str(plan.details.expected_revision_id)),
+                    StoredMedicationLogicalId(str(plan.details.regime_logical_id)),
+                    plan.details.scheduled_at,
+                    tuple(
+                        (item.taken_at, str(item.amount)) for item in plan.details.actual_intakes
+                    ),
+                    plan.details.withdrawal_reason,
+                    plan.details.base_snapshot_ref,
+                    plan.details.medication_as_of,
+                )
+            )
+        except StoreError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.PLAN_CHANGED, ("plan_changed",), expected_plan
+            )
+        finally:
+            writer.close()
+        return WriteReceipt(
+            operation_id,
+            expected_plan,
+            MedicationDeviationReceipt(
+                MedicationLogicalId(str(publication.logical_id)),
+                MedicationRevisionId(str(publication.revision_id)),
+                publication.snapshot_id,
+            ),
+            plan.preflight,
+        )
+
+    def _execute_intake_reason_category_write(
+        self, request: ReviseIntakeReasonCategory, plan: WritePlan, expected_plan: PlanFingerprint
+    ) -> WriteReceipt:
+        if (
+            not isinstance(plan.details, MedicationRevisionPlan)
+            or plan.details.object_kind != "intake_reason_category"
+            or plan.details.base_snapshot_ref is None
+        ):
+            return self._not_started(
+                plan, WriteNotStartedStatus.BLOCKED, plan.diagnostics, expected_plan
+            )
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        try:
+            blocked = self._recheck_snapshot_capacity(
+                writer, plan, expected_plan, CapacityMethodId.MANUAL_SNAPSHOT
+            )
+            if blocked is not None:
+                return blocked
+            operation_id = OperationId(uuid4().hex)
+            publication = writer.publish_intake_reason_category(
+                IntakeReasonCategoryPublication(
+                    operation_id,
+                    plan.details.intent,
+                    StoredMedicationLogicalId(str(plan.details.logical_id)),
+                    None
+                    if plan.details.expected_revision_id is None
+                    else StoredMedicationRevisionId(str(plan.details.expected_revision_id)),
+                    plan.details.name,
+                    plan.details.withdrawal_reason,
+                    plan.details.base_snapshot_ref,
+                    plan.details.medication_as_of,
+                )
+            )
+        except StoreError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.PLAN_CHANGED, ("plan_changed",), expected_plan
+            )
+        finally:
+            writer.close()
+        return WriteReceipt(
+            operation_id,
+            expected_plan,
+            IntakeReasonCategoryReceipt(
+                MedicationLogicalId(str(publication.logical_id)),
+                MedicationRevisionId(str(publication.revision_id)),
+                publication.snapshot_id,
+            ),
+            plan.preflight,
+        )
+
+    def _execute_as_needed_intake_write(
+        self, request: ReviseAsNeededIntake, plan: WritePlan, expected_plan: PlanFingerprint
+    ) -> WriteReceipt:
+        if (
+            not isinstance(plan.details, MedicationRevisionPlan)
+            or plan.details.object_kind != "as_needed_intake"
+            or plan.details.base_snapshot_ref is None
+            or plan.details.regime_logical_id is None
+            or plan.details.entry_id is None
+            or plan.details.taken_at is None
+            or plan.details.amount is None
+        ):
+            return self._not_started(
+                plan, WriteNotStartedStatus.BLOCKED, plan.diagnostics, expected_plan
+            )
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        try:
+            blocked = self._recheck_snapshot_capacity(
+                writer, plan, expected_plan, CapacityMethodId.MANUAL_SNAPSHOT
+            )
+            if blocked is not None:
+                return blocked
+            operation_id = OperationId(uuid4().hex)
+            publication = writer.publish_as_needed_intake(
+                AsNeededIntakePublication(
+                    operation_id,
+                    plan.details.intent,
+                    StoredMedicationLogicalId(str(plan.details.logical_id)),
+                    None
+                    if plan.details.expected_revision_id is None
+                    else StoredMedicationRevisionId(str(plan.details.expected_revision_id)),
+                    StoredMedicationLogicalId(str(plan.details.regime_logical_id)),
+                    str(plan.details.entry_id),
+                    plan.details.taken_at,
+                    str(plan.details.amount),
+                    None
+                    if plan.details.reason_category_logical_id is None
+                    else StoredMedicationLogicalId(str(plan.details.reason_category_logical_id)),
+                    plan.details.withdrawal_reason,
+                    plan.details.base_snapshot_ref,
+                    plan.details.medication_as_of,
+                )
+            )
+        except StoreError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.PLAN_CHANGED, ("plan_changed",), expected_plan
+            )
+        finally:
+            writer.close()
+        return WriteReceipt(
+            operation_id,
+            expected_plan,
+            AsNeededIntakeReceipt(
+                MedicationLogicalId(str(publication.logical_id)),
+                MedicationRevisionId(str(publication.revision_id)),
+                publication.snapshot_id,
+            ),
+            plan.preflight,
+        )
+
+    def _execute_illness_write(
+        self,
+        request: ReviseIllnessCategory
+        | ReviseIllnessPeriod
+        | ReviseDailyStress
+        | ReviseCustomContextLabel
+        | ReviseCustomContextPeriod,
+        plan: WritePlan,
+        expected_plan: PlanFingerprint,
+    ) -> WriteReceipt:
+        if (
+            not isinstance(plan.details, ManualContextRevisionPlan)
+            or plan.details.object_kind == "context_coverage_start"
+        ):
+            return self._not_started(
+                plan, WriteNotStartedStatus.PLAN_CHANGED, ("plan_changed",), expected_plan
+            )
+        if plan.details.base_snapshot_ref is None:
+            return self._not_started(
+                plan, WriteNotStartedStatus.BLOCKED, plan.diagnostics, expected_plan
+            )
+        details = plan.details
+        assert details.base_snapshot_ref is not None
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        try:
+            blocked = self._recheck_snapshot_capacity(
+                writer, plan, expected_plan, CapacityMethodId.MANUAL_SNAPSHOT
+            )
+            if blocked is not None:
+                return blocked
+            operation_id = OperationId(uuid4().hex)
+            publication = writer.publish_illness(
+                publication=IllnessPublication(
+                    operation_id,
+                    details.intent,
+                    cast(
+                        Literal[
+                            "illness_category",
+                            "illness_period",
+                            "daily_stress",
+                            "custom_context_label",
+                            "custom_context_period",
+                        ],
+                        details.object_kind,
+                    ),
+                    StoredContextLogicalId(str(details.logical_id)),
+                    None
+                    if details.expected_revision_id is None
+                    else StoredContextRevisionId(str(details.expected_revision_id)),
+                    details.name,
+                    None
+                    if details.category_logical_id is None
+                    else StoredContextLogicalId(str(details.category_logical_id)),
+                    details.start_date,
+                    details.end_date,
+                    None if details.severity is None else details.severity.value,
+                    None if details.stress_level is None else details.stress_level.value,
+                    details.note,
+                    details.withdrawal_reason,
+                    details.base_snapshot_ref,
+                    details.snapshot_as_of,
+                    details.snapshot_as_of.date(),
+                    details.context_timezone,
+                )
+            )
+        except StoreError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.PLAN_CHANGED, ("plan_changed",), expected_plan
+            )
+        finally:
+            writer.close()
+        return WriteReceipt(
+            operation_id,
+            expected_plan,
+            ManualContextRevisionReceipt(
+                ContextLogicalId(str(publication.logical_id)),
+                ContextRevisionId(str(publication.revision_id)),
+                publication.snapshot_id,
+            ),
+            plan.preflight,
+        )
+
     def _execute_plausibility_rule_write(
         self,
         request: CreatePlausibilityRuleVersion,
@@ -2956,9 +6298,13 @@ class HealthLab:
                     "correct",
                     "exclude_local",
                     "accept_source",
+                    "correct_workout",
+                    "exclude_workout_local",
                 ]
                 corrected_value: float | None = None
                 canonical_unit: str | None = None
+                corrected_distance_kilometers: float | None = None
+                corrected_active_energy_kilocalories: float | None = None
                 reason: str | None = None
                 direct_logical_id: str | None = None
                 if isinstance(resolution, DataConfirmation):
@@ -2993,10 +6339,14 @@ class HealthLab:
                     version = writer.load_measurement_version_fact(
                         resolution.measurement_version_id
                     )
-                    if version is None or (
-                        case is not None
-                        and case.measurement_version_id != resolution.measurement_version_id
-                    ) or resolution.unit.value != version.canonical_unit:
+                    if (
+                        version is None
+                        or (
+                            case is not None
+                            and case.measurement_version_id != resolution.measurement_version_id
+                        )
+                        or resolution.unit.value != version.canonical_unit
+                    ):
                         return self._not_started(
                             plan,
                             WriteNotStartedStatus.BLOCKED,
@@ -3021,6 +6371,71 @@ class HealthLab:
                         )
                     action = "exclude_local"
                     selected = str(resolution.measurement_version_id)
+                    reason = resolution.reason
+                    note = resolution.note
+                elif isinstance(resolution, WorkoutCorrection):
+                    assert case is not None
+                    if (
+                        case.kind
+                        not in {
+                            DataReviewCaseKind.WORKOUT_PLAUSIBILITY,
+                            DataReviewCaseKind.WORKOUT_OVERLAP,
+                        }
+                        or resolution.workout_version_id
+                        not in writer.load_workout_review_case_versions(str(case.case_id))
+                    ):
+                        return self._not_started(
+                            plan,
+                            WriteNotStartedStatus.BLOCKED,
+                            ("resolution_not_allowed",),
+                            expected_plan,
+                        )
+                    action = "correct_workout"
+                    selected = str(resolution.workout_version_id)
+                    corrected_value = resolution.effective_duration_minutes
+                    corrected_distance_kilometers = resolution.distance_kilometers
+                    corrected_active_energy_kilocalories = resolution.active_energy_kilocalories
+                    direct_logical_id = writer.load_workout_logical_id(
+                        resolution.workout_version_id
+                    )
+                    if direct_logical_id is None:
+                        return self._not_started(
+                            plan,
+                            WriteNotStartedStatus.BLOCKED,
+                            ("resolution_not_allowed",),
+                            expected_plan,
+                        )
+                    reason = resolution.reason
+                    note = resolution.note
+                elif isinstance(resolution, LocalWorkoutExclusion):
+                    assert case is not None
+                    if (
+                        case.kind
+                        not in {
+                            DataReviewCaseKind.WORKOUT_PLAUSIBILITY,
+                            DataReviewCaseKind.WORKOUT_OVERLAP,
+                        }
+                        or resolution.workout_version_id
+                        not in writer.load_workout_review_case_versions(str(case.case_id))
+                    ):
+                        return self._not_started(
+                            plan,
+                            WriteNotStartedStatus.BLOCKED,
+                            ("resolution_not_allowed",),
+                            expected_plan,
+                        )
+                    action = "exclude_workout_local"
+                    selected = str(resolution.workout_version_id)
+                    direct_logical_id = writer.load_workout_logical_id(
+                        resolution.workout_version_id
+                    )
+                    if direct_logical_id is None:
+                        return self._not_started(
+                            plan,
+                            WriteNotStartedStatus.BLOCKED,
+                            ("resolution_not_allowed",),
+                            expected_plan,
+                        )
                     reason = resolution.reason
                     note = resolution.note
                 elif isinstance(resolution, SourceValueAcceptance):
@@ -3073,7 +6488,7 @@ class HealthLab:
                     review_case_id=None if case is None else str(case.case_id),
                     logical_measurement_id=(
                         direct_logical_id
-                        if case is None
+                        if case is None or action in {"correct_workout", "exclude_workout_local"}
                         else (
                             None
                             if case.logical_measurement_id is None
@@ -3091,6 +6506,8 @@ class HealthLab:
                     reason=reason,
                     corrected_value=corrected_value,
                     canonical_unit=canonical_unit,
+                    corrected_distance_kilometers=corrected_distance_kilometers,
+                    corrected_active_energy_kilocalories=corrected_active_energy_kilocalories,
                     cycle_updates=(
                         ()
                         if case is None
@@ -3121,10 +6538,7 @@ class HealthLab:
                         writer.load_open_data_review_cases(),
                         key=lambda item: item.review_case_id,
                     )
-                    if (
-                        request.selection.kind is None
-                        or case.kind == request.selection.kind.value
-                    )
+                    if (request.selection.kind is None or case.kind == request.selection.kind.value)
                     and case.kind in {"plausibility", "continued_override"}
                     for detail in (load_review_case_detail(writer, case.review_case_id),)
                     if case.kind == "plausibility" or detail.reasons
@@ -3143,10 +6557,7 @@ class HealthLab:
                         None if request.selection.kind is None else request.selection.kind.value
                     ),
                     materialized_matches=json.dumps(
-                        [
-                            _data_review_batch_match_payload(item)
-                            for item in plan.details.matches
-                        ],
+                        [_data_review_batch_match_payload(item) for item in plan.details.matches],
                         sort_keys=True,
                         separators=(",", ":"),
                     ),
@@ -3256,6 +6667,56 @@ class HealthLab:
             diagnostics=diagnostics,
         )
 
+    def _recheck_snapshot_capacity(
+        self,
+        writer: LocalStore,
+        plan: WritePlan,
+        expected_plan: PlanFingerprint,
+        method_id: CapacityMethodId,
+    ) -> WriteReceipt | None:
+        capacity = writer.preflight_snapshot_write(
+            method_id=method_id,
+            requested_start=self._snapshot_capacity_start(plan),
+            requested_end=self._snapshot_capacity_end(plan),
+        )
+        if capacity.status is not CapacityStatus.READY:
+            diagnostic = "capacity_" + (
+                capacity.reason.value if capacity.reason is not None else capacity.status.value
+            )
+            return self._not_started_with_preflight(
+                plan,
+                WriteNotStartedStatus.BLOCKED,
+                (diagnostic,),
+                expected_plan,
+                capacity=capacity,
+            )
+        return None
+
+    @staticmethod
+    def _snapshot_capacity_start(plan: WritePlan) -> date | None:
+        details = plan.details
+        if isinstance(details, ManualContextRevisionPlan):
+            return details.start_date
+        if isinstance(details, MedicationRevisionPlan):
+            value = (
+                details.starts_at
+                if details.object_kind == "medication_regime"
+                else details.scheduled_at
+                if details.object_kind == "medication_deviation"
+                else details.taken_at
+            )
+            return None if value is None else value.date()
+        return None
+
+    @staticmethod
+    def _snapshot_capacity_end(plan: WritePlan) -> date | None:
+        details = plan.details
+        if isinstance(details, ManualContextRevisionPlan):
+            return details.snapshot_as_of.date()
+        if isinstance(details, MedicationRevisionPlan):
+            return details.medication_as_of.date()
+        return None
+
     def _execute_resting_heart_rate_analysis(
         self,
         request: RunRestingHeartRateAnalysis,
@@ -3279,8 +6740,7 @@ class HealthLab:
                 config_schema_version=request.schema_version,
                 expected_snapshot_id=plan.details.base_snapshot_ref,
                 open_review_case_ids=tuple(
-                    str(case.case_id)
-                    for case in self.load_data_review(DataReviewSelection()).cases
+                    str(case.case_id) for case in self.load_data_review(DataReviewSelection()).cases
                 ),
             )
         except AnalysisInputChanged:
@@ -3329,6 +6789,1332 @@ class HealthLab:
         reader = self._require_open()
         return reader.load(selection)
 
+    def load_import_details(self, import_id: ImportId) -> ImportDetails:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        try:
+            stored = self._store.load_import_details(import_id)
+        except StoreError as error:
+            raise HealthLabError("Importdetails sind nicht verfügbar.") from error
+        if stored is None:
+            raise ConfigurationError("Import-ID ist unbekannt.")
+        return ImportDetails(
+            import_id,
+            ImportCanonicalCounts(
+                stored.package_record_count,
+                stored.record_count,
+                stored.logical_measurement_count,
+                stored.measurement_version_count,
+                stored.source_occurrence_count,
+                stored.anomaly_count,
+            ),
+            tuple(
+                ImportContentCount(
+                    UnsupportedContentCategory(item.category),
+                    item.external_identifier,
+                    item.count,
+                )
+                for item in stored.unsupported_content
+            ),
+        )
+
+    def load_weight_nutrition(self, selection: SnapshotDateSelection) -> WeightNutrition:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        try:
+            snapshot_ref, stored_measurements = self._store.load_weight_nutrition_measurements(
+                selection.snapshot_ref, selection.start_date, selection.end_date
+            )
+        except StoreError as error:
+            raise HealthLabError(
+                "Gewichts- und Ernährungsprojektion ist nicht verfügbar."
+            ) from error
+
+        def public_weight(item: StoredMeasurement) -> WeightMeasurement:
+            return WeightMeasurement(
+                logical_measurement_id=item.logical_measurement_id,
+                measurement_version_id=item.measurement_version_id,
+                value_kg=item.value,
+                effective_value_kg=item.effective_value,
+                disposition=item.disposition,
+                is_selected=item.is_selected,
+                source_start=item.source_start,
+                source_end=item.source_end,
+                source_updated_at=item.source_updated_at,
+                measurement_local_day=item.measurement_local_day,
+                source_name=item.source_name,
+                source_version=item.source_version,
+                device=item.device,
+                original_value=item.original_value,
+                original_unit=item.original_unit,
+                review_case_ids=tuple(
+                    DataReviewCaseId(str(value)) for value in item.review_case_ids
+                ),
+            )
+
+        def public_nutrition_sample(
+            item: StoredMeasurement,
+        ) -> HealthKitNutritionSample:
+            return HealthKitNutritionSample(
+                logical_measurement_id=item.logical_measurement_id,
+                measurement_version_id=item.measurement_version_id,
+                data_type=item.data_type,
+                unit=item.unit,
+                value=item.value,
+                effective_value=item.effective_value,
+                disposition=item.disposition,
+                is_selected=item.is_selected,
+                source_start=item.source_start,
+                source_end=item.source_end,
+                source_updated_at=item.source_updated_at,
+                measurement_local_day=item.measurement_local_day,
+                source_name=item.source_name,
+                source_version=item.source_version,
+                device=item.device,
+                original_value=item.original_value,
+                original_unit=item.original_unit,
+                review_case_ids=tuple(
+                    DataReviewCaseId(str(value)) for value in item.review_case_ids
+                ),
+            )
+
+        weight_measurements = tuple(
+            public_weight(item)
+            for item in stored_measurements
+            if item.data_type is CanonicalHealthType.BODY_MASS
+        )
+        healthkit_nutrition_samples = tuple(
+            public_nutrition_sample(item)
+            for item in stored_measurements
+            if item.data_type.value.startswith("dietary_")
+        )
+        selected_weights = tuple(
+            item
+            for item in weight_measurements
+            if item.is_selected
+            and item.effective_value_kg is not None
+            and item.disposition in {"included_source", "included_correction"}
+        )
+        selected_nutrition_samples = tuple(
+            item
+            for item in healthkit_nutrition_samples
+            if item.is_selected
+            and item.effective_value is not None
+            and item.disposition in {"included_source", "included_correction"}
+        )
+        selected_days = tuple(item.measurement_local_day for item in selected_weights) + tuple(
+            item.measurement_local_day for item in selected_nutrition_samples
+        )
+        start_date: date | None
+        end_date: date | None
+        if selection.start_date is not None and selection.end_date is not None:
+            start_date, end_date = selection.start_date, selection.end_date
+        elif selected_days:
+            start_date = min(selected_days)
+            end_date = max(selected_days)
+        else:
+            start_date = end_date = None
+
+        by_day: dict[date, list[WeightMeasurement]] = {}
+        for item in selected_weights:
+            by_day.setdefault(item.measurement_local_day, []).append(item)
+        days = []
+        nutrition_days = []
+        current = start_date
+        while current is not None and end_date is not None and current <= end_date:
+            candidates = by_day.get(current, [])
+            if not candidates:
+                days.append(PreferredDailyWeight(current, WeightDayStatus.MISSING, None))
+            else:
+                latest_at = max(item.source_start for item in candidates)
+                latest = tuple(item for item in candidates if item.source_start == latest_at)
+                values = {item.effective_value_kg for item in latest}
+                review_case_ids = tuple(
+                    sorted(
+                        {case_id for item in latest for case_id in item.review_case_ids},
+                        key=str,
+                    )
+                )
+                observed = len(values) == 1
+                days.append(
+                    PreferredDailyWeight(
+                        day=current,
+                        status=(
+                            WeightDayStatus.OBSERVED if observed else WeightDayStatus.AMBIGUOUS
+                        ),
+                        value_kg=next(iter(values)) if observed else None,
+                        logical_measurement_ids=tuple(
+                            item.logical_measurement_id for item in latest
+                        ),
+                        measurement_version_ids=tuple(
+                            item.measurement_version_id for item in latest
+                        ),
+                        review_case_ids=review_case_ids,
+                        quality_status=(
+                            DataQualityStatus.PROVISIONAL
+                            if review_case_ids
+                            else DataQualityStatus.REVIEWED
+                        ),
+                    )
+                )
+
+            def feature(data_type: CanonicalHealthType, day: date) -> DailyNutritionFeature:
+                contributors = tuple(
+                    item
+                    for item in selected_nutrition_samples
+                    if item.measurement_local_day == day and item.data_type is data_type
+                )
+                review_case_ids = tuple(
+                    sorted(
+                        {case_id for item in contributors for case_id in item.review_case_ids},
+                        key=str,
+                    )
+                )
+                return DailyNutritionFeature(
+                    data_type=data_type,
+                    unit=canonical_unit_for(data_type),
+                    value=(
+                        sum(
+                            item.effective_value
+                            for item in contributors
+                            if item.effective_value is not None
+                        )
+                        if contributors
+                        else None
+                    ),
+                    logical_measurement_ids=tuple(
+                        item.logical_measurement_id for item in contributors
+                    ),
+                    measurement_version_ids=tuple(
+                        item.measurement_version_id for item in contributors
+                    ),
+                    review_case_ids=review_case_ids,
+                    quality_status=(
+                        DataQualityStatus.PROVISIONAL
+                        if review_case_ids
+                        else DataQualityStatus.REVIEWED
+                    ),
+                )
+
+            nutrition_days.append(
+                DailyNutrition(
+                    day=current,
+                    energy=feature(CanonicalHealthType.DIETARY_ENERGY_CONSUMED, current),
+                    protein=feature(CanonicalHealthType.DIETARY_PROTEIN, current),
+                    carbohydrates=feature(CanonicalHealthType.DIETARY_CARBOHYDRATES, current),
+                    total_fat=feature(CanonicalHealthType.DIETARY_FAT_TOTAL, current),
+                )
+            )
+            current += timedelta(days=1)
+        return WeightNutrition(
+            snapshot_ref=snapshot_ref,
+            status=(
+                DataQualityStatus.PROVISIONAL
+                if any(item.review_case_ids for item in selected_weights)
+                or any(item.review_case_ids for item in selected_nutrition_samples)
+                else DataQualityStatus.REVIEWED
+            ),
+            days=tuple(days),
+            weight_measurements=weight_measurements,
+            nutrition_days=tuple(nutrition_days),
+            healthkit_nutrition_samples=healthkit_nutrition_samples,
+        )
+
+    def load_activity_settings(self) -> ActivitySettings:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        record = self._store.load_activity_derivation_version(None)
+        active = ActivityDerivationVersion(
+            record.version_id, record.coverage_gap_minutes, record.source_classifier_version
+        )
+        recommendation = ActivityDerivationVersion(
+            _ACTIVITY_DERIVATION_VERSION,
+            _ACTIVITY_COVERAGE_GAP_MINUTES,
+            _ACTIVITY_SOURCE_CLASSIFIER_VERSION,
+        )
+        return ActivitySettings(active, recommendation)
+
+    @staticmethod
+    def _context_record(
+        value: StoredContextCoverageStart | None,
+    ) -> ContextCoverageStartRecord | None:
+        if value is None or value.start_date is None:
+            return None
+        return ContextCoverageStartRecord(
+            ContextLogicalId(value.logical_id),
+            ContextRevisionId(value.revision_id),
+            value.start_date,
+        )
+
+    def load_daily_context(self, selection: SnapshotDateSelection) -> DailyContext:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        snapshot_ref = (
+            self._store.load_active_snapshot_id()
+            if selection.snapshot_ref is None
+            else selection.snapshot_ref
+        )
+        if snapshot_ref is None:
+            return DailyContext(None, None, "Europe/Berlin", ())
+        coverage = self._store.load_context_coverage_start(snapshot_ref)
+        context_as_of, timezone = self._store.load_context_as_of_date(snapshot_ref)
+        if selection.start_date is None:
+            start = context_as_of if coverage is None else coverage.start_date or context_as_of
+            end = context_as_of
+        else:
+            selected_start = selection.start_date
+            selected_end = selection.end_date
+            assert selected_start is not None
+            assert selected_end is not None
+            start = selected_start
+            end = min(selected_end, context_as_of)
+        if start > end:
+            return DailyContext(snapshot_ref, context_as_of, timezone, ())
+        values = self._store.load_active_illness(snapshot_ref)
+        periods = tuple(
+            value
+            for value in values
+            if value.object_kind == "illness_period" and value.start_date is not None
+        )
+        stress_days = {
+            value.start_date: value
+            for value in values
+            if value.object_kind == "daily_stress" and value.start_date is not None
+        }
+        custom_periods = tuple(
+            value
+            for value in values
+            if value.object_kind == "custom_context_period" and value.start_date is not None
+        )
+        labels = {
+            value.logical_id: value.name
+            for value in values
+            if value.object_kind == "custom_context_label" and value.name is not None
+        }
+
+        def illness_for(current: date) -> tuple[ContextIllnessOrigin, IllnessSeverity | None]:
+            active = tuple(
+                value
+                for value in periods
+                if value.start_date is not None
+                and value.start_date <= current
+                and (value.end_date is None or current <= value.end_date)
+            )
+            if active:
+                return ContextIllnessOrigin.OBSERVED, max(
+                    (
+                        IllnessSeverity(value.severity)
+                        for value in active
+                        if value.severity is not None
+                    ),
+                    key=(
+                        IllnessSeverity.MILD,
+                        IllnessSeverity.MODERATE,
+                        IllnessSeverity.SEVERE,
+                    ).index,
+                )
+            return (
+                ContextIllnessOrigin.ASSUMED_NONE
+                if coverage is not None
+                and coverage.start_date is not None
+                and current >= coverage.start_date
+                else ContextIllnessOrigin.UNKNOWN,
+                None,
+            )
+
+        days = tuple(
+            DailyContextDay(
+                current,
+                illness_for(current)[0],
+                (
+                    ContextStressOrigin.OBSERVED
+                    if current in stress_days
+                    else ContextStressOrigin.ASSUMED_AVERAGE
+                    if coverage is not None
+                    and coverage.start_date is not None
+                    and current >= coverage.start_date
+                    else ContextStressOrigin.UNKNOWN
+                ),
+                illness_for(current)[1],
+                (
+                    StressLevel(cast(str, stress_days[current].stress_level))
+                    if current in stress_days and stress_days[current].stress_level is not None
+                    else StressLevel.AVERAGE
+                    if coverage is not None
+                    and coverage.start_date is not None
+                    and current >= coverage.start_date
+                    else None
+                ),
+                tuple(
+                    sorted(
+                        labels[value.category_logical_id]
+                        for value in custom_periods
+                        if value.category_logical_id in labels
+                        and value.start_date is not None
+                        and value.start_date <= current
+                        and (value.end_date is None or current <= value.end_date)
+                    )
+                ),
+            )
+            for current in (
+                start + timedelta(days=index) for index in range((end - start).days + 1)
+            )
+        )
+        return DailyContext(snapshot_ref, context_as_of, timezone, days)
+
+    def load_context_records(
+        self, selection: SnapshotSelection = _ACTIVE_SNAPSHOT_SELECTION
+    ) -> ContextRecords:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        selected = (
+            self._store.load_active_snapshot_id()
+            if selection.snapshot_ref is None
+            else selection.snapshot_ref
+        )
+        values = self._store.load_active_illness(selected)
+        return ContextRecords(
+            selected,
+            self._context_record(self._store.load_context_coverage_start(selected)),
+            tuple(
+                IllnessCategoryRecord(
+                    ContextLogicalId(value.logical_id),
+                    ContextRevisionId(value.revision_id),
+                    value.name,
+                )
+                for value in values
+                if value.object_kind == "illness_category" and value.name is not None
+            ),
+            tuple(
+                IllnessPeriodRecord(
+                    ContextLogicalId(value.logical_id),
+                    ContextRevisionId(value.revision_id),
+                    ContextLogicalId(value.category_logical_id),
+                    value.start_date,
+                    value.end_date,
+                    IllnessSeverity(value.severity),
+                )
+                for value in values
+                if value.object_kind == "illness_period"
+                and value.category_logical_id is not None
+                and value.start_date is not None
+                and value.severity is not None
+            ),
+            tuple(
+                DailyStressRecord(
+                    ContextLogicalId(value.logical_id),
+                    ContextRevisionId(value.revision_id),
+                    value.start_date,
+                    StressLevel(value.stress_level),
+                )
+                for value in values
+                if value.object_kind == "daily_stress"
+                and value.start_date is not None
+                and value.stress_level is not None
+            ),
+            tuple(
+                CustomContextLabelRecord(
+                    ContextLogicalId(value.logical_id),
+                    ContextRevisionId(value.revision_id),
+                    value.name,
+                )
+                for value in values
+                if value.object_kind == "custom_context_label" and value.name is not None
+            ),
+            tuple(
+                CustomContextPeriodRecord(
+                    ContextLogicalId(value.logical_id),
+                    ContextRevisionId(value.revision_id),
+                    ContextLogicalId(value.category_logical_id),
+                    value.start_date,
+                    value.end_date,
+                    value.note,
+                )
+                for value in values
+                if value.object_kind == "custom_context_period"
+                and value.category_logical_id is not None
+                and value.start_date is not None
+            ),
+        )
+
+    def load_context_audit(self, logical_id: ContextLogicalId) -> ContextAudit:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        coverage_revisions = self._store.load_context_coverage_audit(str(logical_id))
+        if coverage_revisions:
+            return ContextAudit(
+                logical_id,
+                tuple(
+                    ContextAuditRevision(
+                        ContextRevisionId(value.revision_id),
+                        None
+                        if value.previous_revision_id is None
+                        else ContextRevisionId(value.previous_revision_id),
+                        value.state,
+                        "context_coverage_start",
+                        value.start_date,
+                    )
+                    for value in coverage_revisions
+                ),
+            )
+        revisions = self._store.load_illness_revisions(str(logical_id))
+        return ContextAudit(
+            logical_id,
+            tuple(
+                ContextAuditRevision(
+                    ContextRevisionId(value.revision_id),
+                    None
+                    if value.previous_revision_id is None
+                    else ContextRevisionId(value.previous_revision_id),
+                    value.state,
+                    value.object_kind,
+                    value.start_date,
+                    value.name,
+                    None
+                    if value.category_logical_id is None
+                    else ContextLogicalId(value.category_logical_id),
+                    value.end_date,
+                    None if value.severity is None else IllnessSeverity(value.severity),
+                    None if value.stress_level is None else StressLevel(value.stress_level),
+                    value.note,
+                )
+                for value in revisions
+            ),
+        )
+
+    def load_medication_days(self, selection: SnapshotDateSelection) -> MedicationDays:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        snapshot = (
+            self._store.load_active_snapshot_id()
+            if selection.snapshot_ref is None
+            else selection.snapshot_ref
+        )
+        if snapshot is None:
+            return MedicationDays(None, None, None, ())
+        as_of = self._store.load_medication_as_of(snapshot)
+        regimes = self._store.load_active_medication_regimes(snapshot)
+        timezone = regimes[0].timezone if regimes else None
+        if selection.start_date is None:
+            start = as_of.astimezone(ZoneInfo(timezone or "Europe/Berlin")).date()
+            end = start
+        else:
+            start = selection.start_date
+            end = min(
+                cast(date, selection.end_date),
+                as_of.astimezone(ZoneInfo(timezone or "Europe/Berlin")).date(),
+            )
+        if start > end:
+            return MedicationDays(snapshot, as_of, timezone, ())
+        active = tuple(sorted(regimes, key=lambda regime: regime.starts_at))
+        deviations = {
+            (item.regime_logical_id, item.scheduled_at): item
+            for item in self._store.load_active_medication_deviations(snapshot)
+        }
+        categories = {
+            item.logical_id: item.name
+            for item in self._store.load_active_intake_reason_categories(snapshot)
+        }
+        as_needed = self._store.load_active_as_needed_intakes(snapshot)
+        days: list[MedicationDay] = []
+        for offset in range((end - start).days + 1):
+            current_day = start + timedelta(days=offset)
+            regime = next(
+                (item for item in reversed(active) if item.starts_at.date() <= current_day), None
+            )
+            if regime is None:
+                days.append(MedicationDay(current_day, "unknown", ()))
+                continue
+            next_regime = next((item for item in active if item.starts_at > regime.starts_at), None)
+            occurrences = tuple(
+                MedicationDoseOccurrence(
+                    name,
+                    Decimal(amount),
+                    unit,
+                    scheduled,
+                    "deviated"
+                    if (regime.logical_id, scheduled) in deviations
+                    else "assumed_as_planned",
+                    tuple(
+                        MedicationActualIntake(taken_at, Decimal(amount))
+                        for taken_at, amount in deviations[
+                            (regime.logical_id, scheduled)
+                        ].actual_intakes
+                    )
+                    if (regime.logical_id, scheduled) in deviations
+                    else (),
+                )
+                for name, amount, unit, local_time, weekdays in regime.scheduled_doses
+                if Weekday(current_day.strftime("%A").lower()) in {Weekday(day) for day in weekdays}
+                for scheduled in (
+                    _resolve_medication_local_datetime(current_day, local_time, regime.timezone),
+                )
+                if scheduled >= regime.starts_at
+                and scheduled <= as_of
+                and (next_regime is None or scheduled < next_regime.starts_at)
+            )
+            as_needed_intakes = tuple(
+                MedicationAsNeededIntake(
+                    MedicationLogicalId(item.logical_id),
+                    item.taken_at,
+                    next(
+                        entry[0]
+                        for stored_regime in active
+                        if stored_regime.logical_id == item.regime_logical_id
+                        for entry in stored_regime.as_needed_medications
+                        if entry[4] == item.entry_id
+                    ),
+                    Decimal(item.amount),
+                    next(
+                        entry[2]
+                        for stored_regime in active
+                        if stored_regime.logical_id == item.regime_logical_id
+                        for entry in stored_regime.as_needed_medications
+                        if entry[4] == item.entry_id
+                    ),
+                    None
+                    if item.reason_category_logical_id is None
+                    else categories.get(item.reason_category_logical_id),
+                )
+                for item in as_needed
+                if item.taken_at.date() == current_day
+            )
+            days.append(
+                MedicationDay(
+                    current_day,
+                    "planned" if occurrences else "empty",
+                    occurrences,
+                    as_needed_intakes,
+                )
+            )
+        return MedicationDays(snapshot, as_of, timezone, tuple(days))
+
+    def load_medication_plan(
+        self, selection: SnapshotSelection = _ACTIVE_SNAPSHOT_SELECTION
+    ) -> MedicationPlan:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        selected = (
+            self._store.load_active_snapshot_id()
+            if selection.snapshot_ref is None
+            else selection.snapshot_ref
+        )
+        if selected is None:
+            return MedicationPlan(None, None, ())
+        return MedicationPlan(
+            selected,
+            self._store.load_medication_as_of(selected),
+            tuple(
+                MedicationRegimeRecord(
+                    MedicationLogicalId(value.logical_id),
+                    MedicationRevisionId(value.revision_id),
+                    value.starts_at,
+                    value.timezone,
+                    tuple(
+                        ScheduledDose(
+                            name,
+                            Decimal(amount),
+                            unit,
+                            local_time,
+                            frozenset(Weekday(day) for day in weekdays),
+                        )
+                        for name, amount, unit, local_time, weekdays in value.scheduled_doses
+                    ),
+                    tuple(
+                        AsNeededMedication(
+                            name,
+                            Decimal(amount),
+                            unit,
+                            tuple(MedicationLogicalId(item) for item in preferred),
+                            MedicationPlanEntryId(entry_id),
+                        )
+                        for name, amount, unit, preferred, entry_id in value.as_needed_medications
+                    ),
+                )
+                for value in self._store.load_active_medication_regimes(selected)
+            ),
+            tuple(
+                IntakeReasonCategoryRecord(
+                    MedicationLogicalId(value.logical_id),
+                    MedicationRevisionId(value.revision_id),
+                    value.name,
+                )
+                for value in self._store.load_active_intake_reason_categories(selected)
+                if value.name is not None
+            ),
+        )
+
+    def load_medication_audit(self, logical_id: MedicationLogicalId) -> MedicationAudit:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        regimes = self._store.load_medication_regime_audit(str(logical_id))
+        if regimes:
+            return MedicationAudit(
+                logical_id,
+                tuple(
+                    MedicationAuditRevision(
+                        MedicationRevisionId(value.revision_id),
+                        None
+                        if value.previous_revision_id is None
+                        else MedicationRevisionId(value.previous_revision_id),
+                        value.state,
+                        value.starts_at,
+                        value.timezone,
+                        tuple(
+                            ScheduledDose(
+                                name,
+                                Decimal(amount),
+                                unit,
+                                local_time,
+                                frozenset(Weekday(day) for day in weekdays),
+                            )
+                            for name, amount, unit, local_time, weekdays in value.scheduled_doses
+                        ),
+                        tuple(
+                            AsNeededMedication(
+                                name,
+                                Decimal(amount),
+                                unit,
+                                tuple(MedicationLogicalId(item) for item in preferred),
+                                MedicationPlanEntryId(entry_id),
+                            )
+                            for name, amount, unit, preferred, entry_id in (
+                                value.as_needed_medications
+                            )
+                        ),
+                    )
+                    for value in regimes
+                ),
+            )
+        categories = self._store.load_intake_reason_category_audit(str(logical_id))
+        if categories:
+            return MedicationAudit(
+                logical_id,
+                tuple(
+                    IntakeReasonCategoryAuditRevision(
+                        MedicationRevisionId(value.revision_id),
+                        None
+                        if value.previous_revision_id is None
+                        else MedicationRevisionId(value.previous_revision_id),
+                        value.state,
+                        value.name,
+                    )
+                    for value in categories
+                ),
+            )
+        as_needed = self._store.load_as_needed_intake_audit(str(logical_id))
+        if as_needed:
+            return MedicationAudit(
+                logical_id,
+                tuple(
+                    AsNeededIntakeAuditRevision(
+                        MedicationRevisionId(value.revision_id),
+                        None
+                        if value.previous_revision_id is None
+                        else MedicationRevisionId(value.previous_revision_id),
+                        value.state,
+                        MedicationLogicalId(value.regime_logical_id),
+                        MedicationPlanEntryId(value.entry_id),
+                        value.taken_at,
+                        Decimal(value.amount),
+                        None
+                        if value.reason_category_logical_id is None
+                        else MedicationLogicalId(value.reason_category_logical_id),
+                    )
+                    for value in as_needed
+                ),
+            )
+        return MedicationAudit(
+            logical_id,
+            tuple(
+                MedicationDeviationAuditRevision(
+                    MedicationRevisionId(value.revision_id),
+                    None
+                    if value.previous_revision_id is None
+                    else MedicationRevisionId(value.previous_revision_id),
+                    value.state,
+                    MedicationLogicalId(value.regime_logical_id),
+                    value.scheduled_at,
+                    tuple(
+                        MedicationActualIntake(taken_at, Decimal(amount))
+                        for taken_at, amount in value.actual_intakes
+                    ),
+                )
+                for value in self._store.load_medication_deviation_audit(str(logical_id))
+            ),
+        )
+
+    def load_activity_days(self, selection: SnapshotDateSelection) -> ActivityDays:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        try:
+            snapshot_ref, stored_measurements = self._store.load_activity_measurements(
+                selection.snapshot_ref, selection.start_date, selection.end_date
+            )
+        except StoreError as error:
+            raise HealthLabError("Aktivitätstagsprojektion ist nicht verfügbar.") from error
+
+        def public_measurements(
+            values: tuple[StoredMeasurement, ...],
+        ) -> tuple[ActivityMeasurement, ...]:
+            return tuple(
+                ActivityMeasurement(
+                    logical_measurement_id=item.logical_measurement_id,
+                    measurement_version_id=item.measurement_version_id,
+                    data_type=_ACTIVITY_TYPES[item.data_type],
+                    unit=item.unit,
+                    value=item.value,
+                    effective_value=item.effective_value,
+                    disposition=item.disposition,
+                    is_selected=item.is_selected,
+                    source_class=classify_activity_source(item.source_name, item.device),
+                    source_start=item.source_start,
+                    source_end=item.source_end,
+                    source_updated_at=item.source_updated_at,
+                    measurement_local_day=item.measurement_local_day,
+                    source_name=item.source_name,
+                    source_version=item.source_version,
+                    device=item.device,
+                    original_value=item.original_value,
+                    original_unit=item.original_unit,
+                    review_case_ids=tuple(
+                        DataReviewCaseId(str(value)) for value in item.review_case_ids
+                    ),
+                )
+                for item in values
+            )
+
+        measurements = public_measurements(stored_measurements)
+        all_snapshot_ref, all_stored_measurements = self._store.load_activity_measurements(
+            snapshot_ref, None, None
+        )
+        assert all_snapshot_ref == snapshot_ref
+        all_measurements = public_measurements(all_stored_measurements)
+        record = self._store.load_activity_derivation_version(snapshot_ref)
+        derivation_version = ActivityDerivationVersion(
+            record.version_id, record.coverage_gap_minutes, record.source_classifier_version
+        )
+        selected = tuple(
+            item
+            for item in all_measurements
+            if item.is_selected
+            and item.effective_value is not None
+            and item.disposition in {"included_source", "included_correction"}
+        )
+        interval_selected = tuple(item for item in selected if item.source_end > item.source_start)
+
+        def union(
+            intervals: tuple[tuple[datetime, datetime], ...],
+        ) -> tuple[tuple[datetime, datetime], ...]:
+            merged: list[tuple[datetime, datetime]] = []
+            for start, end in sorted(intervals):
+                if merged and start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                else:
+                    merged.append((start, end))
+            return tuple(merged)
+
+        def bridge(
+            intervals: tuple[tuple[datetime, datetime], ...],
+        ) -> tuple[tuple[datetime, datetime], ...]:
+            merged: list[tuple[datetime, datetime]] = []
+            for start, end in intervals:
+                if (
+                    merged
+                    and start - merged[-1][1]
+                    < timedelta(minutes=derivation_version.coverage_gap_minutes)
+                    and merged[-1][1].utcoffset() == start.utcoffset()
+                ):
+                    merged[-1] = (merged[-1][0], end)
+                else:
+                    merged.append((start, end))
+            return tuple(merged)
+
+        watch_intervals = [
+            (item.source_start, item.source_end)
+            for item in interval_selected
+            if item.source_class is ActivitySourceClass.WATCH
+        ]
+        _, workouts = self._store.load_workouts(snapshot_ref, None, None)
+        watch_intervals.extend(
+            (item.source_start, item.source_end)
+            for item in workouts
+            if item.is_selected
+            and item.source_end > item.source_start
+            and classify_activity_source(item.source_name, item.device) is ActivitySourceClass.WATCH
+        )
+        _, sleep_intervals = self._store.load_sleep_measurements(snapshot_ref)
+        watch_intervals.extend(
+            (item.source_start, item.source_end)
+            for item in sleep_intervals
+            if item.is_selected
+            and item.source_end > item.source_start
+            and _classify_sleep_source(item.source_name, item.device) is SleepSourceClass.WATCH
+        )
+        watch_coverage = bridge(union(tuple(watch_intervals)))
+        watch_gaps = tuple(
+            (left[1], right[0]) for left, right in pairwise(watch_coverage) if left[1] < right[0]
+        )
+        iphone_fallback_ids = {
+            item.measurement_version_id
+            for item in interval_selected
+            if item.source_class is ActivitySourceClass.IPHONE
+            and any(
+                start <= item.source_start and item.source_end <= end for start, end in watch_gaps
+            )
+        }
+        iphone_coverage: list[tuple[datetime, datetime]] = []
+        for gap_start, gap_end in watch_gaps:
+            iphone_coverage.extend(
+                bridge(
+                    union(
+                        tuple(
+                            (item.source_start, item.source_end)
+                            for item in interval_selected
+                            if item.measurement_version_id in iphone_fallback_ids
+                            and gap_start <= item.source_start
+                            and item.source_end <= gap_end
+                        )
+                    )
+                )
+            )
+
+        def suppression_reason(item: ActivityMeasurement) -> str | None:
+            if item not in selected:
+                return None
+            if (
+                item.source_class is ActivitySourceClass.IPHONE
+                and item.measurement_version_id not in iphone_fallback_ids
+            ):
+                return "iphone_outside_watch_gap"
+            if item.source_class in {ActivitySourceClass.OTHER, ActivitySourceClass.UNKNOWN}:
+                return "ineligible_source"
+            return None
+
+        measurements = tuple(
+            replace(item, suppression_reason=suppression_reason(item)) for item in measurements
+        )
+        eligible = tuple(
+            item
+            for item in selected
+            if item.source_class is ActivitySourceClass.WATCH
+            or item.measurement_version_id in iphone_fallback_ids
+        )
+        start_date: date | None
+        end_date: date | None
+        if selection.start_date is not None and selection.end_date is not None:
+            start_date, end_date = selection.start_date, selection.end_date
+        elif eligible:
+            start_date = min(item.measurement_local_day for item in eligible)
+            end_date = max(item.measurement_local_day for item in eligible)
+        else:
+            start_date = end_date = None
+
+        def feature(metric: ActivityMetric, day: date) -> DailyActivityMetric:
+            contributors = tuple(
+                item
+                for item in eligible
+                if item.data_type is metric and item.measurement_local_day == day
+            )
+            review_case_ids = tuple(
+                sorted(
+                    {case_id for item in contributors for case_id in item.review_case_ids}, key=str
+                )
+            )
+
+            def source_total(source_class: ActivitySourceClass) -> float | None:
+                values = tuple(
+                    item.effective_value
+                    for item in contributors
+                    if item.source_class is source_class and item.effective_value is not None
+                )
+                return sum(values) if values else None
+
+            return DailyActivityMetric(
+                data_type=metric,
+                unit=canonical_unit_for(CanonicalHealthType(metric.value)),
+                value=(
+                    sum(
+                        item.effective_value
+                        for item in contributors
+                        if item.effective_value is not None
+                    )
+                    if contributors
+                    else None
+                ),
+                logical_measurement_ids=tuple(item.logical_measurement_id for item in contributors),
+                measurement_version_ids=tuple(item.measurement_version_id for item in contributors),
+                review_case_ids=review_case_ids,
+                quality_status=(
+                    DataQualityStatus.PROVISIONAL if review_case_ids else DataQualityStatus.REVIEWED
+                ),
+                watch_value=source_total(ActivitySourceClass.WATCH),
+                iphone_value=source_total(ActivitySourceClass.IPHONE),
+            )
+
+        coverage_segments: dict[date, list[ActivityCoverageSegment]] = {}
+        coverage_candidates = tuple(
+            item
+            for item in selected
+            if item.source_class in {ActivitySourceClass.WATCH, ActivitySourceClass.IPHONE}
+            and item.source_end > item.source_start
+        )
+        if coverage_candidates:
+            first = min(coverage_candidates, key=lambda item: item.measurement_local_day)
+            last = max(coverage_candidates, key=lambda item: item.measurement_local_day)
+            range_start = datetime.combine(
+                first.measurement_local_day, time.min, first.source_start.tzinfo
+            )
+            range_end = datetime.combine(
+                last.measurement_local_day + timedelta(days=1), time.min, last.source_start.tzinfo
+            )
+            covered = tuple(
+                (start, end, ActivityCoverageKind.WATCH) for start, end in watch_coverage
+            ) + tuple(
+                (start, end, ActivityCoverageKind.IPHONE_FALLBACK) for start, end in iphone_coverage
+            )
+            boundaries = sorted(
+                {
+                    range_start,
+                    range_end,
+                    *(
+                        value
+                        for start, end, _ in covered
+                        for value in (max(start, range_start), min(end, range_end))
+                    ),
+                }
+            )
+            for start, end in pairwise(boundaries):
+                if start == end:
+                    continue
+                kind = next(
+                    (kind for left, right, kind in covered if left <= start and end <= right),
+                    ActivityCoverageKind.UNOBSERVED,
+                )
+                current_start = start
+                while current_start < end:
+                    midnight = datetime.combine(
+                        current_start.date() + timedelta(days=1), time.min, current_start.tzinfo
+                    )
+                    current_end = min(end, midnight)
+                    coverage_segments.setdefault(current_start.date(), []).append(
+                        ActivityCoverageSegment(kind, current_start, current_end)
+                    )
+                    current_start = current_end
+
+        days = []
+        current = start_date
+        while current is not None and end_date is not None and current <= end_date:
+            days.append(
+                ActivityDay(
+                    day=current,
+                    exercise_time=feature(ActivityMetric.EXERCISE_TIME, current),
+                    step_count=feature(ActivityMetric.STEP_COUNT, current),
+                    walking_running_distance=feature(
+                        ActivityMetric.WALKING_RUNNING_DISTANCE, current
+                    ),
+                    active_energy=feature(ActivityMetric.ACTIVE_ENERGY, current),
+                    coverage_segments=tuple(coverage_segments.get(current, ())),
+                    is_complete=not any(
+                        segment.kind is ActivityCoverageKind.UNOBSERVED
+                        for segment in coverage_segments.get(current, ())
+                    ),
+                    incomplete_reasons=(
+                        ("unobserved_coverage",)
+                        if any(
+                            segment.kind is ActivityCoverageKind.UNOBSERVED
+                            for segment in coverage_segments.get(current, ())
+                        )
+                        else ()
+                    ),
+                )
+            )
+            current += timedelta(days=1)
+        return ActivityDays(
+            snapshot_ref=snapshot_ref,
+            status=(
+                DataQualityStatus.PROVISIONAL
+                if any(item.review_case_ids for item in eligible)
+                or any(not item.is_complete for item in days)
+                else DataQualityStatus.REVIEWED
+            ),
+            days=tuple(days),
+            measurements=measurements,
+            source_classifier_version=derivation_version.source_classifier_version,
+            derivation_version=derivation_version.version_id,
+            coverage_gap_minutes=derivation_version.coverage_gap_minutes,
+        )
+
+    def load_workouts(self, selection: SnapshotDateSelection) -> Workouts:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        try:
+            snapshot_ref, stored = self._store.load_workouts(
+                selection.snapshot_ref, selection.start_date, selection.end_date
+            )
+        except StoreError as error:
+            raise HealthLabError("Trainingsprojektion ist nicht verfügbar.") from error
+        workouts = tuple(
+            Workout(
+                item.logical_workout_id,
+                item.workout_version_id,
+                item.original_activity_type,
+                item.source_start,
+                item.source_end,
+                item.source_updated_at,
+                item.measurement_local_day,
+                item.source_name,
+                item.source_version,
+                item.device,
+                item.strong_source_id_hash,
+                item.reported_duration_minutes,
+                item.effective_duration_minutes
+                if item.effective_duration_minutes is not None
+                else (item.source_end - item.source_start).total_seconds() / 60
+                if item.reported_duration_minutes is None
+                else item.reported_duration_minutes,
+                item.distance_kilometers,
+                item.active_energy_kilocalories,
+                item.is_selected,
+                tuple(DataReviewCaseId(str(case_id)) for case_id in item.review_case_ids),
+            )
+            for item in stored
+        )
+        aggregates = []
+        for day, activity_type in sorted(
+            {(item.measurement_local_day, item.original_activity_type) for item in workouts}
+        ):
+            contributors = tuple(
+                item
+                for item in workouts
+                if item.is_selected
+                and (item.measurement_local_day, item.original_activity_type)
+                == (day, activity_type)
+            )
+            if contributors:
+                aggregates.append(
+                    WorkoutAggregate(
+                        day,
+                        activity_type,
+                        len(contributors),
+                        sum(item.effective_duration_minutes for item in contributors),
+                        (
+                            sum(
+                                item.distance_kilometers
+                                for item in contributors
+                                if item.distance_kilometers is not None
+                            )
+                            if any(item.distance_kilometers is not None for item in contributors)
+                            else None
+                        ),
+                        (
+                            sum(
+                                item.active_energy_kilocalories
+                                for item in contributors
+                                if item.active_energy_kilocalories is not None
+                            )
+                            if any(
+                                item.active_energy_kilocalories is not None for item in contributors
+                            )
+                            else None
+                        ),
+                        tuple(
+                            sorted(
+                                {case for item in contributors for case in item.review_case_ids},
+                                key=str,
+                            )
+                        ),
+                    )
+                )
+        return Workouts(
+            snapshot_ref,
+            DataQualityStatus.PROVISIONAL
+            if any(item.review_case_ids for item in workouts)
+            else DataQualityStatus.REVIEWED,
+            workouts,
+            tuple(aggregates),
+        )
+
+    def load_sleep_days(self, selection: SnapshotDateSelection) -> SleepDays:
+        self._require_ready()
+        self._require_open()
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        try:
+            snapshot_ref, stored = self._store.load_sleep_measurements(selection.snapshot_ref)
+        except StoreError as error:
+            raise HealthLabError("Schlafprojektion ist nicht verfügbar.") from error
+        intervals = tuple(
+            SleepInterval(
+                logical_measurement_id=item.logical_measurement_id,
+                measurement_version_id=item.measurement_version_id,
+                original_category=item.original_category,
+                canonical_category=_SLEEP_CATEGORIES[item.canonical_category],
+                source_class=_classify_sleep_source(item.source_name, item.device),
+                is_selected=item.is_selected,
+                source_start=item.source_start,
+                source_end=item.source_end,
+                source_updated_at=item.source_updated_at,
+                source_name=item.source_name,
+                source_version=item.source_version,
+                device=item.device,
+            )
+            for item in stored
+            if (selection.start_date is None or item.source_end.date() >= selection.start_date)
+            and (selection.end_date is None or item.source_start.date() <= selection.end_date)
+        )
+        accepted = tuple(item for item in intervals if item.source_class is SleepSourceClass.WATCH)
+        rejected = tuple(
+            item for item in intervals if item.source_class is not SleepSourceClass.WATCH
+        )
+        selected = tuple(item for item in accepted if item.is_selected)
+        groups: list[list[SleepInterval]] = []
+        for interval in selected:
+            if interval.canonical_category is SleepCategory.IN_BED:
+                continue
+            if interval.source_end <= interval.source_start:
+                continue
+            if not groups or interval.source_start - max(
+                item.source_end for item in groups[-1]
+            ) > timedelta(minutes=90):
+                groups.append([interval])
+            else:
+                groups[-1].append(interval)
+        episodes_by_day: dict[date, list[SleepEpisode]] = {}
+        for group in groups:
+            start = min(item.source_start for item in group)
+            end = max(item.source_end for item in group)
+            in_bed = tuple(
+                replace(
+                    item,
+                    source_start=max(item.source_start, start),
+                    source_end=min(item.source_end, end),
+                )
+                for item in selected
+                if item.canonical_category is SleepCategory.IN_BED
+                and item.source_start < end
+                and item.source_end > start
+            )
+            episode = _sleep_episode(tuple(group) + in_bed)
+            episodes_by_day.setdefault(episode.end.date(), []).append(episode)
+        if selection.start_date is not None and selection.end_date is not None:
+            dates = tuple(
+                selection.start_date + timedelta(days=offset)
+                for offset in range((selection.end_date - selection.start_date).days + 1)
+            )
+        elif selected:
+            first_day = min(item.source_end.date() for item in selected)
+            last_day = max(item.source_end.date() for item in selected)
+            dates = tuple(
+                first_day + timedelta(days=offset)
+                for offset in range((last_day - first_day).days + 1)
+            )
+        else:
+            dates = ()
+
+        def quality(day: date, ambiguous: bool = False) -> SleepQuality:
+            day_intervals = tuple(item for item in intervals if item.source_end.date() == day)
+            selected_day = tuple(item for item in day_intervals if item.is_selected)
+            return SleepQuality(
+                source_classifier_version=_SLEEP_SOURCE_CLASSIFIER_VERSION,
+                derivation_version=_SLEEP_DERIVATION_VERSION,
+                accepted_interval_count=sum(
+                    item.source_class is SleepSourceClass.WATCH for item in selected_day
+                ),
+                rejected_interval_count=sum(
+                    item.source_class is not SleepSourceClass.WATCH for item in selected_day
+                ),
+                contributing_watch_source_count=len(
+                    {
+                        item.source_name
+                        for item in selected_day
+                        if item.source_class is SleepSourceClass.WATCH
+                    }
+                ),
+                source_counts=tuple(
+                    SleepSourceCount(
+                        source_class,
+                        sum(
+                            item.source_class is source_class
+                            and source_class is SleepSourceClass.WATCH
+                            for item in selected_day
+                        ),
+                        sum(
+                            item.source_class is source_class
+                            and source_class is not SleepSourceClass.WATCH
+                            for item in selected_day
+                        ),
+                    )
+                    for source_class in SleepSourceClass
+                ),
+                primary_selection_ambiguous=ambiguous,
+            )
+
+        days = []
+        for day in dates:
+            candidates = tuple(
+                item for item in episodes_by_day.get(day, ()) if item.observed_sleep > timedelta()
+            )
+            if not candidates:
+                status = (
+                    SleepObservationStatus.PARTIAL
+                    if any(
+                        item.is_selected and item.source_class is SleepSourceClass.WATCH
+                        for item in intervals
+                        if item.source_end.date() == day
+                    )
+                    else SleepObservationStatus.UNOBSERVED
+                )
+                days.append(SleepDay(day, status, None, (), quality(day)))
+                continue
+            largest = max(item.observed_sleep for item in candidates)
+            primary = tuple(item for item in candidates if item.observed_sleep == largest)
+            if len(primary) != 1:
+                days.append(
+                    SleepDay(
+                        day, SleepObservationStatus.PARTIAL, None, candidates, quality(day, True)
+                    )
+                )
+                continue
+            selected_episode = primary[0]
+            complete = not (
+                selected_episode.uncovered_gap
+                or selected_episode.stage_ambiguous
+                or selected_episode.asleep_awake_conflict
+            )
+            days.append(
+                SleepDay(
+                    day,
+                    SleepObservationStatus.OBSERVED if complete else SleepObservationStatus.PARTIAL,
+                    selected_episode,
+                    tuple(item for item in candidates if item is not selected_episode),
+                    quality(day),
+                )
+            )
+        return SleepDays(snapshot_ref, tuple(days), accepted, rejected)
+
     def load_data_review(self, selection: DataReviewSelection) -> DataReview:
         self._require_ready()
         self._require_open()
@@ -3348,9 +8134,7 @@ class HealthLab:
             if kind == "continued_override":
                 detail = load_review_case_detail(store, case.review_case_id)
                 first = (
-                    DataReviewAction.CONFIRM
-                    if detail.reasons
-                    else DataReviewAction.ACCEPT_SOURCE
+                    DataReviewAction.CONFIRM if detail.reasons else DataReviewAction.ACCEPT_SOURCE
                 )
                 return (
                     first,
@@ -3361,6 +8145,10 @@ class HealthLab:
                 return (DataReviewAction.CONFIRM, DataReviewAction.REJECT)
             if kind == "source_conflict":
                 return (DataReviewAction.PREFER, DataReviewAction.SPLIT)
+            if kind == "preferred_daily_weight_conflict":
+                return (DataReviewAction.CORRECT, DataReviewAction.EXCLUDE_LOCAL)
+            if kind in {"workout_plausibility", "workout_overlap"}:
+                return (DataReviewAction.CORRECT, DataReviewAction.EXCLUDE_LOCAL)
             return ()
 
         cases = tuple(
@@ -3439,7 +8227,15 @@ class HealthLab:
         if self._store is None:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
         identity = self._store.load_identity()
-        if identity.store_id is None or not identity.is_current:
+        snapshot_version = self._store.load_active_snapshot_schema_version()
+        if (
+            identity.store_id is None
+            or not identity.is_current
+            or (
+                snapshot_version is not None
+                and snapshot_version != current_snapshot_schema_version()
+            )
+        ):
             state = WorkspaceState.MIGRATION_REQUIRED
         elif self._store.load_restore_session() is not None:
             state = WorkspaceState.RESTORE_PENDING
@@ -3495,11 +8291,25 @@ class HealthLab:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
         raw_source = self._store.load_identity().schema_version
         target, steps, diagnostics = plan_store_migration(raw_source)
+        snapshot_source = self._store.load_active_snapshot_schema_version()
+        snapshot_target, snapshot_steps, snapshot_diagnostics = (
+            (current_snapshot_schema_version(), (), ())
+            if snapshot_source is None
+            else plan_snapshot_migration(snapshot_source)
+        )
         try:
             source = int(raw_source)
         except ValueError:
             source = None
-        return MigrationDiagnostics(source, target, steps, diagnostics)
+        return MigrationDiagnostics(
+            source,
+            target,
+            steps,
+            snapshot_source,
+            snapshot_target,
+            snapshot_steps,
+            diagnostics + snapshot_diagnostics,
+        )
 
     def load_plausibility_rules(self) -> PlausibilityRules:
         self._require_ready()
@@ -3545,7 +8355,10 @@ class HealthLab:
                     tuple(versions),
                     recommendations[data_type],
                 )
-                for data_type, versions in sorted(grouped.items(), key=lambda item: item[0].value)
+                for data_type in sorted(
+                    grouped.keys() | recommendations.keys(), key=lambda x: x.value
+                )
+                for versions in (grouped.get(data_type, []),)
             )
         )
 

@@ -9,15 +9,16 @@ import plistlib
 import shutil
 import sqlite3
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta, timezone
+from dataclasses import dataclass, replace
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from enum import StrEnum
 from itertools import pairwise
 from pathlib import Path
 from typing import IO, Literal, Self, cast
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import duckdb
 
@@ -27,7 +28,10 @@ from personal_health_lab.health_data import (
     AnalysisFreshness,
     CanonicalHealthRecord,
     CanonicalHealthType,
+    CanonicalSleepCategory,
+    CanonicalSleepInterval,
     CanonicalUnit,
+    CanonicalWorkout,
     DailyHealthSeries,
     DailyHealthValue,
     DataQualityStatus,
@@ -43,13 +47,80 @@ from personal_health_lab.health_data import (
 _METADATA_FILE = "metadata.sqlite3"
 _PARQUET_DIRECTORY = "parquet"
 _QUERY_FILE = "query.duckdb"
-_STORE_SCHEMA_VERSION = 6
+_STORE_SCHEMA_VERSION = 11
 _WRITER_LOCK_FILE = ".writer.lock"
-_FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
-_STORE_MIGRATION_METHOD = "cow-migration/v1"
-_SNAPSHOT_SCHEMA_VERSION = 1
-_IDENTITY_RULE_VERSION = "healthkit-natural/v2"
-_MAPPING_RULE_VERSION = "healthkit-canonical/v1"
+
+
+class CapacityMethodId(StrEnum):
+    FULL_SNAPSHOT_IMPORT = "full-snapshot-import/v1"
+    MANUAL_SNAPSHOT = "manual-snapshot/v1"
+    ACTIVITY_DERIVATION = "activity-derivation/v1"
+    STORE_MIGRATION = "cow-migration/v1"
+    METADATA_BACKUP = "metadata-backup/v1"
+    RESTORE_START = "restore-start/v1"
+    RESTORE_SOURCE_IMPORT = "restore-source-import/v1"
+    RESTORE_ACTIVATE = "restore-activate/v1"
+
+
+_FULL_SNAPSHOT_IMPORT_METHOD = CapacityMethodId.FULL_SNAPSHOT_IMPORT
+_SNAPSHOT_WRITE_METHODS = {
+    CapacityMethodId.ACTIVITY_DERIVATION,
+    CapacityMethodId.MANUAL_SNAPSHOT,
+}
+_STORE_MIGRATION_METHOD = CapacityMethodId.STORE_MIGRATION
+_SNAPSHOT_SCHEMA_VERSION = 7
+_RESTORABLE_MANUAL_METADATA_TABLES = (
+    "activity_derivation_versions",
+    "manual_context_revisions",
+    "context_coverage_start_values",
+    "illness_category_values",
+    "daily_stress_values",
+    "custom_context_label_values",
+    "custom_context_period_values",
+    "illness_period_values",
+    "manual_context_publications",
+    "medication_regime_revisions",
+    "medication_regime_values",
+    "medication_scheduled_doses",
+    "medication_as_needed_entries",
+    "medication_publications",
+    "medication_deviation_revisions",
+    "medication_deviation_values",
+    "medication_deviation_intakes",
+    "medication_deviation_publications",
+    "intake_reason_category_revisions",
+    "intake_reason_category_values",
+    "intake_reason_category_publications",
+    "as_needed_intake_revisions",
+    "as_needed_intake_values",
+    "as_needed_intake_publications",
+    "manual_revision_intents",
+)
+_CANONICAL_HEALTH_TYPES_SQL = ", ".join(f"'{item.value}'" for item in CanonicalHealthType)
+_CANONICAL_UNITS_SQL = ", ".join(f"'{item.value}'" for item in CanonicalUnit)
+_PRE_ACTIVITY_HEALTH_TYPES_SQL = ", ".join(
+    f"'{item.value}'"
+    for item in CanonicalHealthType
+    if item
+    not in {
+        CanonicalHealthType.APPLE_EXERCISE_TIME,
+        CanonicalHealthType.STEP_COUNT,
+        CanonicalHealthType.WALKING_RUNNING_DISTANCE,
+    }
+)
+_PRE_ACTIVITY_UNITS_SQL = ", ".join(
+    f"'{item.value}'"
+    for item in CanonicalUnit
+    if item not in {CanonicalUnit.COUNT, CanonicalUnit.KILOMETER, CanonicalUnit.MINUTE}
+)
+_IDENTITY_RULE_VERSION = "healthkit-identity/v3"
+_SUPPORTED_IDENTITY_RULE_VERSIONS = {"healthkit-natural/v2", _IDENTITY_RULE_VERSION}
+_MAPPING_RULE_VERSION = "healthkit-canonical/v3"
+_SUPPORTED_MAPPING_RULE_VERSIONS = {
+    "healthkit-canonical/v1",
+    "healthkit-canonical/v2",
+    _MAPPING_RULE_VERSION,
+}
 _FIXED_PLAUSIBILITY_RULE_VERSION = "fixed-plausibility/v1"
 _SNAPSHOT_SCHEMAS = {
     "source_occurrences.parquet": (
@@ -82,6 +153,56 @@ _SNAPSHOT_SCHEMAS = {
         ("original_unit", "VARCHAR"),
         ("strong_source_id_hash", "VARCHAR"),
     ),
+    "sleep_intervals.parquet": (
+        ("measurement_version_id", "VARCHAR"),
+        ("identity_candidate_id", "VARCHAR"),
+        ("original_category", "VARCHAR"),
+        ("canonical_category", "VARCHAR"),
+        ("source_start_utc", "VARCHAR"),
+        ("source_end_utc", "VARCHAR"),
+        ("source_updated_at_utc", "VARCHAR"),
+        ("source_start_offset_minutes", "INTEGER"),
+        ("source_end_offset_minutes", "INTEGER"),
+        ("source_updated_at_offset_minutes", "INTEGER"),
+        ("source_name", "VARCHAR"),
+        ("source_version", "VARCHAR"),
+        ("device", "VARCHAR"),
+        ("strong_source_id_hash", "VARCHAR"),
+        ("is_selected", "BOOLEAN"),
+    ),
+    "workouts.parquet": (
+        ("workout_version_id", "VARCHAR"),
+        ("logical_workout_id", "VARCHAR"),
+        ("original_activity_type", "VARCHAR"),
+        ("source_start_utc", "VARCHAR"),
+        ("source_end_utc", "VARCHAR"),
+        ("source_updated_at_utc", "VARCHAR"),
+        ("source_start_offset_minutes", "INTEGER"),
+        ("source_end_offset_minutes", "INTEGER"),
+        ("source_updated_at_offset_minutes", "INTEGER"),
+        ("measurement_local_date", "DATE"),
+        ("source_name", "VARCHAR"),
+        ("source_version", "VARCHAR"),
+        ("device", "VARCHAR"),
+        ("strong_source_id_hash", "VARCHAR"),
+        ("reported_duration_minutes", "DOUBLE"),
+        ("distance_kilometers", "DOUBLE"),
+        ("active_energy_kilocalories", "DOUBLE"),
+        ("is_selected", "BOOLEAN"),
+    ),
+    "resolved_workouts.parquet": (
+        ("logical_workout_id", "VARCHAR"),
+        ("selected_workout_version_id", "VARCHAR"),
+        ("disposition", "VARCHAR"),
+        ("effective_duration_minutes", "DOUBLE"),
+        ("distance_kilometers", "DOUBLE"),
+        ("active_energy_kilocalories", "DOUBLE"),
+        ("effective_decision_id", "VARCHAR"),
+    ),
+    "workout_review_links.parquet": (
+        ("review_case_id", "VARCHAR"),
+        ("workout_version_id", "VARCHAR"),
+    ),
     "resolved_measurements.parquet": (
         ("logical_measurement_id", "VARCHAR"),
         ("selected_measurement_version_id", "VARCHAR"),
@@ -102,6 +223,209 @@ _SNAPSHOT_SCHEMAS = {
         ("rule_version_id", "VARCHAR"),
         ("evidence_fingerprint", "VARCHAR"),
     ),
+    "weight_nutrition_days.parquet": (
+        ("derived_record_id", "VARCHAR"),
+        ("day", "DATE"),
+        ("feature_kind", "VARCHAR"),
+        ("canonical_unit", "VARCHAR"),
+        ("effective_value", "DOUBLE"),
+        ("observation_status", "VARCHAR"),
+        ("quality_status", "VARCHAR"),
+        ("derivation_contract_id", "VARCHAR"),
+        ("snapshot_id", "VARCHAR"),
+        ("derived_at_utc", "VARCHAR"),
+    ),
+    "sleep_episodes.parquet": (
+        ("derived_record_id", "VARCHAR"),
+        ("episode_start_utc", "VARCHAR"),
+        ("episode_end_utc", "VARCHAR"),
+        ("observed_sleep_minutes", "DOUBLE"),
+        ("quality_status", "VARCHAR"),
+        ("derivation_contract_id", "VARCHAR"),
+        ("snapshot_id", "VARCHAR"),
+        ("derived_at_utc", "VARCHAR"),
+    ),
+    "sleep_nights.parquet": (
+        ("derived_record_id", "VARCHAR"),
+        ("day", "DATE"),
+        ("observation_status", "VARCHAR"),
+        ("primary_episode_id", "VARCHAR"),
+        ("quality_status", "VARCHAR"),
+        ("derivation_contract_id", "VARCHAR"),
+        ("snapshot_id", "VARCHAR"),
+        ("derived_at_utc", "VARCHAR"),
+    ),
+    "activity_days.parquet": (
+        ("derived_record_id", "VARCHAR"),
+        ("day", "DATE"),
+        ("metric", "VARCHAR"),
+        ("canonical_unit", "VARCHAR"),
+        ("effective_value", "DOUBLE"),
+        ("watch_value", "DOUBLE"),
+        ("iphone_value", "DOUBLE"),
+        ("quality_status", "VARCHAR"),
+        ("derivation_contract_id", "VARCHAR"),
+        ("snapshot_id", "VARCHAR"),
+        ("derived_at_utc", "VARCHAR"),
+    ),
+    "activity_coverage_segments.parquet": (
+        ("derived_record_id", "VARCHAR"),
+        ("start_utc", "VARCHAR"),
+        ("end_utc", "VARCHAR"),
+        ("coverage_kind", "VARCHAR"),
+        ("derivation_contract_id", "VARCHAR"),
+        ("snapshot_id", "VARCHAR"),
+        ("derived_at_utc", "VARCHAR"),
+    ),
+    "workout_features.parquet": (
+        ("derived_record_id", "VARCHAR"),
+        ("logical_workout_id", "VARCHAR"),
+        ("day", "DATE"),
+        ("activity_type", "VARCHAR"),
+        ("duration_minutes", "DOUBLE"),
+        ("distance_kilometers", "DOUBLE"),
+        ("active_energy_kilocalories", "DOUBLE"),
+        ("quality_status", "VARCHAR"),
+        ("derivation_contract_id", "VARCHAR"),
+        ("snapshot_id", "VARCHAR"),
+        ("derived_at_utc", "VARCHAR"),
+    ),
+    "daily_context.parquet": (
+        ("derived_record_id", "VARCHAR"),
+        ("day", "DATE"),
+        ("illness_severity", "VARCHAR"),
+        ("stress_level", "VARCHAR"),
+        ("quality_status", "VARCHAR"),
+        ("derivation_contract_id", "VARCHAR"),
+        ("snapshot_id", "VARCHAR"),
+        ("derived_at_utc", "VARCHAR"),
+    ),
+    "medication_context.parquet": (
+        ("derived_record_id", "VARCHAR"),
+        ("day", "DATE"),
+        ("scheduled_dose_count", "BIGINT"),
+        ("deviation_count", "BIGINT"),
+        ("as_needed_intake_count", "BIGINT"),
+        ("quality_status", "VARCHAR"),
+        ("derivation_contract_id", "VARCHAR"),
+        ("snapshot_id", "VARCHAR"),
+        ("derived_at_utc", "VARCHAR"),
+    ),
+    "derivation_lineage.parquet": (
+        ("derived_record_id", "VARCHAR"),
+        ("derived_family", "VARCHAR"),
+        ("derivation_contract_id", "VARCHAR"),
+        ("source_logical_id", "VARCHAR"),
+        ("source_version_id", "VARCHAR"),
+        ("contribution_role", "VARCHAR"),
+        ("snapshot_id", "VARCHAR"),
+        ("derived_at_utc", "VARCHAR"),
+    ),
+}
+_SNAPSHOT_FILE_CONTRACTS = {
+    "source_occurrences.parquet": (_IDENTITY_RULE_VERSION, _MAPPING_RULE_VERSION),
+    "measurement_versions.parquet": (_MAPPING_RULE_VERSION,),
+    "sleep_intervals.parquet": (_MAPPING_RULE_VERSION,),
+    "workouts.parquet": (_MAPPING_RULE_VERSION,),
+    "resolved_measurements.parquet": ("resolved-measurement/v1",),
+    "resolved_workouts.parquet": ("resolved-workout/v1",),
+    "workout_review_links.parquet": ("resolved-workout/v1",),
+    "open_review_cases.parquet": (_FIXED_PLAUSIBILITY_RULE_VERSION,),
+    "weight_nutrition_days.parquet": ("weight-nutrition-day/v1",),
+    "sleep_episodes.parquet": ("sleep-episode/v1",),
+    "sleep_nights.parquet": ("sleep-night/v1",),
+    "activity_days.parquet": ("activity-day/v1",),
+    "activity_coverage_segments.parquet": ("activity-coverage/v1",),
+    "workout_features.parquet": ("workout-feature/v1",),
+    "daily_context.parquet": ("daily-context/v1",),
+    "medication_context.parquet": ("medication-context/v1",),
+    "derivation_lineage.parquet": (
+        "resolved-measurement/v1",
+        "resolved-workout/v1",
+        "weight-nutrition-day/v1",
+        "sleep-episode/v1",
+        "sleep-night/v1",
+        "activity-day/v1",
+        "activity-coverage/v1",
+        "workout-feature/v1",
+        "daily-context/v1",
+        "medication-context/v1",
+    ),
+}
+_V6_DERIVATION_FILES = {
+    "weight_nutrition_days.parquet",
+    "sleep_episodes.parquet",
+    "sleep_nights.parquet",
+    "activity_days.parquet",
+    "activity_coverage_segments.parquet",
+    "workout_features.parquet",
+    "daily_context.parquet",
+    "medication_context.parquet",
+}
+_DERIVATION_CONTRACT_IDS = tuple(
+    sorted(
+        {
+            contract_id
+            for filename in _V6_DERIVATION_FILES | {"derivation_lineage.parquet"}
+            for contract_id in _SNAPSHOT_FILE_CONTRACTS[filename]
+        }
+    )
+)
+_MAPPING_CONTRACT_FILES = {
+    "measurement_versions.parquet",
+    "sleep_intervals.parquet",
+    "workouts.parquet",
+}
+_LEGACY_SNAPSHOT_SCHEMAS = {
+    name: schema
+    for name, schema in _SNAPSHOT_SCHEMAS.items()
+    if name
+    in {
+        "source_occurrences.parquet",
+        "measurement_versions.parquet",
+        "resolved_measurements.parquet",
+        "open_review_cases.parquet",
+    }
+}
+_V2_SNAPSHOT_SCHEMAS = {
+    name: (
+        tuple(field for field in schema if field[0] != "strong_source_id_hash")
+        if name == "workouts.parquet"
+        else schema
+    )
+    for name, schema in _SNAPSHOT_SCHEMAS.items()
+    if name
+    not in {
+        "resolved_workouts.parquet",
+        "workout_review_links.parquet",
+        "derivation_lineage.parquet",
+    }
+    | _V6_DERIVATION_FILES
+}
+_V3_SNAPSHOT_SCHEMAS = {
+    name: schema
+    for name, schema in _SNAPSHOT_SCHEMAS.items()
+    if name
+    not in {
+        "resolved_workouts.parquet",
+        "workout_review_links.parquet",
+        "derivation_lineage.parquet",
+    }
+    | _V6_DERIVATION_FILES
+}
+_V4_SNAPSHOT_SCHEMAS = {
+    name: schema
+    for name, schema in _SNAPSHOT_SCHEMAS.items()
+    if name not in _V6_DERIVATION_FILES | {"derivation_lineage.parquet"}
+}
+_V5_SNAPSHOT_SCHEMAS = {
+    name: (
+        tuple(field for field in schema if field[0] not in {"snapshot_id", "derived_at_utc"})
+        if name == "derivation_lineage.parquet"
+        else schema
+    )
+    for name, schema in _SNAPSHOT_SCHEMAS.items()
+    if name not in _V6_DERIVATION_FILES
 }
 _KIB = 1024
 _MIB = 1024 * _KIB
@@ -139,6 +463,16 @@ def _is_timestamp(value: object) -> bool:
     except ValueError:
         return False
     return parsed.tzinfo is not None
+
+
+def _snapshot_file_contract_ids(
+    filename: str, identity_rule_version_id: str, mapping_rule_version_id: str
+) -> tuple[str, ...]:
+    if filename == "source_occurrences.parquet":
+        return identity_rule_version_id, mapping_rule_version_id
+    if filename in _MAPPING_CONTRACT_FILES:
+        return (mapping_rule_version_id,)
+    return _SNAPSHOT_FILE_CONTRACTS[filename]
 
 
 class StoreError(RuntimeError):
@@ -204,7 +538,7 @@ class CapacityReason(StrEnum):
 class CapacityCheck:
     status: CapacityStatus
     target_volume: str
-    method_id: str
+    method_id: CapacityMethodId
     estimate_bytes: int | None
     safety_margin_bytes: int | None
     minimum_remaining_bytes: int
@@ -270,12 +604,47 @@ def cow_migration_estimate(
     return _DIRECTORY_OVERHEAD + backup_catalog_and_journal + snapshot_and_scratch
 
 
+def _snapshot_write_estimate(
+    output_bound_bytes: int,
+    metadata_bytes: int,
+    fragment_size: int,
+    *,
+    writer_bound: bool = True,
+    scratch_bound: bool = True,
+) -> int | None:
+    """Bound a V0.3 snapshot write without recounting hard-linked immutable artifacts."""
+    if not writer_bound or not scratch_bound:
+        return None
+    if output_bound_bytes < 0 or metadata_bytes < 0 or fragment_size <= 0:
+        raise ValueError("Kapazitätseingaben müssen nichtnegativ und Fragmente positiv sein.")
+    output = _round_up(max(2 * output_bound_bytes, 64 * _KIB), fragment_size)
+    scratch = _round_up(max(4 * output_bound_bytes, 64 * _KIB), fragment_size)
+    catalog_and_journal = _round_up(max(4 * metadata_bytes, 64 * _KIB), fragment_size)
+    return _DIRECTORY_OVERHEAD + output + scratch + catalog_and_journal
+
+
 def _allocation_checkpoint(root: Path, phase: str) -> None:
     """Private test seam for measuring the real writer's live allocation."""
 
 
 def _publication_fault_point(root: Path, fault_point_id: str) -> None:
     """Private test seam for durable import-publication transitions."""
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_snapshot(directory: Path) -> None:
+    for path in sorted(directory.iterdir()):
+        if path.is_file():
+            with path.open("rb") as artifact:
+                os.fsync(artifact.fileno())
+    _fsync_directory(directory)
 
 
 def _migration_backup_fault_point(root: Path) -> None:
@@ -290,7 +659,7 @@ def probe_capacity(
     path: Path,
     estimate_bytes: int | None,
     *,
-    method_id: str = _FULL_SNAPSHOT_IMPORT_METHOD,
+    method_id: CapacityMethodId = _FULL_SNAPSHOT_IMPORT_METHOD,
 ) -> CapacityCheck:
     minimum_remaining = _GIB
     try:
@@ -599,6 +968,10 @@ def current_store_schema_version() -> int:
     return _STORE_SCHEMA_VERSION
 
 
+def current_snapshot_schema_version() -> int:
+    return _SNAPSHOT_SCHEMA_VERSION
+
+
 @dataclass(frozen=True, slots=True)
 class AnalysisRunId(_OpaqueStoreId):
     pass
@@ -759,6 +1132,94 @@ class PublishImportResult:
     diagnostics: tuple[str, ...] = ()
 
 
+UnsupportedContentCategory = Literal[
+    "record_type",
+    "sleep_value",
+    "top_level_element",
+    "unit",
+    "workout_activity_type",
+    "workout_child",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class UnsupportedImportContent:
+    category: UnsupportedContentCategory
+    external_identifier: str
+    count: int
+
+
+@dataclass(frozen=True, slots=True)
+class StoredImportDetails:
+    package_record_count: int
+    record_count: int
+    logical_measurement_count: int
+    measurement_version_count: int
+    source_occurrence_count: int
+    anomaly_count: int
+    unsupported_content: tuple[UnsupportedImportContent, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StoredMeasurement:
+    logical_measurement_id: LogicalMeasurementId
+    measurement_version_id: MeasurementVersionId
+    data_type: CanonicalHealthType
+    unit: CanonicalUnit
+    value: float
+    effective_value: float | None
+    disposition: (
+        Literal[
+            "included_source",
+            "included_correction",
+            "excluded_local",
+            "excluded_source_deletion",
+        ]
+        | None
+    )
+    is_selected: bool
+    source_start: datetime
+    source_end: datetime
+    source_updated_at: datetime
+    measurement_local_day: date
+    source_name: str
+    source_version: str
+    device: str
+    original_value: float
+    original_unit: str
+    review_case_ids: tuple[ReviewCaseId, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StoredWorkout:
+    logical_workout_id: LogicalMeasurementId
+    workout_version_id: MeasurementVersionId
+    original_activity_type: str
+    source_start: datetime
+    source_end: datetime
+    source_updated_at: datetime
+    measurement_local_day: date
+    source_name: str
+    source_version: str
+    device: str
+    strong_source_id_hash: str | None
+    reported_duration_minutes: float | None
+    distance_kilometers: float | None
+    active_energy_kilocalories: float | None
+    is_selected: bool
+    effective_duration_minutes: float | None
+    disposition: str | None
+    review_case_ids: tuple[ReviewCaseId, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityDerivationRecord:
+    version_id: str
+    coverage_gap_minutes: int
+    source_classifier_version: str
+    created_at: datetime
+
+
 @dataclass(frozen=True, slots=True)
 class PublishDecisionResult:
     operation_id: OperationId
@@ -779,10 +1240,13 @@ class OpenDataReviewCase:
     review_case_id: str
     kind: Literal[
         "plausibility",
+        "workout_plausibility",
+        "workout_overlap",
         "continued_override",
         "suspected_source_deletion",
         "source_conflict",
         "rule_definition",
+        "preferred_daily_weight_conflict",
     ]
     logical_measurement_id: LogicalMeasurementId | None
     measurement_version_id: MeasurementVersionId | None
@@ -834,6 +1298,37 @@ class ResolvedMeasurement:
     correction_decision_id: str | None
     source_deletion_decision_id: str | None
     conflict_resolution_decision_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkoutVersionFact:
+    workout_version_id: str
+    logical_workout_id: str
+    source_start_utc: str
+    source_end_utc: str
+    source_updated_at_utc: str
+    source_version: str
+    reported_duration_minutes: float | None
+    distance_kilometers: float | None
+    active_energy_kilocalories: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedWorkout:
+    logical_workout_id: str
+    selected_workout_version_id: str
+    disposition: str
+    effective_duration_minutes: float | None
+    distance_kilometers: float | None
+    active_energy_kilocalories: float | None
+    effective_decision_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkoutResolution:
+    workouts: tuple[ResolvedWorkout, ...]
+    review_cases: tuple[OpenDataReviewCase, ...]
+    review_links: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -925,6 +1420,7 @@ class HistoricalReviewPublication:
 
 
 type SourceResolver = Callable[..., SourceResolution]
+type WorkoutResolver = Callable[..., WorkoutResolution]
 
 
 @dataclass(frozen=True, slots=True)
@@ -957,11 +1453,285 @@ class BackupSnapshotFact:
 
 
 @dataclass(frozen=True, slots=True)
+class BackupSnapshotOrigin:
+    snapshot_id: SnapshotId
+    schema_version: int
+    manifest_sha256: str
+    snapshot_as_of: datetime
+    context_timezone: str
+    context_as_of_date: date
+    medication_as_of: datetime
+    activity_derivation_version_id: str
+    manual_revision_bindings: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ReviewSnapshotFacts:
     snapshot_id: SnapshotId
     cases: tuple[OpenDataReviewCase, ...]
     versions: tuple[MeasurementVersionFact, ...]
     measurements: tuple[ResolvedMeasurement, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StoredContextCoverageStart:
+    logical_id: str
+    revision_id: str
+    previous_revision_id: str | None
+    state: Literal["active", "withdrawn"]
+    start_date: date | None
+    snapshot_id: SnapshotId | None
+
+
+@dataclass(frozen=True, slots=True)
+class ContextLogicalId:
+    value: str
+
+    def __post_init__(self) -> None:
+        if len(self.value) != 32 or not set(self.value) <= set("0123456789abcdef"):
+            raise ValueError("Kontext-ID muss ein 32-stelliger Hex-Wert sein.")
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True, slots=True)
+class ContextRevisionId:
+    value: str
+
+    def __post_init__(self) -> None:
+        if len(self.value) != 32 or not set(self.value) <= set("0123456789abcdef"):
+            raise ValueError("Kontextrevisions-ID muss ein 32-stelliger Hex-Wert sein.")
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCoverageStartPublication:
+    operation_id: OperationId
+    intent: Literal["create", "revise", "withdraw", "restore"]
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId | None
+    start_date: date | None
+    withdrawal_reason: str | None
+    expected_snapshot_id: SnapshotId
+    snapshot_as_of: datetime
+    context_as_of_date: date
+    context_timezone: str
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCoverageStartPublicationResult:
+    logical_id: ContextLogicalId
+    revision_id: ContextRevisionId
+    snapshot_id: SnapshotId
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationLogicalId:
+    value: str
+
+    def __post_init__(self) -> None:
+        if len(self.value) != 32 or not set(self.value) <= set("0123456789abcdef"):
+            raise ValueError("Medikamenten-ID muss ein 32-stelliger Hex-Wert sein.")
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRevisionId:
+    value: str
+
+    def __post_init__(self) -> None:
+        if len(self.value) != 32 or not set(self.value) <= set("0123456789abcdef"):
+            raise ValueError("Medikamentenrevisions-ID muss ein 32-stelliger Hex-Wert sein.")
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRegimePublication:
+    operation_id: OperationId
+    intent: Literal["create", "revise", "withdraw", "restore"]
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId | None
+    starts_at: datetime
+    timezone: str
+    scheduled_doses: tuple[tuple[str, str, str, time, tuple[str, ...]], ...]
+    as_needed_medications: tuple[tuple[str, str, str, tuple[str, ...], str], ...]
+    withdrawal_reason: str | None
+    expected_snapshot_id: SnapshotId
+    medication_as_of: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRegimePublicationResult:
+    logical_id: MedicationLogicalId
+    revision_id: MedicationRevisionId
+    snapshot_id: SnapshotId
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationDeviationPublication:
+    operation_id: OperationId
+    intent: Literal["create", "revise", "withdraw", "restore"]
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId | None
+    regime_logical_id: MedicationLogicalId
+    scheduled_at: datetime
+    actual_intakes: tuple[tuple[datetime, str], ...]
+    withdrawal_reason: str | None
+    expected_snapshot_id: SnapshotId
+    medication_as_of: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationDeviationPublicationResult:
+    logical_id: MedicationLogicalId
+    revision_id: MedicationRevisionId
+    snapshot_id: SnapshotId
+
+
+@dataclass(frozen=True, slots=True)
+class AsNeededIntakePublication:
+    operation_id: OperationId
+    intent: Literal["create", "revise", "withdraw", "restore"]
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId | None
+    regime_logical_id: MedicationLogicalId
+    entry_id: str
+    taken_at: datetime
+    amount: str
+    reason_category_logical_id: MedicationLogicalId | None
+    withdrawal_reason: str | None
+    expected_snapshot_id: SnapshotId
+    medication_as_of: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class IntakeReasonCategoryPublication:
+    operation_id: OperationId
+    intent: Literal["create", "revise", "withdraw", "restore"]
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId | None
+    name: str | None
+    withdrawal_reason: str | None
+    expected_snapshot_id: SnapshotId
+    medication_as_of: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRootPublicationResult:
+    logical_id: MedicationLogicalId
+    revision_id: MedicationRevisionId
+    snapshot_id: SnapshotId
+
+
+@dataclass(frozen=True, slots=True)
+class StoredMedicationDeviation:
+    logical_id: str
+    revision_id: str
+    previous_revision_id: str | None
+    state: Literal["active", "withdrawn"]
+    regime_logical_id: str
+    scheduled_at: datetime
+    actual_intakes: tuple[tuple[datetime, str], ...]
+    withdrawal_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class StoredMedicationRegime:
+    logical_id: str
+    revision_id: str
+    previous_revision_id: str | None
+    state: Literal["active", "withdrawn"]
+    starts_at: datetime
+    timezone: str
+    scheduled_doses: tuple[tuple[str, str, str, time, tuple[str, ...]], ...]
+    as_needed_medications: tuple[tuple[str, str, str, tuple[str, ...], str], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StoredAsNeededIntake:
+    logical_id: str
+    revision_id: str
+    previous_revision_id: str | None
+    state: Literal["active", "withdrawn"]
+    regime_logical_id: str
+    entry_id: str
+    taken_at: datetime
+    amount: str
+    reason_category_logical_id: str | None
+    withdrawal_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class StoredIntakeReasonCategory:
+    logical_id: str
+    revision_id: str
+    previous_revision_id: str | None
+    state: Literal["active", "withdrawn"]
+    name: str | None
+    withdrawal_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class StoredIllnessRevision:
+    logical_id: str
+    revision_id: str
+    previous_revision_id: str | None
+    state: Literal["active", "withdrawn"]
+    object_kind: Literal[
+        "illness_category",
+        "illness_period",
+        "daily_stress",
+        "custom_context_label",
+        "custom_context_period",
+    ]
+    name: str | None
+    category_logical_id: str | None
+    start_date: date | None
+    end_date: date | None
+    severity: str | None
+    stress_level: str | None
+    note: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessPublication:
+    operation_id: OperationId
+    intent: Literal["create", "revise", "withdraw", "restore"]
+    object_kind: Literal[
+        "illness_category",
+        "illness_period",
+        "daily_stress",
+        "custom_context_label",
+        "custom_context_period",
+    ]
+    logical_id: ContextLogicalId
+    expected_revision_id: ContextRevisionId | None
+    name: str | None
+    category_logical_id: ContextLogicalId | None
+    start_date: date | None
+    end_date: date | None
+    severity: str | None
+    stress_level: str | None
+    note: str | None
+    withdrawal_reason: str | None
+    expected_snapshot_id: SnapshotId
+    snapshot_as_of: datetime
+    context_as_of_date: date
+    context_timezone: str
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessPublicationResult:
+    logical_id: ContextLogicalId
+    revision_id: ContextRevisionId
+    snapshot_id: SnapshotId
 
 
 def _execute_script(metadata: sqlite3.Connection, script: str) -> None:
@@ -975,10 +1745,19 @@ def _execute_script(metadata: sqlite3.Connection, script: str) -> None:
         raise sqlite3.DatabaseError("incomplete schema statement")
 
 
+def _normalized_context_name(name: str) -> str:
+    return " ".join(name.split()).casefold()
+
+
+def _manual_payload_sha256(payload: Mapping[str, object]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
 def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
     _execute_script(
         metadata,
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS imports (
             import_id TEXT PRIMARY KEY CHECK (
                 length(import_id) = 32 AND import_id NOT GLOB '*[^0-9a-f]*'
@@ -1013,7 +1792,9 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                                  'revoke_data_review_decision',
                                  'create_plausibility_rule_version',
                                  'run_historical_review', 'migrate_store',
-                                 'rollback_migration')
+                                 'rollback_migration', 'revise_context_coverage_start',
+                                 'revise_medication_regime', 'revise_medication_deviation',
+                                 'revise_as_needed_intake', 'revise_intake_reason_category')
             ),
             started_at_utc TEXT NOT NULL CHECK (
                 length(started_at_utc) >= 20 AND substr(started_at_utc, 11, 1) = 'T'
@@ -1049,17 +1830,47 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             activation_kind TEXT NOT NULL CHECK (
                 activation_kind IN (
                     'import', 'data_review_decision', 'rule_version', 'historical',
-                    'migration'
+                    'migration', 'manual_context_revision'
                 )
             ),
             activated_at_utc TEXT NOT NULL CHECK (
                 length(activated_at_utc) >= 20 AND substr(activated_at_utc, 11, 1) = 'T'
             )
         ) STRICT;
+        CREATE TABLE IF NOT EXISTS snapshot_contract_bindings (
+            snapshot_id TEXT PRIMARY KEY REFERENCES dataset_snapshots(snapshot_id),
+            snapshot_as_of TEXT NOT NULL,
+            context_timezone TEXT NOT NULL CHECK (context_timezone != ''),
+            context_as_of_date TEXT NOT NULL CHECK (length(context_as_of_date) = 10),
+            medication_as_of TEXT NOT NULL,
+            CHECK (snapshot_as_of = medication_as_of)
+        ) STRICT;
         CREATE TABLE IF NOT EXISTS active_snapshot (
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(snapshot_id)
         ) STRICT;
+        CREATE TABLE IF NOT EXISTS activity_derivation_versions (
+            version_id TEXT PRIMARY KEY,
+            coverage_gap_minutes INTEGER NOT NULL CHECK (
+                coverage_gap_minutes BETWEEN 1 AND 1440
+            ),
+            source_classifier_version TEXT NOT NULL,
+            created_at_utc TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS activity_derivation_active (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            version_id TEXT NOT NULL REFERENCES activity_derivation_versions(version_id)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS activity_derivation_snapshot_bindings (
+            snapshot_id TEXT PRIMARY KEY REFERENCES dataset_snapshots(snapshot_id),
+            version_id TEXT NOT NULL REFERENCES activity_derivation_versions(version_id)
+        ) STRICT;
+        CREATE TRIGGER IF NOT EXISTS activity_derivation_versions_no_update
+        BEFORE UPDATE ON activity_derivation_versions
+        BEGIN SELECT RAISE(ABORT, 'activity derivation versions are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS activity_derivation_versions_no_delete
+        BEFORE DELETE ON activity_derivation_versions
+        BEGIN SELECT RAISE(ABORT, 'activity derivation versions are append-only'); END;
         CREATE TABLE IF NOT EXISTS import_measurement_versions (
             import_id TEXT NOT NULL REFERENCES imports(import_id),
             measurement_version_id TEXT NOT NULL CHECK (
@@ -1067,6 +1878,25 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                 AND measurement_version_id NOT GLOB '*[^0-9a-f]*'
             ),
             PRIMARY KEY (import_id, measurement_version_id)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS import_canonical_counts (
+            import_id TEXT PRIMARY KEY REFERENCES imports(import_id),
+            logical_measurement_count INTEGER NOT NULL CHECK (logical_measurement_count >= 0),
+            measurement_version_count INTEGER NOT NULL CHECK (measurement_version_count >= 0),
+            source_occurrence_count INTEGER NOT NULL CHECK (source_occurrence_count >= 0),
+            anomaly_count INTEGER NOT NULL CHECK (anomaly_count >= 0)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS unsupported_import_content (
+            import_id TEXT NOT NULL REFERENCES imports(import_id),
+            category TEXT NOT NULL CHECK (
+                category IN (
+                    'record_type', 'sleep_value', 'top_level_element', 'unit',
+                    'workout_activity_type', 'workout_child'
+                )
+            ),
+            external_identifier TEXT NOT NULL CHECK (length(external_identifier) > 0),
+            count INTEGER NOT NULL CHECK (count > 0),
+            PRIMARY KEY (import_id, category, external_identifier)
         ) STRICT;
         CREATE TABLE IF NOT EXISTS exports (
             export_id TEXT PRIMARY KEY CHECK (
@@ -1103,9 +1933,9 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS plausibility_rule_versions (
             rule_version_id TEXT NOT NULL REFERENCES rule_version_refs(rule_version_id),
             data_type TEXT NOT NULL CHECK (
-                data_type IN ('active_energy', 'apple_resting_heart_rate')
+                data_type IN ({_CANONICAL_HEALTH_TYPES_SQL})
             ),
-            canonical_unit TEXT NOT NULL CHECK (canonical_unit IN ('kcal', 'count/min')),
+            canonical_unit TEXT NOT NULL CHECK (canonical_unit IN ({_CANONICAL_UNITS_SQL})),
             fixed_lower_bound REAL,
             fixed_upper_bound REAL,
             personal_range_enabled INTEGER NOT NULL CHECK (personal_range_enabled IN (0, 1)),
@@ -1175,7 +2005,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             event_kind TEXT NOT NULL CHECK (
                 event_kind IN (
                     'import_published', 'data_review_decision', 'metadata_tombstone',
-                    'store_migrated'
+                    'store_migrated', 'manual_context_revision', 'manual_medication_revision'
                 )
             ),
             occurred_at_utc TEXT NOT NULL CHECK (
@@ -1192,13 +2022,339 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             snapshot_id TEXT REFERENCES dataset_snapshots(snapshot_id),
             source_schema_version INTEGER NOT NULL CHECK (source_schema_version > 0),
             target_schema_version INTEGER NOT NULL CHECK (
-                target_schema_version > source_schema_version
+                target_schema_version >= source_schema_version
             ),
-            backup_file TEXT NOT NULL
+            snapshot_source_schema_version INTEGER CHECK (
+                snapshot_source_schema_version IS NULL
+                OR snapshot_source_schema_version > 0
+            ),
+            snapshot_target_schema_version INTEGER CHECK (
+                snapshot_target_schema_version IS NULL
+                OR snapshot_target_schema_version > snapshot_source_schema_version
+            ),
+            backup_file TEXT NOT NULL,
+            CHECK (
+                (snapshot_source_schema_version IS NULL)
+                    = (snapshot_target_schema_version IS NULL)
+            ),
+            CHECK (
+                target_schema_version > source_schema_version
+                OR snapshot_target_schema_version > snapshot_source_schema_version
+            )
         ) STRICT;
         CREATE TABLE IF NOT EXISTS restored_publications (
             audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id)
         ) STRICT;
+        CREATE TABLE IF NOT EXISTS snapshot_restore_origins (
+            snapshot_id TEXT PRIMARY KEY REFERENCES dataset_snapshots(snapshot_id),
+            backup_id TEXT NOT NULL CHECK (
+                length(backup_id) = 32 AND backup_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            source_snapshot_id TEXT NOT NULL CHECK (
+                length(source_snapshot_id) = 32
+                AND source_snapshot_id NOT GLOB '*[^0-9a-f]*'
+            )
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS manual_revision_intents (
+            revision_id TEXT PRIMARY KEY CHECK (
+                length(revision_id) = 32 AND revision_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            intent TEXT NOT NULL CHECK (intent IN ('create', 'revise', 'withdraw', 'restore')),
+            withdrawal_reason TEXT
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS manual_context_revisions (
+            revision_id TEXT PRIMARY KEY CHECK (
+                length(revision_id) = 32 AND revision_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            logical_id TEXT NOT NULL CHECK (
+                length(logical_id) = 32 AND logical_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            object_kind TEXT NOT NULL CHECK (object_kind IN (
+                'context_coverage_start', 'illness_category', 'illness_period',
+                'daily_stress', 'custom_context_label', 'custom_context_period'
+            )),
+            previous_revision_id TEXT UNIQUE REFERENCES manual_context_revisions(revision_id),
+            state TEXT NOT NULL CHECK (state IN ('active', 'withdrawn')),
+            operation_id TEXT NOT NULL UNIQUE REFERENCES write_operations(operation_id),
+            created_at_utc TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL CHECK (
+                length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'
+            )
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS context_coverage_start_values (
+            revision_id TEXT PRIMARY KEY REFERENCES manual_context_revisions(revision_id),
+            start_date TEXT NOT NULL CHECK (length(start_date) = 10)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS manual_context_snapshot_bindings (
+            snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(snapshot_id),
+            revision_id TEXT NOT NULL REFERENCES manual_context_revisions(revision_id)
+            , PRIMARY KEY (snapshot_id, revision_id)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS manual_context_publications (
+            audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
+            revision_id TEXT NOT NULL UNIQUE REFERENCES manual_context_revisions(revision_id),
+            snapshot_id TEXT NOT NULL UNIQUE REFERENCES dataset_snapshots(snapshot_id),
+            context_as_of_date TEXT NOT NULL CHECK (length(context_as_of_date) = 10),
+            context_timezone TEXT NOT NULL
+        ) STRICT;
+        CREATE TRIGGER IF NOT EXISTS manual_context_revisions_no_update
+        BEFORE UPDATE ON manual_context_revisions
+        BEGIN SELECT RAISE(ABORT, 'manual context revisions are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS manual_context_revisions_no_delete
+        BEFORE DELETE ON manual_context_revisions
+        BEGIN SELECT RAISE(ABORT, 'manual context revisions are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS manual_context_revisions_same_chain
+        BEFORE INSERT ON manual_context_revisions
+        WHEN NEW.previous_revision_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM manual_context_revisions previous
+            WHERE previous.revision_id = NEW.previous_revision_id
+              AND (previous.logical_id != NEW.logical_id OR previous.object_kind != NEW.object_kind)
+        )
+        BEGIN SELECT RAISE(ABORT, 'manual context revision chain changed object'); END;
+        CREATE TRIGGER IF NOT EXISTS context_coverage_start_values_no_update
+        BEFORE UPDATE ON context_coverage_start_values
+        BEGIN SELECT RAISE(ABORT, 'manual context values are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS context_coverage_start_values_no_delete
+        BEFORE DELETE ON context_coverage_start_values
+        BEGIN SELECT RAISE(ABORT, 'manual context values are immutable'); END;
+        CREATE TABLE IF NOT EXISTS illness_category_values (
+            revision_id TEXT PRIMARY KEY REFERENCES manual_context_revisions(revision_id),
+            name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 80),
+            name_key TEXT NOT NULL CHECK (length(name_key) BETWEEN 1 AND 80)
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS illness_category_name_reserved
+        ON illness_category_values(name_key);
+        CREATE TABLE IF NOT EXISTS daily_stress_values (
+            revision_id TEXT PRIMARY KEY REFERENCES manual_context_revisions(revision_id),
+            day TEXT NOT NULL CHECK (length(day) = 10),
+            level TEXT NOT NULL CHECK (level IN ('very_low', 'low', 'average', 'high', 'very_high'))
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS custom_context_label_values (
+            revision_id TEXT PRIMARY KEY REFERENCES manual_context_revisions(revision_id),
+            name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 80),
+            name_key TEXT NOT NULL CHECK (length(name_key) BETWEEN 1 AND 80)
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS custom_context_label_name_reserved
+        ON custom_context_label_values(name_key);
+        CREATE TABLE IF NOT EXISTS custom_context_period_values (
+            revision_id TEXT PRIMARY KEY REFERENCES manual_context_revisions(revision_id),
+            label_logical_id TEXT NOT NULL,
+            start_date TEXT NOT NULL CHECK (length(start_date) = 10),
+            end_date TEXT CHECK (end_date IS NULL OR length(end_date) = 10),
+            note TEXT CHECK (note IS NULL OR length(note) <= 1000)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS illness_period_values (
+            revision_id TEXT PRIMARY KEY REFERENCES manual_context_revisions(revision_id),
+            category_logical_id TEXT NOT NULL CHECK (
+                length(category_logical_id) = 32 AND category_logical_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            start_date TEXT NOT NULL CHECK (length(start_date) = 10),
+            end_date TEXT CHECK (end_date IS NULL OR length(end_date) = 10),
+            severity TEXT NOT NULL CHECK (severity IN ('mild', 'moderate', 'severe')),
+            CHECK (end_date IS NULL OR start_date <= end_date)
+        ) STRICT;
+        CREATE TRIGGER IF NOT EXISTS illness_category_values_no_update
+        BEFORE UPDATE ON illness_category_values
+        BEGIN SELECT RAISE(ABORT, 'illness category values are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS illness_category_values_no_delete
+        BEFORE DELETE ON illness_category_values
+        BEGIN SELECT RAISE(ABORT, 'illness category values are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS illness_period_values_no_update
+        BEFORE UPDATE ON illness_period_values
+        BEGIN SELECT RAISE(ABORT, 'illness period values are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS illness_period_values_no_delete
+        BEFORE DELETE ON illness_period_values
+        BEGIN SELECT RAISE(ABORT, 'illness period values are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS manual_context_snapshot_bindings_no_update
+        BEFORE UPDATE ON manual_context_snapshot_bindings
+        BEGIN SELECT RAISE(ABORT, 'manual context bindings are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS manual_context_snapshot_bindings_no_delete
+        BEFORE DELETE ON manual_context_snapshot_bindings
+        BEGIN SELECT RAISE(ABORT, 'manual context bindings are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS manual_context_publications_no_update
+        BEFORE UPDATE ON manual_context_publications
+        BEGIN SELECT RAISE(ABORT, 'manual context publications are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS manual_context_publications_no_delete
+        BEFORE DELETE ON manual_context_publications
+        BEGIN SELECT RAISE(ABORT, 'manual context publications are immutable'); END;
+        CREATE TABLE IF NOT EXISTS medication_regime_revisions (
+            revision_id TEXT PRIMARY KEY CHECK (
+                length(revision_id) = 32 AND revision_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            logical_id TEXT NOT NULL CHECK (
+                length(logical_id) = 32 AND logical_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            previous_revision_id TEXT UNIQUE REFERENCES medication_regime_revisions(revision_id),
+            operation_id TEXT NOT NULL UNIQUE REFERENCES write_operations(operation_id),
+            created_at_utc TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL CHECK (
+                length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'
+            )
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS medication_regime_values (
+            revision_id TEXT PRIMARY KEY REFERENCES medication_regime_revisions(revision_id),
+            starts_at TEXT NOT NULL,
+            timezone TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS medication_scheduled_doses (
+            dose_id TEXT PRIMARY KEY CHECK (
+                length(dose_id) = 32 AND dose_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            revision_id TEXT NOT NULL REFERENCES medication_regime_revisions(revision_id),
+            medication_name TEXT NOT NULL CHECK (length(medication_name) BETWEEN 1 AND 120),
+            amount TEXT NOT NULL,
+            unit TEXT NOT NULL CHECK (length(unit) BETWEEN 1 AND 32),
+            local_time TEXT NOT NULL CHECK (length(local_time) = 8),
+            weekdays TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS medication_as_needed_entries (
+            entry_id TEXT NOT NULL CHECK (
+                length(entry_id) = 32 AND entry_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            revision_id TEXT NOT NULL REFERENCES medication_regime_revisions(revision_id),
+            medication_name TEXT NOT NULL CHECK (length(medication_name) BETWEEN 1 AND 120),
+            amount TEXT NOT NULL,
+            unit TEXT NOT NULL CHECK (length(unit) BETWEEN 1 AND 32),
+            preferred_reason_category_ids TEXT NOT NULL,
+            PRIMARY KEY (revision_id, entry_id)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS medication_snapshot_bindings (
+            snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(snapshot_id),
+            revision_id TEXT NOT NULL REFERENCES medication_regime_revisions(revision_id),
+            PRIMARY KEY (snapshot_id, revision_id)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS medication_publications (
+            audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
+            revision_id TEXT NOT NULL UNIQUE REFERENCES medication_regime_revisions(revision_id),
+            snapshot_id TEXT NOT NULL UNIQUE REFERENCES dataset_snapshots(snapshot_id),
+            medication_as_of TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS medication_deviation_revisions (
+            revision_id TEXT PRIMARY KEY CHECK (
+                length(revision_id) = 32 AND revision_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            logical_id TEXT NOT NULL CHECK (
+                length(logical_id) = 32 AND logical_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            previous_revision_id TEXT UNIQUE REFERENCES medication_deviation_revisions(revision_id),
+            operation_id TEXT NOT NULL UNIQUE REFERENCES write_operations(operation_id),
+            state TEXT NOT NULL CHECK (state IN ('active', 'withdrawn')),
+            created_at_utc TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL CHECK (
+                length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'
+            )
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS medication_deviation_values (
+            revision_id TEXT PRIMARY KEY REFERENCES medication_deviation_revisions(revision_id),
+            regime_logical_id TEXT NOT NULL CHECK (
+                length(regime_logical_id) = 32 AND regime_logical_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            scheduled_at TEXT NOT NULL
+            , withdrawal_reason TEXT
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS medication_deviation_intakes (
+            revision_id TEXT NOT NULL REFERENCES medication_deviation_revisions(revision_id),
+            taken_at TEXT NOT NULL,
+            amount TEXT NOT NULL,
+            PRIMARY KEY (revision_id, taken_at, amount)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS medication_deviation_snapshot_bindings (
+            snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(snapshot_id),
+            revision_id TEXT NOT NULL REFERENCES medication_deviation_revisions(revision_id),
+            PRIMARY KEY (snapshot_id, revision_id)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS medication_deviation_publications (
+            audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
+            revision_id TEXT NOT NULL UNIQUE REFERENCES medication_deviation_revisions(revision_id),
+            snapshot_id TEXT NOT NULL UNIQUE REFERENCES dataset_snapshots(snapshot_id),
+            medication_as_of TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS intake_reason_category_revisions (
+            revision_id TEXT PRIMARY KEY CHECK (
+                length(revision_id) = 32 AND revision_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            logical_id TEXT NOT NULL CHECK (
+                length(logical_id) = 32 AND logical_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            previous_revision_id TEXT UNIQUE
+                REFERENCES intake_reason_category_revisions(revision_id),
+            operation_id TEXT NOT NULL UNIQUE REFERENCES write_operations(operation_id),
+            state TEXT NOT NULL CHECK (state IN ('active', 'withdrawn')),
+            created_at_utc TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL CHECK (
+                length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'
+            )
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS intake_reason_category_values (
+            revision_id TEXT PRIMARY KEY REFERENCES intake_reason_category_revisions(revision_id),
+            name TEXT,
+            name_key TEXT
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS intake_reason_category_snapshot_bindings (
+            snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(snapshot_id),
+            revision_id TEXT NOT NULL REFERENCES intake_reason_category_revisions(revision_id),
+            PRIMARY KEY (snapshot_id, revision_id)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS intake_reason_category_publications (
+            audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
+            revision_id TEXT NOT NULL UNIQUE
+                REFERENCES intake_reason_category_revisions(revision_id),
+            snapshot_id TEXT NOT NULL UNIQUE REFERENCES dataset_snapshots(snapshot_id),
+            medication_as_of TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS as_needed_intake_revisions (
+            revision_id TEXT PRIMARY KEY CHECK (
+                length(revision_id) = 32 AND revision_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            logical_id TEXT NOT NULL CHECK (
+                length(logical_id) = 32 AND logical_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            previous_revision_id TEXT UNIQUE REFERENCES as_needed_intake_revisions(revision_id),
+            operation_id TEXT NOT NULL UNIQUE REFERENCES write_operations(operation_id),
+            state TEXT NOT NULL CHECK (state IN ('active', 'withdrawn')),
+            created_at_utc TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL CHECK (
+                length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'
+            )
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS as_needed_intake_values (
+            revision_id TEXT PRIMARY KEY REFERENCES as_needed_intake_revisions(revision_id),
+            regime_logical_id TEXT NOT NULL,
+            entry_id TEXT NOT NULL,
+            taken_at TEXT NOT NULL,
+            amount TEXT NOT NULL,
+            reason_category_logical_id TEXT,
+            withdrawal_reason TEXT
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS as_needed_intake_snapshot_bindings (
+            snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(snapshot_id),
+            revision_id TEXT NOT NULL REFERENCES as_needed_intake_revisions(revision_id),
+            PRIMARY KEY (snapshot_id, revision_id)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS as_needed_intake_publications (
+            audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
+            revision_id TEXT NOT NULL UNIQUE REFERENCES as_needed_intake_revisions(revision_id),
+            snapshot_id TEXT NOT NULL UNIQUE REFERENCES dataset_snapshots(snapshot_id),
+            medication_as_of TEXT NOT NULL
+        ) STRICT;
+        CREATE TRIGGER IF NOT EXISTS manual_revision_intents_owner
+        BEFORE INSERT ON manual_revision_intents
+        WHEN (
+            SELECT count(*) FROM (
+                SELECT revision_id FROM manual_context_revisions
+                UNION ALL SELECT revision_id FROM medication_regime_revisions
+                UNION ALL SELECT revision_id FROM medication_deviation_revisions
+                UNION ALL SELECT revision_id FROM intake_reason_category_revisions
+                UNION ALL SELECT revision_id FROM as_needed_intake_revisions
+            ) WHERE revision_id = NEW.revision_id
+        ) != 1
+        BEGIN SELECT RAISE(ABORT, 'manual revision intent owner invalid'); END;
+        CREATE TRIGGER IF NOT EXISTS manual_revision_intents_no_update
+        BEFORE UPDATE ON manual_revision_intents
+        BEGIN SELECT RAISE(ABORT, 'manual revision intents are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS manual_revision_intents_no_delete
+        BEFORE DELETE ON manual_revision_intents
+        BEGIN SELECT RAISE(ABORT, 'manual revision intents are append-only'); END;
         CREATE TABLE IF NOT EXISTS metadata_restores (
             restore_id TEXT PRIMARY KEY CHECK (
                 length(restore_id) = 32 AND restore_id NOT GLOB '*[^0-9a-f]*'
@@ -1247,7 +2403,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             case_kind TEXT NOT NULL CHECK (
                 case_kind IN (
                     'plausibility', 'continued_override', 'suspected_source_deletion',
-                    'source_conflict', 'direct_correction'
+                    'source_conflict', 'preferred_daily_weight_conflict', 'direct_correction'
                 )
             ),
             logical_measurement_id TEXT NOT NULL,
@@ -1385,7 +2541,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             diagnostics TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
-        """
+        """,
     )
     metadata.executemany(
         "INSERT OR IGNORE INTO rule_version_refs VALUES (?, ?)",
@@ -1424,7 +2580,39 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                 "1970-01-01T00:00:00+00:00",
                 None,
             ),
+            *(
+                (
+                    _FIXED_PLAUSIBILITY_RULE_VERSION,
+                    data_type,
+                    unit,
+                    0.0,
+                    None,
+                    0,
+                    None,
+                    None,
+                    None,
+                    "1970-01-01T00:00:00+00:00",
+                    None,
+                )
+                for data_type, unit in (
+                    ("apple_exercise_time", "min"),
+                    ("step_count", "count"),
+                    ("walking_running_distance", "km"),
+                )
+            ),
         ),
+    )
+    metadata.execute(
+        "INSERT OR IGNORE INTO activity_derivation_versions VALUES (?, ?, ?, ?)",
+        (
+            "activity-derivation/v1",
+            240,
+            "activity-source-classification/v1",
+            "1970-01-01T00:00:00+00:00",
+        ),
+    )
+    metadata.execute(
+        "INSERT OR IGNORE INTO activity_derivation_active VALUES (1, 'activity-derivation/v1')"
     )
     import_columns = {
         str(row[1]) for row in metadata.execute("PRAGMA table_info(imports)").fetchall()
@@ -1558,6 +2746,139 @@ def _upgrade_migration_event_constraints(metadata: sqlite3.Connection) -> None:
         raise sqlite3.IntegrityError("foreign key violation after constraint upgrade")
 
 
+def _upgrade_migration_publication_schema(metadata: sqlite3.Connection) -> None:
+    columns = {str(row[1]) for row in metadata.execute("PRAGMA table_info(migration_publications)")}
+    if not columns or "snapshot_source_schema_version" in columns:
+        return
+    for trigger in (
+        "migration_publications_no_update",
+        "migration_publications_no_delete",
+        "migration_publications_kind",
+    ):
+        metadata.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    metadata.execute("ALTER TABLE migration_publications RENAME TO legacy_migration_publications")
+    metadata.execute(
+        """
+        CREATE TABLE migration_publications (
+            audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
+            snapshot_id TEXT REFERENCES dataset_snapshots(snapshot_id),
+            source_schema_version INTEGER NOT NULL CHECK (source_schema_version > 0),
+            target_schema_version INTEGER NOT NULL CHECK (
+                target_schema_version >= source_schema_version
+            ),
+            snapshot_source_schema_version INTEGER CHECK (
+                snapshot_source_schema_version IS NULL
+                OR snapshot_source_schema_version > 0
+            ),
+            snapshot_target_schema_version INTEGER CHECK (
+                snapshot_target_schema_version IS NULL
+                OR snapshot_target_schema_version > snapshot_source_schema_version
+            ),
+            backup_file TEXT NOT NULL,
+            CHECK (
+                (snapshot_source_schema_version IS NULL)
+                    = (snapshot_target_schema_version IS NULL)
+            ),
+            CHECK (
+                target_schema_version > source_schema_version
+                OR snapshot_target_schema_version > snapshot_source_schema_version
+            )
+        ) STRICT
+        """
+    )
+    metadata.execute(
+        "INSERT INTO migration_publications "
+        "(audit_event_id, snapshot_id, source_schema_version, target_schema_version, "
+        "backup_file) SELECT audit_event_id, snapshot_id, source_schema_version, "
+        "target_schema_version, backup_file FROM legacy_migration_publications"
+    )
+    metadata.execute("DROP TABLE legacy_migration_publications")
+
+
+def _upgrade_v03_constraints(metadata: sqlite3.Connection) -> None:
+    metadata.execute("DROP TRIGGER IF EXISTS manual_revision_intents_owner")
+    upgrades = (
+        (
+            "plausibility_rule_versions",
+            (
+                (
+                    "'active_energy', 'apple_resting_heart_rate')",
+                    "'active_energy', 'apple_resting_heart_rate', 'body_mass')",
+                ),
+                (
+                    "'active_energy', 'apple_resting_heart_rate', 'body_mass')",
+                    f"{_CANONICAL_HEALTH_TYPES_SQL})",
+                ),
+                (
+                    "canonical_unit IN ('kcal', 'count/min'))",
+                    "canonical_unit IN ('kcal', 'count/min', 'kg'))",
+                ),
+                (
+                    "canonical_unit IN ('kcal', 'count/min', 'kg'))",
+                    f"canonical_unit IN ({_CANONICAL_UNITS_SQL}))",
+                ),
+                (
+                    f"data_type IN ({_PRE_ACTIVITY_HEALTH_TYPES_SQL})",
+                    f"data_type IN ({_CANONICAL_HEALTH_TYPES_SQL})",
+                ),
+                (
+                    f"canonical_unit IN ({_PRE_ACTIVITY_UNITS_SQL})",
+                    f"canonical_unit IN ({_CANONICAL_UNITS_SQL})",
+                ),
+            ),
+        ),
+        (
+            "data_review_decisions",
+            (
+                (
+                    "'source_conflict', 'direct_correction'",
+                    "'source_conflict', 'preferred_daily_weight_conflict', 'direct_correction'",
+                ),
+            ),
+        ),
+        (
+            "manual_context_revisions",
+            (
+                (
+                    "'context_coverage_start', 'illness_category', 'illness_period'",
+                    "'context_coverage_start', 'illness_category', 'illness_period', "
+                    "'daily_stress', 'custom_context_label', 'custom_context_period'",
+                ),
+            ),
+        ),
+    )
+    for table, replacements in upgrades:
+        row = metadata.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+        if row is None:
+            continue
+        if not isinstance(row[0], str):
+            raise sqlite3.DatabaseError(f"invalid {table} definition")
+        definition = row[0]
+        if table == "plausibility_rule_versions" and all(
+            value in definition
+            for value in (
+                f"{_CANONICAL_HEALTH_TYPES_SQL})",
+                f"canonical_unit IN ({_CANONICAL_UNITS_SQL}))",
+            )
+        ):
+            continue
+        for old, new in replacements:
+            if new in definition:
+                continue
+            if old not in definition:
+                raise sqlite3.DatabaseError(f"unsupported {table} constraint")
+            definition = definition.replace(old, new, 1)
+        temporary = f"{table}__v03_constraint_upgrade"
+        upgraded = definition.replace(f"CREATE TABLE {table}", f"CREATE TABLE {temporary}", 1)
+        metadata.execute(f"DROP TABLE IF EXISTS {temporary}")
+        metadata.execute(upgraded)
+        metadata.execute(f"INSERT INTO {temporary} SELECT * FROM {table}")
+        metadata.execute(f"DROP TABLE {table}")
+        metadata.execute(f"ALTER TABLE {temporary} RENAME TO {table}")
+
+
 @dataclass(slots=True)
 class LocalStore:
     _root: Path
@@ -1584,9 +2905,7 @@ class LocalStore:
             rows = self._metadata.execute(f'SELECT * FROM "{table}"').fetchall()
             if rows:
                 placeholders = ", ".join("?" for _ in columns)
-                destination.executemany(
-                    f'INSERT INTO "{table}" VALUES ({placeholders})', rows
-                )
+                destination.executemany(f'INSERT INTO "{table}" VALUES ({placeholders})', rows)
 
     def validate_recovery_writer(self) -> StoreIdentity:
         self._require_open()
@@ -1731,6 +3050,78 @@ class LocalStore:
             )
         )
 
+    def load_backup_snapshot_origin(self) -> BackupSnapshotOrigin | None:
+        self._require_open()
+        row = self._metadata.execute(
+            "SELECT snapshot.snapshot_id, snapshot.snapshot_schema_version, "
+            "snapshot.manifest_sha256, binding.snapshot_as_of, binding.context_timezone, "
+            "binding.context_as_of_date, binding.medication_as_of, derivation.version_id "
+            "FROM active_snapshot active "
+            "JOIN dataset_snapshots snapshot USING (snapshot_id) "
+            "JOIN snapshot_contract_bindings binding USING (snapshot_id) "
+            "JOIN activity_derivation_snapshot_bindings derivation USING (snapshot_id)"
+        ).fetchone()
+        if row is None:
+            return None
+        snapshot_id = str(row[0])
+        bindings = tuple(
+            (str(item[0]), str(item[1]))
+            for item in self._metadata.execute(
+                "SELECT 'context', revision_id FROM manual_context_snapshot_bindings "
+                "WHERE snapshot_id = ? UNION ALL "
+                "SELECT 'medication_regime', revision_id FROM medication_snapshot_bindings "
+                "WHERE snapshot_id = ? UNION ALL "
+                "SELECT 'medication_deviation', revision_id "
+                "FROM medication_deviation_snapshot_bindings WHERE snapshot_id = ? UNION ALL "
+                "SELECT 'intake_reason_category', revision_id "
+                "FROM intake_reason_category_snapshot_bindings WHERE snapshot_id = ? UNION ALL "
+                "SELECT 'as_needed_intake', revision_id "
+                "FROM as_needed_intake_snapshot_bindings WHERE snapshot_id = ? "
+                "ORDER BY 1, 2",
+                (snapshot_id,) * 5,
+            )
+        )
+        return BackupSnapshotOrigin(
+            SnapshotId(snapshot_id),
+            int(row[1]),
+            str(row[2]),
+            datetime.fromisoformat(str(row[3])),
+            str(row[4]),
+            date.fromisoformat(str(row[5])),
+            datetime.fromisoformat(str(row[6])),
+            str(row[7]),
+            bindings,
+        )
+
+    def load_backup_interval_source_refs(self) -> tuple[tuple[str, str, str], ...]:
+        self._require_open()
+        snapshot_id = self.load_active_snapshot_id()
+        if snapshot_id is None:
+            return ()
+        directory = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
+        refs: list[tuple[str, str, str]] = []
+        for family, filename, logical_column, version_column in (
+            (
+                "sleep",
+                "sleep_intervals.parquet",
+                "identity_candidate_id",
+                "measurement_version_id",
+            ),
+            ("workout", "workouts.parquet", "logical_workout_id", "workout_version_id"),
+        ):
+            path = directory / filename
+            if not path.exists():
+                continue
+            escaped = str(path).replace("'", "''")
+            refs.extend(
+                (family, str(row[0]), str(row[1]))
+                for row in self._query.execute(
+                    f"SELECT {logical_column}, {version_column} "
+                    f"FROM read_parquet('{escaped}') ORDER BY {version_column}"
+                ).fetchall()
+            )
+        return tuple(refs)
+
     def load_migration_rollback_facts(self) -> MigrationRollbackFacts | None:
         self._require_open()
         columns = {
@@ -1791,9 +3182,7 @@ class LocalStore:
                 pass
         return MigrationRollbackFacts(
             migration_operation_id=OperationId(str(row[0])),
-            latest_state_change_operation_id=(
-                None if row[6] is None else OperationId(str(row[6]))
-            ),
+            latest_state_change_operation_id=(None if row[6] is None else OperationId(str(row[6]))),
             backup_file=backup_file,
             backup_sha256=backup_sha256,
             backup_exists=backup_exists,
@@ -1814,9 +3203,7 @@ class LocalStore:
         backup_path = self._root / "migration-backups" / facts.backup_file
         restored = sqlite3.connect(":memory:")
         try:
-            with sqlite3.connect(
-                f"{backup_path.resolve().as_uri()}?mode=ro", uri=True
-            ) as backup:
+            with sqlite3.connect(f"{backup_path.resolve().as_uri()}?mode=ro", uri=True) as backup:
                 backup.backup(restored)
             restored.execute("PRAGMA foreign_keys = OFF")
             _upgrade_migration_event_constraints(restored)
@@ -1864,10 +3251,13 @@ class LocalStore:
                     cast(
                         Literal[
                             "plausibility",
+                            "workout_plausibility",
+                            "workout_overlap",
                             "continued_override",
                             "suspected_source_deletion",
                             "source_conflict",
                             "rule_definition",
+                            "preferred_daily_weight_conflict",
                         ],
                         str(row[1]),
                     ),
@@ -1877,8 +3267,7 @@ class LocalStore:
                     str(row[5]),
                 )
                 for row in self._query.execute(
-                    "SELECT * FROM read_parquet"
-                    f"('{paths['open_review_cases.parquet']}')"
+                    f"SELECT * FROM read_parquet('{paths['open_review_cases.parquet']}')"
                 ).fetchall()
             )
             versions = tuple(
@@ -1962,6 +3351,66 @@ class LocalStore:
         )
         return probe_capacity(self._root, estimate)
 
+    def preflight_snapshot_write(
+        self,
+        *,
+        method_id: CapacityMethodId,
+        requested_start: date | None = None,
+        requested_end: date | None = None,
+        writer_bound: bool = True,
+        scratch_bound: bool = True,
+    ) -> CapacityCheck:
+        if not isinstance(method_id, CapacityMethodId) or method_id not in _SNAPSHOT_WRITE_METHODS:
+            raise ValueError("Unbekannte Kapazitätsmethode.")
+        active = self.load_active_snapshot_id()
+        if active is None:
+            return probe_capacity(self._root, None, method_id=method_id)
+        directory = self._root / _PARQUET_DIRECTORY / "snapshots" / str(active)
+        try:
+            rewritten_bytes = sum(
+                (directory / filename).stat().st_blocks * 512
+                for filename in _V6_DERIVATION_FILES | {"derivation_lineage.parquet"}
+            )
+            metadata_bytes = (self._root / "metadata.sqlite3").stat().st_blocks * 512
+            fragment_size = os.statvfs(self._root).f_frsize
+            output_bound_bytes = rewritten_bytes
+            if method_id is CapacityMethodId.MANUAL_SNAPSHOT and requested_start is not None:
+                if requested_end is None:
+                    return probe_capacity(self._root, None, method_id=method_id)
+                requested_days = max(0, (requested_end - requested_start).days + 1)
+                output_bound_bytes += requested_days * 4 * _KIB
+            elif method_id is CapacityMethodId.ACTIVITY_DERIVATION:
+                source_tables = " UNION ALL ".join(
+                    "SELECT source_start_utc, source_end_utc FROM read_parquet('"
+                    + str(directory / filename).replace("'", "''")
+                    + "')"
+                    for filename in (
+                        "measurement_versions.parquet",
+                        "sleep_intervals.parquet",
+                        "workouts.parquet",
+                    )
+                )
+                row = self._query.execute(
+                    "SELECT count(*), COALESCE(greatest(1, date_diff('day', "
+                    "min(CAST(source_start_utc AS TIMESTAMPTZ)), "
+                    "max(CAST(source_end_utc AS TIMESTAMPTZ))) + 1), 0) FROM ("
+                    + source_tables
+                    + ") AS source_intervals"
+                ).fetchone()
+                if row is None:
+                    return probe_capacity(self._root, None, method_id=method_id)
+                output_bound_bytes = max(output_bound_bytes, (int(row[0]) + int(row[1])) * 4 * _KIB)
+        except (OSError, StoreError, duckdb.Error, TypeError, ValueError):
+            return probe_capacity(self._root, None, method_id=method_id)
+        estimate = _snapshot_write_estimate(
+            output_bound_bytes,
+            metadata_bytes,
+            fragment_size,
+            writer_bound=writer_bound,
+            scratch_bound=scratch_bound and self._scratch_bound,
+        )
+        return probe_capacity(self._root, estimate, method_id=method_id)
+
     def load_identity(self) -> StoreIdentity:
         columns = {
             str(row[1])
@@ -1986,17 +3435,22 @@ class LocalStore:
         imports_table = self._metadata.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'imports'"
         ).fetchone()
-        if imports_table is not None and self._metadata.execute(
-            "SELECT 1 FROM imports "
-            "WHERE status IN ('committed', 'duplicate', 'quarantined') LIMIT 1"
-        ).fetchone() is not None:
+        if (
+            imports_table is not None
+            and self._metadata.execute(
+                "SELECT 1 FROM imports "
+                "WHERE status IN ('committed', 'duplicate', 'quarantined') LIMIT 1"
+            ).fetchone()
+            is not None
+        ):
             return True
         snapshots_table = self._metadata.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'snapshots'"
         ).fetchone()
-        return snapshots_table is not None and self._metadata.execute(
-            "SELECT 1 FROM snapshots LIMIT 1"
-        ).fetchone() is not None
+        return (
+            snapshots_table is not None
+            and self._metadata.execute("SELECT 1 FROM snapshots LIMIT 1").fetchone() is not None
+        )
 
     def preflight_store_migration(self) -> CapacityCheck:
         try:
@@ -2027,6 +3481,8 @@ class LocalStore:
     def migrate_store_schema(
         self,
         steps: tuple[tuple[int, int], ...],
+        snapshot_steps: tuple[tuple[int, int], ...],
+        snapshot_as_of: datetime | None,
         backup_file: str,
         operation_id: OperationId,
     ) -> StoreIdentity:
@@ -2038,14 +3494,46 @@ class LocalStore:
             raise StoreConfigurationError(
                 "Datenspeicherschema ist keine positive Ganzzahl."
             ) from error
-        if (
-            not steps
-            or steps[0][0] != source_version
+        if steps and (
+            steps[0][0] != source_version
             or steps[-1][1] != _STORE_SCHEMA_VERSION
             or any(target != source + 1 for source, target in steps)
             or any(left[1] != right[0] for left, right in pairwise(steps))
         ):
             raise StoreConfigurationError("Migrationskette ist nicht lückenlos registriert.")
+        if not steps and source_version != _STORE_SCHEMA_VERSION:
+            raise StoreConfigurationError("Migrationskette ist nicht lückenlos registriert.")
+
+        active = self.load_active_snapshot_id()
+        snapshot_source_version = (
+            None if active is None else self.load_active_snapshot_schema_version()
+        )
+        if snapshot_steps and (
+            snapshot_source_version is None
+            or snapshot_steps[0][0] != snapshot_source_version
+            or snapshot_steps[-1][1] != _SNAPSHOT_SCHEMA_VERSION
+            or any(target != source + 1 for source, target in snapshot_steps)
+            or any(left[1] != right[0] for left, right in pairwise(snapshot_steps))
+        ):
+            raise StoreConfigurationError(
+                "Snapshot-Migrationskette ist nicht lückenlos registriert."
+            )
+        if (
+            active is not None
+            and not snapshot_steps
+            and (snapshot_source_version != _SNAPSHOT_SCHEMA_VERSION)
+        ):
+            raise StoreConfigurationError(
+                "Snapshot-Migrationskette ist nicht lückenlos registriert."
+            )
+        if active is None and snapshot_steps:
+            raise StoreConfigurationError(
+                "Snapshot-Migrationskette ist nicht lückenlos registriert."
+            )
+        if (active is None) != (snapshot_as_of is None) or (
+            snapshot_as_of is not None and snapshot_as_of.tzinfo is None
+        ):
+            raise StoreConfigurationError("Snapshot-Stichtag stimmt nicht mit dem Plan überein.")
 
         backup_directory = self._root / "migration-backups"
         backup_directory.mkdir(exist_ok=True)
@@ -2054,9 +3542,24 @@ class LocalStore:
         if backup_path.exists() or temporary.exists():
             raise StoreError("migration_backup_failed")
         try:
+            _migration_fault_point(self._root, "migration.before_backup/v1")
             _migration_backup_fault_point(self._root)
             with sqlite3.connect(temporary) as backup:
                 self._metadata.backup(backup)
+                backup_identity = backup.execute(
+                    "SELECT schema_version FROM store_identity WHERE singleton = 1"
+                ).fetchone()
+                backup_active = backup.execute(
+                    "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
+                ).fetchone()
+                if (
+                    backup.execute("PRAGMA integrity_check").fetchone() != ("ok",)
+                    or backup.execute("PRAGMA foreign_key_check").fetchall()
+                    or backup_identity != (source_version,)
+                    or (active is None and backup_active not in {None, (None,)})
+                    or (active is not None and backup_active != (str(active),))
+                ):
+                    raise sqlite3.IntegrityError("migration backup validation failed")
             os.replace(temporary, backup_path)
             _allocation_checkpoint(self._root, "migration_backup")
             _migration_fault_point(self._root, "migration.after_backup/v1")
@@ -2064,7 +3567,6 @@ class LocalStore:
             temporary.unlink(missing_ok=True)
             raise StoreError("migration_backup_failed") from error
 
-        active = self.load_active_snapshot_id()
         existing_store_id = identity.store_id
         store_id = str(existing_store_id) if existing_store_id is not None else None
         if store_id is None and active is not None:
@@ -2085,7 +3587,7 @@ class LocalStore:
                 pass
         if store_id is None:
             store_id = uuid4().hex
-        binding = identity.person_binding
+        person_binding = identity.person_binding
         new_snapshot: SnapshotId | None = None
         manifest_sha256: str | None = None
         created_at = datetime.now(UTC).isoformat()
@@ -2093,13 +3595,12 @@ class LocalStore:
         staging: Path | None = None
         snapshot: Path | None = None
         if active is not None:
+            assert snapshot_as_of is not None
             new_snapshot = SnapshotId(uuid4().hex)
             staging_root = self._root / "migration-staging"
             staging_root.mkdir(exist_ok=True)
             staging = staging_root / str(operation_id)
-            snapshot = (
-                self._root / _PARQUET_DIRECTORY / "snapshots" / str(new_snapshot)
-            )
+            snapshot = self._root / _PARQUET_DIRECTORY / "snapshots" / str(new_snapshot)
             marker.write_text(
                 json.dumps(
                     {"operation_id": str(operation_id), "snapshot_id": str(new_snapshot)},
@@ -2109,33 +3610,21 @@ class LocalStore:
                 encoding="utf-8",
             )
             try:
-                shutil.copytree(
-                    self._root / _PARQUET_DIRECTORY / "snapshots" / str(active), staging
+                manifest_sha256, manifest = self._stage_migration_snapshot(
+                    source_snapshot_id=active,
+                    snapshot_id=new_snapshot,
+                    operation_id=operation_id,
+                    staging=staging,
+                    created_at=created_at,
+                    store_id=store_id,
+                    snapshot_as_of=snapshot_as_of,
                 )
-                manifest = json.loads((staging / "manifest.json").read_bytes())
-                manifest.update(
-                    {
-                        "created_at_utc": created_at,
-                        "created_by_operation_id": str(operation_id),
-                        "parent_snapshot_id": str(active),
-                        "snapshot_id": str(new_snapshot),
-                    }
-                )
-                manifest_bytes = json.dumps(
-                    manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True
-                ).encode()
-                (staging / "manifest.json").write_bytes(manifest_bytes)
-                manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
-                self._validate_snapshot(
-                    staging,
-                    str(new_snapshot),
-                    manifest_sha256,
-                    expected_store_id=store_id,
-                )
+                _fsync_snapshot(staging)
                 _allocation_checkpoint(self._root, "migration_staged")
                 _migration_fault_point(self._root, "migration.before_snapshot_move/v1")
                 snapshot.parent.mkdir(parents=True, exist_ok=True)
                 staging.replace(snapshot)
+                _fsync_directory(snapshot.parent)
                 _allocation_checkpoint(self._root, "migration_moved")
                 _migration_fault_point(self._root, "migration.after_snapshot_move/v1")
             except (OSError, sqlite3.Error, duckdb.Error, StoreError) as error:
@@ -2147,12 +3636,14 @@ class LocalStore:
         try:
             with self._metadata:
                 _upgrade_migration_event_constraints(self._metadata)
+                _upgrade_v03_constraints(self._metadata)
+                _upgrade_migration_publication_schema(self._metadata)
                 _ensure_current_tables(self._metadata)
                 self._metadata.execute("ALTER TABLE store_identity RENAME TO legacy_store_identity")
                 self._metadata.execute(_STORE_IDENTITY_DDL)
                 self._metadata.execute(
                     "INSERT INTO store_identity VALUES (1, ?, ?, ?, ?)",
-                    (self._mode.value, _STORE_SCHEMA_VERSION, store_id, binding.value),
+                    (self._mode.value, _STORE_SCHEMA_VERSION, store_id, person_binding.value),
                 )
                 self._metadata.execute("DROP TABLE legacy_store_identity")
                 self._metadata.execute(
@@ -2174,6 +3665,40 @@ class LocalStore:
                             created_at,
                         ),
                     )
+                    snapshot_binding = manifest["snapshot_binding"]
+                    assert isinstance(snapshot_binding, dict)
+                    self._metadata.execute(
+                        "INSERT INTO snapshot_contract_bindings VALUES (?, ?, ?, ?, ?)",
+                        (
+                            str(new_snapshot),
+                            snapshot_binding["snapshot_as_of"],
+                            snapshot_binding["context_timezone"],
+                            snapshot_binding["context_as_of_date"],
+                            snapshot_binding["medication_as_of"],
+                        ),
+                    )
+                    self._metadata.execute(
+                        "INSERT INTO activity_derivation_snapshot_bindings "
+                        "SELECT ?, version_id FROM activity_derivation_active WHERE singleton = 1",
+                        (str(new_snapshot),),
+                    )
+                    for table in (
+                        "manual_context_snapshot_bindings",
+                        "medication_snapshot_bindings",
+                        "medication_deviation_snapshot_bindings",
+                        "intake_reason_category_snapshot_bindings",
+                        "as_needed_intake_snapshot_bindings",
+                    ):
+                        columns = (
+                            "version_id"
+                            if table == "activity_derivation_snapshot_bindings"
+                            else "revision_id"
+                        )
+                        self._metadata.execute(
+                            f"INSERT INTO {table} (snapshot_id, {columns}) "
+                            f"SELECT ?, {columns} FROM {table} WHERE snapshot_id = ?",
+                            (str(new_snapshot), str(active)),
+                        )
                     self._metadata.execute(
                         "INSERT INTO snapshot_activations VALUES (?, ?, ?, ?, 'migration', ?)",
                         (
@@ -2201,12 +3726,16 @@ class LocalStore:
                 self._metadata.execute(
                     "INSERT INTO migration_publications "
                     "(audit_event_id, snapshot_id, source_schema_version, "
-                    "target_schema_version, backup_file) VALUES (?, ?, ?, ?, ?)",
+                    "target_schema_version, snapshot_source_schema_version, "
+                    "snapshot_target_schema_version, backup_file) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         audit_event_id,
                         None if new_snapshot is None else str(new_snapshot),
                         source_version,
                         _STORE_SCHEMA_VERSION,
+                        snapshot_source_version if snapshot_steps else None,
+                        _SNAPSHOT_SCHEMA_VERSION if snapshot_steps else None,
                         backup_file,
                     ),
                 )
@@ -2218,9 +3747,176 @@ class LocalStore:
             raise StoreError("migration_validation_failed") from error
         finally:
             self._metadata.execute("PRAGMA foreign_keys = ON")
+        _migration_fault_point(self._root, "migration.after_sqlite_commit/v1")
         with suppress(OSError):
             marker.unlink(missing_ok=True)
         return self.load_identity()
+
+    def _stage_migration_snapshot(
+        self,
+        *,
+        source_snapshot_id: SnapshotId,
+        snapshot_id: SnapshotId,
+        operation_id: OperationId,
+        staging: Path,
+        created_at: str,
+        store_id: str,
+        snapshot_as_of: datetime,
+    ) -> tuple[str, dict[str, object]]:
+        source = self._root / _PARQUET_DIRECTORY / "snapshots" / str(source_snapshot_id)
+
+        def link_parquet(source_name: str, target_name: str) -> str:
+            if Path(source_name).suffix == ".parquet":
+                os.link(source_name, target_name)
+                return target_name
+            return shutil.copy2(source_name, target_name)
+
+        shutil.copytree(source, staging, copy_function=link_parquet)
+        manifest = json.loads((staging / "manifest.json").read_bytes())
+        if not isinstance(manifest, dict):
+            raise StoreError("Snapshot-Manifest ist ungültig.")
+        resolution_basis = manifest.get("resolution_basis")
+        if not isinstance(resolution_basis, dict):
+            raise StoreError("Snapshot-Auflösungsbasis fehlt.")
+        identity_rule_version_id = str(resolution_basis.get("identity_rule_version_id"))
+        mapping_rule_version_id = str(resolution_basis.get("mapping_rule_version_id"))
+
+        reused_files: set[str] = set()
+        for filename, schema in _SNAPSHOT_SCHEMAS.items():
+            table = filename.removesuffix(".parquet")
+            path = staging / filename
+            if path.exists():
+                escaped = str(path).replace("'", "''")
+                source_description = tuple(
+                    (str(row[0]), str(row[1]))
+                    for row in self._query.execute(
+                        f"DESCRIBE SELECT * FROM read_parquet('{escaped}')"
+                    ).fetchall()
+                )
+                columns = {name for name, _ in source_description}
+                if source_description == schema and filename not in _V6_DERIVATION_FILES | {
+                    "derivation_lineage.parquet"
+                }:
+                    reused_files.add(filename)
+                projection = ", ".join(
+                    f'CAST("{name}" AS {kind}) AS "{name}"'
+                    if name in columns
+                    else f'NULL::{kind} AS "{name}"'
+                    for name, kind in schema
+                )
+                self._query.execute(
+                    f"CREATE OR REPLACE TEMP TABLE {table} AS "
+                    f"SELECT {projection} FROM read_parquet('{escaped}')"
+                )
+            else:
+                definitions = ", ".join(f'"{name}" {kind}' for name, kind in schema)
+                self._query.execute(f"CREATE OR REPLACE TEMP TABLE {table} ({definitions})")
+
+        raw_binding = manifest.get("snapshot_binding")
+        source_binding = raw_binding if isinstance(raw_binding, dict) else {}
+        raw_revision_ids = source_binding.get("manual_revision_ids", [])
+        manual_revision_ids = (
+            tuple(str(value) for value in raw_revision_ids)
+            if isinstance(raw_revision_ids, list)
+            else ()
+        )
+        context_timezone = str(source_binding.get("context_timezone", "Europe/Berlin"))
+        self._refresh_v03_derivations(snapshot_id, snapshot_as_of, manual_revision_ids)
+        self._refresh_derivation_lineage(snapshot_id, snapshot_as_of, manual_revision_ids)
+
+        entries: list[dict[str, int | str | list[str]]] = []
+        for filename in sorted(_SNAPSHOT_SCHEMAS):
+            table = filename.removesuffix(".parquet")
+            path = staging / filename
+            escaped = str(path).replace("'", "''")
+            if filename not in reused_files:
+                path.unlink(missing_ok=True)
+                self._query.execute(f"COPY (SELECT * FROM {table}) TO '{escaped}' (FORMAT PARQUET)")
+            description = tuple(
+                (str(row[0]), str(row[1]))
+                for row in self._query.execute(
+                    f"DESCRIBE SELECT * FROM read_parquet('{escaped}')"
+                ).fetchall()
+            )
+            if description != _SNAPSHOT_SCHEMAS[filename]:
+                raise StoreError(
+                    f"Staging-Snapshot besitzt für {filename} ein unerwartetes Schema."
+                )
+            row = self._query.execute(f"SELECT count(*) FROM read_parquet('{escaped}')").fetchone()
+            assert row is not None
+            entries.append(
+                {
+                    "name": filename,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "allocated_bytes": path.stat().st_blocks * 512,
+                    "row_count": int(row[0]),
+                    "parquet_schema_fingerprint": hashlib.sha256(
+                        json.dumps(description, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                    "contract_ids": list(
+                        _snapshot_file_contract_ids(
+                            filename,
+                            identity_rule_version_id,
+                            mapping_rule_version_id,
+                        )
+                    ),
+                }
+            )
+
+        counts = self._query.execute(
+            "SELECT (SELECT count(DISTINCT export_id) FROM source_occurrences), "
+            "(SELECT count(*) FROM source_occurrences), "
+            "(SELECT count(*) FROM measurement_versions), "
+            "(SELECT count(*) FROM resolved_measurements), "
+            "(SELECT count(*) FROM resolved_measurements WHERE disposition LIKE 'included%'), "
+            "(SELECT count(*) FROM resolved_measurements WHERE disposition LIKE 'excluded%'), "
+            "(SELECT count(*) FROM open_review_cases)"
+        ).fetchone()
+        assert counts is not None
+        audit_position = int(
+            self._metadata.execute(
+                "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+            ).fetchone()[0]
+        )
+        resolution_basis["audit_max_position"] = audit_position
+        manifest.update(
+            snapshot_schema_version=_SNAPSHOT_SCHEMA_VERSION,
+            snapshot_id=str(snapshot_id),
+            store_id=store_id,
+            created_at_utc=created_at,
+            created_by_operation_id=str(operation_id),
+            parent_snapshot_id=str(source_snapshot_id),
+            resolution_basis=resolution_basis,
+            derivation_contract_ids=list(_DERIVATION_CONTRACT_IDS),
+            snapshot_binding=self._snapshot_binding(
+                snapshot_as_of=snapshot_as_of,
+                context_timezone=context_timezone,
+                manual_revision_ids=manual_revision_ids,
+            ),
+            files=entries,
+            validation_counts=dict(
+                zip(
+                    (
+                        "exports",
+                        "source_occurrences",
+                        "measurement_versions",
+                        "logical_measurements",
+                        "included",
+                        "excluded",
+                        "open_review_cases",
+                    ),
+                    map(int, counts),
+                    strict=True,
+                )
+            ),
+        )
+        manifest_bytes = json.dumps(
+            manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode()
+        (staging / "manifest.json").write_bytes(manifest_bytes)
+        digest = hashlib.sha256(manifest_bytes).hexdigest()
+        self._validate_snapshot(staging, str(snapshot_id), digest, expected_store_id=store_id)
+        return digest, manifest
 
     def _quarantine_migration_artifacts(
         self,
@@ -2250,7 +3946,7 @@ class LocalStore:
                     encoding="utf-8",
                 )
         marker_root = self._root / "migration-staging"
-        for marker in (() if not marker_root.exists() else marker_root.glob("*.json")):
+        for marker in () if not marker_root.exists() else marker_root.glob("*.json"):
             try:
                 values = json.loads(marker.read_bytes())
                 raw_operation_id = values["operation_id"]
@@ -2282,9 +3978,7 @@ class LocalStore:
             )
         if marker_root.exists():
             for staging in tuple(path for path in marker_root.iterdir() if path.is_dir()):
-                self._quarantine_migration_artifacts(
-                    OperationId(uuid4().hex), staging, None
-                )
+                self._quarantine_migration_artifacts(OperationId(uuid4().hex), staging, None)
         has_snapshot_catalog = self._metadata.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'dataset_snapshots'"
         ).fetchone()
@@ -2298,9 +3992,7 @@ class LocalStore:
         if snapshot_root.exists():
             for snapshot in tuple(path for path in snapshot_root.iterdir() if path.is_dir()):
                 if snapshot.name not in cataloged:
-                    self._quarantine_migration_artifacts(
-                        OperationId(uuid4().hex), None, snapshot
-                    )
+                    self._quarantine_migration_artifacts(OperationId(uuid4().hex), None, snapshot)
 
     @classmethod
     def open(cls, root: Path, mode: DataMode) -> Self:
@@ -2574,9 +4266,13 @@ class LocalStore:
         export_id: str,
         export_date: datetime | None,
         records: tuple[CanonicalHealthRecord, ...],
+        sleep_intervals: tuple[CanonicalSleepInterval, ...],
+        workouts: tuple[CanonicalWorkout, ...],
         unknown_source_types: tuple[str, ...],
+        unsupported_content: tuple[UnsupportedImportContent, ...],
         governing_export_id: str,
         resolve_sources: SourceResolver,
+        resolve_workouts: WorkoutResolver,
         restore_overlay: Path | None = None,
         restore_overlay_sha256: str | None = None,
         restore_exports: tuple[
@@ -2585,7 +4281,18 @@ class LocalStore:
     ) -> PublishImportResult:
         self._require_open()
         self._require_writer()
+        verified_overlay: Path | None = None
         try:
+            if restore_overlay is not None:
+                if restore_overlay_sha256 is None:
+                    raise StoreError("restore_working_copy_changed")
+                verified_overlay = self._root / "staging" / f".{operation_id}.restore.sqlite3"
+                verified_overlay.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(restore_overlay, verified_overlay)
+                verified_overlay.chmod(0o400)
+                with verified_overlay.open("rb") as working:
+                    if hashlib.file_digest(working, "sha256").hexdigest() != restore_overlay_sha256:
+                        raise StoreError("restore_working_copy_changed")
             return self._publish_import(
                 operation_id=operation_id,
                 import_id=import_id,
@@ -2594,15 +4301,23 @@ class LocalStore:
                 export_id=export_id,
                 export_date=export_date,
                 records=records,
+                sleep_intervals=sleep_intervals,
+                workouts=workouts,
                 unknown_source_types=unknown_source_types,
+                unsupported_content=unsupported_content,
                 governing_export_id=governing_export_id,
                 resolve_sources=resolve_sources,
-                restore_overlay=restore_overlay,
+                resolve_workouts=resolve_workouts,
+                restore_overlay=verified_overlay,
                 restore_overlay_sha256=restore_overlay_sha256,
                 restore_exports=restore_exports,
             )
         except (OSError, sqlite3.Error, duckdb.Error) as error:
             raise StoreError("Health-Import konnte nicht veröffentlicht werden.") from error
+        finally:
+            if verified_overlay is not None and verified_overlay.exists():
+                verified_overlay.chmod(0o600)
+                verified_overlay.unlink(missing_ok=True)
 
     def _publish_import(
         self,
@@ -2614,9 +4329,13 @@ class LocalStore:
         export_id: str,
         export_date: datetime | None,
         records: tuple[CanonicalHealthRecord, ...],
+        sleep_intervals: tuple[CanonicalSleepInterval, ...],
+        workouts: tuple[CanonicalWorkout, ...],
         unknown_source_types: tuple[str, ...],
+        unsupported_content: tuple[UnsupportedImportContent, ...],
         governing_export_id: str,
         resolve_sources: SourceResolver,
+        resolve_workouts: WorkoutResolver,
         restore_overlay: Path | None,
         restore_overlay_sha256: str | None,
         restore_exports: tuple[
@@ -2624,6 +4343,38 @@ class LocalStore:
         ],
     ) -> PublishImportResult:
         observed_at = datetime.now().astimezone()
+        active = self._metadata.execute(
+            "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
+        ).fetchone()
+        if active is not None:
+            previous_versions = (
+                self._root
+                / _PARQUET_DIRECTORY
+                / "snapshots"
+                / str(active[0])
+                / "measurement_versions.parquet"
+            )
+            escaped_previous_versions = str(previous_versions).replace("'", "''")
+            legacy_versions = {
+                str(row[0]): (str(row[1]), str(row[2]))
+                for row in self._query.execute(
+                    "SELECT measurement_version_id, source_updated_at_utc, source_version "
+                    f"FROM read_parquet('{escaped_previous_versions}')"
+                ).fetchall()
+            }
+            records = tuple(
+                replace(record, measurement_version_id=legacy_id)
+                if (
+                    (legacy_id := record.legacy_measurement_version_id) is not None
+                    and legacy_versions.get(str(legacy_id))
+                    == (
+                        record.source_updated_at.astimezone(UTC).isoformat(),
+                        record.provenance.source_version,
+                    )
+                )
+                else record
+                for record in records
+            )
         duplicate = self._metadata.execute(
             """
             SELECT active_snapshot.snapshot_id
@@ -2652,16 +4403,18 @@ class LocalStore:
                     package_hash=package_hash,
                     snapshot_id=result.snapshot_id,
                     status=result.status,
-                    package_record_count=len(records),
+                    package_record_count=len(records) + len(sleep_intervals) + len(workouts),
                     record_count=0,
-                    records=records,
+                    records=(*records, *sleep_intervals, *workouts),
+                    logical_measurement_count=result.logical_measurement_count,
+                    measurement_version_count=result.measurement_version_count,
+                    source_occurrence_count=result.source_occurrence_count,
+                    anomaly_count=result.anomaly_count,
+                    unsupported_content=unsupported_content,
                 )
             shutil.rmtree(self._root / "staging" / str(import_id), ignore_errors=True)
             return result
 
-        active = self._metadata.execute(
-            "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
-        ).fetchone()
         staging = self._root / "staging" / str(import_id)
         snapshot = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
         self._query.execute(
@@ -2701,8 +4454,12 @@ class LocalStore:
                             "value": record.value,
                             "start": record.source_start.isoformat(),
                             "end": record.source_end.isoformat(),
+                            "updated": record.source_updated_at.isoformat(),
                             "source": record.provenance.source_name,
+                            "source_version": record.provenance.source_version,
                             "device": record.provenance.device,
+                            "original_value": record.provenance.original_value,
+                            "original_unit": record.provenance.original_unit,
                         },
                         sort_keys=True,
                         separators=(",", ":"),
@@ -2773,6 +4530,181 @@ class LocalStore:
                 ) = 1
                 """
             )
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE staged_sleep_intervals (
+                measurement_version_id VARCHAR,
+                identity_candidate_id VARCHAR,
+                original_category VARCHAR,
+                canonical_category VARCHAR,
+                source_start_utc VARCHAR,
+                source_end_utc VARCHAR,
+                source_updated_at_utc VARCHAR,
+                source_start_offset_minutes INTEGER,
+                source_end_offset_minutes INTEGER,
+                source_updated_at_offset_minutes INTEGER,
+                source_name VARCHAR,
+                source_version VARCHAR,
+                device VARCHAR,
+                strong_source_id_hash VARCHAR,
+                is_selected BOOLEAN
+            )
+            """
+        )
+        if sleep_intervals:
+            self._query.executemany(
+                "INSERT INTO staged_sleep_intervals "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        str(interval.measurement_version_id),
+                        str(interval.logical_measurement_id),
+                        interval.original_category,
+                        interval.canonical_category.value,
+                        interval.source_start.astimezone(UTC).isoformat(),
+                        interval.source_end.astimezone(UTC).isoformat(),
+                        interval.source_updated_at.astimezone(UTC).isoformat(),
+                        _utc_offset_minutes(interval.source_start),
+                        _utc_offset_minutes(interval.source_end),
+                        _utc_offset_minutes(interval.source_updated_at),
+                        interval.source_name,
+                        interval.source_version,
+                        interval.device,
+                        interval.strong_source_id_hash,
+                        False,
+                    )
+                    for interval in sleep_intervals
+                ],
+            )
+        if active is None:
+            combined_sleep = "SELECT *, 1 AS source_priority FROM staged_sleep_intervals"
+            previous_sleep_count = 0
+        else:
+            previous_sleep = (
+                self._root
+                / _PARQUET_DIRECTORY
+                / "snapshots"
+                / str(active[0])
+                / "sleep_intervals.parquet"
+            )
+            escaped_previous_sleep = str(previous_sleep).replace("'", "''")
+            combined_sleep = (
+                f"SELECT * FROM read_parquet('{escaped_previous_sleep}') "
+                "UNION ALL BY NAME SELECT *, 1 AS source_priority FROM staged_sleep_intervals"
+            )
+            previous_sleep_row = self._query.execute(
+                f"SELECT count(*) FROM read_parquet('{escaped_previous_sleep}')"
+            ).fetchone()
+            assert previous_sleep_row is not None
+            previous_sleep_count = int(previous_sleep_row[0])
+        self._query.execute(
+            f"""
+            CREATE OR REPLACE TEMP TABLE sleep_intervals AS
+            SELECT * EXCLUDE(source_priority, is_selected), row_number() OVER (
+                PARTITION BY identity_candidate_id
+                ORDER BY source_updated_at_utc DESC, source_version DESC,
+                         measurement_version_id DESC
+            ) = 1 AS is_selected
+            FROM ({combined_sleep})
+            QUALIFY row_number() OVER (
+                PARTITION BY measurement_version_id ORDER BY source_priority
+            ) = 1
+            """
+        )
+        sleep_count_row = self._query.execute(
+            "SELECT count(*), count(DISTINCT identity_candidate_id) FROM sleep_intervals"
+        ).fetchone()
+        assert sleep_count_row is not None
+        sleep_version_count, sleep_logical_count = map(int, sleep_count_row)
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE staged_workouts (
+                workout_version_id VARCHAR,
+                logical_workout_id VARCHAR,
+                original_activity_type VARCHAR,
+                source_start_utc VARCHAR,
+                source_end_utc VARCHAR,
+                source_updated_at_utc VARCHAR,
+                source_start_offset_minutes INTEGER,
+                source_end_offset_minutes INTEGER,
+                source_updated_at_offset_minutes INTEGER,
+                measurement_local_date DATE,
+                source_name VARCHAR,
+                source_version VARCHAR,
+                device VARCHAR,
+                strong_source_id_hash VARCHAR,
+                reported_duration_minutes DOUBLE,
+                distance_kilometers DOUBLE,
+                active_energy_kilocalories DOUBLE
+            )
+            """
+        )
+        if workouts:
+            self._query.executemany(
+                "INSERT INTO staged_workouts VALUES "
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        str(item.workout_version_id),
+                        str(item.logical_workout_id),
+                        item.original_activity_type,
+                        item.source_start.astimezone(UTC).isoformat(),
+                        item.source_end.astimezone(UTC).isoformat(),
+                        item.source_updated_at.astimezone(UTC).isoformat(),
+                        _utc_offset_minutes(item.source_start),
+                        _utc_offset_minutes(item.source_end),
+                        _utc_offset_minutes(item.source_updated_at),
+                        item.measurement_local_day,
+                        item.provenance.source_name,
+                        item.provenance.source_version,
+                        item.provenance.device,
+                        item.provenance.strong_source_id_hash,
+                        item.reported_duration_minutes,
+                        item.distance_kilometers,
+                        item.active_energy_kilocalories,
+                    )
+                    for item in workouts
+                ],
+            )
+        previous_workouts = (
+            None
+            if active is None
+            else (
+                self._root / _PARQUET_DIRECTORY / "snapshots" / str(active[0]) / "workouts.parquet"
+            )
+        )
+        if previous_workouts is None or not previous_workouts.exists():
+            self._query.execute(
+                "CREATE OR REPLACE TEMP TABLE workouts AS SELECT * FROM staged_workouts"
+            )
+            previous_workout_count = 0
+        else:
+            escaped_previous_workouts = str(previous_workouts).replace("'", "''")
+            self._query.execute(
+                f"""
+                CREATE OR REPLACE TEMP TABLE workouts AS
+                SELECT * EXCLUDE(source_priority, is_selected), false AS is_selected
+                FROM (
+                    SELECT *, 0 AS source_priority FROM read_parquet('{escaped_previous_workouts}')
+                    UNION ALL BY NAME SELECT *, 1 AS source_priority FROM staged_workouts
+                )
+                QUALIFY row_number() OVER (
+                    PARTITION BY workout_version_id ORDER BY source_priority
+                ) = 1
+                """
+            )
+            count_row = self._query.execute(
+                f"SELECT count(*) FROM read_parquet('{escaped_previous_workouts}')"
+            ).fetchone()
+            assert count_row is not None
+            previous_workout_count = int(count_row[0])
+        if previous_workouts is None or not previous_workouts.exists():
+            self._query.execute("ALTER TABLE workouts ADD COLUMN is_selected BOOLEAN DEFAULT false")
+        workout_count_row = self._query.execute(
+            "SELECT count(*), count(DISTINCT logical_workout_id) FROM workouts"
+        ).fetchone()
+        assert workout_count_row is not None
+        workout_version_count, workout_logical_count = map(int, workout_count_row)
         count_row = self._query.execute(
             "SELECT count(*), count(DISTINCT identity_candidate_id) FROM combined_samples"
         ).fetchone()
@@ -2783,6 +4715,8 @@ class LocalStore:
 
         restored_decision_refs: tuple[tuple[str, str], ...] = ()
         restored_rule_refs: tuple[tuple[str, str], ...] = ()
+        bound_snapshot_as_of = observed_at
+        bound_context_timezone = "Europe/Berlin"
         if restore_overlay is None:
             audit_position = int(
                 self._metadata.execute(
@@ -2810,6 +4744,17 @@ class LocalStore:
                         "SELECT rule_version_id, rule_kind FROM rule_version_refs"
                     ).fetchall()
                 )
+                if "snapshot_origin" in {
+                    str(row[0])
+                    for row in backup.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+                }:
+                    origin = backup.execute(
+                        "SELECT snapshot_as_of, context_timezone FROM snapshot_origin"
+                    ).fetchone()
+                    if origin is None:
+                        raise StoreError("backup_integrity_conflict")
+                    bound_snapshot_as_of = datetime.fromisoformat(str(origin[0]))
+                    bound_context_timezone = str(origin[1])
         manifest_sha256, resolution = self._stage_snapshot(
             staging,
             operation_id=operation_id,
@@ -2822,14 +4767,20 @@ class LocalStore:
             unknown_source_types=unknown_source_types,
             audit_position=audit_position,
             resolve_sources=resolve_sources,
+            resolve_workouts=resolve_workouts,
             restore_exports=restore_exports,
             restored_decision_refs=restored_decision_refs,
             restored_rule_refs=restored_rule_refs,
+            snapshot_as_of=bound_snapshot_as_of,
+            context_timezone=bound_context_timezone,
+            restore_overlay=restore_overlay,
         )
         _allocation_checkpoint(self._root, "staged")
+        _fsync_snapshot(staging)
         _publication_fault_point(self._root, "import.before_snapshot_move/v1")
         snapshot.parent.mkdir(parents=True, exist_ok=True)
         staging.replace(snapshot)
+        _fsync_directory(snapshot.parent)
         _publication_fault_point(self._root, "import.after_snapshot_move/v1")
         completed_at = datetime.now(UTC).isoformat()
         audit_event_id = uuid4().hex
@@ -2862,16 +4813,6 @@ class LocalStore:
                     for item_export_id, item_export_date, item_package_hash, _ in exports_to_record
                 ),
             )
-            self._record_import(
-                operation_id=operation_id,
-                import_id=import_id,
-                package_hash=package_hash,
-                snapshot_id=snapshot_id,
-                status="committed",
-                package_record_count=len(records),
-                record_count=new_record_count,
-                records=records,
-            )
             self._metadata.execute(
                 "INSERT INTO dataset_snapshots VALUES (?, ?, ?, ?, ?, ?)",
                 (
@@ -2882,6 +4823,76 @@ class LocalStore:
                     None if active is None else str(active[0]),
                     completed_at,
                 ),
+            )
+            self._insert_snapshot_contract_binding(snapshot_id)
+            self._metadata.execute(
+                "INSERT INTO activity_derivation_snapshot_bindings VALUES (?, "
+                "(SELECT version_id FROM activity_derivation_active WHERE singleton = 1))",
+                (str(snapshot_id),),
+            )
+            if active is not None:
+                self._metadata.execute(
+                    "INSERT INTO manual_context_snapshot_bindings "
+                    "SELECT ?, revision_id FROM manual_context_snapshot_bindings "
+                    "WHERE snapshot_id = ?",
+                    (str(snapshot_id), str(active[0])),
+                )
+                self._metadata.execute(
+                    "INSERT INTO medication_snapshot_bindings "
+                    "SELECT ?, revision_id FROM medication_snapshot_bindings WHERE snapshot_id = ?",
+                    (str(snapshot_id), str(active[0])),
+                )
+                self._metadata.execute(
+                    "INSERT INTO medication_deviation_snapshot_bindings "
+                    "SELECT ?, revision_id FROM medication_deviation_snapshot_bindings "
+                    "WHERE snapshot_id = ?",
+                    (str(snapshot_id), str(active[0])),
+                )
+                self._metadata.execute(
+                    "INSERT INTO intake_reason_category_snapshot_bindings "
+                    "SELECT ?, revision_id FROM intake_reason_category_snapshot_bindings "
+                    "WHERE snapshot_id = ?",
+                    (str(snapshot_id), str(active[0])),
+                )
+                self._metadata.execute(
+                    "INSERT INTO as_needed_intake_snapshot_bindings "
+                    "SELECT ?, revision_id FROM as_needed_intake_snapshot_bindings "
+                    "WHERE snapshot_id = ?",
+                    (str(snapshot_id), str(active[0])),
+                )
+            elif restore_overlay is not None:
+                self._bind_restored_snapshot(snapshot_id, restore_overlay)
+            all_intervals: tuple[
+                CanonicalHealthRecord | CanonicalSleepInterval | CanonicalWorkout, ...
+            ] = (
+                *records,
+                *sleep_intervals,
+                *workouts,
+            )
+            self._record_import(
+                operation_id=operation_id,
+                import_id=import_id,
+                package_hash=package_hash,
+                snapshot_id=snapshot_id,
+                status="committed",
+                package_record_count=len(all_intervals),
+                record_count=(
+                    new_record_count
+                    + sleep_version_count
+                    - previous_sleep_count
+                    + workout_version_count
+                    - previous_workout_count
+                ),
+                records=all_intervals,
+                logical_measurement_count=logical_count
+                + sleep_logical_count
+                + workout_logical_count,
+                measurement_version_count=version_count
+                + sleep_version_count
+                + workout_version_count,
+                source_occurrence_count=self._snapshot_occurrence_count(snapshot_id),
+                anomaly_count=resolution.anomaly_count,
+                unsupported_content=unsupported_content,
             )
             self._metadata.executemany(
                 "INSERT OR IGNORE INTO source_type_catalog VALUES (?, ?)",
@@ -2942,13 +4953,18 @@ class LocalStore:
                     (completed_at,),
                 )
             _allocation_checkpoint(self._root, "activated")
+            if restore_overlay is not None:
+                _publication_fault_point(self._root, "restore-activation.before_sqlite_commit/v1")
             _publication_fault_point(self._root, "import.before_sqlite_commit/v1")
+        _publication_fault_point(self._root, "import.after_sqlite_commit/v1")
+        if restore_overlay is not None:
+            _publication_fault_point(self._root, "restore-activation.after_sqlite_commit/v1")
         return PublishImportResult(
             status="committed",
             snapshot_id=snapshot_id,
-            record_count=new_record_count,
-            logical_measurement_count=logical_count,
-            measurement_version_count=version_count,
+            record_count=new_record_count + sleep_version_count - previous_sleep_count,
+            logical_measurement_count=logical_count + sleep_logical_count,
+            measurement_version_count=version_count + sleep_version_count,
             source_occurrence_count=self._snapshot_occurrence_count(snapshot_id),
             anomaly_count=resolution.anomaly_count,
         )
@@ -2960,6 +4976,10 @@ class LocalStore:
             if hashlib.file_digest(working, "sha256").hexdigest() != expected_sha256:
                 raise StoreError("restore_working_copy_changed")
         with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True) as backup:
+            backup_tables = {
+                str(row[0])
+                for row in backup.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
 
             def copy(
                 table: str, *, ignore_existing: bool = False, order_by: str | None = None
@@ -2970,7 +4990,7 @@ class LocalStore:
                 if rows:
                     self._metadata.executemany(
                         f'INSERT {"OR IGNORE " if ignore_existing else ""}INTO "{table}" '
-                        f'VALUES ({", ".join("?" for _ in range(columns))})',
+                        f"VALUES ({', '.join('?' for _ in range(columns))})",
                         rows,
                     )
 
@@ -2983,6 +5003,8 @@ class LocalStore:
                 copy(table)
             copy("rule_version_refs", ignore_existing=True)
             copy("plausibility_rule_versions", ignore_existing=True)
+            if "activity_derivation_versions" in backup_tables:
+                copy("activity_derivation_versions", ignore_existing=True)
             copy("audit_events", order_by="audit_position")
             for table in (
                 "data_review_decisions",
@@ -2991,6 +5013,23 @@ class LocalStore:
                 "source_absence_suppressions",
             ):
                 copy(table)
+            for table in _RESTORABLE_MANUAL_METADATA_TABLES:
+                if (
+                    table in backup_tables
+                    and table != "activity_derivation_versions"
+                    and not table.endswith("_publications")
+                ):
+                    copy(table)
+            if "snapshot_origin" in backup_tables:
+                version = backup.execute(
+                    "SELECT activity_derivation_version_id FROM snapshot_origin"
+                ).fetchone()
+                if version is None:
+                    raise StoreError("backup_integrity_conflict")
+                self._metadata.execute(
+                    "UPDATE activity_derivation_active SET version_id = ? WHERE singleton = 1",
+                    (str(version[0]),),
+                )
             payload_ids = {
                 str(row[0])
                 for table in ("data_review_decisions", "metadata_tombstones")
@@ -3010,6 +5049,144 @@ class LocalStore:
             "UPDATE store_identity SET person_binding = 'bound' WHERE singleton = 1"
         )
 
+    def _bind_restored_snapshot(self, snapshot_id: SnapshotId, path: Path) -> None:
+        with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True) as backup:
+            tables = {
+                str(row[0])
+                for row in backup.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            }
+            if "snapshot_origin" not in tables:
+                return
+            origin = backup.execute("SELECT source_snapshot_id FROM snapshot_origin").fetchone()
+            manifest = backup.execute(
+                "SELECT backup_id FROM backup_manifest WHERE singleton = 1"
+            ).fetchone()
+            if origin is None or manifest is None:
+                raise StoreError("backup_integrity_conflict")
+            binding_tables = {
+                "context": "manual_context_snapshot_bindings",
+                "medication_regime": "medication_snapshot_bindings",
+                "medication_deviation": "medication_deviation_snapshot_bindings",
+                "intake_reason_category": "intake_reason_category_snapshot_bindings",
+                "as_needed_intake": "as_needed_intake_snapshot_bindings",
+            }
+            for kind, revision_id in backup.execute(
+                "SELECT revision_kind, revision_id FROM manual_revision_bindings"
+            ):
+                table = binding_tables.get(str(kind))
+                if table is None:
+                    raise StoreError("backup_integrity_conflict")
+                self._metadata.execute(
+                    f'INSERT INTO "{table}" VALUES (?, ?)',
+                    (str(snapshot_id), str(revision_id)),
+                )
+            self._metadata.execute(
+                "INSERT INTO snapshot_restore_origins VALUES (?, ?, ?)",
+                (str(snapshot_id), str(manifest[0]), str(origin[0])),
+            )
+
+    def _effective_manual_revision_ids(self) -> tuple[str, ...]:
+        rows = self._metadata.execute(
+            """
+            SELECT revision_id FROM manual_context_revisions current
+            WHERE state = 'active' AND NOT EXISTS (
+                SELECT 1 FROM manual_context_revisions next
+                WHERE next.previous_revision_id = current.revision_id
+            )
+            UNION ALL
+            SELECT revision_id FROM medication_regime_revisions current
+            WHERE current.revision_id IN (
+                SELECT revision_id FROM manual_revision_intents WHERE intent != 'withdraw'
+            ) AND NOT EXISTS (
+                SELECT 1 FROM medication_regime_revisions next
+                WHERE next.previous_revision_id = current.revision_id
+            )
+            UNION ALL
+            SELECT revision_id FROM medication_deviation_revisions current
+            WHERE state = 'active' AND NOT EXISTS (
+                SELECT 1 FROM medication_deviation_revisions next
+                WHERE next.previous_revision_id = current.revision_id
+            )
+            UNION ALL
+            SELECT revision_id FROM intake_reason_category_revisions current
+            WHERE state = 'active' AND NOT EXISTS (
+                SELECT 1 FROM intake_reason_category_revisions next
+                WHERE next.previous_revision_id = current.revision_id
+            )
+            UNION ALL
+            SELECT revision_id FROM as_needed_intake_revisions current
+            WHERE state = 'active' AND NOT EXISTS (
+                SELECT 1 FROM as_needed_intake_revisions next
+                WHERE next.previous_revision_id = current.revision_id
+            )
+            """
+        ).fetchall()
+        return tuple(sorted(str(row[0]) for row in rows))
+
+    def _bound_manual_revision_ids(self, snapshot_id: SnapshotId) -> tuple[str, ...]:
+        rows = self._metadata.execute(
+            """
+            SELECT revision_id FROM manual_context_snapshot_bindings WHERE snapshot_id = ?
+            UNION ALL
+            SELECT revision_id FROM medication_snapshot_bindings WHERE snapshot_id = ?
+            UNION ALL
+            SELECT revision_id FROM medication_deviation_snapshot_bindings WHERE snapshot_id = ?
+            UNION ALL
+            SELECT revision_id FROM intake_reason_category_snapshot_bindings WHERE snapshot_id = ?
+            UNION ALL
+            SELECT revision_id FROM as_needed_intake_snapshot_bindings WHERE snapshot_id = ?
+            """,
+            (str(snapshot_id),) * 5,
+        ).fetchall()
+        return tuple(sorted(str(row[0]) for row in rows))
+
+    def _snapshot_binding(
+        self,
+        *,
+        snapshot_as_of: datetime,
+        context_timezone: str,
+        manual_revision_ids: tuple[str, ...],
+    ) -> dict[str, str | list[str]]:
+        source_version_ids = tuple(
+            sorted(
+                str(row[0])
+                for row in self._query.execute(
+                    """
+                    SELECT selected_measurement_version_id FROM resolved_measurements
+                    UNION
+                    SELECT measurement_version_id FROM sleep_intervals WHERE is_selected
+                    UNION
+                    SELECT selected_workout_version_id FROM resolved_workouts
+                    """
+                ).fetchall()
+            )
+        )
+        return {
+            "snapshot_as_of": snapshot_as_of.isoformat(),
+            "context_timezone": context_timezone,
+            "context_as_of_date": snapshot_as_of.astimezone(ZoneInfo(context_timezone))
+            .date()
+            .isoformat(),
+            "medication_as_of": snapshot_as_of.isoformat(),
+            "source_version_ids": list(source_version_ids),
+            "manual_revision_ids": list(manual_revision_ids),
+        }
+
+    def _insert_snapshot_contract_binding(self, snapshot_id: SnapshotId) -> None:
+        binding = self._load_snapshot_binding(snapshot_id)
+        if binding is None:
+            raise StoreError("Snapshot-Vertragsbindung fehlt.")
+        self._metadata.execute(
+            "INSERT INTO snapshot_contract_bindings VALUES (?, ?, ?, ?, ?)",
+            (
+                str(snapshot_id),
+                str(binding["snapshot_as_of"]),
+                str(binding["context_timezone"]),
+                str(binding["context_as_of_date"]),
+                str(binding["medication_as_of"]),
+            ),
+        )
+
     def _stage_snapshot(
         self,
         directory: Path,
@@ -3024,11 +5201,15 @@ class LocalStore:
         unknown_source_types: tuple[str, ...],
         audit_position: int,
         resolve_sources: SourceResolver,
+        resolve_workouts: WorkoutResolver,
         restore_exports: tuple[
             tuple[str, datetime | None, str, tuple[CanonicalHealthRecord, ...]], ...
         ],
         restored_decision_refs: tuple[tuple[str, str], ...],
         restored_rule_refs: tuple[tuple[str, str], ...],
+        snapshot_as_of: datetime,
+        context_timezone: str,
+        restore_overlay: Path | None,
     ) -> tuple[str, SourceResolution]:
         self._query.execute(
             """
@@ -3125,13 +5306,13 @@ class LocalStore:
                 ),
             )
             for item_export_id, item_export_date, _, _ in (
-                restore_exports
-                or ((export_id, export_date, "", records),)
+                restore_exports or ((export_id, export_date, "", records),)
             )
         )
         self._query.executemany("INSERT INTO export_order VALUES (?, ?)", export_rows)
         previous_measurements: tuple[ResolvedMeasurement, ...] = ()
         previous_review_cases: tuple[OpenDataReviewCase, ...] = ()
+        previous_workouts: tuple[ResolvedWorkout, ...] = ()
         if parent_snapshot_id is not None:
             previous_directory = (
                 self._root / _PARQUET_DIRECTORY / "snapshots" / str(parent_snapshot_id)
@@ -3174,6 +5355,15 @@ class LocalStore:
                     f"SELECT * FROM read_parquet('{previous_reviews}')"
                 ).fetchall()
             )
+            previous_workout_path = previous_directory / "resolved_workouts.parquet"
+            if previous_workout_path.exists():
+                escaped_previous_workouts = str(previous_workout_path).replace("'", "''")
+                previous_workouts = tuple(
+                    ResolvedWorkout(*row)
+                    for row in self._query.execute(
+                        f"SELECT * FROM read_parquet('{escaped_previous_workouts}')"
+                    ).fetchall()
+                )
 
         occurrence_facts = tuple(
             SourceOccurrenceFact(str(row[0]), int(row[1]), str(row[2]), str(row[3]))
@@ -3243,6 +5433,47 @@ class LocalStore:
             ),
             plausibility_rules=self.load_plausibility_rule_versions(),
         )
+        workout_resolution = resolve_workouts(
+            versions=tuple(
+                WorkoutVersionFact(
+                    str(row[0]),
+                    str(row[1]),
+                    str(row[2]),
+                    cast(Literal["active", "withdrawn"], str(row[3])),
+                    str(row[4]),
+                    str(row[5]),
+                    None if row[6] is None else float(row[6]),
+                    None if row[7] is None else float(row[7]),
+                    None if row[8] is None else float(row[8]),
+                )
+                for row in self._query.execute(
+                    "SELECT workout_version_id, logical_workout_id, source_start_utc, "
+                    "source_end_utc, source_updated_at_utc, source_version, "
+                    "reported_duration_minutes, distance_kilometers, "
+                    "active_energy_kilocalories FROM workouts"
+                ).fetchall()
+            ),
+            previous_workouts=previous_workouts,
+        )
+        prior_case_ids = {item.review_case_id for item in previous_review_cases}
+        new_workout_case_ids = tuple(
+            ReviewCaseId(item.review_case_id)
+            for item in workout_resolution.review_cases
+            if item.review_case_id not in prior_case_ids
+        )
+        all_cases = {item.review_case_id: item for item in resolution.review_cases}
+        all_cases.update((item.review_case_id, item) for item in workout_resolution.review_cases)
+        resolution = replace(
+            resolution,
+            review_cases=tuple(all_cases[key] for key in sorted(all_cases)),
+            new_review_case_ids=(*resolution.new_review_case_ids, *new_workout_case_ids),
+            cycle_status="open"
+            if resolution.new_review_case_ids or new_workout_case_ids
+            else "closed",
+            cycle_open_case_count=(len(resolution.new_review_case_ids) + len(new_workout_case_ids)),
+            anomaly_count=resolution.anomaly_count
+            + sum(item.kind == "workout_plausibility" for item in workout_resolution.review_cases),
+        )
         self._query.execute(
             "CREATE OR REPLACE TEMP TABLE resolved_measurements ("
             "logical_measurement_id VARCHAR, selected_measurement_version_id VARCHAR, "
@@ -3272,6 +5503,36 @@ class LocalStore:
                 resolved_rows,
             )
         self._query.execute(
+            "CREATE OR REPLACE TEMP TABLE resolved_workouts ("
+            "logical_workout_id VARCHAR, selected_workout_version_id VARCHAR, disposition VARCHAR, "
+            "effective_duration_minutes DOUBLE, distance_kilometers DOUBLE, "
+            "active_energy_kilocalories DOUBLE, effective_decision_id VARCHAR)"
+        )
+        if workout_resolution.workouts:
+            self._query.executemany(
+                "INSERT INTO resolved_workouts VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        item.logical_workout_id,
+                        item.selected_workout_version_id,
+                        item.disposition,
+                        item.effective_duration_minutes,
+                        item.distance_kilometers,
+                        item.active_energy_kilocalories,
+                        item.effective_decision_id,
+                    )
+                    for item in workout_resolution.workouts
+                ],
+            )
+        self._query.execute(
+            "CREATE OR REPLACE TEMP TABLE workout_review_links "
+            "(review_case_id VARCHAR, workout_version_id VARCHAR)"
+        )
+        if workout_resolution.review_links:
+            self._query.executemany(
+                "INSERT INTO workout_review_links VALUES (?, ?)", workout_resolution.review_links
+            )
+        self._query.execute(
             "CREATE OR REPLACE TEMP TABLE open_review_cases ("
             "review_case_id VARCHAR, case_kind VARCHAR, logical_measurement_id VARCHAR, "
             "measurement_version_id VARCHAR, rule_version_id VARCHAR, "
@@ -3292,8 +5553,46 @@ class LocalStore:
             self._query.executemany(
                 "INSERT INTO open_review_cases VALUES (?, ?, ?, ?, ?, ?)", review_rows
             )
+        restored_metadata: sqlite3.Connection | None = None
+        if restore_overlay is not None:
+            restored_metadata = sqlite3.connect(
+                f"{restore_overlay.resolve().as_uri()}?mode=ro", uri=True
+            )
+            restored_tables = {
+                str(row[0])
+                for row in restored_metadata.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            bound_manual_revision_ids = (
+                tuple(
+                    str(row[0])
+                    for row in restored_metadata.execute(
+                        "SELECT revision_id FROM manual_revision_bindings ORDER BY revision_id"
+                    )
+                )
+                if "manual_revision_bindings" in restored_tables
+                else ()
+            )
+        else:
+            bound_manual_revision_ids = (
+                ()
+                if parent_snapshot_id is None
+                else self._bound_manual_revision_ids(parent_snapshot_id)
+            )
+        try:
+            self._refresh_v03_derivations(
+                snapshot_id,
+                snapshot_as_of,
+                bound_manual_revision_ids,
+                restored_metadata,
+            )
+        finally:
+            if restored_metadata is not None:
+                restored_metadata.close()
+        self._refresh_derivation_lineage(snapshot_id, snapshot_as_of, bound_manual_revision_ids)
 
-        entries: list[dict[str, int | str]] = []
+        entries: list[dict[str, int | str | list[str]]] = []
         for filename in sorted(_SNAPSHOT_SCHEMAS):
             table = filename.removesuffix(".parquet")
             path = directory / filename
@@ -3306,7 +5605,9 @@ class LocalStore:
                 ).fetchall()
             )
             if description != _SNAPSHOT_SCHEMAS[filename]:
-                raise StoreError("Staging-Snapshot besitzt ein unerwartetes Schema.")
+                raise StoreError(
+                    f"Staging-Snapshot besitzt für {filename} ein unerwartetes Schema."
+                )
             row = self._query.execute(f"SELECT count(*) FROM read_parquet('{escaped}')").fetchone()
             assert row is not None
             entries.append(
@@ -3318,6 +5619,7 @@ class LocalStore:
                     "parquet_schema_fingerprint": hashlib.sha256(
                         json.dumps(description, separators=(",", ":")).encode()
                     ).hexdigest(),
+                    "contract_ids": list(_SNAPSHOT_FILE_CONTRACTS[filename]),
                 }
             )
 
@@ -3363,6 +5665,12 @@ class LocalStore:
                 "identity_rule_version_id": _IDENTITY_RULE_VERSION,
                 "mapping_rule_version_id": _MAPPING_RULE_VERSION,
             },
+            "derivation_contract_ids": list(_DERIVATION_CONTRACT_IDS),
+            "snapshot_binding": self._snapshot_binding(
+                snapshot_as_of=snapshot_as_of,
+                context_timezone=context_timezone,
+                manual_revision_ids=bound_manual_revision_ids,
+            ),
             "files": entries,
             "validation_counts": {
                 "exports": export_count,
@@ -3385,6 +5693,7 @@ class LocalStore:
             manifest_sha256,
             additional_decision_refs=restored_decision_refs,
             additional_rule_refs=restored_rule_refs,
+            additional_manual_revision_ids=bound_manual_revision_ids,
         )
         return manifest_sha256, resolution
 
@@ -3429,6 +5738,56 @@ class LocalStore:
                 if "restored_publications" in tables
                 else ""
             )
+            manual_count = (
+                "+ count(manual_context_publications.audit_event_id)"
+                if "manual_context_publications" in tables
+                else ""
+            )
+            manual_join = (
+                "LEFT JOIN manual_context_publications USING (audit_event_id)"
+                if "manual_context_publications" in tables
+                else ""
+            )
+            medication_count = (
+                "+ count(medication_publications.audit_event_id)"
+                if "medication_publications" in tables
+                else ""
+            )
+            medication_join = (
+                "LEFT JOIN medication_publications USING (audit_event_id)"
+                if "medication_publications" in tables
+                else ""
+            )
+            deviation_count = (
+                "+ count(medication_deviation_publications.audit_event_id)"
+                if "medication_deviation_publications" in tables
+                else ""
+            )
+            deviation_join = (
+                "LEFT JOIN medication_deviation_publications USING (audit_event_id)"
+                if "medication_deviation_publications" in tables
+                else ""
+            )
+            as_needed_count = (
+                "+ count(as_needed_intake_publications.audit_event_id)"
+                if "as_needed_intake_publications" in tables
+                else ""
+            )
+            as_needed_join = (
+                "LEFT JOIN as_needed_intake_publications USING (audit_event_id)"
+                if "as_needed_intake_publications" in tables
+                else ""
+            )
+            reason_category_count = (
+                "+ count(intake_reason_category_publications.audit_event_id)"
+                if "intake_reason_category_publications" in tables
+                else ""
+            )
+            reason_category_join = (
+                "LEFT JOIN intake_reason_category_publications USING (audit_event_id)"
+                if "intake_reason_category_publications" in tables
+                else ""
+            )
             audit = self._metadata.execute(
                 f"""
                 SELECT count(*), COALESCE(MIN(audit_position), 1),
@@ -3438,12 +5797,22 @@ class LocalStore:
                        + count(metadata_tombstones.audit_event_id)
                        {migration_count}
                        {restored_count}
+                       {manual_count}
+                       {medication_count}
+                       {deviation_count}
+                       {as_needed_count}
+                       {reason_category_count}
                 FROM audit_events
                 LEFT JOIN import_publications USING (audit_event_id)
                 LEFT JOIN data_review_decisions USING (audit_event_id)
                 LEFT JOIN metadata_tombstones USING (audit_event_id)
                 {migration_join}
                 {restored_join}
+                {manual_join}
+                {medication_join}
+                {deviation_join}
+                {as_needed_join}
+                {reason_category_join}
                 """
             ).fetchone()
             assert audit is not None
@@ -3477,6 +5846,24 @@ class LocalStore:
                 or manifest["parent_snapshot_id"] != parent_id
             ):
                 raise StoreError("Snapshot-Katalog und Manifest widersprechen sich.")
+            if schema_version >= 6 and manifest["snapshot_binding"]["manual_revision_ids"] != list(
+                self._bound_manual_revision_ids(SnapshotId(snapshot_id))
+            ):
+                raise StoreError("Snapshot-Revisionsbindung ist nicht geschlossen.")
+            if schema_version >= 6:
+                binding = manifest["snapshot_binding"]
+                catalog_binding = self._metadata.execute(
+                    "SELECT snapshot_as_of, context_timezone, context_as_of_date, "
+                    "medication_as_of FROM snapshot_contract_bindings WHERE snapshot_id = ?",
+                    (snapshot_id,),
+                ).fetchone()
+                if catalog_binding != (
+                    binding["snapshot_as_of"],
+                    binding["context_timezone"],
+                    binding["context_as_of_date"],
+                    binding["medication_as_of"],
+                ):
+                    raise StoreError("Snapshot-Katalogbindung ist nicht geschlossen.")
 
     def _validate_snapshot(
         self,
@@ -3487,12 +5874,19 @@ class LocalStore:
         expected_store_id: str | None = None,
         additional_decision_refs: tuple[tuple[str, str], ...] = (),
         additional_rule_refs: tuple[tuple[str, str], ...] = (),
+        additional_manual_revision_ids: tuple[str, ...] = (),
     ) -> None:
         try:
             manifest_bytes = (directory / "manifest.json").read_bytes()
             manifest = json.loads(manifest_bytes)
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise StoreError("Snapshot-Manifest ist nicht lesbar.") from error
+        if (
+            not isinstance(manifest, dict)
+            or type(manifest.get("snapshot_schema_version")) is not int
+        ):
+            raise StoreError("Snapshot-Manifest ist nicht kanonisch oder gültig.")
+        snapshot_schema_version = int(manifest["snapshot_schema_version"])
         store_row = self._metadata.execute(
             "SELECT store_id FROM store_identity WHERE singleton = 1"
         ).fetchone()
@@ -3500,6 +5894,39 @@ class LocalStore:
         validation_counts = (
             manifest.get("validation_counts") if isinstance(manifest, dict) else None
         )
+        snapshot_binding = manifest.get("snapshot_binding") if isinstance(manifest, dict) else None
+        binding_valid = False
+        if isinstance(snapshot_binding, dict):
+            try:
+                snapshot_as_of = datetime.fromisoformat(str(snapshot_binding["snapshot_as_of"]))
+                medication_as_of = datetime.fromisoformat(str(snapshot_binding["medication_as_of"]))
+                context_timezone = str(snapshot_binding["context_timezone"])
+                context_as_of_date = date.fromisoformat(str(snapshot_binding["context_as_of_date"]))
+                source_version_ids = snapshot_binding["source_version_ids"]
+                manual_revision_ids = snapshot_binding["manual_revision_ids"]
+                binding_valid = (
+                    set(snapshot_binding)
+                    == {
+                        "snapshot_as_of",
+                        "context_timezone",
+                        "context_as_of_date",
+                        "medication_as_of",
+                        "source_version_ids",
+                        "manual_revision_ids",
+                    }
+                    and snapshot_as_of.tzinfo is not None
+                    and medication_as_of == snapshot_as_of
+                    and context_as_of_date
+                    == snapshot_as_of.astimezone(ZoneInfo(context_timezone)).date()
+                    and isinstance(source_version_ids, list)
+                    and source_version_ids == sorted(set(source_version_ids))
+                    and all(_is_lower_hex(value, 64) for value in source_version_ids)
+                    and isinstance(manual_revision_ids, list)
+                    and manual_revision_ids == sorted(set(manual_revision_ids))
+                    and all(_is_lower_hex(value, 32) for value in manual_revision_ids)
+                )
+            except (KeyError, TypeError, ValueError, ZoneInfoNotFoundError):
+                binding_valid = False
         if (
             not isinstance(manifest, dict)
             or store_row is None
@@ -3521,8 +5948,10 @@ class LocalStore:
                 "resolution_basis",
                 "files",
                 "validation_counts",
+                *(("derivation_contract_ids",) if snapshot_schema_version >= 5 else ()),
+                *(("snapshot_binding",) if snapshot_schema_version >= 6 else ()),
             }
-            or manifest["snapshot_schema_version"] != _SNAPSHOT_SCHEMA_VERSION
+            or snapshot_schema_version not in range(1, _SNAPSHOT_SCHEMA_VERSION + 1)
             or manifest["snapshot_id"] != snapshot_id
             or not _is_lower_hex(manifest["snapshot_id"], 32)
             or not _is_lower_hex(manifest["store_id"], 32)
@@ -3543,9 +5972,18 @@ class LocalStore:
             or type(resolution_basis["audit_max_position"]) is not int
             or resolution_basis["audit_max_position"] < 1
             or not _is_lower_hex(resolution_basis["governing_export_id"], 64)
-            or not isinstance(resolution_basis["identity_rule_version_id"], str)
-            or not resolution_basis["identity_rule_version_id"]
-            or resolution_basis["mapping_rule_version_id"] != _MAPPING_RULE_VERSION
+            or resolution_basis["identity_rule_version_id"] not in _SUPPORTED_IDENTITY_RULE_VERSIONS
+            or resolution_basis["mapping_rule_version_id"] not in _SUPPORTED_MAPPING_RULE_VERSIONS
+            or (
+                manifest["snapshot_schema_version"] == 5
+                and manifest.get("derivation_contract_ids")
+                != ["resolved-measurement/v1", "resolved-workout/v1"]
+            )
+            or (
+                manifest["snapshot_schema_version"] >= 6
+                and manifest.get("derivation_contract_ids") != list(_DERIVATION_CONTRACT_IDS)
+            )
+            or (manifest["snapshot_schema_version"] >= 6 and not binding_valid)
             or not isinstance(validation_counts, dict)
             or set(validation_counts)
             != {
@@ -3560,21 +5998,33 @@ class LocalStore:
             or any(type(value) is not int or value < 0 for value in validation_counts.values())
         ):
             raise StoreError("Snapshot-Manifest ist nicht kanonisch oder gültig.")
+        schemas = {
+            1: _LEGACY_SNAPSHOT_SCHEMAS,
+            2: _V2_SNAPSHOT_SCHEMAS,
+            3: _V3_SNAPSHOT_SCHEMAS,
+            4: _V4_SNAPSHOT_SCHEMAS,
+            5: _V5_SNAPSHOT_SCHEMAS,
+            6: _SNAPSHOT_SCHEMAS,
+            _SNAPSHOT_SCHEMA_VERSION: _SNAPSHOT_SCHEMAS,
+        }[manifest["snapshot_schema_version"]]
         files = manifest["files"]
         if (
             not isinstance(files, list)
             or any(not isinstance(entry, dict) for entry in files)
-            or tuple(entry.get("name") for entry in files) != tuple(sorted(_SNAPSHOT_SCHEMAS))
+            or tuple(entry.get("name") for entry in files) != tuple(sorted(schemas))
         ):
             raise StoreError("Snapshot enthält nicht genau vier geschlossene Dateien.")
         for entry in files:
-            if not isinstance(entry, dict) or set(entry) != {
+            expected_entry_fields = {
                 "name",
                 "sha256",
                 "allocated_bytes",
                 "row_count",
                 "parquet_schema_fingerprint",
-            }:
+            }
+            if manifest["snapshot_schema_version"] >= 6:
+                expected_entry_fields.add("contract_ids")
+            if not isinstance(entry, dict) or set(entry) != expected_entry_fields:
                 raise StoreError("Snapshot-Dateieintrag ist ungültig.")
             filename = str(entry["name"])
             if (
@@ -3584,6 +6034,17 @@ class LocalStore:
                 or entry["allocated_bytes"] < 0
                 or type(entry["row_count"]) is not int
                 or entry["row_count"] < 0
+                or (
+                    manifest["snapshot_schema_version"] >= 6
+                    and entry["contract_ids"]
+                    != list(
+                        _snapshot_file_contract_ids(
+                            filename,
+                            str(resolution_basis["identity_rule_version_id"]),
+                            str(resolution_basis["mapping_rule_version_id"]),
+                        )
+                    )
+                )
             ):
                 raise StoreError("Snapshot-Dateieintrag ist ungültig.")
             path = directory / filename
@@ -3609,7 +6070,7 @@ class LocalStore:
                 json.dumps(description, separators=(",", ":")).encode()
             ).hexdigest()
             if (
-                description != _SNAPSHOT_SCHEMAS[filename]
+                description != schemas[filename]
                 or row is None
                 or int(row[0]) != entry["row_count"]
                 or allocated_bytes != entry["allocated_bytes"]
@@ -3619,13 +6080,62 @@ class LocalStore:
                 raise StoreError("Snapshot-Dateivalidierung fehlgeschlagen.")
         if {path.name for path in directory.iterdir()} != {
             "manifest.json",
-            *_SNAPSHOT_SCHEMAS,
+            *schemas,
         }:
             raise StoreError("Snapshot enthält unerlaubte Artefakte.")
         paths = {
             name.removesuffix(".parquet"): str(directory / name).replace("'", "''")
             for name in _SNAPSHOT_SCHEMAS
         }
+        if manifest["snapshot_schema_version"] >= 6:
+            for filename in _V6_DERIVATION_FILES:
+                contract = _SNAPSHOT_FILE_CONTRACTS[filename][0]
+                table = paths[filename.removesuffix(".parquet")]
+                invalid_derivation = self._query.execute(
+                    f"SELECT count(*) FROM read_parquet('{table}') "
+                    "WHERE derivation_contract_id != ? OR snapshot_id != ? "
+                    "OR try_cast(derived_at_utc AS TIMESTAMPTZ) IS NULL",
+                    (contract, snapshot_id),
+                ).fetchone()
+                if invalid_derivation is None or int(invalid_derivation[0]) != 0:
+                    raise StoreError("Snapshot-Ableitungsbindung ist ungültig.")
+            expected_source_version_ids = sorted(
+                str(row[0])
+                for row in self._query.execute(
+                    f"""
+                    SELECT selected_measurement_version_id
+                    FROM read_parquet('{paths["resolved_measurements"]}')
+                    UNION
+                    SELECT measurement_version_id
+                    FROM read_parquet('{paths["sleep_intervals"]}') WHERE is_selected
+                    UNION
+                    SELECT selected_workout_version_id
+                    FROM read_parquet('{paths["resolved_workouts"]}')
+                    """
+                ).fetchall()
+            )
+            assert isinstance(snapshot_binding, dict)
+            if snapshot_binding["source_version_ids"] != expected_source_version_ids:
+                raise StoreError("Snapshot-Quellversionsbindung ist nicht geschlossen.")
+            manual_revision_ids = cast(list[str], snapshot_binding["manual_revision_ids"])
+            if manual_revision_ids:
+                placeholders = ",".join("?" for _ in manual_revision_ids)
+                known_manual_revision_ids = {
+                    str(row[0])
+                    for row in self._metadata.execute(
+                        "SELECT revision_id FROM ("
+                        "SELECT revision_id FROM manual_context_revisions UNION ALL "
+                        "SELECT revision_id FROM medication_regime_revisions UNION ALL "
+                        "SELECT revision_id FROM medication_deviation_revisions UNION ALL "
+                        "SELECT revision_id FROM intake_reason_category_revisions UNION ALL "
+                        "SELECT revision_id FROM as_needed_intake_revisions"
+                        f") WHERE revision_id IN ({placeholders})",
+                        tuple(manual_revision_ids),
+                    ).fetchall()
+                }
+                known_manual_revision_ids.update(additional_manual_revision_ids)
+                if known_manual_revision_ids != set(manual_revision_ids):
+                    raise StoreError("Snapshot-Revisionsreferenz ist nicht geschlossen.")
         snapshot_decisions = {
             (str(row[0]), str(row[1]))
             for row in self._query.execute(
@@ -3680,8 +6190,8 @@ class LocalStore:
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'rule_version_refs'"
         ).fetchone()
         cataloged_rules = {
-            (_IDENTITY_RULE_VERSION, "identity"),
-            (_MAPPING_RULE_VERSION, "mapping"),
+            *((version, "identity") for version in _SUPPORTED_IDENTITY_RULE_VERSIONS),
+            *((version, "mapping") for version in _SUPPORTED_MAPPING_RULE_VERSIONS),
             (_FIXED_PLAUSIBILITY_RULE_VERSION, "plausibility"),
         }
         if has_rule_refs is not None:
@@ -3756,10 +6266,19 @@ class LocalStore:
                       OR source_updated_at_utc IS NULL
                       OR source_start_utc > source_end_utc
                       OR measurement_local_date IS NULL
-                      OR canonical_type NOT IN ('active_energy', 'apple_resting_heart_rate')
-                      OR (canonical_type = 'active_energy' AND canonical_unit != 'kcal')
-                      OR (canonical_type = 'apple_resting_heart_rate'
-                          AND canonical_unit != 'count/min'))
+                      OR canonical_type NOT IN ({_CANONICAL_HEALTH_TYPES_SQL})
+                      OR canonical_unit != CASE
+                          WHEN canonical_type IN ('active_energy', 'dietary_energy_consumed')
+                              THEN 'kcal'
+                          WHEN canonical_type = 'apple_resting_heart_rate' THEN 'count/min'
+                          WHEN canonical_type = 'apple_exercise_time' THEN 'min'
+                          WHEN canonical_type = 'step_count' THEN 'count'
+                          WHEN canonical_type = 'walking_running_distance' THEN 'km'
+                          WHEN canonical_type = 'body_mass' THEN 'kg'
+                          WHEN canonical_type LIKE 'sleep_%' THEN 'count'
+                          WHEN canonical_type = 'dietary_water' THEN 'mL'
+                          ELSE 'g'
+                      END)
               + (SELECT count(*) FROM resolved
                    WHERE logical_measurement_id IS NULL
                       OR selected_measurement_version_id IS NULL
@@ -3820,7 +6339,9 @@ class LocalStore:
                       OR NOT regexp_full_match(evidence_fingerprint, '[0-9a-f]{{64}}')
                       OR case_kind NOT IN (
                           'plausibility', 'continued_override',
-                          'suspected_source_deletion', 'source_conflict', 'rule_definition'
+                          'suspected_source_deletion', 'source_conflict', 'rule_definition',
+                          'preferred_daily_weight_conflict', 'workout_plausibility',
+                          'workout_overlap'
                       )
                       OR NOT (
                           (case_kind = 'plausibility'
@@ -3837,6 +6358,16 @@ class LocalStore:
                            AND measurement_version_id IS NULL
                            AND rule_version_id IS NULL)
                           OR
+                          (case_kind = 'preferred_daily_weight_conflict'
+                           AND logical_measurement_id IS NOT NULL
+                           AND measurement_version_id IS NOT NULL
+                           AND rule_version_id IS NULL)
+                          OR
+                          (case_kind IN ('workout_plausibility', 'workout_overlap')
+                           AND logical_measurement_id IS NOT NULL
+                           AND measurement_version_id IS NOT NULL
+                           AND rule_version_id IS NULL)
+                          OR
                           (case_kind = 'rule_definition'
                            AND logical_measurement_id IS NULL
                            AND measurement_version_id IS NULL
@@ -3845,16 +6376,242 @@ class LocalStore:
               + (SELECT count(*) FROM reviews r LEFT JOIN versions v
                    ON v.measurement_version_id = r.measurement_version_id
                    WHERE r.measurement_version_id IS NOT NULL
+                     AND r.case_kind NOT IN ('workout_plausibility', 'workout_overlap')
                      AND v.measurement_version_id IS NULL)
               + (SELECT count(*) FROM reviews r LEFT JOIN resolved m
                    ON m.logical_measurement_id = r.logical_measurement_id
                    WHERE r.logical_measurement_id IS NOT NULL
-                     AND r.case_kind != 'rule_definition'
+                     AND r.case_kind NOT IN (
+                         'rule_definition', 'workout_plausibility', 'workout_overlap'
+                     )
                      AND m.logical_measurement_id IS NULL)
             """
         ).fetchone()
         if invalid is None or int(invalid[0]) != 0:
             raise StoreError("Snapshot-ID-Schließung oder Payloadvalidierung fehlgeschlagen.")
+        if manifest["snapshot_schema_version"] >= 6:
+            lineage = paths["derivation_lineage"]
+            invalid_lineage = self._query.execute(
+                f"""
+                WITH lineage AS (SELECT * FROM read_parquet('{lineage}')),
+                sources AS (
+                    SELECT identity_candidate_id AS source_logical_id,
+                           measurement_version_id AS source_version_id
+                    FROM read_parquet('{paths["measurement_versions"]}')
+                    UNION ALL
+                    SELECT identity_candidate_id, measurement_version_id
+                    FROM read_parquet('{paths["sleep_intervals"]}')
+                    UNION ALL
+                    SELECT logical_workout_id, workout_version_id
+                    FROM read_parquet('{paths["workouts"]}')
+                ),
+                expected AS (
+                    SELECT
+                        sha256('resolved-measurement/v1:' || r.logical_measurement_id),
+                        'resolved_measurement',
+                        'resolved-measurement/v1',
+                        v.identity_candidate_id,
+                        r.selected_measurement_version_id,
+                        'selected_source_version'
+                    FROM read_parquet('{paths["resolved_measurements"]}') r
+                    JOIN read_parquet('{paths["measurement_versions"]}') v
+                      ON v.measurement_version_id = r.selected_measurement_version_id
+                    UNION ALL
+                    SELECT
+                        sha256('resolved-workout/v1:' || r.logical_workout_id),
+                        'resolved_workout',
+                        'resolved-workout/v1',
+                        r.logical_workout_id,
+                        r.selected_workout_version_id,
+                        'selected_source_version'
+                    FROM read_parquet('{paths["resolved_workouts"]}') r
+                    JOIN read_parquet('{paths["workouts"]}') w
+                      ON w.workout_version_id = r.selected_workout_version_id
+                    UNION ALL
+                    SELECT d.derived_record_id, 'weight_nutrition_day',
+                           'weight-nutrition-day/v1', v.identity_candidate_id,
+                           v.measurement_version_id, 'daily_feature_contributor'
+                    FROM read_parquet('{paths["weight_nutrition_days"]}') d
+                    JOIN read_parquet('{paths["measurement_versions"]}') v
+                      ON v.measurement_local_date = d.day AND v.canonical_type = d.feature_kind
+                    JOIN read_parquet('{paths["resolved_measurements"]}') r
+                      ON r.selected_measurement_version_id = v.measurement_version_id
+                    WHERE r.disposition IN ('included_source', 'included_correction')
+                    UNION ALL
+                    SELECT d.derived_record_id, 'activity_day', 'activity-day/v1',
+                           v.identity_candidate_id, v.measurement_version_id,
+                           'daily_metric_contributor'
+                    FROM read_parquet('{paths["activity_days"]}') d
+                    JOIN read_parquet('{paths["measurement_versions"]}') v
+                      ON v.measurement_local_date = d.day AND v.canonical_type = d.metric
+                    JOIN read_parquet('{paths["resolved_measurements"]}') r
+                      ON r.selected_measurement_version_id = v.measurement_version_id
+                    WHERE r.disposition IN ('included_source', 'included_correction')
+                      AND ((v.source_name = 'Apple Watch' AND v.device = 'Apple Watch')
+                           OR ((v.source_name = 'iPhone' AND v.device = 'iPhone')
+                               AND EXISTS (
+                                   SELECT 1
+                                   FROM read_parquet('{paths["activity_coverage_segments"]}') c
+                                   WHERE c.coverage_kind = 'iphone_fallback'
+                                     AND c.start_utc::TIMESTAMPTZ
+                                         <= v.source_start_utc::TIMESTAMPTZ
+                                     AND v.source_end_utc::TIMESTAMPTZ
+                                         <= c.end_utc::TIMESTAMPTZ)))
+                    UNION ALL
+                    SELECT c.derived_record_id, 'activity_coverage', 'activity-coverage/v1',
+                           v.identity_candidate_id, v.measurement_version_id, 'coverage_interval'
+                    FROM read_parquet('{paths["activity_coverage_segments"]}') c
+                    JOIN read_parquet('{paths["measurement_versions"]}') v
+                      ON (c.coverage_kind = 'unobserved'
+                          OR (v.source_start_utc::TIMESTAMPTZ < c.end_utc::TIMESTAMPTZ
+                              AND c.start_utc::TIMESTAMPTZ
+                                  < v.source_end_utc::TIMESTAMPTZ))
+                    JOIN read_parquet('{paths["resolved_measurements"]}') r
+                      ON r.selected_measurement_version_id = v.measurement_version_id
+                    WHERE r.disposition IN ('included_source', 'included_correction')
+                      AND v.canonical_type IN ('apple_exercise_time', 'step_count',
+                                               'walking_running_distance', 'active_energy')
+                      AND ((v.source_name = 'Apple Watch' AND v.device = 'Apple Watch')
+                           OR (v.source_name = 'iPhone' AND v.device = 'iPhone'))
+                    UNION ALL
+                    SELECT c.derived_record_id, 'activity_coverage', 'activity-coverage/v1',
+                           s.identity_candidate_id, s.measurement_version_id,
+                           'coverage_interval'
+                    FROM read_parquet('{paths["activity_coverage_segments"]}') c
+                    JOIN read_parquet('{paths["sleep_intervals"]}') s
+                      ON s.is_selected
+                     AND s.source_start_utc::TIMESTAMPTZ < c.end_utc::TIMESTAMPTZ
+                     AND c.start_utc::TIMESTAMPTZ < s.source_end_utc::TIMESTAMPTZ
+                    UNION ALL
+                    SELECT c.derived_record_id, 'activity_coverage', 'activity-coverage/v1',
+                           w.logical_workout_id, w.workout_version_id, 'coverage_interval'
+                    FROM read_parquet('{paths["activity_coverage_segments"]}') c
+                    JOIN read_parquet('{paths["workouts"]}') w
+                      ON w.source_start_utc::TIMESTAMPTZ < c.end_utc::TIMESTAMPTZ
+                     AND c.start_utc::TIMESTAMPTZ < w.source_end_utc::TIMESTAMPTZ
+                    JOIN read_parquet('{paths["resolved_workouts"]}') r
+                      ON r.selected_workout_version_id = w.workout_version_id
+                    UNION ALL
+                    SELECT f.derived_record_id, 'workout_feature', 'workout-feature/v1',
+                           w.logical_workout_id, w.workout_version_id,
+                           'workout_source_version'
+                    FROM read_parquet('{paths["workout_features"]}') f
+                    JOIN read_parquet('{paths["workouts"]}') w USING (logical_workout_id)
+                    JOIN read_parquet('{paths["resolved_workouts"]}') r
+                      ON r.selected_workout_version_id = w.workout_version_id
+                ),
+                derived_ids AS (
+                    SELECT sha256('resolved-measurement/v1:' || logical_measurement_id)
+                               AS derived_record_id,
+                           'resolved_measurement' AS derived_family,
+                           'resolved-measurement/v1' AS derivation_contract_id
+                    FROM read_parquet('{paths["resolved_measurements"]}')
+                    UNION ALL SELECT sha256('resolved-workout/v1:' || logical_workout_id),
+                           'resolved_workout', 'resolved-workout/v1'
+                    FROM read_parquet('{paths["resolved_workouts"]}')
+                    UNION ALL SELECT derived_record_id, 'weight_nutrition_day',
+                           'weight-nutrition-day/v1'
+                    FROM read_parquet('{paths["weight_nutrition_days"]}')
+                    UNION ALL SELECT derived_record_id, 'sleep_episode', 'sleep-episode/v1'
+                    FROM read_parquet('{paths["sleep_episodes"]}')
+                    UNION ALL SELECT derived_record_id, 'sleep_night', 'sleep-night/v1'
+                    FROM read_parquet('{paths["sleep_nights"]}')
+                    UNION ALL SELECT derived_record_id, 'activity_day', 'activity-day/v1'
+                    FROM read_parquet('{paths["activity_days"]}')
+                    UNION ALL SELECT derived_record_id, 'activity_coverage',
+                           'activity-coverage/v1'
+                    FROM read_parquet('{paths["activity_coverage_segments"]}')
+                    UNION ALL SELECT derived_record_id, 'workout_feature', 'workout-feature/v1'
+                    FROM read_parquet('{paths["workout_features"]}')
+                    UNION ALL SELECT derived_record_id, 'daily_context', 'daily-context/v1'
+                    FROM read_parquet('{paths["daily_context"]}')
+                    UNION ALL SELECT derived_record_id, 'medication_context',
+                           'medication-context/v1'
+                    FROM read_parquet('{paths["medication_context"]}')
+                )
+                SELECT
+                    (SELECT count(*) - count(DISTINCT
+                        derived_record_id || ':' || source_version_id || ':' || contribution_role
+                    ) FROM lineage)
+                  + (SELECT count(*) FROM lineage
+                     WHERE NOT regexp_full_match(derived_record_id, '[0-9a-f]{{64}}')
+                        OR NOT regexp_full_match(source_logical_id, '[0-9a-f]{{32}}|[0-9a-f]{{64}}')
+                        OR NOT regexp_full_match(source_version_id, '[0-9a-f]{{32}}|[0-9a-f]{{64}}')
+                        OR NOT regexp_full_match(snapshot_id, '[0-9a-f]{{32}}')
+                        OR try_cast(derived_at_utc AS TIMESTAMPTZ) IS NULL
+                        OR contribution_role NOT IN (
+                            'selected_source_version', 'daily_feature_contributor',
+                            'episode_interval', 'night_interval', 'daily_metric_contributor',
+                            'coverage_interval', 'workout_source_version', 'manual_revision'
+                        )
+                        OR (derived_family, derivation_contract_id) NOT IN (
+                            ('resolved_measurement', 'resolved-measurement/v1'),
+                            ('resolved_workout', 'resolved-workout/v1'),
+                            ('weight_nutrition_day', 'weight-nutrition-day/v1'),
+                            ('sleep_episode', 'sleep-episode/v1'),
+                            ('sleep_night', 'sleep-night/v1'),
+                            ('activity_day', 'activity-day/v1'),
+                            ('activity_coverage', 'activity-coverage/v1'),
+                            ('workout_feature', 'workout-feature/v1'),
+                            ('daily_context', 'daily-context/v1'),
+                            ('medication_context', 'medication-context/v1')
+                        ))
+                  + (SELECT count(*) FROM lineage l LEFT JOIN sources s
+                     USING (source_logical_id, source_version_id)
+                     WHERE length(l.source_version_id) = 64 AND s.source_version_id IS NULL)
+                  + (SELECT count(*) FROM (
+                        SELECT * FROM expected EXCEPT
+                        SELECT derived_record_id, derived_family, derivation_contract_id,
+                               source_logical_id, source_version_id, contribution_role
+                        FROM lineage
+                    ))
+                  + (SELECT count(*) FROM (
+                        SELECT derived_record_id, derived_family, derivation_contract_id,
+                               source_logical_id, source_version_id, contribution_role
+                        FROM lineage
+                        WHERE length(source_version_id) = 64
+                          AND derived_family NOT IN ('sleep_episode', 'sleep_night')
+                        EXCEPT SELECT * FROM expected
+                    ))
+                  + (SELECT count(*) FROM derived_ids d LEFT JOIN lineage l
+                     USING (derived_record_id, derived_family, derivation_contract_id)
+                     WHERE l.derived_record_id IS NULL)
+                  + (SELECT count(*) FROM lineage l LEFT JOIN derived_ids d
+                     USING (derived_record_id, derived_family, derivation_contract_id)
+                     WHERE d.derived_record_id IS NULL)
+                """
+            ).fetchone()
+            if invalid_lineage is None or int(invalid_lineage[0]) != 0:
+                raise StoreError("Snapshot-Lineage ist nicht vollständig oder geschlossen.")
+            manual_lineage_revision_ids = {
+                str(row[0])
+                for row in self._query.execute(
+                    f"SELECT DISTINCT source_version_id FROM read_parquet('{lineage}') "
+                    "WHERE length(source_version_id) = 32"
+                ).fetchall()
+            }
+            assert isinstance(snapshot_binding, dict)
+            if not manual_lineage_revision_ids <= set(snapshot_binding["manual_revision_ids"]):
+                raise StoreError("Snapshot-Lineage verweist auf ungebundene Revisionen.")
+            lineage_snapshot_ids = {
+                str(row[0])
+                for row in self._query.execute(
+                    f"SELECT DISTINCT snapshot_id FROM read_parquet('{lineage}')"
+                ).fetchall()
+            }
+            unknown_lineage_snapshots = lineage_snapshot_ids - {snapshot_id}
+            if unknown_lineage_snapshots:
+                known = {
+                    str(row[0])
+                    for row in self._metadata.execute(
+                        "SELECT snapshot_id FROM dataset_snapshots WHERE snapshot_id IN ("
+                        + ",".join("?" for _ in unknown_lineage_snapshots)
+                        + ")",
+                        tuple(sorted(unknown_lineage_snapshots)),
+                    ).fetchall()
+                }
+                if known != unknown_lineage_snapshots:
+                    raise StoreError("Snapshot-Lineage verweist auf unbekannte Snapshots.")
         counts = self._query.execute(
             f"""
             SELECT
@@ -3898,7 +6655,12 @@ class LocalStore:
         status: Literal["committed", "duplicate"],
         package_record_count: int,
         record_count: int,
-        records: tuple[CanonicalHealthRecord, ...],
+        records: tuple[CanonicalHealthRecord | CanonicalSleepInterval | CanonicalWorkout, ...],
+        logical_measurement_count: int,
+        measurement_version_count: int,
+        source_occurrence_count: int,
+        anomaly_count: int,
+        unsupported_content: tuple[UnsupportedImportContent, ...],
     ) -> None:
         self._metadata.execute(
             """
@@ -3921,7 +6683,34 @@ class LocalStore:
         )
         self._metadata.executemany(
             "INSERT OR IGNORE INTO import_measurement_versions VALUES (?, ?)",
-            {(str(import_id), str(record.measurement_version_id)) for record in records},
+            {
+                (
+                    str(import_id),
+                    str(
+                        record.workout_version_id
+                        if isinstance(record, CanonicalWorkout)
+                        else record.measurement_version_id
+                    ),
+                )
+                for record in records
+            },
+        )
+        self._metadata.execute(
+            "INSERT INTO import_canonical_counts VALUES (?, ?, ?, ?, ?)",
+            (
+                str(import_id),
+                logical_measurement_count,
+                measurement_version_count,
+                source_occurrence_count,
+                anomaly_count,
+            ),
+        )
+        self._metadata.executemany(
+            "INSERT INTO unsupported_import_content VALUES (?, ?, ?, ?)",
+            (
+                (str(import_id), item.category, item.external_identifier, item.count)
+                for item in unsupported_content
+            ),
         )
 
     def _current_import_result(
@@ -3948,12 +6737,26 @@ class LocalStore:
         ).fetchone()
         assert count_row is not None
         version_count, logical_count = map(int, count_row)
+        sleep_path = (
+            self._root
+            / _PARQUET_DIRECTORY
+            / "snapshots"
+            / str(snapshot_id)
+            / "sleep_intervals.parquet"
+        )
+        escaped_sleep_path = str(sleep_path).replace("'", "''")
+        sleep_count_row = self._query.execute(
+            f"SELECT count(*), count(DISTINCT identity_candidate_id) "
+            f"FROM read_parquet('{escaped_sleep_path}')"
+        ).fetchone()
+        assert sleep_count_row is not None
+        sleep_version_count, sleep_logical_count = map(int, sleep_count_row)
         return PublishImportResult(
             status=status,
             snapshot_id=snapshot_id,
             record_count=record_count,
-            logical_measurement_count=logical_count,
-            measurement_version_count=version_count,
+            logical_measurement_count=logical_count + sleep_logical_count,
+            measurement_version_count=version_count + sleep_version_count,
             source_occurrence_count=self._snapshot_occurrence_count(snapshot_id),
             diagnostics=diagnostics,
         )
@@ -3969,7 +6772,21 @@ class LocalStore:
         escaped = str(path).replace("'", "''")
         row = self._query.execute(f"SELECT count(*) FROM read_parquet('{escaped}')").fetchone()
         assert row is not None
-        return int(row[0])
+        sleep_path = path.with_name("sleep_intervals.parquet")
+        escaped_sleep_path = str(sleep_path).replace("'", "''")
+        sleep_row = self._query.execute(
+            f"SELECT count(*) FROM read_parquet('{escaped_sleep_path}')"
+        ).fetchone()
+        assert sleep_row is not None
+        workouts_path = path.with_name("workouts.parquet")
+        if not workouts_path.exists():
+            return int(row[0]) + int(sleep_row[0])
+        escaped_workouts_path = str(workouts_path).replace("'", "''")
+        workout_row = self._query.execute(
+            f"SELECT count(*) FROM read_parquet('{escaped_workouts_path}')"
+        ).fetchone()
+        assert workout_row is not None
+        return int(row[0]) + int(sleep_row[0]) + int(workout_row[0])
 
     def publish_data_review_resolution(
         self,
@@ -3986,6 +6803,8 @@ class LocalStore:
             "correct",
             "exclude_local",
             "accept_source",
+            "correct_workout",
+            "exclude_workout_local",
         ],
         selected_measurement_version_id: str | None,
         candidate_version_ids: tuple[str, ...],
@@ -3994,6 +6813,8 @@ class LocalStore:
         corrected_value: float | None,
         canonical_unit: str | None,
         cycle_updates: tuple[ReviewCycleUpdate, ...],
+        corrected_distance_kilometers: float | None = None,
+        corrected_active_energy_kilocalories: float | None = None,
     ) -> PublishDecisionResult:
         self._require_open()
         self._require_writer()
@@ -4013,6 +6834,7 @@ class LocalStore:
         logical_id = (
             logical_measurement_id
             if case is None
+            or (case is not None and case.kind in {"workout_plausibility", "workout_overlap"})
             else str(case.logical_measurement_id)
         )
         if logical_id is None:
@@ -4040,14 +6862,31 @@ class LocalStore:
                 "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
             ).fetchone()[0]
         )
-        previous_version = self._resolved_version(active, logical_id)
-        resolved = self.load_resolved_measurement(logical_id)
         case_kind = "direct_correction" if case is None else case.kind
+        is_workout_case = case_kind in {"workout_plausibility", "workout_overlap"}
+        recorded_case_kind = "plausibility" if is_workout_case else case_kind
+        recorded_action = {
+            "correct_workout": "correct",
+            "exclude_workout_local": "exclude_local",
+        }.get(action, action)
+        previous_version = (
+            self._resolved_workout_version(active, logical_id)
+            if is_workout_case
+            else self._resolved_version(active, logical_id)
+        )
+        resolved = None if is_workout_case else self.load_resolved_measurement(logical_id)
         superseded_decision_id = (
             None
             if resolved is None
             or (
-                action not in {"correct", "exclude_local", "accept_source"}
+                action
+                not in {
+                    "correct",
+                    "exclude_local",
+                    "accept_source",
+                    "correct_workout",
+                    "exclude_workout_local",
+                }
                 and not (action == "confirm" and case_kind == "continued_override")
             )
             else resolved.effective_decision_id
@@ -4070,11 +6909,11 @@ class LocalStore:
             "prefer": "conflict_resolution",
             "split": "conflict_resolution",
             "reject": "source_deletion",
+            "correct_workout": "correction",
+            "exclude_workout_local": "local_exclusion",
         }.get(
             action,
-            "source_deletion"
-            if case_kind == "suspected_source_deletion"
-            else "confirmation",
+            "source_deletion" if case_kind == "suspected_source_deletion" else "confirmation",
         )
         completed_at = datetime.now(UTC).isoformat()
         with self._metadata:
@@ -4092,13 +6931,12 @@ class LocalStore:
                 (audit_position, audit_event_id, str(operation_id), completed_at),
             )
             self._metadata.execute(
-                "INSERT INTO data_review_decisions VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO data_review_decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     audit_event_id,
                     decision_id,
                     review_case_id,
-                    case_kind,
+                    recorded_case_kind,
                     logical_id,
                     (
                         hashlib.sha256(
@@ -4107,7 +6945,7 @@ class LocalStore:
                         if case is None
                         else case.evidence_fingerprint
                     ),
-                    action,
+                    recorded_action,
                     selected_measurement_version_id,
                     previous_version,
                     json.dumps([str(item) for item in candidates], separators=(",", ":")),
@@ -4158,6 +6996,8 @@ class LocalStore:
                 candidate_version_ids=tuple(str(item) for item in candidates),
                 corrected_value=corrected_value,
                 canonical_unit=canonical_unit,
+                corrected_distance_kilometers=corrected_distance_kilometers,
+                corrected_active_energy_kilocalories=corrected_active_energy_kilocalories,
             )
             self._activate_review_snapshot(
                 operation_id, snapshot_id, active, manifest_sha256, completed_at
@@ -4532,9 +7372,7 @@ class LocalStore:
                         ),
                         logical_measurement_id=LogicalMeasurementId(str(case_row[2])),
                         measurement_version_id=(
-                            None
-                            if case_row[3] is None
-                            else MeasurementVersionId(str(case_row[3]))
+                            None if case_row[3] is None else MeasurementVersionId(str(case_row[3]))
                         ),
                         rule_version_id=None if case_row[4] is None else str(case_row[4]),
                         evidence_fingerprint=str(case_row[5]),
@@ -4605,6 +7443,21 @@ class LocalStore:
         ).fetchone()
         if row is None:
             raise StoreError("Aufgelöste Quellmessung fehlt.")
+        return str(row[0])
+
+    def _resolved_workout_version(self, snapshot_id: SnapshotId, logical_id: str) -> str:
+        path = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
+        resolved = path / "resolved_workouts.parquet"
+        if not resolved.exists():
+            raise StoreError("Aufgelöstes Training fehlt.")
+        escaped = str(resolved).replace("'", "''")
+        row = self._query.execute(
+            f"SELECT selected_workout_version_id FROM read_parquet('{escaped}') "
+            "WHERE logical_workout_id = ?",
+            (logical_id,),
+        ).fetchone()
+        if row is None:
+            raise StoreError("Aufgelöstes Training fehlt.")
         return str(row[0])
 
     def _include_source(self, logical_id: str, version_id: str) -> None:
@@ -4689,9 +7542,7 @@ class LocalStore:
                 continue
             restored_identities.add(identity_id)
             version_id = (
-                selected_version_id
-                if identity_id == str(previous_identity[0])
-                else candidate_id
+                selected_version_id if identity_id == str(previous_identity[0]) else candidate_id
             )
             chosen = self._query.execute(
                 "SELECT canonical_value, canonical_unit FROM measurement_versions "
@@ -4723,18 +7574,23 @@ class LocalStore:
         candidate_version_ids: tuple[str, ...],
         corrected_value: float | None = None,
         canonical_unit: str | None = None,
+        corrected_distance_kilometers: float | None = None,
+        corrected_active_energy_kilocalories: float | None = None,
         reopened_case: OpenDataReviewCase | None = None,
         replacement_plausibility_cases: tuple[OpenDataReviewCase, ...] | None = None,
         replaced_measurement_version_ids: tuple[str, ...] = (),
         batch_confirmations: tuple[tuple[OpenDataReviewCase, str], ...] = (),
-        batch_revocations: tuple[
-            tuple[OpenDataReviewCase, str, str, tuple[str, ...]], ...
-        ] = (),
+        batch_revocations: tuple[tuple[OpenDataReviewCase, str, str, tuple[str, ...]], ...] = (),
+        snapshot_as_of: datetime | None = None,
+        context_timezone: str = "Europe/Berlin",
     ) -> str:
+        bound_as_of = (
+            datetime.now(ZoneInfo(context_timezone)) if snapshot_as_of is None else snapshot_as_of
+        )
         parent = self._root / _PARQUET_DIRECTORY / "snapshots" / str(parent_snapshot_id)
         staging = self._root / "staging" / str(operation_id)
-        shutil.copytree(parent, staging)
-        for filename in _SNAPSHOT_SCHEMAS:
+        shutil.copytree(parent, staging, copy_function=os.link)
+        for filename in _V4_SNAPSHOT_SCHEMAS:
             table = filename.removesuffix(".parquet")
             escaped = str(staging / filename).replace("'", "''")
             self._query.execute(
@@ -4861,7 +7717,35 @@ class LocalStore:
                     "DELETE FROM open_review_cases WHERE review_case_id = ?",
                     (review_case_id,),
                 )
-            if action == "confirm":
+            if case_kind in {"workout_plausibility", "workout_overlap"}:
+                if action == "correct_workout":
+                    assert selected_measurement_version_id is not None
+                    assert corrected_value is not None
+                    self._query.execute(
+                        "UPDATE resolved_workouts SET disposition = 'included_correction', "
+                        "effective_duration_minutes = ?, distance_kilometers = "
+                        "COALESCE(?, distance_kilometers), active_energy_kilocalories = "
+                        "COALESCE(?, active_energy_kilocalories), effective_decision_id = ? "
+                        "WHERE logical_workout_id = ? AND selected_workout_version_id = ?",
+                        (
+                            corrected_value,
+                            corrected_distance_kilometers,
+                            corrected_active_energy_kilocalories,
+                            decision_id,
+                            logical_id,
+                            selected_measurement_version_id,
+                        ),
+                    )
+                elif action == "exclude_workout_local":
+                    assert selected_measurement_version_id is not None
+                    self._query.execute(
+                        "UPDATE resolved_workouts SET disposition = 'excluded_local', "
+                        "effective_duration_minutes = NULL, distance_kilometers = NULL, "
+                        "active_energy_kilocalories = NULL, effective_decision_id = ? "
+                        "WHERE logical_workout_id = ? AND selected_workout_version_id = ?",
+                        (decision_id, logical_id, selected_measurement_version_id),
+                    )
+            elif action == "confirm":
                 if case_kind == "suspected_source_deletion":
                     self._query.execute(
                         """
@@ -4964,18 +7848,46 @@ class LocalStore:
                         "'source', NULL, NULL, NULL, ?)",
                         (split_id, version_id, float(version[0]), str(version[1]), decision_id),
                     )
-        for filename in _SNAPSHOT_SCHEMAS:
+        manual_revision_ids = (
+            self._effective_manual_revision_ids()
+            if action.startswith("manual_")
+            else self._bound_manual_revision_ids(parent_snapshot_id)
+        )
+        self._refresh_v03_derivations(snapshot_id, bound_as_of, manual_revision_ids)
+        self._refresh_derivation_lineage(snapshot_id, bound_as_of, manual_revision_ids)
+        manifest = json.loads((staging / "manifest.json").read_bytes())
+        rewritten_files = (
+            *(
+                (
+                    "resolved_measurements.parquet",
+                    "resolved_workouts.parquet",
+                    "workout_review_links.parquet",
+                    "open_review_cases.parquet",
+                )
+                if not action.startswith("manual_")
+                else ()
+            ),
+            "derivation_lineage.parquet",
+            *sorted(_V6_DERIVATION_FILES),
+        )
+        for filename in rewritten_files:
             table = filename.removesuffix(".parquet")
             path = staging / filename
-            path.unlink()
+            path.unlink(missing_ok=True)
             escaped = str(path).replace("'", "''")
             self._query.execute(f"COPY (SELECT * FROM {table}) TO '{escaped}' (FORMAT PARQUET)")
-        manifest = json.loads((staging / "manifest.json").read_bytes())
         manifest.update(
+            snapshot_schema_version=_SNAPSHOT_SCHEMA_VERSION,
             snapshot_id=str(snapshot_id),
             created_at_utc=datetime.now(UTC).isoformat(),
             created_by_operation_id=str(operation_id),
             parent_snapshot_id=str(parent_snapshot_id),
+            derivation_contract_ids=list(_DERIVATION_CONTRACT_IDS),
+            snapshot_binding=self._snapshot_binding(
+                snapshot_as_of=bound_as_of,
+                context_timezone=context_timezone,
+                manual_revision_ids=manual_revision_ids,
+            ),
         )
         manifest["resolution_basis"]["audit_max_position"] = audit_position
         entries = []
@@ -5001,6 +7913,7 @@ class LocalStore:
                     "parquet_schema_fingerprint": hashlib.sha256(
                         json.dumps(description, separators=(",", ":")).encode()
                     ).hexdigest(),
+                    "contract_ids": list(_SNAPSHOT_FILE_CONTRACTS[filename]),
                 }
             )
         manifest["files"] = entries
@@ -5034,9 +7947,12 @@ class LocalStore:
         manifest_bytes = json.dumps(
             manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True
         ).encode()
-        (staging / "manifest.json").write_bytes(manifest_bytes)
+        manifest_path = staging / "manifest.json"
+        manifest_path.unlink()
+        manifest_path.write_bytes(manifest_bytes)
         digest = hashlib.sha256(manifest_bytes).hexdigest()
         self._validate_snapshot(staging, str(snapshot_id), digest)
+        _allocation_checkpoint(self._root, "snapshot_staged")
         return digest
 
     def _activate_review_snapshot(
@@ -5047,13 +7963,18 @@ class LocalStore:
         manifest_sha256: str,
         completed_at: str,
         *,
-        activation_kind: Literal["data_review_decision", "rule_version", "historical"] = (
-            "data_review_decision"
-        ),
+        activation_kind: Literal[
+            "data_review_decision", "rule_version", "historical", "manual_context_revision"
+        ] = ("data_review_decision"),
+        replaced_context_logical_id: str | None = None,
     ) -> None:
         staging = self._root / "staging" / str(operation_id)
         snapshot = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
+        _fsync_snapshot(staging)
+        _publication_fault_point(self._root, "snapshot.before_move/v1")
         staging.replace(snapshot)
+        _fsync_directory(snapshot.parent)
+        _publication_fault_point(self._root, "snapshot.after_move/v1")
         self._metadata.execute(
             "INSERT INTO dataset_snapshots VALUES (?, ?, ?, ?, ?, ?)",
             (
@@ -5065,6 +7986,7 @@ class LocalStore:
                 completed_at,
             ),
         )
+        self._insert_snapshot_contract_binding(snapshot_id)
         self._metadata.execute(
             "INSERT INTO snapshot_activations VALUES (?, ?, ?, ?, ?, ?)",
             (
@@ -5078,6 +8000,883 @@ class LocalStore:
         )
         self._metadata.execute(
             "UPDATE active_snapshot SET snapshot_id = ? WHERE singleton = 1", (str(snapshot_id),)
+        )
+        self._metadata.execute(
+            "INSERT INTO activity_derivation_snapshot_bindings "
+            "SELECT ?, version_id FROM activity_derivation_snapshot_bindings WHERE snapshot_id = ?",
+            (str(snapshot_id), str(previous_snapshot_id)),
+        )
+        if replaced_context_logical_id is None:
+            self._metadata.execute(
+                "INSERT INTO manual_context_snapshot_bindings "
+                "SELECT ?, revision_id FROM manual_context_snapshot_bindings WHERE snapshot_id = ?",
+                (str(snapshot_id), str(previous_snapshot_id)),
+            )
+        else:
+            self._metadata.execute(
+                "INSERT INTO manual_context_snapshot_bindings "
+                "SELECT ?, revision_id FROM manual_context_snapshot_bindings "
+                "WHERE snapshot_id = ? AND revision_id NOT IN "
+                "(SELECT revision_id FROM manual_context_revisions WHERE logical_id = ?)",
+                (str(snapshot_id), str(previous_snapshot_id), replaced_context_logical_id),
+            )
+        self._metadata.execute(
+            "INSERT INTO medication_snapshot_bindings "
+            "SELECT ?, revision_id FROM medication_snapshot_bindings WHERE snapshot_id = ?",
+            (str(snapshot_id), str(previous_snapshot_id)),
+        )
+        self._metadata.execute(
+            "INSERT INTO medication_deviation_snapshot_bindings "
+            "SELECT ?, revision_id FROM medication_deviation_snapshot_bindings "
+            "WHERE snapshot_id = ?",
+            (str(snapshot_id), str(previous_snapshot_id)),
+        )
+        self._metadata.execute(
+            "INSERT INTO intake_reason_category_snapshot_bindings "
+            "SELECT ?, revision_id FROM intake_reason_category_snapshot_bindings "
+            "WHERE snapshot_id = ?",
+            (str(snapshot_id), str(previous_snapshot_id)),
+        )
+        self._metadata.execute(
+            "INSERT INTO as_needed_intake_snapshot_bindings "
+            "SELECT ?, revision_id FROM as_needed_intake_snapshot_bindings "
+            "WHERE snapshot_id = ?",
+            (str(snapshot_id), str(previous_snapshot_id)),
+        )
+        _allocation_checkpoint(self._root, "snapshot_activated")
+        _publication_fault_point(self._root, "snapshot.before_sqlite_commit/v1")
+
+    def _refresh_v03_derivations(
+        self,
+        snapshot_id: SnapshotId,
+        snapshot_as_of: datetime,
+        manual_revision_ids: tuple[str, ...],
+        metadata: sqlite3.Connection | None = None,
+    ) -> None:
+        source = self._metadata if metadata is None else metadata
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE weight_nutrition_days AS
+            WITH contributors AS (
+                SELECT v.measurement_local_date AS day, v.canonical_type AS feature_kind,
+                       v.canonical_unit, r.effective_value, v.source_start_utc
+                FROM resolved_measurements r JOIN measurement_versions v
+                  ON v.measurement_version_id = r.selected_measurement_version_id
+                WHERE r.disposition IN ('included_source', 'included_correction')
+                  AND (v.canonical_type = 'body_mass' OR v.canonical_type LIKE 'dietary_%')
+            )
+            SELECT sha256('weight-nutrition-day/v1:' || day || ':' || feature_kind)
+                       AS derived_record_id,
+                   day, feature_kind, canonical_unit,
+                   CASE WHEN feature_kind = 'body_mass'
+                        THEN arg_max(effective_value, source_start_utc)
+                        ELSE sum(effective_value) END AS effective_value,
+                   'observed' AS observation_status, 'reviewed' AS quality_status
+            FROM contributors GROUP BY day, feature_kind, canonical_unit
+            """
+        )
+        context_revision_ids = tuple(
+            revision_id
+            for revision_id in manual_revision_ids
+            if source.execute(
+                "SELECT 1 FROM manual_context_revisions WHERE revision_id = ?", (revision_id,)
+            ).fetchone()
+        )
+        medication_revision_ids = tuple(
+            revision_id
+            for revision_id in manual_revision_ids
+            if source.execute(
+                "SELECT 1 FROM medication_regime_revisions WHERE revision_id = ? UNION ALL "
+                "SELECT 1 FROM medication_deviation_revisions WHERE revision_id = ? UNION ALL "
+                "SELECT 1 FROM intake_reason_category_revisions WHERE revision_id = ? UNION ALL "
+                "SELECT 1 FROM as_needed_intake_revisions WHERE revision_id = ?",
+                (revision_id,) * 4,
+            ).fetchone()
+        )
+        self._refresh_context_derivations(snapshot_as_of, context_revision_ids, source)
+        self._refresh_medication_derivations(snapshot_as_of, medication_revision_ids, source)
+        self._refresh_sleep_derivations()
+        self._refresh_activity_derivations(source)
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE workout_features AS
+            SELECT sha256('workout-feature/v1:' || r.logical_workout_id) AS derived_record_id,
+                   r.logical_workout_id, w.measurement_local_date AS day,
+                   w.original_activity_type AS activity_type,
+                   r.effective_duration_minutes AS duration_minutes,
+                   r.distance_kilometers, r.active_energy_kilocalories,
+                   'reviewed' AS quality_status
+            FROM resolved_workouts r JOIN workouts w
+              ON w.workout_version_id = r.selected_workout_version_id
+            WHERE r.disposition LIKE 'included%'
+            """
+        )
+        derived_at = snapshot_as_of.astimezone(UTC).isoformat()
+        for filename in _V6_DERIVATION_FILES:
+            table = filename.removesuffix(".parquet")
+            contract = _SNAPSHOT_FILE_CONTRACTS[filename][0]
+            self._query.execute(
+                f"ALTER TABLE {table} ADD COLUMN derivation_contract_id VARCHAR; "
+                f"ALTER TABLE {table} ADD COLUMN snapshot_id VARCHAR; "
+                f"ALTER TABLE {table} ADD COLUMN derived_at_utc VARCHAR; "
+                f"UPDATE {table} SET derivation_contract_id = ?, snapshot_id = ?, "
+                "derived_at_utc = ?",
+                (contract, str(snapshot_id), derived_at),
+            )
+
+    def _refresh_context_derivations(
+        self,
+        snapshot_as_of: datetime,
+        revision_ids: tuple[str, ...],
+        metadata: sqlite3.Connection,
+    ) -> None:
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE daily_context (
+                derived_record_id VARCHAR, day DATE, illness_severity VARCHAR,
+                stress_level VARCHAR, quality_status VARCHAR
+            );
+            CREATE OR REPLACE TEMP TABLE daily_context_contributors (
+                derived_record_id VARCHAR, source_logical_id VARCHAR, source_version_id VARCHAR
+            );
+            """
+        )
+        if not revision_ids:
+            return
+        placeholders = ",".join("?" for _ in revision_ids)
+        rows = metadata.execute(
+            "SELECT revision.logical_id, revision.revision_id, revision.object_kind, "
+            "revision.state, COALESCE(period.start_date, stress.day, custom.start_date), "
+            "COALESCE(period.end_date, custom.end_date), period.severity, stress.level, "
+            "COALESCE(period.category_logical_id, custom.label_logical_id) "
+            "FROM manual_context_revisions revision "
+            "LEFT JOIN illness_period_values period USING (revision_id) "
+            "LEFT JOIN daily_stress_values stress USING (revision_id) "
+            "LEFT JOIN custom_context_period_values custom USING (revision_id) "
+            f"WHERE revision.revision_id IN ({placeholders}) ORDER BY revision.rowid",
+            revision_ids,
+        ).fetchall()
+        coverage = metadata.execute(
+            "SELECT revision.logical_id, revision.revision_id, value.start_date "
+            "FROM manual_context_revisions revision "
+            "JOIN context_coverage_start_values value USING (revision_id) "
+            f"WHERE revision.revision_id IN ({placeholders}) AND revision.state = 'active'",
+            revision_ids,
+        ).fetchone()
+        if coverage is None and not any(
+            row[2] in {"illness_period", "daily_stress", "custom_context_period"}
+            and row[3] == "active"
+            for row in rows
+        ):
+            return
+        as_of = snapshot_as_of.astimezone(ZoneInfo("Europe/Berlin")).date()
+        severity_order = {"mild": 0, "moderate": 1, "severe": 2}
+        derived_rows = []
+        lineage_rows = []
+        if coverage is not None:
+            start = date.fromisoformat(str(coverage[2]))
+            days = tuple(
+                start + timedelta(days=offset) for offset in range((as_of - start).days + 1)
+            )
+        else:
+            days = tuple(
+                sorted(
+                    {
+                        current
+                        for row in rows
+                        if row[3] == "active" and row[4] is not None
+                        for start in (date.fromisoformat(str(row[4])),)
+                        for end in (
+                            min(
+                                as_of,
+                                as_of if row[5] is None else date.fromisoformat(str(row[5])),
+                            ),
+                        )
+                        for current in (
+                            start + timedelta(days=offset)
+                            for offset in range((end - start).days + 1)
+                        )
+                    }
+                )
+            )
+        for current in days:
+            active_periods = tuple(
+                row
+                for row in rows
+                if row[2] == "illness_period"
+                and row[3] == "active"
+                and row[4] is not None
+                and date.fromisoformat(str(row[4])) <= current
+                and (row[5] is None or current <= date.fromisoformat(str(row[5])))
+            )
+            stress = next(
+                (
+                    row
+                    for row in rows
+                    if row[2] == "daily_stress"
+                    and row[3] == "active"
+                    and row[4] is not None
+                    and date.fromisoformat(str(row[4])) == current
+                ),
+                None,
+            )
+            severity = (
+                max((str(row[6]) for row in active_periods), key=severity_order.__getitem__)
+                if active_periods
+                else None
+            )
+            stress_level = str(stress[7]) if stress is not None else "average"
+            derived_id = hashlib.sha256(f"daily-context/v1:{current}".encode()).hexdigest()
+            derived_rows.append((derived_id, current, severity, stress_level, "reviewed"))
+            contributors = list(active_periods)
+            if stress is not None:
+                contributors.append(stress)
+            contributors.extend(
+                row
+                for row in rows
+                if row[2] == "custom_context_period"
+                and row[3] == "active"
+                and row[4] is not None
+                and date.fromisoformat(str(row[4])) <= current
+                and (row[5] is None or current <= date.fromisoformat(str(row[5])))
+            )
+            if coverage is not None:
+                lineage_rows.append((derived_id, str(coverage[0]), str(coverage[1])))
+            lineage_rows.extend((derived_id, str(row[0]), str(row[1])) for row in contributors)
+        self._query.executemany("INSERT INTO daily_context VALUES (?, ?, ?, ?, ?)", derived_rows)
+        if lineage_rows:
+            self._query.executemany(
+                "INSERT INTO daily_context_contributors VALUES (?, ?, ?)", lineage_rows
+            )
+
+    def _refresh_medication_derivations(
+        self,
+        snapshot_as_of: datetime,
+        revision_ids: tuple[str, ...],
+        metadata: sqlite3.Connection,
+    ) -> None:
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE medication_context (
+                derived_record_id VARCHAR, day DATE, scheduled_dose_count BIGINT,
+                deviation_count BIGINT, as_needed_intake_count BIGINT,
+                quality_status VARCHAR
+            );
+            CREATE OR REPLACE TEMP TABLE medication_context_contributors (
+                derived_record_id VARCHAR, source_logical_id VARCHAR, source_version_id VARCHAR
+            );
+            """
+        )
+        if not revision_ids:
+            return
+        placeholders = ",".join("?" for _ in revision_ids)
+        regimes = metadata.execute(
+            "SELECT revision.logical_id, revision.revision_id, value.starts_at, value.timezone "
+            "FROM medication_regime_revisions revision "
+            "JOIN medication_regime_values value USING (revision_id) "
+            f"WHERE revision.revision_id IN ({placeholders}) "
+            "ORDER BY value.starts_at, revision.rowid",
+            revision_ids,
+        ).fetchall()
+        deviations = metadata.execute(
+            "SELECT revision.logical_id, revision.revision_id, value.regime_logical_id, "
+            "value.scheduled_at FROM medication_deviation_revisions revision "
+            "JOIN medication_deviation_values value USING (revision_id) "
+            f"WHERE revision.revision_id IN ({placeholders}) AND revision.state = 'active'",
+            revision_ids,
+        ).fetchall()
+        as_needed = metadata.execute(
+            "SELECT revision.logical_id, revision.revision_id, value.taken_at "
+            "FROM as_needed_intake_revisions revision "
+            "JOIN as_needed_intake_values value USING (revision_id) "
+            f"WHERE revision.revision_id IN ({placeholders}) AND revision.state = 'active'",
+            revision_ids,
+        ).fetchall()
+        categories = metadata.execute(
+            "SELECT logical_id, revision_id FROM intake_reason_category_revisions "
+            f"WHERE revision_id IN ({placeholders}) AND state = 'active'",
+            revision_ids,
+        ).fetchall()
+        if not regimes and not deviations and not as_needed and not categories:
+            return
+        timezone_name = str(regimes[0][3]) if regimes else "Europe/Berlin"
+        as_of_day = snapshot_as_of.astimezone(ZoneInfo(timezone_name)).date()
+        start = (
+            min(datetime.fromisoformat(str(row[2])).date() for row in regimes)
+            if regimes
+            else as_of_day
+        )
+
+        def scheduled_at(day: date, local_time: time, zone_name: str) -> datetime:
+            zone = ZoneInfo(zone_name)
+            local = datetime.combine(day, local_time)
+            for minute in range(181):
+                shifted = local + timedelta(minutes=minute)
+                candidate = shifted.replace(tzinfo=zone, fold=0)
+                if candidate.astimezone(UTC).astimezone(zone).replace(tzinfo=None) == shifted:
+                    return candidate
+            raise StoreError("Lokale Dosiszeit konnte nicht aufgelöst werden.")
+
+        derived_rows = []
+        lineage_rows = []
+        parsed_regimes = tuple(
+            (str(row[0]), str(row[1]), datetime.fromisoformat(str(row[2])), str(row[3]))
+            for row in regimes
+        )
+        for offset in range((as_of_day - start).days + 1):
+            current = start + timedelta(days=offset)
+            regime = next(
+                (row for row in reversed(parsed_regimes) if row[2].date() <= current), None
+            )
+            next_regime = (
+                None
+                if regime is None
+                else next((row for row in parsed_regimes if row[2] > regime[2]), None)
+            )
+            scheduled_count = 0
+            if regime is not None:
+                for local_time, weekdays in metadata.execute(
+                    "SELECT local_time, weekdays FROM medication_scheduled_doses "
+                    "WHERE revision_id = ?",
+                    (regime[1],),
+                ).fetchall():
+                    if current.strftime("%A").lower() not in json.loads(str(weekdays)):
+                        continue
+                    occurrence = scheduled_at(
+                        current, time.fromisoformat(str(local_time)), regime[3]
+                    )
+                    if (
+                        occurrence >= regime[2]
+                        and occurrence <= snapshot_as_of
+                        and (next_regime is None or occurrence < next_regime[2])
+                    ):
+                        scheduled_count += 1
+            day_deviations = tuple(
+                row for row in deviations if datetime.fromisoformat(str(row[3])).date() == current
+            )
+            day_as_needed = tuple(
+                row for row in as_needed if datetime.fromisoformat(str(row[2])).date() == current
+            )
+            derived_id = hashlib.sha256(f"medication-context/v1:{current}".encode()).hexdigest()
+            derived_rows.append(
+                (
+                    derived_id,
+                    current,
+                    scheduled_count,
+                    len(day_deviations),
+                    len(day_as_needed),
+                    "reviewed",
+                )
+            )
+            if regime is not None:
+                lineage_rows.append((derived_id, regime[0], regime[1]))
+            lineage_rows.extend((derived_id, str(row[0]), str(row[1])) for row in day_deviations)
+            lineage_rows.extend((derived_id, str(row[0]), str(row[1])) for row in day_as_needed)
+            if regime is None and not day_deviations and not day_as_needed:
+                lineage_rows.extend((derived_id, str(row[0]), str(row[1])) for row in categories)
+        self._query.executemany(
+            "INSERT INTO medication_context VALUES (?, ?, ?, ?, ?, ?)", derived_rows
+        )
+        if lineage_rows:
+            self._query.executemany(
+                "INSERT INTO medication_context_contributors VALUES (?, ?, ?)", lineage_rows
+            )
+
+    def _refresh_sleep_derivations(self) -> None:
+        rows = self._query.execute(
+            """
+            SELECT measurement_version_id, identity_candidate_id, canonical_category,
+                   source_start_utc, source_end_utc, source_start_offset_minutes,
+                   source_end_offset_minutes
+            FROM sleep_intervals
+            WHERE is_selected AND source_end_utc::TIMESTAMPTZ > source_start_utc::TIMESTAMPTZ
+              AND source_name = 'Apple Watch' AND device = 'Apple Watch'
+            ORDER BY source_start_utc, source_end_utc, measurement_version_id
+            """
+        ).fetchall()
+
+        def value_datetime(value: object, offset: object) -> datetime:
+            return datetime.fromisoformat(str(value)).astimezone(
+                timezone(timedelta(minutes=int(str(offset))))
+            )
+
+        intervals = tuple(
+            (
+                str(row[0]),
+                str(row[1]),
+                str(row[2]),
+                value_datetime(row[3], row[5]),
+                value_datetime(row[4], row[6]),
+            )
+            for row in rows
+        )
+        groups: list[list[tuple[str, str, str, datetime, datetime]]] = []
+        for interval in intervals:
+            if interval[2] == "in_bed":
+                continue
+            if not groups or interval[3] - max(item[4] for item in groups[-1]) > timedelta(
+                minutes=90
+            ):
+                groups.append([interval])
+            else:
+                groups[-1].append(interval)
+
+        asleep_categories = {"asleep_unspecified", "asleep_core", "asleep_deep", "asleep_rem"}
+        episode_rows: list[tuple[str, str, str, float, str]] = []
+        contributor_rows: list[tuple[str, str, str]] = []
+        episodes_by_day: dict[date, list[tuple[str, float]]] = {}
+        for group in groups:
+            start = min(item[3] for item in group)
+            end = max(item[4] for item in group)
+            boundaries = sorted({value for item in group for value in (item[3], item[4])})
+            observed = timedelta()
+            for left, right in pairwise(boundaries):
+                active = {item[2] for item in group if item[3] <= left and item[4] >= right}
+                asleep = active & asleep_categories
+                if asleep and "awake" not in active:
+                    observed += right - left
+            version_ids = tuple(sorted(item[0] for item in group))
+            derived_id = hashlib.sha256(
+                f"sleep-episode/v1:{':'.join(version_ids)}".encode()
+            ).hexdigest()
+            observed_minutes = observed.total_seconds() / 60
+            episode_rows.append(
+                (
+                    derived_id,
+                    start.astimezone(UTC).isoformat(),
+                    end.astimezone(UTC).isoformat(),
+                    observed_minutes,
+                    "reviewed",
+                )
+            )
+            contributors = tuple(group) + tuple(
+                item
+                for item in intervals
+                if item[2] == "in_bed" and item[3] < end and item[4] > start
+            )
+            contributor_rows.extend((derived_id, item[1], item[0]) for item in contributors)
+            episodes_by_day.setdefault(end.date(), []).append((derived_id, observed_minutes))
+        night_rows: list[tuple[str, date, str, str | None, str]] = []
+        night_contributors: list[tuple[str, str, str]] = []
+        for day, episodes in sorted(episodes_by_day.items()):
+            largest = max(value for _, value in episodes)
+            primary = tuple(derived_id for derived_id, value in episodes if value == largest)
+            night_id = hashlib.sha256(f"sleep-night/v1:{day}".encode()).hexdigest()
+            night_rows.append(
+                (
+                    night_id,
+                    day,
+                    "observed" if len(primary) == 1 else "partial",
+                    primary[0] if len(primary) == 1 else None,
+                    "reviewed" if len(primary) == 1 else "provisional",
+                )
+            )
+            episode_ids = {derived_id for derived_id, _ in episodes}
+            night_contributors.extend(
+                (night_id, logical_id, version_id)
+                for episode_id, logical_id, version_id in contributor_rows
+                if episode_id in episode_ids
+            )
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE sleep_episodes (
+                derived_record_id VARCHAR, episode_start_utc VARCHAR, episode_end_utc VARCHAR,
+                observed_sleep_minutes DOUBLE, quality_status VARCHAR
+            );
+            CREATE OR REPLACE TEMP TABLE sleep_nights (
+                derived_record_id VARCHAR, day DATE, observation_status VARCHAR,
+                primary_episode_id VARCHAR, quality_status VARCHAR
+            );
+            CREATE OR REPLACE TEMP TABLE sleep_episode_contributors (
+                derived_record_id VARCHAR, source_logical_id VARCHAR, source_version_id VARCHAR
+            );
+            CREATE OR REPLACE TEMP TABLE sleep_night_contributors (
+                derived_record_id VARCHAR, source_logical_id VARCHAR, source_version_id VARCHAR
+            );
+            """
+        )
+        if episode_rows:
+            self._query.executemany(
+                "INSERT INTO sleep_episodes VALUES (?, ?, ?, ?, ?)", episode_rows
+            )
+            self._query.executemany(
+                "INSERT INTO sleep_episode_contributors VALUES (?, ?, ?)", contributor_rows
+            )
+        if night_rows:
+            self._query.executemany("INSERT INTO sleep_nights VALUES (?, ?, ?, ?, ?)", night_rows)
+            self._query.executemany(
+                "INSERT INTO sleep_night_contributors VALUES (?, ?, ?)", night_contributors
+            )
+
+    def _refresh_activity_derivations(self, metadata: sqlite3.Connection) -> None:
+        rows = self._query.execute(
+            """
+            SELECT v.measurement_version_id, v.measurement_local_date, v.canonical_type,
+                   v.canonical_unit, r.effective_value, v.source_start_utc, v.source_end_utc,
+                   v.source_start_offset_minutes, v.source_end_offset_minutes,
+                   v.source_name, v.device,
+                   EXISTS (SELECT 1 FROM open_review_cases c
+                           WHERE c.logical_measurement_id = r.logical_measurement_id
+                              OR c.measurement_version_id = v.measurement_version_id)
+            FROM resolved_measurements r JOIN measurement_versions v
+              ON v.measurement_version_id = r.selected_measurement_version_id
+            WHERE r.disposition IN ('included_source', 'included_correction')
+              AND v.canonical_type IN ('apple_exercise_time', 'step_count',
+                                       'walking_running_distance', 'active_energy')
+            ORDER BY v.source_start_utc, v.measurement_version_id
+            """
+        ).fetchall()
+
+        def local_datetime(value: object, offset: object) -> datetime:
+            return datetime.fromisoformat(str(value)).astimezone(
+                timezone(timedelta(minutes=int(str(offset))))
+            )
+
+        measurements = tuple(
+            (
+                str(row[0]),
+                cast(date, row[1]),
+                str(row[2]),
+                str(row[3]),
+                float(row[4]),
+                local_datetime(row[5], row[7]),
+                local_datetime(row[6], row[8]),
+                "watch"
+                if (str(row[9]), str(row[10])) == ("Apple Watch", "Apple Watch")
+                else "iphone"
+                if (str(row[9]), str(row[10])) == ("iPhone", "iPhone")
+                else "other",
+                bool(row[11]),
+            )
+            for row in rows
+        )
+
+        def union(
+            intervals: tuple[tuple[datetime, datetime], ...],
+        ) -> tuple[tuple[datetime, datetime], ...]:
+            merged: list[tuple[datetime, datetime]] = []
+            for start, end in sorted(intervals):
+                if merged and start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                else:
+                    merged.append((start, end))
+            return tuple(merged)
+
+        metadata_tables = {
+            str(row[0])
+            for row in metadata.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        version = (
+            metadata.execute(
+                "SELECT coverage_gap_minutes FROM activity_derivation_active "
+                "JOIN activity_derivation_versions USING (version_id) WHERE singleton = 1"
+            ).fetchone()
+            if "activity_derivation_active" in metadata_tables
+            else metadata.execute(
+                "SELECT coverage_gap_minutes FROM snapshot_origin origin "
+                "JOIN activity_derivation_versions version "
+                "ON version.version_id = origin.activity_derivation_version_id"
+            ).fetchone()
+            if "snapshot_origin" in metadata_tables
+            else None
+        )
+        gap_minutes = 240 if version is None else int(version[0])
+
+        def bridge(
+            intervals: tuple[tuple[datetime, datetime], ...],
+        ) -> tuple[tuple[datetime, datetime], ...]:
+            merged: list[tuple[datetime, datetime]] = []
+            for start, end in intervals:
+                if (
+                    merged
+                    and start - merged[-1][1] < timedelta(minutes=gap_minutes)
+                    and merged[-1][1].utcoffset() == start.utcoffset()
+                ):
+                    merged[-1] = (merged[-1][0], end)
+                else:
+                    merged.append((start, end))
+            return tuple(merged)
+
+        interval_measurements = tuple(item for item in measurements if item[6] > item[5])
+        watch_intervals = [
+            (item[5], item[6]) for item in interval_measurements if item[7] == "watch"
+        ]
+        for table in ("workouts", "sleep_intervals"):
+            watch_intervals.extend(
+                (
+                    local_datetime(row[0], row[2]),
+                    local_datetime(row[1], row[3]),
+                )
+                for row in self._query.execute(
+                    f"SELECT source_start_utc, source_end_utc, source_start_offset_minutes, "
+                    f"source_end_offset_minutes FROM {table} WHERE is_selected "
+                    "AND source_end_utc::TIMESTAMPTZ > source_start_utc::TIMESTAMPTZ "
+                    "AND source_name = 'Apple Watch' AND device = 'Apple Watch'"
+                ).fetchall()
+            )
+        watch_coverage = bridge(union(tuple(watch_intervals)))
+        watch_gaps = tuple(
+            (left[1], right[0]) for left, right in pairwise(watch_coverage) if left[1] < right[0]
+        )
+        iphone_ids = {
+            item[0]
+            for item in interval_measurements
+            if item[7] == "iphone"
+            and any(start <= item[5] and item[6] <= end for start, end in watch_gaps)
+        }
+        iphone_coverage = tuple(
+            interval
+            for gap_start, gap_end in watch_gaps
+            for interval in bridge(
+                union(
+                    tuple(
+                        (item[5], item[6])
+                        for item in interval_measurements
+                        if item[0] in iphone_ids and gap_start <= item[5] and item[6] <= gap_end
+                    )
+                )
+            )
+        )
+        eligible = tuple(
+            item for item in measurements if item[7] == "watch" or item[0] in iphone_ids
+        )
+        day_rows = []
+        for day, metric, unit in sorted({(item[1], item[2], item[3]) for item in eligible}):
+            contributors = tuple(
+                item for item in eligible if (item[1], item[2], item[3]) == (day, metric, unit)
+            )
+            watch = tuple(item[4] for item in contributors if item[7] == "watch")
+            iphone = tuple(item[4] for item in contributors if item[7] == "iphone")
+            day_rows.append(
+                (
+                    hashlib.sha256(f"activity-day/v1:{day}:{metric}".encode()).hexdigest(),
+                    day,
+                    metric,
+                    unit,
+                    sum(item[4] for item in contributors),
+                    sum(watch) if watch else None,
+                    sum(iphone) if iphone else None,
+                    "provisional" if any(item[8] for item in contributors) else "reviewed",
+                )
+            )
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE activity_days (
+                derived_record_id VARCHAR, day DATE, metric VARCHAR, canonical_unit VARCHAR,
+                effective_value DOUBLE, watch_value DOUBLE, iphone_value DOUBLE,
+                quality_status VARCHAR
+            )
+            """
+        )
+        if day_rows:
+            self._query.executemany(
+                "INSERT INTO activity_days VALUES (?, ?, ?, ?, ?, ?, ?, ?)", day_rows
+            )
+
+        segments: list[tuple[str, str, str, str]] = []
+        coverage_candidates = tuple(
+            item for item in interval_measurements if item[7] in {"watch", "iphone"}
+        )
+        if coverage_candidates:
+            first = min(coverage_candidates, key=lambda item: item[1])
+            last = max(coverage_candidates, key=lambda item: item[1])
+            range_start = datetime.combine(first[1], time.min, first[5].tzinfo)
+            range_end = datetime.combine(last[1] + timedelta(days=1), time.min, last[5].tzinfo)
+            covered = tuple((start, end, "watch") for start, end in watch_coverage) + tuple(
+                (start, end, "iphone_fallback") for start, end in iphone_coverage
+            )
+            boundaries = sorted(
+                {
+                    range_start,
+                    range_end,
+                    *(
+                        value
+                        for start, end, _ in covered
+                        for value in (max(start, range_start), min(end, range_end))
+                    ),
+                }
+            )
+            for start, end in pairwise(boundaries):
+                if start == end:
+                    continue
+                kind = next(
+                    (kind for left, right, kind in covered if left <= start and end <= right),
+                    "unobserved",
+                )
+                current = start
+                while current < end:
+                    midnight = datetime.combine(
+                        current.date() + timedelta(days=1), time.min, current.tzinfo
+                    )
+                    current_end = min(end, midnight)
+                    key = (
+                        f"activity-coverage/v1:{current.isoformat()}:"
+                        f"{current_end.isoformat()}:{kind}"
+                    )
+                    segments.append(
+                        (
+                            hashlib.sha256(key.encode()).hexdigest(),
+                            current.astimezone(UTC).isoformat(),
+                            current_end.astimezone(UTC).isoformat(),
+                            kind,
+                        )
+                    )
+                    current = current_end
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE activity_coverage_segments (
+                derived_record_id VARCHAR, start_utc VARCHAR, end_utc VARCHAR,
+                coverage_kind VARCHAR
+            )
+            """
+        )
+        if segments:
+            self._query.executemany(
+                "INSERT INTO activity_coverage_segments VALUES (?, ?, ?, ?)", segments
+            )
+
+    def _refresh_derivation_lineage(
+        self,
+        snapshot_id: SnapshotId,
+        derived_at: datetime,
+        manual_revision_ids: tuple[str, ...],
+    ) -> None:
+        self._query.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE derivation_lineage AS
+            SELECT
+                sha256('resolved-measurement/v1:' || r.logical_measurement_id) AS derived_record_id,
+                'resolved_measurement' AS derived_family,
+                'resolved-measurement/v1' AS derivation_contract_id,
+                v.identity_candidate_id AS source_logical_id,
+                r.selected_measurement_version_id AS source_version_id,
+                'selected_source_version' AS contribution_role,
+                ? AS snapshot_id,
+                ? AS derived_at_utc
+            FROM resolved_measurements r
+            JOIN measurement_versions v
+              ON v.measurement_version_id = r.selected_measurement_version_id
+            UNION ALL
+            SELECT
+                sha256('resolved-workout/v1:' || r.logical_workout_id) AS derived_record_id,
+                'resolved_workout' AS derived_family,
+                'resolved-workout/v1' AS derivation_contract_id,
+                r.logical_workout_id AS source_logical_id,
+                r.selected_workout_version_id AS source_version_id,
+                'selected_source_version' AS contribution_role,
+                ? AS snapshot_id,
+                ? AS derived_at_utc
+            FROM resolved_workouts r
+            JOIN workouts w ON w.workout_version_id = r.selected_workout_version_id
+            """,
+            (
+                str(snapshot_id),
+                derived_at.astimezone(UTC).isoformat(),
+                str(snapshot_id),
+                derived_at.astimezone(UTC).isoformat(),
+            ),
+        )
+
+        snapshot_ref = str(snapshot_id)
+        derived_ref = derived_at.astimezone(UTC).isoformat()
+        self._query.execute(
+            f"""
+            INSERT INTO derivation_lineage
+            SELECT d.derived_record_id, 'weight_nutrition_day', 'weight-nutrition-day/v1',
+                   v.identity_candidate_id, v.measurement_version_id,
+                   'daily_feature_contributor', '{snapshot_ref}', '{derived_ref}'
+            FROM weight_nutrition_days d JOIN measurement_versions v
+              ON v.measurement_local_date = d.day AND v.canonical_type = d.feature_kind
+            JOIN resolved_measurements r
+              ON r.selected_measurement_version_id = v.measurement_version_id
+            WHERE r.disposition IN ('included_source', 'included_correction');
+
+            INSERT INTO derivation_lineage
+            SELECT e.derived_record_id, 'sleep_episode', 'sleep-episode/v1',
+                   s.source_logical_id, s.source_version_id,
+                   'episode_interval', '{snapshot_ref}', '{derived_ref}'
+            FROM sleep_episodes e JOIN sleep_episode_contributors s
+              USING (derived_record_id)
+            UNION ALL
+            SELECT n.derived_record_id, 'sleep_night', 'sleep-night/v1',
+                   s.source_logical_id, s.source_version_id,
+                   'night_interval', '{snapshot_ref}', '{derived_ref}'
+            FROM sleep_nights n JOIN sleep_night_contributors s
+              USING (derived_record_id);
+
+            INSERT INTO derivation_lineage
+            SELECT d.derived_record_id, 'activity_day', 'activity-day/v1',
+                   v.identity_candidate_id, v.measurement_version_id,
+                   'daily_metric_contributor', '{snapshot_ref}', '{derived_ref}'
+            FROM activity_days d JOIN measurement_versions v
+              ON v.measurement_local_date = d.day AND v.canonical_type = d.metric
+            JOIN resolved_measurements r
+              ON r.selected_measurement_version_id = v.measurement_version_id
+            WHERE r.disposition IN ('included_source', 'included_correction')
+              AND ((v.source_name = 'Apple Watch' AND v.device = 'Apple Watch')
+                   OR ((v.source_name = 'iPhone' AND v.device = 'iPhone')
+                       AND EXISTS (
+                           SELECT 1 FROM activity_coverage_segments c
+                           WHERE c.coverage_kind = 'iphone_fallback'
+                             AND c.start_utc::TIMESTAMPTZ <= v.source_start_utc::TIMESTAMPTZ
+                             AND v.source_end_utc::TIMESTAMPTZ <= c.end_utc::TIMESTAMPTZ
+                       )))
+            UNION ALL
+            SELECT c.derived_record_id, 'activity_coverage', 'activity-coverage/v1',
+                   v.identity_candidate_id, v.measurement_version_id,
+                   'coverage_interval', '{snapshot_ref}', '{derived_ref}'
+            FROM activity_coverage_segments c JOIN measurement_versions v
+              ON (c.coverage_kind = 'unobserved'
+                  OR (v.source_start_utc::TIMESTAMPTZ < c.end_utc::TIMESTAMPTZ
+                      AND c.start_utc::TIMESTAMPTZ < v.source_end_utc::TIMESTAMPTZ))
+            JOIN resolved_measurements r
+              ON r.selected_measurement_version_id = v.measurement_version_id
+            WHERE r.disposition IN ('included_source', 'included_correction')
+              AND v.canonical_type IN ('apple_exercise_time', 'step_count',
+                                       'walking_running_distance', 'active_energy')
+              AND ((v.source_name = 'Apple Watch' AND v.device = 'Apple Watch')
+                   OR (v.source_name = 'iPhone' AND v.device = 'iPhone'))
+            UNION ALL
+            SELECT DISTINCT c.derived_record_id, 'activity_coverage', 'activity-coverage/v1',
+                   s.identity_candidate_id, s.measurement_version_id,
+                   'coverage_interval', '{snapshot_ref}', '{derived_ref}'
+            FROM activity_coverage_segments c JOIN sleep_intervals s
+              ON s.is_selected
+             AND s.source_start_utc::TIMESTAMPTZ < c.end_utc::TIMESTAMPTZ
+             AND c.start_utc::TIMESTAMPTZ < s.source_end_utc::TIMESTAMPTZ
+            UNION ALL
+            SELECT DISTINCT c.derived_record_id, 'activity_coverage', 'activity-coverage/v1',
+                   w.logical_workout_id, w.workout_version_id,
+                   'coverage_interval', '{snapshot_ref}', '{derived_ref}'
+            FROM activity_coverage_segments c JOIN workouts w
+              ON w.source_start_utc::TIMESTAMPTZ < c.end_utc::TIMESTAMPTZ
+             AND c.start_utc::TIMESTAMPTZ < w.source_end_utc::TIMESTAMPTZ
+            JOIN resolved_workouts r
+              ON r.selected_workout_version_id = w.workout_version_id;
+
+            INSERT INTO derivation_lineage
+            SELECT f.derived_record_id, 'workout_feature', 'workout-feature/v1',
+                   w.logical_workout_id, w.workout_version_id,
+                   'workout_source_version', '{snapshot_ref}', '{derived_ref}'
+            FROM workout_features f JOIN workouts w USING (logical_workout_id)
+            JOIN resolved_workouts r
+              ON r.selected_workout_version_id = w.workout_version_id;
+            """
+        )
+
+        self._query.execute(
+            f"""
+            INSERT INTO derivation_lineage
+            SELECT derived_record_id, 'daily_context', 'daily-context/v1',
+                   source_logical_id, source_version_id, 'manual_revision',
+                   '{snapshot_ref}', '{derived_ref}'
+            FROM daily_context_contributors
+            UNION ALL
+            SELECT derived_record_id, 'medication_context', 'medication-context/v1',
+                   source_logical_id, source_version_id, 'manual_revision',
+                   '{snapshot_ref}', '{derived_ref}'
+            FROM medication_context_contributors
+            """
         )
 
     def load_daily_series(
@@ -5176,6 +8975,322 @@ class LocalStore:
             for (data_type, unit), values in grouped.items()
         )
 
+    def load_weight_nutrition_measurements(
+        self,
+        snapshot_id: SnapshotId | None,
+        start_date: date | None,
+        end_date: date | None,
+    ) -> tuple[SnapshotId | None, tuple[StoredMeasurement, ...]]:
+        return self._load_measurements(
+            snapshot_id,
+            start_date,
+            end_date,
+            "(versions.canonical_type = 'body_mass' OR versions.canonical_type LIKE 'dietary_%')",
+        )
+
+    def load_activity_measurements(
+        self,
+        snapshot_id: SnapshotId | None,
+        start_date: date | None,
+        end_date: date | None,
+    ) -> tuple[SnapshotId | None, tuple[StoredMeasurement, ...]]:
+        return self._load_measurements(
+            snapshot_id,
+            start_date,
+            end_date,
+            "versions.canonical_type IN ('apple_exercise_time', 'step_count', "
+            "'walking_running_distance', 'active_energy')",
+        )
+
+    def _load_measurements(
+        self,
+        snapshot_id: SnapshotId | None,
+        start_date: date | None,
+        end_date: date | None,
+        type_clause: str,
+    ) -> tuple[SnapshotId | None, tuple[StoredMeasurement, ...]]:
+        self._require_open()
+        selected_snapshot = snapshot_id or self.load_active_snapshot_id()
+        if selected_snapshot is None:
+            return None, ()
+        if (
+            self._metadata.execute(
+                "SELECT 1 FROM dataset_snapshots WHERE snapshot_id = ?", (str(selected_snapshot),)
+            ).fetchone()
+            is None
+        ):
+            raise StoreError("Datensatz-Snapshot ist unbekannt.")
+        directory = self._root / _PARQUET_DIRECTORY / "snapshots" / str(selected_snapshot)
+        versions = str(directory / "measurement_versions.parquet").replace("'", "''")
+        resolved = str(directory / "resolved_measurements.parquet").replace("'", "''")
+        reviews = str(directory / "open_review_cases.parquet").replace("'", "''")
+        clauses = [type_clause]
+        parameters: list[date] = []
+        if start_date is not None:
+            clauses.append("versions.measurement_local_date >= ?")
+            parameters.append(start_date)
+        if end_date is not None:
+            clauses.append("versions.measurement_local_date <= ?")
+            parameters.append(end_date)
+        rows = self._query.execute(
+            f"""
+            SELECT versions.identity_candidate_id, versions.measurement_version_id,
+                   versions.canonical_type, versions.canonical_unit,
+                   versions.canonical_value, resolved.effective_value, resolved.disposition,
+                   resolved.selected_measurement_version_id IS NOT NULL,
+                   versions.source_start_utc, versions.source_end_utc,
+                   versions.source_updated_at_utc, versions.source_start_offset_minutes,
+                   versions.source_end_offset_minutes, versions.source_updated_at_offset_minutes,
+                   versions.measurement_local_date, versions.source_name,
+                   versions.source_version, versions.device, versions.original_value,
+                   versions.original_unit,
+                   coalesce(list(reviews.review_case_id ORDER BY reviews.review_case_id)
+                            FILTER (WHERE reviews.review_case_id IS NOT NULL), [])
+            FROM read_parquet('{versions}') AS versions
+            LEFT JOIN read_parquet('{resolved}') AS resolved
+              ON resolved.selected_measurement_version_id = versions.measurement_version_id
+            LEFT JOIN read_parquet('{reviews}') AS reviews
+              ON reviews.logical_measurement_id = versions.identity_candidate_id
+            WHERE {" AND ".join(clauses)}
+            GROUP BY ALL
+            ORDER BY versions.measurement_local_date, versions.source_start_utc,
+                     versions.measurement_version_id
+            """,
+            parameters,
+        ).fetchall()
+
+        def local_time(value: str, offset: int) -> datetime:
+            return datetime.fromisoformat(value).astimezone(timezone(timedelta(minutes=offset)))
+
+        return selected_snapshot, tuple(
+            StoredMeasurement(
+                logical_measurement_id=LogicalMeasurementId(str(row[0])),
+                measurement_version_id=MeasurementVersionId(str(row[1])),
+                data_type=CanonicalHealthType(str(row[2])),
+                unit=CanonicalUnit(str(row[3])),
+                value=float(row[4]),
+                effective_value=None if row[5] is None else float(row[5]),
+                disposition=(
+                    None
+                    if row[6] is None
+                    else cast(
+                        Literal[
+                            "included_source",
+                            "included_correction",
+                            "excluded_local",
+                            "excluded_source_deletion",
+                        ],
+                        row[6],
+                    )
+                ),
+                is_selected=bool(row[7]),
+                source_start=local_time(str(row[8]), int(row[11])),
+                source_end=local_time(str(row[9]), int(row[12])),
+                source_updated_at=local_time(str(row[10]), int(row[13])),
+                measurement_local_day=row[14],
+                source_name=str(row[15]),
+                source_version=str(row[16]),
+                device=str(row[17]),
+                original_value=float(row[18]),
+                original_unit=str(row[19]),
+                review_case_ids=tuple(ReviewCaseId(str(item)) for item in row[20]),
+            )
+            for row in rows
+        )
+
+    def load_sleep_measurements(
+        self, snapshot_id: SnapshotId | None
+    ) -> tuple[SnapshotId | None, tuple[CanonicalSleepInterval, ...]]:
+        self._require_open()
+        selected_snapshot = snapshot_id or self.load_active_snapshot_id()
+        if selected_snapshot is None:
+            return None, ()
+        if (
+            self._metadata.execute(
+                "SELECT 1 FROM dataset_snapshots WHERE snapshot_id = ?", (str(selected_snapshot),)
+            ).fetchone()
+            is None
+        ):
+            raise StoreError("Datensatz-Snapshot ist unbekannt.")
+        path = self._root / _PARQUET_DIRECTORY / "snapshots" / str(selected_snapshot)
+        sleep_path = path / "sleep_intervals.parquet"
+        if not sleep_path.exists():
+            return selected_snapshot, ()
+        sleep = str(sleep_path).replace("'", "''")
+        rows = self._query.execute(
+            f"""
+            SELECT identity_candidate_id, measurement_version_id, original_category,
+                   canonical_category, source_start_utc, source_end_utc,
+                   source_updated_at_utc, source_start_offset_minutes,
+                   source_end_offset_minutes, source_updated_at_offset_minutes,
+                   source_name, source_version, device, strong_source_id_hash
+                   , is_selected
+            FROM read_parquet('{sleep}')
+            ORDER BY source_start_utc, measurement_version_id
+            """
+        ).fetchall()
+
+        def local_time(value: str, offset: int) -> datetime:
+            return datetime.fromisoformat(value).astimezone(timezone(timedelta(minutes=offset)))
+
+        return selected_snapshot, tuple(
+            CanonicalSleepInterval(
+                logical_measurement_id=LogicalMeasurementId(str(row[0])),
+                measurement_version_id=MeasurementVersionId(str(row[1])),
+                original_category=str(row[2]),
+                canonical_category=CanonicalSleepCategory(str(row[3])),
+                source_start=local_time(str(row[4]), int(row[7])),
+                source_end=local_time(str(row[5]), int(row[8])),
+                source_updated_at=local_time(str(row[6]), int(row[9])),
+                source_name=str(row[10]),
+                source_version=str(row[11]),
+                device=str(row[12]),
+                strong_source_id_hash=None if row[13] is None else str(row[13]),
+                is_selected=bool(row[14]),
+            )
+            for row in rows
+        )
+
+    def load_workouts(
+        self, snapshot_id: SnapshotId | None, start_date: date | None, end_date: date | None
+    ) -> tuple[SnapshotId | None, tuple[StoredWorkout, ...]]:
+        self._require_open()
+        selected_snapshot = snapshot_id or self.load_active_snapshot_id()
+        if selected_snapshot is None:
+            return None, ()
+        path = (
+            self._root
+            / _PARQUET_DIRECTORY
+            / "snapshots"
+            / str(selected_snapshot)
+            / "workouts.parquet"
+        )
+        if not path.exists():
+            return selected_snapshot, ()
+        clauses, parameters = [], []
+        if start_date is not None:
+            clauses.append("measurement_local_date >= ?")
+            parameters.append(start_date)
+        if end_date is not None:
+            clauses.append("measurement_local_date <= ?")
+            parameters.append(end_date)
+        escaped = str(path).replace("'", "''")
+        where = "" if not clauses else " WHERE " + " AND ".join(clauses)
+        rows = self._query.execute(
+            f"SELECT * FROM read_parquet('{escaped}'){where} "
+            "ORDER BY measurement_local_date, source_start_utc, workout_version_id",
+            parameters,
+        ).fetchall()
+        resolved_path = path.parent / "resolved_workouts.parquet"
+        resolved: dict[str, ResolvedWorkout] = {}
+        if resolved_path.exists():
+            escaped_resolved = str(resolved_path).replace("'", "''")
+            resolved = {
+                str(row[0]): ResolvedWorkout(*row)
+                for row in self._query.execute(
+                    f"SELECT * FROM read_parquet('{escaped_resolved}')"
+                ).fetchall()
+            }
+        review_cases: dict[str, tuple[ReviewCaseId, ...]] = {}
+        links_path = path.parent / "workout_review_links.parquet"
+        if links_path.exists():
+            escaped_links = str(links_path).replace("'", "''")
+            review_path = path.parent / "open_review_cases.parquet"
+            escaped_reviews = str(review_path).replace("'", "''")
+            grouped: dict[str, list[ReviewCaseId]] = {}
+            for case_id, version_id in self._query.execute(
+                f"SELECT links.review_case_id, links.workout_version_id "
+                f"FROM read_parquet('{escaped_links}') AS links JOIN "
+                f"read_parquet('{escaped_reviews}') AS reviews USING (review_case_id)"
+            ).fetchall():
+                grouped.setdefault(str(version_id), []).append(ReviewCaseId(str(case_id)))
+            review_cases = {
+                version_id: tuple(sorted(case_ids, key=str))
+                for version_id, case_ids in grouped.items()
+            }
+
+        def local_time(value: str, offset: int) -> datetime:
+            return datetime.fromisoformat(value).astimezone(timezone(timedelta(minutes=offset)))
+
+        return selected_snapshot, tuple(
+            StoredWorkout(
+                LogicalMeasurementId(str(row[1])),
+                MeasurementVersionId(str(row[0])),
+                str(row[2]),
+                local_time(str(row[3]), int(row[6])),
+                local_time(str(row[4]), int(row[7])),
+                local_time(str(row[5]), int(row[8])),
+                row[9],
+                str(row[10]),
+                str(row[11]),
+                str(row[12]),
+                None if row[13] is None else str(row[13]),
+                None if row[14] is None else float(row[14]),
+                None if row[15] is None else float(row[15]),
+                None if row[16] is None else float(row[16]),
+                (
+                    resolved[str(row[1])].selected_workout_version_id == str(row[0])
+                    and resolved[str(row[1])].disposition.startswith("included")
+                    if str(row[1]) in resolved
+                    else bool(row[17])
+                ),
+                (
+                    resolved[str(row[1])].effective_duration_minutes
+                    if str(row[1]) in resolved
+                    and resolved[str(row[1])].selected_workout_version_id == str(row[0])
+                    else None
+                ),
+                (
+                    resolved[str(row[1])].disposition
+                    if str(row[1]) in resolved
+                    and resolved[str(row[1])].selected_workout_version_id == str(row[0])
+                    else None
+                ),
+                review_cases.get(str(row[0]), ()),
+            )
+            for row in rows
+        )
+
+    def load_workout_review_case_versions(
+        self, review_case_id: str
+    ) -> tuple[MeasurementVersionId, ...]:
+        self._require_open()
+        snapshot = self.load_active_snapshot_id()
+        if snapshot is None:
+            return ()
+        path = (
+            self._root
+            / _PARQUET_DIRECTORY
+            / "snapshots"
+            / str(snapshot)
+            / "workout_review_links.parquet"
+        )
+        if not path.exists():
+            return ()
+        escaped = str(path).replace("'", "''")
+        return tuple(
+            MeasurementVersionId(str(row[0]))
+            for row in self._query.execute(
+                f"SELECT workout_version_id FROM read_parquet('{escaped}') "
+                "WHERE review_case_id = ? ORDER BY workout_version_id",
+                (review_case_id,),
+            ).fetchall()
+        )
+
+    def load_workout_logical_id(self, workout_version_id: MeasurementVersionId) -> str | None:
+        self._require_open()
+        snapshot = self.load_active_snapshot_id()
+        if snapshot is None:
+            return None
+        path = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot) / "workouts.parquet"
+        escaped = str(path).replace("'", "''")
+        row = self._query.execute(
+            f"SELECT logical_workout_id FROM read_parquet('{escaped}') "
+            "WHERE workout_version_id = ?",
+            (str(workout_version_id),),
+        ).fetchone()
+        return None if row is None else str(row[0])
+
     def load_open_data_review_cases(self) -> tuple[OpenDataReviewCase, ...]:
         self._require_open()
         row = self._metadata.execute(
@@ -5209,6 +9324,7 @@ class LocalStore:
                         "suspected_source_deletion",
                         "source_conflict",
                         "rule_definition",
+                        "preferred_daily_weight_conflict",
                     ],
                     kind,
                 ),
@@ -5305,6 +9421,1605 @@ class LocalStore:
                 "ORDER BY data_type, effective_from IS NOT NULL, effective_from, created_at"
             ).fetchall()
         )
+
+    def load_activity_derivation_version(
+        self, snapshot_id: SnapshotId | None
+    ) -> ActivityDerivationRecord:
+        self._require_open()
+        selected_snapshot = snapshot_id or self.load_active_snapshot_id()
+        row = None
+        if selected_snapshot is not None:
+            row = self._metadata.execute(
+                "SELECT version_id, coverage_gap_minutes, source_classifier_version, "
+                "created_at_utc "
+                "FROM activity_derivation_snapshot_bindings JOIN activity_derivation_versions "
+                "USING (version_id) WHERE snapshot_id = ?",
+                (str(selected_snapshot),),
+            ).fetchone()
+        if row is None:
+            row = self._metadata.execute(
+                "SELECT version_id, coverage_gap_minutes, source_classifier_version, "
+                "created_at_utc "
+                "FROM activity_derivation_versions WHERE version_id = 'activity-derivation/v1'"
+            ).fetchone()
+        assert row is not None
+        return ActivityDerivationRecord(
+            str(row[0]), int(row[1]), str(row[2]), datetime.fromisoformat(str(row[3]))
+        )
+
+    def load_context_coverage_start(
+        self, snapshot_id: SnapshotId | None
+    ) -> StoredContextCoverageStart | None:
+        self._require_open()
+        selected = self.load_active_snapshot_id() if snapshot_id is None else snapshot_id
+        if selected is None:
+            return None
+        row = self._metadata.execute(
+            """
+            SELECT revision.logical_id, revision.revision_id, revision.previous_revision_id,
+                   revision.state, value.start_date
+            FROM manual_context_snapshot_bindings binding
+            JOIN manual_context_revisions revision USING (revision_id)
+            LEFT JOIN context_coverage_start_values value USING (revision_id)
+            WHERE binding.snapshot_id = ? AND revision.object_kind = 'context_coverage_start'
+            """,
+            (str(selected),),
+        ).fetchone()
+        if row is None:
+            return None
+        return StoredContextCoverageStart(
+            str(row[0]),
+            str(row[1]),
+            None if row[2] is None else str(row[2]),
+            cast(Literal["active", "withdrawn"], str(row[3])),
+            None if row[4] is None else date.fromisoformat(str(row[4])),
+            selected,
+        )
+
+    def _load_snapshot_binding(self, snapshot_id: SnapshotId) -> dict[str, object] | None:
+        try:
+            manifest = json.loads(
+                (
+                    self._root
+                    / _PARQUET_DIRECTORY
+                    / "snapshots"
+                    / str(snapshot_id)
+                    / "manifest.json"
+                ).read_bytes()
+            )
+        except (OSError, json.JSONDecodeError) as error:
+            raise StoreError("Snapshot-Manifest ist nicht lesbar.") from error
+        binding = manifest.get("snapshot_binding") if isinstance(manifest, dict) else None
+        return binding if isinstance(binding, dict) else None
+
+    def load_medication_as_of(self, snapshot_id: SnapshotId | None) -> datetime:
+        self._require_open()
+        selected = self.load_active_snapshot_id() if snapshot_id is None else snapshot_id
+        if selected is None:
+            return datetime.now(UTC)
+        binding = self._load_snapshot_binding(selected)
+        if binding is not None:
+            return datetime.fromisoformat(str(binding["medication_as_of"]))
+        row = self._metadata.execute(
+            "SELECT medication_as_of FROM medication_publications WHERE snapshot_id = ?",
+            (str(selected),),
+        ).fetchone()
+        if row is None:
+            row = self._metadata.execute(
+                "SELECT medication_as_of FROM medication_deviation_publications "
+                "WHERE snapshot_id = ?",
+                (str(selected),),
+            ).fetchone()
+        if row is None:
+            row = self._metadata.execute(
+                "SELECT medication_as_of FROM intake_reason_category_publications "
+                "WHERE snapshot_id = ?",
+                (str(selected),),
+            ).fetchone()
+        if row is None:
+            row = self._metadata.execute(
+                "SELECT medication_as_of FROM as_needed_intake_publications WHERE snapshot_id = ?",
+                (str(selected),),
+            ).fetchone()
+        if row is not None:
+            return datetime.fromisoformat(str(row[0]))
+        row = self._metadata.execute(
+            "SELECT created_at_utc FROM dataset_snapshots WHERE snapshot_id = ?", (str(selected),)
+        ).fetchone()
+        if row is None:
+            raise StoreError("Snapshot fehlt.")
+        return datetime.fromisoformat(str(row[0]))
+
+    def _stored_medication_regimes(
+        self, where: str, args: tuple[object, ...]
+    ) -> tuple[StoredMedicationRegime, ...]:
+        rows = self._metadata.execute(
+            "SELECT revision.logical_id, revision.revision_id, revision.previous_revision_id, "
+            "CASE WHEN intent.intent = 'withdraw' THEN 'withdrawn' ELSE 'active' END, "
+            "value.starts_at, value.timezone FROM medication_regime_revisions revision "
+            "JOIN medication_regime_values value USING (revision_id) "
+            "JOIN manual_revision_intents intent USING (revision_id) "
+            + where
+            + " ORDER BY value.starts_at, revision.rowid",
+            args,
+        ).fetchall()
+        values: list[StoredMedicationRegime] = []
+        for row in rows:
+            doses = tuple(
+                (
+                    str(dose[0]),
+                    str(dose[1]),
+                    str(dose[2]),
+                    time.fromisoformat(str(dose[3])),
+                    tuple(json.loads(str(dose[4]))),
+                )
+                for dose in self._metadata.execute(
+                    "SELECT medication_name, amount, unit, local_time, weekdays "
+                    "FROM medication_scheduled_doses WHERE revision_id = ? ORDER BY rowid",
+                    (str(row[1]),),
+                ).fetchall()
+            )
+            as_needed = tuple(
+                (
+                    str(entry[0]),
+                    str(entry[1]),
+                    str(entry[2]),
+                    tuple(json.loads(str(entry[3]))),
+                    str(entry[4]),
+                )
+                for entry in self._metadata.execute(
+                    "SELECT medication_name, amount, unit, preferred_reason_category_ids, entry_id "
+                    "FROM medication_as_needed_entries WHERE revision_id = ? ORDER BY rowid",
+                    (str(row[1]),),
+                ).fetchall()
+            )
+            values.append(
+                StoredMedicationRegime(
+                    str(row[0]),
+                    str(row[1]),
+                    None if row[2] is None else str(row[2]),
+                    cast(Literal["active", "withdrawn"], str(row[3])),
+                    datetime.fromisoformat(str(row[4])),
+                    str(row[5]),
+                    doses,
+                    as_needed,
+                )
+            )
+        return tuple(values)
+
+    def load_active_medication_regimes(
+        self, snapshot_id: SnapshotId | None
+    ) -> tuple[StoredMedicationRegime, ...]:
+        self._require_open()
+        selected = self.load_active_snapshot_id() if snapshot_id is None else snapshot_id
+        if selected is None:
+            return ()
+        return self._stored_medication_regimes(
+            "JOIN medication_snapshot_bindings binding USING (revision_id) "
+            "WHERE binding.snapshot_id = ?",
+            (str(selected),),
+        )
+
+    def load_medication_regime(
+        self, snapshot_id: SnapshotId | None, logical_id: str
+    ) -> StoredMedicationRegime | None:
+        return next(
+            (
+                item
+                for item in self.load_active_medication_regimes(snapshot_id)
+                if item.logical_id == logical_id
+            ),
+            None,
+        )
+
+    def load_medication_regime_audit(self, logical_id: str) -> tuple[StoredMedicationRegime, ...]:
+        self._require_open()
+        return self._stored_medication_regimes("WHERE revision.logical_id = ?", (logical_id,))
+
+    def _stored_medication_deviations(
+        self, where: str, args: tuple[object, ...]
+    ) -> tuple[StoredMedicationDeviation, ...]:
+        rows = self._metadata.execute(
+            "SELECT revision.logical_id, revision.revision_id, revision.previous_revision_id, "
+            "revision.state, value.regime_logical_id, value.scheduled_at, value.withdrawal_reason "
+            "FROM medication_deviation_revisions revision "
+            "JOIN medication_deviation_values value USING (revision_id) "
+            + where
+            + " ORDER BY revision.rowid",
+            args,
+        ).fetchall()
+        return tuple(
+            StoredMedicationDeviation(
+                str(row[0]),
+                str(row[1]),
+                None if row[2] is None else str(row[2]),
+                cast(Literal["active", "withdrawn"], str(row[3])),
+                str(row[4]),
+                datetime.fromisoformat(str(row[5])),
+                tuple(
+                    (datetime.fromisoformat(str(item[0])), str(item[1]))
+                    for item in self._metadata.execute(
+                        "SELECT taken_at, amount FROM medication_deviation_intakes "
+                        "WHERE revision_id = ? ORDER BY rowid",
+                        (str(row[1]),),
+                    ).fetchall()
+                ),
+                None if row[6] is None else str(row[6]),
+            )
+            for row in rows
+        )
+
+    def load_active_medication_deviations(
+        self, snapshot_id: SnapshotId | None
+    ) -> tuple[StoredMedicationDeviation, ...]:
+        self._require_open()
+        selected = self.load_active_snapshot_id() if snapshot_id is None else snapshot_id
+        if selected is None:
+            return ()
+        return self._stored_medication_deviations(
+            "JOIN medication_deviation_snapshot_bindings binding USING (revision_id) "
+            "WHERE binding.snapshot_id = ?",
+            (str(selected),),
+        )
+
+    def load_medication_deviation(
+        self, snapshot_id: SnapshotId | None, logical_id: str
+    ) -> StoredMedicationDeviation | None:
+        return next(
+            (
+                item
+                for item in self.load_active_medication_deviations(snapshot_id)
+                if item.logical_id == logical_id
+            ),
+            None,
+        )
+
+    def load_medication_deviation_audit(
+        self, logical_id: str
+    ) -> tuple[StoredMedicationDeviation, ...]:
+        self._require_open()
+        return self._stored_medication_deviations("WHERE revision.logical_id = ?", (logical_id,))
+
+    def _stored_intake_reason_categories(
+        self, where: str, args: tuple[object, ...]
+    ) -> tuple[StoredIntakeReasonCategory, ...]:
+        rows = self._metadata.execute(
+            "SELECT revision.logical_id, revision.revision_id, revision.previous_revision_id, "
+            "revision.state, value.name, value.name_key, value.rowid "
+            "FROM intake_reason_category_revisions revision "
+            "JOIN intake_reason_category_values value USING (revision_id) "
+            + where
+            + " ORDER BY value.rowid",
+            args,
+        ).fetchall()
+        return tuple(
+            StoredIntakeReasonCategory(
+                str(row[0]),
+                str(row[1]),
+                None if row[2] is None else str(row[2]),
+                cast(Literal["active", "withdrawn"], str(row[3])),
+                None if row[4] is None else str(row[4]),
+                None,
+            )
+            for row in rows
+        )
+
+    def load_active_intake_reason_categories(
+        self, snapshot_id: SnapshotId | None
+    ) -> tuple[StoredIntakeReasonCategory, ...]:
+        self._require_open()
+        selected = self.load_active_snapshot_id() if snapshot_id is None else snapshot_id
+        if selected is None:
+            return ()
+        return self._stored_intake_reason_categories(
+            "JOIN intake_reason_category_snapshot_bindings binding USING (revision_id) "
+            "WHERE binding.snapshot_id = ? AND revision.state = 'active'",
+            (str(selected),),
+        )
+
+    def load_intake_reason_category(
+        self, snapshot_id: SnapshotId | None, logical_id: str
+    ) -> StoredIntakeReasonCategory | None:
+        return next(
+            (
+                item
+                for item in self.load_active_intake_reason_categories(snapshot_id)
+                if item.logical_id == logical_id
+            ),
+            None,
+        )
+
+    def load_intake_reason_category_audit(
+        self, logical_id: str
+    ) -> tuple[StoredIntakeReasonCategory, ...]:
+        self._require_open()
+        return self._stored_intake_reason_categories("WHERE revision.logical_id = ?", (logical_id,))
+
+    def is_intake_reason_category_name_reserved(
+        self, name: str, *, excluding_logical_id: str | None = None
+    ) -> bool:
+        self._require_open()
+        name_key = " ".join(name.split()).casefold()
+        return (
+            self._metadata.execute(
+                "SELECT 1 FROM intake_reason_category_values value "
+                "JOIN intake_reason_category_revisions revision USING (revision_id) "
+                "WHERE value.name_key = ? AND (? IS NULL OR revision.logical_id != ?)",
+                (name_key, excluding_logical_id, excluding_logical_id),
+            ).fetchone()
+            is not None
+        )
+
+    def _stored_as_needed_intakes(
+        self, where: str, args: tuple[object, ...]
+    ) -> tuple[StoredAsNeededIntake, ...]:
+        rows = self._metadata.execute(
+            "SELECT revision.logical_id, revision.revision_id, revision.previous_revision_id, "
+            "revision.state, value.regime_logical_id, value.entry_id, value.taken_at, "
+            "value.amount, "
+            "value.reason_category_logical_id, value.withdrawal_reason "
+            "FROM as_needed_intake_revisions revision "
+            "JOIN as_needed_intake_values value USING (revision_id) "
+            + where
+            + " ORDER BY revision.rowid",
+            args,
+        ).fetchall()
+        return tuple(
+            StoredAsNeededIntake(
+                str(row[0]),
+                str(row[1]),
+                None if row[2] is None else str(row[2]),
+                cast(Literal["active", "withdrawn"], str(row[3])),
+                str(row[4]),
+                str(row[5]),
+                datetime.fromisoformat(str(row[6])),
+                str(row[7]),
+                None if row[8] is None else str(row[8]),
+                None if row[9] is None else str(row[9]),
+            )
+            for row in rows
+        )
+
+    def load_active_as_needed_intakes(
+        self, snapshot_id: SnapshotId | None
+    ) -> tuple[StoredAsNeededIntake, ...]:
+        self._require_open()
+        selected = self.load_active_snapshot_id() if snapshot_id is None else snapshot_id
+        if selected is None:
+            return ()
+        return self._stored_as_needed_intakes(
+            "JOIN as_needed_intake_snapshot_bindings binding USING (revision_id) "
+            "WHERE binding.snapshot_id = ? AND revision.state = 'active'",
+            (str(selected),),
+        )
+
+    def load_as_needed_intake(
+        self, snapshot_id: SnapshotId | None, logical_id: str
+    ) -> StoredAsNeededIntake | None:
+        return next(
+            (
+                item
+                for item in self.load_active_as_needed_intakes(snapshot_id)
+                if item.logical_id == logical_id
+            ),
+            None,
+        )
+
+    def load_as_needed_intake_audit(self, logical_id: str) -> tuple[StoredAsNeededIntake, ...]:
+        self._require_open()
+        return self._stored_as_needed_intakes("WHERE revision.logical_id = ?", (logical_id,))
+
+    def publish_intake_reason_category(
+        self, publication: IntakeReasonCategoryPublication
+    ) -> MedicationRootPublicationResult:
+        self._require_open()
+        self._require_writer()
+        active = self.load_active_snapshot_id()
+        if active != publication.expected_snapshot_id:
+            raise StoreError("Aktiver Snapshot hat sich geändert.")
+        audit = self.load_intake_reason_category_audit(str(publication.logical_id))
+        current = self.load_intake_reason_category(active, str(publication.logical_id))
+        if publication.intent == "create":
+            if audit:
+                raise StoreError("Einnahmegrund existiert bereits.")
+            previous, state = None, "active"
+        elif publication.intent == "restore":
+            if (
+                not audit
+                or audit[-1].revision_id != str(publication.expected_revision_id)
+                or audit[-1].state != "withdrawn"
+            ):
+                raise StoreError("Einnahmegrundrevision hat sich geändert.")
+            previous, state = audit[-1].revision_id, "active"
+        else:
+            if current is None or current.revision_id != str(publication.expected_revision_id):
+                raise StoreError("Einnahmegrundrevision hat sich geändert.")
+            previous, state = (
+                current.revision_id,
+                "withdrawn" if publication.intent == "withdraw" else "active",
+            )
+        revision_id, snapshot_id = MedicationRevisionId(uuid4().hex), SnapshotId(uuid4().hex)
+        created_at = datetime.now(UTC).isoformat()
+        payload = {
+            "intent": publication.intent,
+            "name": publication.name,
+            "withdrawal_reason": publication.withdrawal_reason,
+        }
+        payload_sha256 = _manual_payload_sha256(payload)
+        try:
+            with self._metadata:
+                self._metadata.execute(
+                    "INSERT INTO write_operations VALUES "
+                    "(?, 'revise_intake_reason_category', ?, ?, 'committed', 1)",
+                    (str(publication.operation_id), created_at, created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO intake_reason_category_revisions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        str(revision_id),
+                        str(publication.logical_id),
+                        previous,
+                        str(publication.operation_id),
+                        state,
+                        created_at,
+                        payload_sha256,
+                    ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO manual_revision_intents VALUES (?, ?, ?)",
+                    (str(revision_id), publication.intent, publication.withdrawal_reason),
+                )
+                self._metadata.execute(
+                    "INSERT INTO intake_reason_category_values VALUES (?, ?, ?)",
+                    (
+                        str(revision_id),
+                        publication.name,
+                        None
+                        if publication.name is None
+                        else " ".join(publication.name.split()).casefold(),
+                    ),
+                )
+                position = int(
+                    self._metadata.execute(
+                        "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+                    ).fetchone()[0]
+                )
+                manifest = self._stage_review_snapshot(
+                    parent_snapshot_id=active,
+                    snapshot_id=snapshot_id,
+                    operation_id=publication.operation_id,
+                    audit_position=position,
+                    review_case_id=None,
+                    decision_id="",
+                    action="manual_medication_revision",
+                    selected_measurement_version_id=None,
+                    candidate_version_ids=(),
+                    replacement_plausibility_cases=(),
+                    snapshot_as_of=publication.medication_as_of,
+                )
+                self._activate_review_snapshot(
+                    publication.operation_id,
+                    snapshot_id,
+                    active,
+                    manifest,
+                    created_at,
+                    activation_kind="manual_context_revision",
+                )
+                self._metadata.execute(
+                    "DELETE FROM intake_reason_category_snapshot_bindings WHERE snapshot_id = ? "
+                    "AND revision_id IN (SELECT revision_id FROM intake_reason_category_revisions "
+                    "WHERE logical_id = ?)",
+                    (str(snapshot_id), str(publication.logical_id)),
+                )
+                if state == "active":
+                    self._metadata.execute(
+                        "INSERT INTO intake_reason_category_snapshot_bindings VALUES (?, ?)",
+                        (str(snapshot_id), str(revision_id)),
+                    )
+                audit_event_id = uuid4().hex
+                self._metadata.execute(
+                    "INSERT INTO audit_events VALUES (?, ?, ?, 'manual_medication_revision', ?)",
+                    (position, audit_event_id, str(publication.operation_id), created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO intake_reason_category_publications VALUES (?, ?, ?, ?)",
+                    (
+                        audit_event_id,
+                        str(revision_id),
+                        str(snapshot_id),
+                        publication.medication_as_of.isoformat(),
+                    ),
+                )
+        except Exception:
+            shutil.rmtree(
+                self._root / "staging" / str(publication.operation_id), ignore_errors=True
+            )
+            shutil.rmtree(
+                self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id), ignore_errors=True
+            )
+            raise
+        _publication_fault_point(self._root, "snapshot.after_sqlite_commit/v1")
+        return MedicationRootPublicationResult(publication.logical_id, revision_id, snapshot_id)
+
+    def publish_as_needed_intake(
+        self, publication: AsNeededIntakePublication
+    ) -> MedicationRootPublicationResult:
+        self._require_open()
+        self._require_writer()
+        active = self.load_active_snapshot_id()
+        if active != publication.expected_snapshot_id:
+            raise StoreError("Aktiver Snapshot hat sich geändert.")
+        audit = self.load_as_needed_intake_audit(str(publication.logical_id))
+        current = self.load_as_needed_intake(active, str(publication.logical_id))
+        if publication.intent == "create":
+            if audit:
+                raise StoreError("Bedarfseinnahme existiert bereits.")
+            previous, state = None, "active"
+        elif publication.intent == "restore":
+            if (
+                not audit
+                or audit[-1].revision_id != str(publication.expected_revision_id)
+                or audit[-1].state != "withdrawn"
+            ):
+                raise StoreError("Bedarfseinnahmerevision hat sich geändert.")
+            previous, state = audit[-1].revision_id, "active"
+        else:
+            if current is None or current.revision_id != str(publication.expected_revision_id):
+                raise StoreError("Bedarfseinnahmerevision hat sich geändert.")
+            previous, state = (
+                current.revision_id,
+                "withdrawn" if publication.intent == "withdraw" else "active",
+            )
+        revision_id, snapshot_id = MedicationRevisionId(uuid4().hex), SnapshotId(uuid4().hex)
+        created_at = datetime.now(UTC).isoformat()
+        payload = {
+            "intent": publication.intent,
+            "regime_logical_id": str(publication.regime_logical_id),
+            "entry_id": publication.entry_id,
+            "taken_at": publication.taken_at.isoformat(),
+            "amount": publication.amount,
+            "reason_category_logical_id": None
+            if publication.reason_category_logical_id is None
+            else str(publication.reason_category_logical_id),
+            "withdrawal_reason": publication.withdrawal_reason,
+        }
+        payload_sha256 = _manual_payload_sha256(payload)
+        try:
+            with self._metadata:
+                self._metadata.execute(
+                    "INSERT INTO write_operations VALUES "
+                    "(?, 'revise_as_needed_intake', ?, ?, 'committed', 1)",
+                    (str(publication.operation_id), created_at, created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO as_needed_intake_revisions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        str(revision_id),
+                        str(publication.logical_id),
+                        previous,
+                        str(publication.operation_id),
+                        state,
+                        created_at,
+                        payload_sha256,
+                    ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO manual_revision_intents VALUES (?, ?, ?)",
+                    (str(revision_id), publication.intent, publication.withdrawal_reason),
+                )
+                self._metadata.execute(
+                    "INSERT INTO as_needed_intake_values VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        str(revision_id),
+                        str(publication.regime_logical_id),
+                        publication.entry_id,
+                        publication.taken_at.isoformat(),
+                        publication.amount,
+                        None
+                        if publication.reason_category_logical_id is None
+                        else str(publication.reason_category_logical_id),
+                        publication.withdrawal_reason,
+                    ),
+                )
+                position = int(
+                    self._metadata.execute(
+                        "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+                    ).fetchone()[0]
+                )
+                manifest = self._stage_review_snapshot(
+                    parent_snapshot_id=active,
+                    snapshot_id=snapshot_id,
+                    operation_id=publication.operation_id,
+                    audit_position=position,
+                    review_case_id=None,
+                    decision_id="",
+                    action="manual_medication_revision",
+                    selected_measurement_version_id=None,
+                    candidate_version_ids=(),
+                    replacement_plausibility_cases=(),
+                    snapshot_as_of=publication.medication_as_of,
+                )
+                self._activate_review_snapshot(
+                    publication.operation_id,
+                    snapshot_id,
+                    active,
+                    manifest,
+                    created_at,
+                    activation_kind="manual_context_revision",
+                )
+                self._metadata.execute(
+                    "DELETE FROM as_needed_intake_snapshot_bindings WHERE snapshot_id = ? "
+                    "AND revision_id IN (SELECT revision_id FROM as_needed_intake_revisions "
+                    "WHERE logical_id = ?)",
+                    (str(snapshot_id), str(publication.logical_id)),
+                )
+                if state == "active":
+                    self._metadata.execute(
+                        "INSERT INTO as_needed_intake_snapshot_bindings VALUES (?, ?)",
+                        (str(snapshot_id), str(revision_id)),
+                    )
+                audit_event_id = uuid4().hex
+                self._metadata.execute(
+                    "INSERT INTO audit_events VALUES (?, ?, ?, 'manual_medication_revision', ?)",
+                    (position, audit_event_id, str(publication.operation_id), created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO as_needed_intake_publications VALUES (?, ?, ?, ?)",
+                    (
+                        audit_event_id,
+                        str(revision_id),
+                        str(snapshot_id),
+                        publication.medication_as_of.isoformat(),
+                    ),
+                )
+        except Exception:
+            shutil.rmtree(
+                self._root / "staging" / str(publication.operation_id), ignore_errors=True
+            )
+            shutil.rmtree(
+                self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id), ignore_errors=True
+            )
+            raise
+        _publication_fault_point(self._root, "snapshot.after_sqlite_commit/v1")
+        return MedicationRootPublicationResult(publication.logical_id, revision_id, snapshot_id)
+
+    def publish_medication_regime(
+        self, publication: MedicationRegimePublication
+    ) -> MedicationRegimePublicationResult:
+        self._require_open()
+        self._require_writer()
+        active = self.load_active_snapshot_id()
+        if active != publication.expected_snapshot_id:
+            raise StoreError("Aktiver Snapshot hat sich geändert.")
+        audit = self.load_medication_regime_audit(str(publication.logical_id))
+        current = self.load_medication_regime(active, str(publication.logical_id))
+        if publication.intent == "create":
+            if audit or any(
+                regime.starts_at == publication.starts_at
+                for regime in self.load_active_medication_regimes(active)
+            ):
+                raise StoreError("Medikamentenregime existiert bereits.")
+            previous = None
+        elif publication.intent == "restore":
+            if (
+                not audit
+                or current is not None
+                or audit[-1].revision_id != str(publication.expected_revision_id)
+                or audit[-1].state != "withdrawn"
+            ):
+                raise StoreError("Medikamentenrevision hat sich geändert.")
+            previous = audit[-1].revision_id
+        else:
+            if (
+                not audit
+                or current is None
+                or current.revision_id != str(publication.expected_revision_id)
+            ):
+                raise StoreError("Medikamentenrevision hat sich geändert.")
+            previous = current.revision_id
+        revision_id, snapshot_id = MedicationRevisionId(uuid4().hex), SnapshotId(uuid4().hex)
+        created_at = datetime.now(UTC).isoformat()
+        payload = {
+            "intent": publication.intent,
+            "starts_at": publication.starts_at.isoformat(),
+            "timezone": publication.timezone,
+            "doses": [
+                (name, amount, unit, local_time.isoformat(), days)
+                for name, amount, unit, local_time, days in publication.scheduled_doses
+            ],
+            "as_needed": publication.as_needed_medications,
+        }
+        if publication.withdrawal_reason is not None:
+            payload["withdrawal_reason"] = publication.withdrawal_reason
+        payload_sha256 = _manual_payload_sha256(payload)
+        try:
+            with self._metadata:
+                self._metadata.execute(
+                    "INSERT INTO write_operations VALUES "
+                    "(?, 'revise_medication_regime', ?, ?, 'committed', 1)",
+                    (str(publication.operation_id), created_at, created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO medication_regime_revisions VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        str(revision_id),
+                        str(publication.logical_id),
+                        previous,
+                        str(publication.operation_id),
+                        created_at,
+                        payload_sha256,
+                    ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO manual_revision_intents VALUES (?, ?, ?)",
+                    (str(revision_id), publication.intent, publication.withdrawal_reason),
+                )
+                self._metadata.execute(
+                    "INSERT INTO medication_regime_values VALUES (?, ?, ?)",
+                    (str(revision_id), publication.starts_at.isoformat(), publication.timezone),
+                )
+                self._metadata.executemany(
+                    "INSERT INTO medication_scheduled_doses VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            uuid4().hex,
+                            str(revision_id),
+                            name,
+                            amount,
+                            unit,
+                            local_time.isoformat(),
+                            json.dumps(days),
+                        )
+                        for name, amount, unit, local_time, days in publication.scheduled_doses
+                    ],
+                )
+                self._metadata.executemany(
+                    "INSERT INTO medication_as_needed_entries VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            entry_id,
+                            str(revision_id),
+                            name,
+                            amount,
+                            unit,
+                            json.dumps(reason_ids),
+                        )
+                        for name, amount, unit, reason_ids, entry_id in (
+                            publication.as_needed_medications
+                        )
+                    ],
+                )
+                position = int(
+                    self._metadata.execute(
+                        "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+                    ).fetchone()[0]
+                )
+                manifest = self._stage_review_snapshot(
+                    parent_snapshot_id=active,
+                    snapshot_id=snapshot_id,
+                    operation_id=publication.operation_id,
+                    audit_position=position,
+                    review_case_id=None,
+                    decision_id="",
+                    action="manual_medication_revision",
+                    selected_measurement_version_id=None,
+                    candidate_version_ids=(),
+                    replacement_plausibility_cases=(),
+                    snapshot_as_of=publication.medication_as_of,
+                )
+                self._activate_review_snapshot(
+                    publication.operation_id,
+                    snapshot_id,
+                    active,
+                    manifest,
+                    created_at,
+                    activation_kind="manual_context_revision",
+                )
+                self._metadata.execute(
+                    "DELETE FROM medication_snapshot_bindings WHERE snapshot_id = ? "
+                    "AND revision_id IN (SELECT revision_id FROM medication_regime_revisions "
+                    "WHERE logical_id = ?)",
+                    (str(snapshot_id), str(publication.logical_id)),
+                )
+                if publication.intent != "withdraw":
+                    self._metadata.execute(
+                        "INSERT INTO medication_snapshot_bindings VALUES (?, ?)",
+                        (str(snapshot_id), str(revision_id)),
+                    )
+                audit_event_id = uuid4().hex
+                self._metadata.execute(
+                    "INSERT INTO audit_events VALUES (?, ?, ?, 'manual_medication_revision', ?)",
+                    (position, audit_event_id, str(publication.operation_id), created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO medication_publications VALUES (?, ?, ?, ?)",
+                    (
+                        audit_event_id,
+                        str(revision_id),
+                        str(snapshot_id),
+                        publication.medication_as_of.isoformat(),
+                    ),
+                )
+        except Exception:
+            shutil.rmtree(
+                self._root / "staging" / str(publication.operation_id), ignore_errors=True
+            )
+            shutil.rmtree(
+                self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id), ignore_errors=True
+            )
+            raise
+        _publication_fault_point(self._root, "snapshot.after_sqlite_commit/v1")
+        return MedicationRegimePublicationResult(publication.logical_id, revision_id, snapshot_id)
+
+    def publish_medication_deviation(
+        self, publication: MedicationDeviationPublication
+    ) -> MedicationDeviationPublicationResult:
+        self._require_open()
+        self._require_writer()
+        active = self.load_active_snapshot_id()
+        if active != publication.expected_snapshot_id:
+            raise StoreError("Aktiver Snapshot hat sich geändert.")
+        audit = self.load_medication_deviation_audit(str(publication.logical_id))
+        current = self.load_medication_deviation(active, str(publication.logical_id))
+        if publication.intent == "create":
+            if audit or any(
+                item.regime_logical_id == str(publication.regime_logical_id)
+                and item.scheduled_at == publication.scheduled_at
+                for item in self.load_active_medication_deviations(active)
+            ):
+                raise StoreError("Einnahmeabweichung existiert bereits.")
+            previous, state = None, "active"
+        elif publication.intent == "restore":
+            if (
+                not audit
+                or audit[-1].revision_id != str(publication.expected_revision_id)
+                or audit[-1].state != "withdrawn"
+            ):
+                raise StoreError("Einnahmeabweichungsrevision hat sich geändert.")
+            previous, state = audit[-1].revision_id, "active"
+        else:
+            if current is None or current.revision_id != str(publication.expected_revision_id):
+                raise StoreError("Einnahmeabweichungsrevision hat sich geändert.")
+            previous, state = (
+                current.revision_id,
+                "withdrawn" if publication.intent == "withdraw" else "active",
+            )
+        revision_id, snapshot_id = MedicationRevisionId(uuid4().hex), SnapshotId(uuid4().hex)
+        created_at = datetime.now(UTC).isoformat()
+        payload = {
+            "intent": publication.intent,
+            "regime_logical_id": str(publication.regime_logical_id),
+            "scheduled_at": publication.scheduled_at.isoformat(),
+            "withdrawal_reason": publication.withdrawal_reason,
+            "actual_intakes": [
+                (item.isoformat(), amount) for item, amount in publication.actual_intakes
+            ],
+        }
+        payload_sha256 = _manual_payload_sha256(payload)
+        try:
+            with self._metadata:
+                self._metadata.execute(
+                    "INSERT INTO write_operations VALUES "
+                    "(?, 'revise_medication_deviation', ?, ?, 'committed', 1)",
+                    (str(publication.operation_id), created_at, created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO medication_deviation_revisions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        str(revision_id),
+                        str(publication.logical_id),
+                        previous,
+                        str(publication.operation_id),
+                        state,
+                        created_at,
+                        payload_sha256,
+                    ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO manual_revision_intents VALUES (?, ?, ?)",
+                    (str(revision_id), publication.intent, publication.withdrawal_reason),
+                )
+                self._metadata.execute(
+                    "INSERT INTO medication_deviation_values VALUES (?, ?, ?, ?)",
+                    (
+                        str(revision_id),
+                        str(publication.regime_logical_id),
+                        publication.scheduled_at.isoformat(),
+                        publication.withdrawal_reason,
+                    ),
+                )
+                self._metadata.executemany(
+                    "INSERT INTO medication_deviation_intakes VALUES (?, ?, ?)",
+                    [
+                        (str(revision_id), taken_at.isoformat(), amount)
+                        for taken_at, amount in publication.actual_intakes
+                    ],
+                )
+                position = int(
+                    self._metadata.execute(
+                        "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+                    ).fetchone()[0]
+                )
+                manifest = self._stage_review_snapshot(
+                    parent_snapshot_id=active,
+                    snapshot_id=snapshot_id,
+                    operation_id=publication.operation_id,
+                    audit_position=position,
+                    review_case_id=None,
+                    decision_id="",
+                    action="manual_medication_revision",
+                    selected_measurement_version_id=None,
+                    candidate_version_ids=(),
+                    replacement_plausibility_cases=(),
+                    snapshot_as_of=publication.medication_as_of,
+                )
+                self._activate_review_snapshot(
+                    publication.operation_id,
+                    snapshot_id,
+                    active,
+                    manifest,
+                    created_at,
+                    activation_kind="manual_context_revision",
+                )
+                self._metadata.execute(
+                    "DELETE FROM medication_deviation_snapshot_bindings "
+                    "WHERE snapshot_id = ? AND revision_id IN "
+                    "(SELECT revision_id FROM medication_deviation_revisions WHERE logical_id = ?)",
+                    (str(snapshot_id), str(publication.logical_id)),
+                )
+                if state == "active":
+                    self._metadata.execute(
+                        "INSERT INTO medication_deviation_snapshot_bindings VALUES (?, ?)",
+                        (str(snapshot_id), str(revision_id)),
+                    )
+                audit_event_id = uuid4().hex
+                self._metadata.execute(
+                    "INSERT INTO audit_events VALUES (?, ?, ?, 'manual_medication_revision', ?)",
+                    (position, audit_event_id, str(publication.operation_id), created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO medication_deviation_publications VALUES (?, ?, ?, ?)",
+                    (
+                        audit_event_id,
+                        str(revision_id),
+                        str(snapshot_id),
+                        publication.medication_as_of.isoformat(),
+                    ),
+                )
+        except Exception:
+            shutil.rmtree(
+                self._root / "staging" / str(publication.operation_id), ignore_errors=True
+            )
+            shutil.rmtree(
+                self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id), ignore_errors=True
+            )
+            raise
+        _publication_fault_point(self._root, "snapshot.after_sqlite_commit/v1")
+        return MedicationDeviationPublicationResult(
+            publication.logical_id, revision_id, snapshot_id
+        )
+
+    def load_context_coverage_audit(
+        self, logical_id: str
+    ) -> tuple[StoredContextCoverageStart, ...]:
+        self._require_open()
+        rows = self._metadata.execute(
+            """
+            SELECT revision.logical_id, revision.revision_id, revision.previous_revision_id,
+                   revision.state, value.start_date
+            FROM manual_context_revisions revision
+            LEFT JOIN context_coverage_start_values value USING (revision_id)
+            WHERE revision.logical_id = ? AND revision.object_kind = 'context_coverage_start'
+            ORDER BY revision.rowid
+            """,
+            (logical_id,),
+        ).fetchall()
+        return tuple(
+            StoredContextCoverageStart(
+                str(row[0]),
+                str(row[1]),
+                None if row[2] is None else str(row[2]),
+                cast(Literal["active", "withdrawn"], str(row[3])),
+                None if row[4] is None else date.fromisoformat(str(row[4])),
+                None,
+            )
+            for row in rows
+        )
+
+    def load_illness_revisions(self, logical_id: str) -> tuple[StoredIllnessRevision, ...]:
+        self._require_open()
+        rows = self._metadata.execute(
+            """
+            SELECT revision.logical_id, revision.revision_id, revision.previous_revision_id,
+                   revision.state, revision.object_kind, COALESCE(category.name, label.name),
+                   COALESCE(period.category_logical_id, custom_period.label_logical_id),
+                   COALESCE(period.start_date, custom_period.start_date, stress.day),
+                   COALESCE(period.end_date, custom_period.end_date), period.severity,
+                   stress.level, custom_period.note
+            FROM manual_context_revisions revision
+            LEFT JOIN illness_category_values category USING (revision_id)
+            LEFT JOIN illness_period_values period USING (revision_id)
+            LEFT JOIN daily_stress_values stress USING (revision_id)
+            LEFT JOIN custom_context_label_values label USING (revision_id)
+            LEFT JOIN custom_context_period_values custom_period USING (revision_id)
+            WHERE revision.logical_id = ?
+              AND revision.object_kind IN (
+                  'illness_category', 'illness_period', 'daily_stress',
+                  'custom_context_label', 'custom_context_period'
+              )
+            ORDER BY revision.rowid
+            """,
+            (logical_id,),
+        ).fetchall()
+        return tuple(
+            StoredIllnessRevision(
+                str(row[0]),
+                str(row[1]),
+                None if row[2] is None else str(row[2]),
+                cast(Literal["active", "withdrawn"], str(row[3])),
+                cast(
+                    Literal[
+                        "illness_category",
+                        "illness_period",
+                        "daily_stress",
+                        "custom_context_label",
+                        "custom_context_period",
+                    ],
+                    str(row[4]),
+                ),
+                None if row[5] is None else str(row[5]),
+                None if row[6] is None else str(row[6]),
+                None if row[7] is None else date.fromisoformat(str(row[7])),
+                None if row[8] is None else date.fromisoformat(str(row[8])),
+                None if row[9] is None else str(row[9]),
+                None if row[10] is None else str(row[10]),
+                None if row[11] is None else str(row[11]),
+            )
+            for row in rows
+        )
+
+    def is_custom_context_label_name_reserved(
+        self, name: str, *, excluding_logical_id: str | None = None
+    ) -> bool:
+        self._require_open()
+        return (
+            self._metadata.execute(
+                """
+                SELECT 1
+                FROM custom_context_label_values value
+                JOIN manual_context_revisions revision USING (revision_id)
+                WHERE value.name_key = ?
+                  AND (? IS NULL OR revision.logical_id != ?)
+                """,
+                (_normalized_context_name(name), excluding_logical_id, excluding_logical_id),
+            ).fetchone()
+            is not None
+        )
+
+    def is_illness_category_name_reserved(
+        self, name: str, *, excluding_logical_id: str | None = None
+    ) -> bool:
+        self._require_open()
+        return (
+            self._metadata.execute(
+                """
+                SELECT 1
+                FROM illness_category_values value
+                JOIN manual_context_revisions revision USING (revision_id)
+                WHERE value.name_key = ?
+                  AND (? IS NULL OR revision.logical_id != ?)
+                """,
+                (_normalized_context_name(name), excluding_logical_id, excluding_logical_id),
+            ).fetchone()
+            is not None
+        )
+
+    def load_active_illness(
+        self, snapshot_id: SnapshotId | None
+    ) -> tuple[StoredIllnessRevision, ...]:
+        self._require_open()
+        selected = self.load_active_snapshot_id() if snapshot_id is None else snapshot_id
+        if selected is None:
+            return ()
+        rows = self._metadata.execute(
+            """
+            SELECT revision.logical_id, revision.revision_id, revision.previous_revision_id,
+                   revision.state, revision.object_kind, COALESCE(category.name, label.name),
+                   COALESCE(period.category_logical_id, custom_period.label_logical_id),
+                   COALESCE(period.start_date, custom_period.start_date, stress.day),
+                   COALESCE(period.end_date, custom_period.end_date), period.severity,
+                   stress.level, custom_period.note
+            FROM manual_context_snapshot_bindings binding
+            JOIN manual_context_revisions revision USING (revision_id)
+            LEFT JOIN illness_category_values category USING (revision_id)
+            LEFT JOIN illness_period_values period USING (revision_id)
+            LEFT JOIN daily_stress_values stress USING (revision_id)
+            LEFT JOIN custom_context_label_values label USING (revision_id)
+            LEFT JOIN custom_context_period_values custom_period USING (revision_id)
+            WHERE binding.snapshot_id = ?
+              AND revision.object_kind IN (
+                  'illness_category', 'illness_period', 'daily_stress',
+                  'custom_context_label', 'custom_context_period'
+              )
+            ORDER BY revision.rowid
+            """,
+            (str(selected),),
+        ).fetchall()
+        return tuple(
+            StoredIllnessRevision(
+                str(row[0]),
+                str(row[1]),
+                None if row[2] is None else str(row[2]),
+                cast(Literal["active", "withdrawn"], str(row[3])),
+                cast(
+                    Literal[
+                        "illness_category",
+                        "illness_period",
+                        "daily_stress",
+                        "custom_context_label",
+                        "custom_context_period",
+                    ],
+                    str(row[4]),
+                ),
+                None if row[5] is None else str(row[5]),
+                None if row[6] is None else str(row[6]),
+                None if row[7] is None else date.fromisoformat(str(row[7])),
+                None if row[8] is None else date.fromisoformat(str(row[8])),
+                None if row[9] is None else str(row[9]),
+                None if row[10] is None else str(row[10]),
+                None if row[11] is None else str(row[11]),
+            )
+            for row in rows
+        )
+
+    def load_context_as_of_date(self, snapshot_id: SnapshotId) -> tuple[date, str]:
+        self._require_open()
+        binding = self._load_snapshot_binding(snapshot_id)
+        if binding is not None:
+            return (
+                date.fromisoformat(str(binding["context_as_of_date"])),
+                str(binding["context_timezone"]),
+            )
+        row = self._metadata.execute(
+            "SELECT context_as_of_date, context_timezone FROM manual_context_publications "
+            "WHERE snapshot_id = ?",
+            (str(snapshot_id),),
+        ).fetchone()
+        if row is not None:
+            return date.fromisoformat(str(row[0])), str(row[1])
+        snapshot = self._metadata.execute(
+            "SELECT created_at_utc FROM dataset_snapshots WHERE snapshot_id = ?",
+            (str(snapshot_id),),
+        ).fetchone()
+        if snapshot is None:
+            raise StoreError("Snapshot fehlt.")
+        return datetime.fromisoformat(str(snapshot[0])).date(), "Europe/Berlin"
+
+    def publish_context_coverage_start(
+        self,
+        *,
+        publication: ContextCoverageStartPublication,
+    ) -> ContextCoverageStartPublicationResult:
+        operation_id = publication.operation_id
+        intent = publication.intent
+        logical_id = publication.logical_id
+        expected_revision_id = publication.expected_revision_id
+        start_date = publication.start_date
+        withdrawal_reason = publication.withdrawal_reason
+        expected_snapshot_id = publication.expected_snapshot_id
+        context_as_of_date = publication.context_as_of_date
+        context_timezone = publication.context_timezone
+        self._require_open()
+        self._require_writer()
+        active = self.load_active_snapshot_id()
+        if active != expected_snapshot_id:
+            raise StoreError("Aktiver Snapshot hat sich geändert.")
+        current = self.load_context_coverage_start(active)
+        audit = self.load_context_coverage_audit(str(logical_id))
+        latest = audit[-1] if audit else None
+        if intent == "create":
+            if current is not None or latest is not None or start_date is None:
+                raise StoreError("Kontextabdeckungsbeginn kann nicht erstellt werden.")
+            previous = None
+            state = "active"
+        elif latest is None or latest.revision_id != str(expected_revision_id):
+            raise StoreError("Kontextrevision hat sich geändert.")
+        elif intent == "withdraw":
+            if current is None or current.revision_id != str(expected_revision_id):
+                raise StoreError("Kontextabdeckungsbeginn ist nicht aktiv.")
+            previous, state, start_date = latest.revision_id, "withdrawn", None
+        else:
+            if start_date is None:
+                raise StoreError("Kontextabdeckungsbeginn fehlt.")
+            if intent == "revise" and (
+                current is None or current.revision_id != str(expected_revision_id)
+            ):
+                raise StoreError("Kontextabdeckungsbeginn ist nicht aktiv.")
+            if intent == "restore" and current is not None:
+                raise StoreError("Kontextabdeckungsbeginn ist bereits aktiv.")
+            previous, state = latest.revision_id, "active"
+        revision_id = ContextRevisionId(uuid4().hex)
+        snapshot_id = SnapshotId(uuid4().hex)
+        created_at = datetime.now(UTC).isoformat()
+        payload_sha256 = _manual_payload_sha256(
+            {
+                "intent": intent,
+                "logical_id": str(logical_id),
+                "start_date": None if start_date is None else start_date.isoformat(),
+                "withdrawal_reason": withdrawal_reason,
+            }
+        )
+        try:
+            with self._metadata:
+                self._metadata.execute(
+                    "INSERT INTO write_operations VALUES "
+                    "(?, 'revise_context_coverage_start', ?, ?, 'committed', 1)",
+                    (str(operation_id), created_at, created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO manual_context_revisions VALUES "
+                    "(?, ?, 'context_coverage_start', ?, ?, ?, ?, ?)",
+                    (
+                        str(revision_id),
+                        str(logical_id),
+                        None if previous is None else str(previous),
+                        state,
+                        str(operation_id),
+                        created_at,
+                        payload_sha256,
+                    ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO manual_revision_intents VALUES (?, ?, ?)",
+                    (str(revision_id), intent, withdrawal_reason),
+                )
+                if start_date is not None:
+                    self._metadata.execute(
+                        "INSERT INTO context_coverage_start_values VALUES (?, ?)",
+                        (str(revision_id), start_date.isoformat()),
+                    )
+                audit_position = int(
+                    self._metadata.execute(
+                        "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+                    ).fetchone()[0]
+                )
+                manifest = self._stage_review_snapshot(
+                    parent_snapshot_id=active,
+                    snapshot_id=snapshot_id,
+                    operation_id=operation_id,
+                    audit_position=audit_position,
+                    review_case_id=None,
+                    decision_id="",
+                    action="manual_context_revision",
+                    selected_measurement_version_id=None,
+                    candidate_version_ids=(),
+                    replacement_plausibility_cases=(),
+                    snapshot_as_of=publication.snapshot_as_of,
+                    context_timezone=publication.context_timezone,
+                )
+                self._activate_review_snapshot(
+                    operation_id,
+                    snapshot_id,
+                    active,
+                    manifest,
+                    created_at,
+                    activation_kind="manual_context_revision",
+                    replaced_context_logical_id=str(logical_id),
+                )
+                if state == "active":
+                    self._metadata.execute(
+                        "INSERT INTO manual_context_snapshot_bindings VALUES (?, ?)",
+                        (str(snapshot_id), str(revision_id)),
+                    )
+                audit_event_id = uuid4().hex
+                self._metadata.execute(
+                    "INSERT INTO audit_events VALUES (?, ?, ?, 'manual_context_revision', ?)",
+                    (audit_position, audit_event_id, str(operation_id), created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO manual_context_publications VALUES (?, ?, ?, ?, ?)",
+                    (
+                        audit_event_id,
+                        str(revision_id),
+                        str(snapshot_id),
+                        context_as_of_date.isoformat(),
+                        context_timezone,
+                    ),
+                )
+        except Exception:
+            shutil.rmtree(self._root / "staging" / str(operation_id), ignore_errors=True)
+            shutil.rmtree(
+                self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id), ignore_errors=True
+            )
+            raise
+        _publication_fault_point(self._root, "snapshot.after_sqlite_commit/v1")
+        return ContextCoverageStartPublicationResult(logical_id, revision_id, snapshot_id)
+
+    def publish_illness(self, *, publication: IllnessPublication) -> IllnessPublicationResult:
+        self._require_open()
+        self._require_writer()
+        active = self.load_active_snapshot_id()
+        if active != publication.expected_snapshot_id:
+            raise StoreError("Aktiver Snapshot hat sich geändert.")
+        audit = self.load_illness_revisions(str(publication.logical_id))
+        latest = audit[-1] if audit else None
+        current = next(
+            (
+                item
+                for item in self.load_active_illness(active)
+                if item.logical_id == str(publication.logical_id)
+            ),
+            None,
+        )
+        if publication.intent == "create":
+            if latest is not None:
+                raise StoreError("Krankheitsobjekt existiert bereits.")
+            previous, state = None, "active"
+        elif latest is None or latest.revision_id != str(publication.expected_revision_id):
+            raise StoreError("Krankheitsrevision hat sich geändert.")
+        elif publication.intent == "withdraw":
+            if current is None:
+                raise StoreError("Krankheitsobjekt ist nicht aktiv.")
+            previous, state = latest.revision_id, "withdrawn"
+        else:
+            if publication.intent == "revise" and current is None:
+                raise StoreError("Krankheitsobjekt ist nicht aktiv.")
+            if publication.intent == "restore" and current is not None:
+                raise StoreError("Krankheitsobjekt ist bereits aktiv.")
+            previous, state = latest.revision_id, "active"
+        revision_id = ContextRevisionId(uuid4().hex)
+        snapshot_id = SnapshotId(uuid4().hex)
+        created_at = datetime.now(UTC).isoformat()
+        payload_sha256 = _manual_payload_sha256(
+            {
+                "intent": publication.intent,
+                "kind": publication.object_kind,
+                "name": publication.name,
+                "category": None
+                if publication.category_logical_id is None
+                else str(publication.category_logical_id),
+                "start": None
+                if publication.start_date is None
+                else publication.start_date.isoformat(),
+                "end": None if publication.end_date is None else publication.end_date.isoformat(),
+                "severity": publication.severity,
+                "stress": publication.stress_level,
+                "note": publication.note,
+                "reason": publication.withdrawal_reason,
+            }
+        )
+        try:
+            with self._metadata:
+                self._metadata.execute(
+                    "INSERT INTO write_operations VALUES (?, ?, ?, ?, 'committed', 1)",
+                    (
+                        str(publication.operation_id),
+                        "revise_context_coverage_start",
+                        created_at,
+                        created_at,
+                    ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO manual_context_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        str(revision_id),
+                        str(publication.logical_id),
+                        publication.object_kind,
+                        previous,
+                        state,
+                        str(publication.operation_id),
+                        created_at,
+                        payload_sha256,
+                    ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO manual_revision_intents VALUES (?, ?, ?)",
+                    (
+                        str(revision_id),
+                        publication.intent,
+                        publication.withdrawal_reason,
+                    ),
+                )
+                if state == "active" and publication.object_kind == "illness_category":
+                    assert publication.name is not None
+                    self._metadata.execute(
+                        "INSERT INTO illness_category_values VALUES (?, ?, ?)",
+                        (
+                            str(revision_id),
+                            publication.name,
+                            _normalized_context_name(publication.name),
+                        ),
+                    )
+                if state == "active" and publication.object_kind == "illness_period":
+                    assert (
+                        publication.category_logical_id is not None
+                        and publication.start_date is not None
+                        and publication.severity is not None
+                    )
+                    self._metadata.execute(
+                        "INSERT INTO illness_period_values VALUES (?, ?, ?, ?, ?)",
+                        (
+                            str(revision_id),
+                            str(publication.category_logical_id),
+                            publication.start_date.isoformat(),
+                            None
+                            if publication.end_date is None
+                            else publication.end_date.isoformat(),
+                            publication.severity,
+                        ),
+                    )
+                if state == "active" and publication.object_kind == "daily_stress":
+                    assert (
+                        publication.start_date is not None and publication.stress_level is not None
+                    )
+                    self._metadata.execute(
+                        "INSERT INTO daily_stress_values VALUES (?, ?, ?)",
+                        (
+                            str(revision_id),
+                            publication.start_date.isoformat(),
+                            publication.stress_level,
+                        ),
+                    )
+                if state == "active" and publication.object_kind == "custom_context_label":
+                    assert publication.name is not None
+                    self._metadata.execute(
+                        "INSERT INTO custom_context_label_values VALUES (?, ?, ?)",
+                        (
+                            str(revision_id),
+                            publication.name,
+                            _normalized_context_name(publication.name),
+                        ),
+                    )
+                if state == "active" and publication.object_kind == "custom_context_period":
+                    assert (
+                        publication.category_logical_id is not None
+                        and publication.start_date is not None
+                    )
+                    self._metadata.execute(
+                        "INSERT INTO custom_context_period_values VALUES (?, ?, ?, ?, ?)",
+                        (
+                            str(revision_id),
+                            str(publication.category_logical_id),
+                            publication.start_date.isoformat(),
+                            None
+                            if publication.end_date is None
+                            else publication.end_date.isoformat(),
+                            publication.note,
+                        ),
+                    )
+                audit_position = int(
+                    self._metadata.execute(
+                        "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+                    ).fetchone()[0]
+                )
+                manifest = self._stage_review_snapshot(
+                    parent_snapshot_id=active,
+                    snapshot_id=snapshot_id,
+                    operation_id=publication.operation_id,
+                    audit_position=audit_position,
+                    review_case_id=None,
+                    decision_id="",
+                    action="manual_context_revision",
+                    selected_measurement_version_id=None,
+                    candidate_version_ids=(),
+                    replacement_plausibility_cases=(),
+                    snapshot_as_of=publication.snapshot_as_of,
+                    context_timezone=publication.context_timezone,
+                )
+                self._activate_review_snapshot(
+                    publication.operation_id,
+                    snapshot_id,
+                    active,
+                    manifest,
+                    created_at,
+                    activation_kind="manual_context_revision",
+                    replaced_context_logical_id=str(publication.logical_id),
+                )
+                if state == "active":
+                    self._metadata.execute(
+                        "INSERT INTO manual_context_snapshot_bindings VALUES (?, ?)",
+                        (str(snapshot_id), str(revision_id)),
+                    )
+                audit_event_id = uuid4().hex
+                self._metadata.execute(
+                    "INSERT INTO audit_events VALUES (?, ?, ?, 'manual_context_revision', ?)",
+                    (audit_position, audit_event_id, str(publication.operation_id), created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO manual_context_publications VALUES (?, ?, ?, ?, ?)",
+                    (
+                        audit_event_id,
+                        str(revision_id),
+                        str(snapshot_id),
+                        publication.context_as_of_date.isoformat(),
+                        publication.context_timezone,
+                    ),
+                )
+        except Exception:
+            shutil.rmtree(
+                self._root / "staging" / str(publication.operation_id), ignore_errors=True
+            )
+            shutil.rmtree(
+                self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id), ignore_errors=True
+            )
+            raise
+        _publication_fault_point(self._root, "snapshot.after_sqlite_commit/v1")
+        return IllnessPublicationResult(publication.logical_id, revision_id, snapshot_id)
+
+    def create_activity_derivation_version(
+        self,
+        *,
+        operation_id: OperationId,
+        version_id: str,
+        coverage_gap_minutes: int,
+        source_classifier_version: str,
+        expected_snapshot_id: SnapshotId | None,
+    ) -> SnapshotId | None:
+        self._require_open()
+        self._require_writer()
+        active = self.load_active_snapshot_id()
+        if active != expected_snapshot_id:
+            raise StoreError("Aktiver Snapshot hat sich geändert.")
+        created_at = datetime.now(UTC).isoformat()
+        snapshot_id = None if active is None else SnapshotId(uuid4().hex)
+        try:
+            with self._metadata:
+                # Existing stores constrain this ledger to the established rule-version kind.
+                self._metadata.execute(
+                    "INSERT INTO write_operations VALUES (?, "
+                    "'create_plausibility_rule_version', ?, ?, "
+                    "'committed', 1)",
+                    (str(operation_id), created_at, created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO activity_derivation_versions VALUES (?, ?, ?, ?)",
+                    (version_id, coverage_gap_minutes, source_classifier_version, created_at),
+                )
+                self._metadata.execute(
+                    "UPDATE activity_derivation_active SET version_id = ? WHERE singleton = 1",
+                    (version_id,),
+                )
+                if active is not None and snapshot_id is not None:
+                    audit_position = int(
+                        self._metadata.execute(
+                            "SELECT COALESCE(MAX(audit_position), 0) FROM audit_events"
+                        ).fetchone()[0]
+                    )
+                    manifest = self._stage_review_snapshot(
+                        parent_snapshot_id=active,
+                        snapshot_id=snapshot_id,
+                        operation_id=operation_id,
+                        audit_position=audit_position,
+                        review_case_id=None,
+                        decision_id="",
+                        action="activity_derivation_version",
+                        selected_measurement_version_id=None,
+                        candidate_version_ids=(),
+                        replacement_plausibility_cases=(),
+                    )
+                    self._activate_review_snapshot(
+                        operation_id,
+                        snapshot_id,
+                        active,
+                        manifest,
+                        created_at,
+                        activation_kind="rule_version",
+                    )
+                    self._metadata.execute(
+                        "UPDATE activity_derivation_snapshot_bindings SET version_id = ? "
+                        "WHERE snapshot_id = ?",
+                        (version_id, str(snapshot_id)),
+                    )
+        except Exception:
+            shutil.rmtree(self._root / "staging" / str(operation_id), ignore_errors=True)
+            if snapshot_id is not None:
+                shutil.rmtree(
+                    self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id),
+                    ignore_errors=True,
+                )
+            raise
+        _publication_fault_point(self._root, "snapshot.after_sqlite_commit/v1")
+        return snapshot_id
 
     def load_effective_confirmation_case_ids(self) -> frozenset[str]:
         self._require_open()
@@ -5681,11 +11396,41 @@ class LocalStore:
                 FROM read_parquet('{escaped}')
                 WHERE identity_candidate_id = ?
             )
-            SELECT DISTINCT measurement_version_id
-            FROM read_parquet('{escaped}')
-            WHERE identity_candidate_id = ?
-               OR (canonical_type, source_start_utc, source_end_utc, source_name, device)
+            SELECT DISTINCT candidates.measurement_version_id
+            FROM read_parquet('{escaped}') AS candidates
+            WHERE candidates.identity_candidate_id = ?
+               OR (candidates.canonical_type, candidates.source_start_utc,
+                   candidates.source_end_utc, candidates.source_name, candidates.device)
                   IN (SELECT * FROM seed)
+               OR EXISTS (
+                    SELECT 1 FROM seed
+                    WHERE candidates.canonical_type IN (
+                        'apple_exercise_time', 'step_count',
+                        'walking_running_distance', 'active_energy'
+                    )
+                      AND candidates.canonical_type = seed.canonical_type
+                      AND candidates.source_start_utc < candidates.source_end_utc
+                      AND seed.source_start_utc < seed.source_end_utc
+                      AND candidates.source_start_utc < seed.source_end_utc
+                      AND candidates.source_end_utc > seed.source_start_utc
+                      AND CASE
+                            WHEN candidates.source_name = 'Apple Watch'
+                             AND candidates.device = 'Apple Watch'
+                                THEN 'watch'
+                            WHEN candidates.source_name = 'iPhone' AND candidates.device = 'iPhone'
+                                THEN 'iphone'
+                            WHEN candidates.source_name != ''
+                              OR candidates.device != '' THEN 'other'
+                            ELSE 'unknown'
+                          END = CASE
+                            WHEN seed.source_name = 'Apple Watch' AND seed.device = 'Apple Watch'
+                                THEN 'watch'
+                            WHEN seed.source_name = 'iPhone' AND seed.device = 'iPhone'
+                                THEN 'iphone'
+                            WHEN seed.source_name != '' OR seed.device != '' THEN 'other'
+                            ELSE 'unknown'
+                          END
+               )
             ORDER BY measurement_version_id
             """,
             (str(logical_measurement_id), str(logical_measurement_id)),
@@ -5708,12 +11453,81 @@ class LocalStore:
             ).fetchall()
         )
 
+    def load_import_details(self, import_id: ImportId) -> StoredImportDetails | None:
+        self._require_open()
+        try:
+            row = self._metadata.execute(
+                """
+                SELECT imports.package_record_count, imports.record_count,
+                       counts.logical_measurement_count, counts.measurement_version_count,
+                       counts.source_occurrence_count, counts.anomaly_count
+                FROM imports
+                JOIN import_canonical_counts AS counts USING (import_id)
+                WHERE import_id = ?
+                """,
+                (str(import_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            return StoredImportDetails(
+                int(row[0]),
+                int(row[1]),
+                int(row[2]),
+                int(row[3]),
+                int(row[4]),
+                int(row[5]),
+                tuple(
+                    UnsupportedImportContent(category, str(identifier), int(count))
+                    for category, identifier, count in self._metadata.execute(
+                        """
+                        SELECT category, external_identifier, count
+                        FROM unsupported_import_content
+                        WHERE import_id = ?
+                        ORDER BY category, external_identifier
+                        """,
+                        (str(import_id),),
+                    ).fetchall()
+                ),
+            )
+        except sqlite3.Error as error:
+            raise StoreError("Importdetails sind nicht verfügbar.") from error
+
     def load_active_snapshot_id(self) -> SnapshotId | None:
         self._require_open()
         row = self._metadata.execute(
             "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
         ).fetchone()
         return None if row is None else SnapshotId(str(row[0]))
+
+    def load_active_snapshot_schema_version(self) -> int | None:
+        row = self._metadata.execute(
+            "SELECT snapshot_schema_version FROM dataset_snapshots "
+            "JOIN active_snapshot USING (snapshot_id) WHERE singleton = 1"
+        ).fetchone()
+        return None if row is None else int(row[0])
+
+    def load_active_snapshot_as_of(self) -> datetime | None:
+        active = self.load_active_snapshot_id()
+        if active is None:
+            return None
+        try:
+            manifest = json.loads(
+                (
+                    self._root / _PARQUET_DIRECTORY / "snapshots" / str(active) / "manifest.json"
+                ).read_bytes()
+            )
+            binding = manifest.get("snapshot_binding")
+            raw_value = (
+                binding.get("snapshot_as_of")
+                if isinstance(binding, dict)
+                else manifest.get("created_at_utc")
+            )
+            value = datetime.fromisoformat(str(raw_value))
+        except (OSError, AttributeError, ValueError, json.JSONDecodeError) as error:
+            raise StoreError("Snapshot-Stichtag ist ungültig.") from error
+        if value.tzinfo is None:
+            raise StoreError("Snapshot-Stichtag ist ungültig.")
+        return value
 
     def load_analysis_input(
         self, start_date: date | None, end_date: date | None
@@ -5985,9 +11799,7 @@ class LocalStore:
                             "minimum_input_completeness": (
                                 result.methodology.minimum_input_completeness
                             ),
-                            "max_feature_dependency": (
-                                result.methodology.max_feature_dependency
-                            ),
+                            "max_feature_dependency": (result.methodology.max_feature_dependency),
                             "minimum_bootstrap_success_rate": (
                                 result.methodology.minimum_bootstrap_success_rate
                             ),
@@ -6153,9 +11965,7 @@ class LocalStore:
                     Literal["simultaneous_band_includes_zero", "simultaneous_band_excludes_zero"],
                     diagnostic_values["association_guardrail"],
                 ),
-                input_completeness=cast(
-                    float | None, diagnostic_values.get("input_completeness")
-                ),
+                input_completeness=cast(float | None, diagnostic_values.get("input_completeness")),
                 outcome_standard_deviation=cast(
                     float | None, diagnostic_values.get("outcome_standard_deviation")
                 ),

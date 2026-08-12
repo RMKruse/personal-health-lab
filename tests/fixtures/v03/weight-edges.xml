@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<HealthData>
+  <ExportDate value="2024-01-10 12:00:00 +0100"/>
+  <Record type="HKQuantityTypeIdentifierBodyMass" sourceName="Scale" sourceVersion="1" device="Scale A" unit="kg" value="70" creationDate="2024-01-01 07:01:00 +0100" startDate="2024-01-01 07:00:00 +0100" endDate="2024-01-01 07:00:00 +0100">
+    <MetadataEntry key="HKMetadataKeySyncIdentifier" value="versioned"/>
+  </Record>
+  <Record type="HKQuantityTypeIdentifierBodyMass" sourceName="Scale" sourceVersion="1" device="Scale A" unit="g" value="70000" creationDate="2024-01-03 07:01:00 -0500" startDate="2024-01-03 07:00:00 -0500" endDate="2024-01-03 07:00:00 -0500">
+    <MetadataEntry key="HKMetadataKeySyncIdentifier" value="grams"/>
+  </Record>
+  <Record type="HKQuantityTypeIdentifierBodyMass" sourceName="Scale" sourceVersion="1" device="Scale A" unit="lb" value="100" creationDate="2024-01-03 09:01:00 -0500" startDate="2024-01-03 09:00:00 -0500" endDate="2024-01-03 09:00:00 -0500">
+    <MetadataEntry key="HKMetadataKeySyncIdentifier" value="pounds"/>
+  </Record>
+  <Record type="HKQuantityTypeIdentifierBodyMass" sourceName="Scale A" sourceVersion="2" device="Scale A" unit="kg" value="80" creationDate="2024-01-04 08:01:00 +0100" startDate="2024-01-04 08:00:00 +0100" endDate="2024-01-04 08:00:00 +0100">
+    <MetadataEntry key="HKMetadataKeySyncIdentifier" value="equal-a"/>
+  </Record>
+  <Record type="HKQuantityTypeIdentifierBodyMass" sourceName="Scale B" sourceVersion="3" device="Scale B" unit="kg" value="80" creationDate="2024-01-04 08:02:00 +0100" startDate="2024-01-04 08:00:00 +0100" endDate="2024-01-04 08:00:00 +0100">
+    <MetadataEntry key="HKMetadataKeySyncIdentifier" value="equal-b"/>
+  </Record>
+  <Record type="HKQuantityTypeIdentifierBodyMass" sourceName="Scale A" sourceVersion="2" device="Scale A" unit="kg" value="81" creationDate="2024-01-05 08:01:00 +0100" startDate="2024-01-05 08:00:00 +0100" endDate="2024-01-05 08:00:00 +0100">
+    <MetadataEntry key="HKMetadataKeySyncIdentifier" value="conflict-a"/>
+  </Record>
+  <Record type="HKQuantityTypeIdentifierBodyMass" sourceName="Scale B" sourceVersion="3" device="Scale B" unit="kg" value="82" creationDate="2024-01-05 08:02:00 +0100" startDate="2024-01-05 08:00:00 +0100" endDate="2024-01-05 08:00:00 +0100">
+    <MetadataEntry key="HKMetadataKeySyncIdentifier" value="conflict-b"/>
+  </Record>
+  <Record type="HKQuantityTypeIdentifierDietaryEnergyConsumed" sourceName="Food" sourceVersion="1" device="Nutrition App" unit="kcal" value="100" creationDate="2024-01-01 23:01:00 +0100" startDate="2024-01-01 23:00:00 +0100" endDate="2024-01-02 01:00:00 +0100"/>
+  <Record type="HKQuantityTypeIdentifierDietaryProtein" sourceName="Food" sourceVersion="1" device="Nutrition App" unit="g" value="20" creationDate="2024-01-01 20:01:00 +0100" startDate="2024-01-01 20:00:00 +0100" endDate="2024-01-01 20:00:00 +0100"/>
+  <Record type="HKQuantityTypeIdentifierDietaryCarbohydrates" sourceName="Food" sourceVersion="1" device="Nutrition App" unit="g" value="30" creationDate="2024-01-02 20:01:00 +0100" startDate="2024-01-02 20:00:00 +0100" endDate="2024-01-02 20:00:00 +0100"/>
+  <Record type="HKQuantityTypeIdentifierDietaryFatTotal" sourceName="Food" sourceVersion="1" device="Nutrition App" unit="g" value="10" creationDate="2024-01-03 20:01:00 +0100" startDate="2024-01-03 20:00:00 +0100" endDate="2024-01-03 20:00:00 +0100"/>
+  <Record type="HKQuantityTypeIdentifierDietaryBiotin" sourceName="Food" sourceVersion="1" device="Nutrition App" unit="mcg" value="100" creationDate="2024-01-04 20:01:00 +0100" startDate="2024-01-04 20:00:00 +0100" endDate="2024-01-04 20:00:00 +0100"/>
+</HealthData>

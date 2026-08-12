@@ -21,16 +21,42 @@ from personal_health_lab.application import (
 )
 
 PARQUET_FILES = (
+    "activity_coverage_segments.parquet",
+    "activity_days.parquet",
+    "daily_context.parquet",
+    "derivation_lineage.parquet",
     "measurement_versions.parquet",
+    "medication_context.parquet",
     "open_review_cases.parquet",
     "resolved_measurements.parquet",
+    "resolved_workouts.parquet",
+    "sleep_episodes.parquet",
+    "sleep_intervals.parquet",
+    "sleep_nights.parquet",
     "source_occurrences.parquet",
+    "weight_nutrition_days.parquet",
+    "workout_features.parquet",
+    "workout_review_links.parquet",
+    "workouts.parquet",
 )
 LAST_COLUMNS = {
+    "activity_coverage_segments.parquet": "derived_at_utc",
+    "activity_days.parquet": "derived_at_utc",
+    "daily_context.parquet": "derived_at_utc",
+    "derivation_lineage.parquet": "derived_at_utc",
+    "medication_context.parquet": "derived_at_utc",
     "measurement_versions.parquet": "strong_source_id_hash",
     "open_review_cases.parquet": "evidence_fingerprint",
     "resolved_measurements.parquet": "conflict_resolution_decision_id",
+    "resolved_workouts.parquet": "effective_decision_id",
+    "sleep_episodes.parquet": "derived_at_utc",
+    "sleep_intervals.parquet": "is_selected",
+    "sleep_nights.parquet": "derived_at_utc",
     "source_occurrences.parquet": "occurrence_fingerprint",
+    "workout_review_links.parquet": "workout_version_id",
+    "workout_features.parquet": "derived_at_utc",
+    "workouts.parquet": "is_selected",
+    "weight_nutrition_days.parquet": "derived_at_utc",
 }
 
 
@@ -112,9 +138,8 @@ def test_import_publishes_one_validated_four_file_snapshot(tmp_path: Path) -> No
     assert receipt.result.status is ImportStatus.COMMITTED
     assert receipt.result.snapshot_ref is not None
     snapshot = config.active_store / "parquet" / "snapshots" / str(receipt.result.snapshot_ref)
-    assert tuple(sorted(path.name for path in snapshot.iterdir())) == (
-        "manifest.json",
-        *PARQUET_FILES,
+    assert tuple(sorted(path.name for path in snapshot.iterdir())) == tuple(
+        sorted(("manifest.json", *PARQUET_FILES))
     )
 
     manifest_bytes = (snapshot / "manifest.json").read_bytes()
@@ -205,6 +230,20 @@ def test_manifest_rejects_nested_non_schema_fields(tmp_path: Path) -> None:
         pass
 
 
+def test_manifest_rejects_non_integer_snapshot_schema_version(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    snapshot = _publish_snapshot(config, _package(tmp_path / "health.zip"))
+    manifest = json.loads((snapshot / "manifest.json").read_bytes())
+    manifest["snapshot_schema_version"] = None
+    _rewrite_manifest(config, snapshot, manifest)
+
+    with (
+        pytest.raises(HealthLabError, match="Datenspeicher konnte nicht geöffnet"),
+        HealthLab.open(config),
+    ):
+        pass
+
+
 def test_legacy_versioned_store_with_identity_still_validates_snapshot(tmp_path: Path) -> None:
     config = _config(tmp_path)
     snapshot = _publish_snapshot(config, _package(tmp_path / "health.zip"))
@@ -282,6 +321,7 @@ def test_each_snapshot_file_rejects_hash_schema_and_row_count_corruption(
         "import.before_snapshot_move/v1",
         "import.after_snapshot_move/v1",
         "import.before_sqlite_commit/v1",
+        "import.after_sqlite_commit/v1",
     ),
 )
 def test_publication_fault_keeps_old_snapshot_active_and_quarantines_remainder(
@@ -310,6 +350,15 @@ def test_publication_fault_keeps_old_snapshot_active_and_quarantines_remainder(
     monkeypatch.undo()
     with HealthLab.open(config) as health_lab:
         overview = health_lab.load_overview(OverviewSelection())
+
+    if fault_point == "import.after_sqlite_commit/v1":
+        assert overview.snapshot_count == 2
+        assert overview.measurement_version_count == 2
+        assert overview.quarantined_import_count == 0
+        with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
+            assert metadata.execute("SELECT count(*) FROM write_operations").fetchone() == (2,)
+            assert metadata.execute("SELECT count(*) FROM audit_events").fetchone() == (2,)
+        return
 
     assert overview.snapshot_count == 1
     assert overview.measurement_version_count == 1
@@ -587,9 +636,7 @@ def test_valid_open_review_case_is_closed_over_snapshot_ids(tmp_path: Path) -> N
     manifest["validation_counts"]["open_review_cases"] = 1
     _rewrite_manifest(config, snapshot, manifest)
     with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
-        metadata.execute(
-            "INSERT INTO rule_version_refs VALUES ('plausibility/v1', 'plausibility')"
-        )
+        metadata.execute("INSERT INTO rule_version_refs VALUES ('plausibility/v1', 'plausibility')")
 
     with HealthLab.open(config):
         pass
@@ -627,12 +674,8 @@ def test_next_import_carries_forward_resolution_and_open_review_state(tmp_path: 
     manifest["validation_counts"].update(included=0, excluded=1, open_review_cases=1)
     _rewrite_manifest(config, snapshot, manifest)
     with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
-        metadata.execute(
-            "INSERT INTO decision_refs VALUES (?, 'local_exclusion')", ("a" * 32,)
-        )
-        metadata.execute(
-            "INSERT INTO rule_version_refs VALUES ('plausibility/v1', 'plausibility')"
-        )
+        metadata.execute("INSERT INTO decision_refs VALUES (?, 'local_exclusion')", ("a" * 32,))
+        metadata.execute("INSERT INTO rule_version_refs VALUES ('plausibility/v1', 'plausibility')")
 
     next_snapshot = _publish_snapshot(config, _package(tmp_path / "second.zip", 61))
     next_resolved = next_snapshot / "resolved_measurements.parquet"
@@ -679,7 +722,7 @@ def test_sqlite_catalog_and_audit_constraints_are_hard(tmp_path: Path) -> None:
         } <= strict_tables
         assert metadata.execute(
             "SELECT schema_version, typeof(schema_version) FROM store_identity"
-        ).fetchone() == (6, "integer")
+        ).fetchone() == (11, "integer")
 
         with pytest.raises(sqlite3.IntegrityError):
             metadata.execute(

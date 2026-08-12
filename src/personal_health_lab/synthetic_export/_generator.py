@@ -173,10 +173,7 @@ def _daily_active_energy(seed: int, noise_standard_deviation: float) -> list[flo
         totals.append(
             max(
                 80.0,
-                520.0
-                + weekly_pattern
-                + seasonal_pattern
-                + rng.gauss(0, noise_standard_deviation),
+                520.0 + weekly_pattern + seasonal_pattern + rng.gauss(0, noise_standard_deviation),
             )
         )
     return totals
@@ -241,9 +238,7 @@ def _scenario_metadata(
         "signal": {
             "description": definition.signal_description,
             "expected_lag_days": definition.expected_lag_days,
-            "expected_association_bpm_per_100_kcal": (
-                definition.association_bpm_per_kcal * 100.0
-            ),
+            "expected_association_bpm_per_100_kcal": (definition.association_bpm_per_kcal * 100.0),
         },
         "time_fixtures": {
             "base_timezone": "Europe/Berlin",
@@ -376,8 +371,7 @@ def generate_export(
         encoding="utf-8",
     )
     checksums_path.write_text(
-        f"{_sha256(export_path)}  {_EXPORT_NAME}\n"
-        f"{_sha256(metadata_path)}  {_METADATA_NAME}\n",
+        f"{_sha256(export_path)}  {_EXPORT_NAME}\n{_sha256(metadata_path)}  {_METADATA_NAME}\n",
         encoding="ascii",
     )
     return GeneratedFixture(
