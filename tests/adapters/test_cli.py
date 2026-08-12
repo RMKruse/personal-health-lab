@@ -15,10 +15,14 @@ import pytest
 from jsonschema import Draft202012Validator, ValidationError
 
 from personal_health_lab.adapters.cli import main
+from personal_health_lab.adapters.cli._cli import _write_plan_json, _write_receipt_json
+from personal_health_lab.adapters.cli._v03_json import decode_write_request
 from personal_health_lab.application import (
     AsNeededMedication,
     CanonicalUnit,
+    ConfigurationError,
     ContextCoverageStartCreate,
+    CreateActivityDerivationVersion,
     CreateMetadataBackup,
     DataCorrection,
     DataMode,
@@ -27,13 +31,22 @@ from personal_health_lab.application import (
     FeatureNotAvailableError,
     HealthLab,
     ImportHealthExport,
+    IntakeReasonCategoryCreate,
     ManualContextRevisionReceipt,
     MedicationRegimeCreate,
+    OperationId,
+    PlanFingerprint,
     ResolveDataReviewCase,
     ReviseContextCoverageStart,
+    ReviseIntakeReasonCategory,
     ReviseMedicationRegime,
     RuntimeConfig,
     SnapshotDateSelection,
+    WriteApproval,
+    WriteApprovalStatus,
+    WriteNoChange,
+    WritePreflight,
+    WriteReceipt,
 )
 from personal_health_lab.synthetic_export import GenerationOptions, generate_export
 
@@ -116,6 +129,7 @@ def _execute_json_analysis(
     return exit_code, receipt
 
 
+@pytest.mark.v03_adapter("cli", "MedicationAudit", "MedicationDays", "MedicationPlan")
 def test_cli_runs_intake_reason_category_lifecycle(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -127,8 +141,14 @@ def test_cli_runs_intake_reason_category_lifecycle(
             request, expected_plan=health_lab.preview_write(request).fingerprint
         )
     common = [
-        "--mode", "synthetic", "--synthetic-store", str(config.synthetic_store),
-        "--real-store", str(config.real_store), "medication", "reason",
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(config.synthetic_store),
+        "--real-store",
+        str(config.real_store),
+        "medication",
+        "reason",
     ]
     monkeypatch.setattr("builtins.input", lambda _prompt: "j")
 
@@ -137,30 +157,49 @@ def test_cli_runs_intake_reason_category_lifecycle(
     with HealthLab.open(config) as health_lab:
         category = health_lab.load_medication_plan().intake_reason_categories[0]
 
-    assert main(
-        [*common, "revise", str(category.logical_id), str(category.revision_id), "Schmerz"]
-    ) == 0
+    read_common = common[:-1]
+    assert main([*read_common, "plan", "--json"]) == 0
+    medication_plan = json.loads(capsys.readouterr().out)
+    _assert_json_contract(medication_plan)
+    assert medication_plan["kind"] == "medication_plan"
+    assert main([*read_common, "days", "--json"]) == 0
+    medication_days = json.loads(capsys.readouterr().out)
+    _assert_json_contract(medication_days)
+    assert medication_days["kind"] == "medication_days"
+    assert main([*read_common, "audit", str(category.logical_id), "--json"]) == 0
+    medication_audit = json.loads(capsys.readouterr().out)
+    _assert_json_contract(medication_audit)
+    assert medication_audit["kind"] == "medication_audit"
+
+    assert (
+        main([*common, "revise", str(category.logical_id), str(category.revision_id), "Schmerz"])
+        == 0
+    )
     capsys.readouterr()
     with HealthLab.open(config) as health_lab:
         revision = health_lab.load_medication_audit(category.logical_id).revisions[-1]
 
-    assert main(
-        [
-            *common,
-            "withdraw",
-            str(category.logical_id),
-            str(revision.revision_id),
-            "--reason",
-            "Nicht mehr gebraucht",
-        ]
-    ) == 0
+    assert (
+        main(
+            [
+                *common,
+                "withdraw",
+                str(category.logical_id),
+                str(revision.revision_id),
+                "--reason",
+                "Nicht mehr gebraucht",
+            ]
+        )
+        == 0
+    )
     capsys.readouterr()
     with HealthLab.open(config) as health_lab:
         withdrawn = health_lab.load_medication_audit(category.logical_id).revisions[-1]
 
-    assert main(
-        [*common, "restore", str(category.logical_id), str(withdrawn.revision_id), "Schmerz"]
-    ) == 0
+    assert (
+        main([*common, "restore", str(category.logical_id), str(withdrawn.revision_id), "Schmerz"])
+        == 0
+    )
     capsys.readouterr()
     with HealthLab.open(config) as health_lab:
         restored = health_lab.load_medication_plan().intake_reason_categories[0]
@@ -184,18 +223,21 @@ def test_cli_runs_intake_reason_category_lifecycle(
     intake = [*common[:-1], "intake"]
     taken_at = "2024-04-01T12:00:00+02:00"
 
-    assert main(
-        [
-            *intake,
-            "create",
-            str(regime_receipt.result.logical_id),
-            str(entry_id),
-            taken_at,
-            "200",
-            "--reason-category",
-            str(restored.logical_id),
-        ]
-    ) == 0
+    assert (
+        main(
+            [
+                *intake,
+                "create",
+                str(regime_receipt.result.logical_id),
+                str(entry_id),
+                taken_at,
+                "200",
+                "--reason-category",
+                str(restored.logical_id),
+            ]
+        )
+        == 0
+    )
     capsys.readouterr()
     with HealthLab.open(config) as health_lab:
         day = health_lab.load_medication_days(
@@ -204,48 +246,61 @@ def test_cli_runs_intake_reason_category_lifecycle(
         intake_record = day.as_needed_intakes[0]
         intake_revision = health_lab.load_medication_audit(intake_record.logical_id).revisions[-1]
 
-    assert main(
-        [
-            *intake,
-            "revise",
-            str(intake_record.logical_id),
-            str(intake_revision.revision_id),
-            taken_at,
-            "300",
-            "--reason-category",
-            str(restored.logical_id),
-        ]
-    ) == 0
+    assert (
+        main(
+            [
+                *intake,
+                "revise",
+                str(intake_record.logical_id),
+                str(intake_revision.revision_id),
+                str(regime_receipt.result.logical_id),
+                str(entry_id),
+                taken_at,
+                "300",
+                "--reason-category",
+                str(restored.logical_id),
+            ]
+        )
+        == 0
+    )
     capsys.readouterr()
     with HealthLab.open(config) as health_lab:
         intake_revision = health_lab.load_medication_audit(intake_record.logical_id).revisions[-1]
 
-    assert main(
-        [
-            *intake,
-            "withdraw",
-            str(intake_record.logical_id),
-            str(intake_revision.revision_id),
-            "--reason",
-            "Doppelt erfasst",
-        ]
-    ) == 0
+    assert (
+        main(
+            [
+                *intake,
+                "withdraw",
+                str(intake_record.logical_id),
+                str(intake_revision.revision_id),
+                "--reason",
+                "Doppelt erfasst",
+            ]
+        )
+        == 0
+    )
     capsys.readouterr()
     with HealthLab.open(config) as health_lab:
         intake_revision = health_lab.load_medication_audit(intake_record.logical_id).revisions[-1]
 
-    assert main(
-        [
-            *intake,
-            "restore",
-            str(intake_record.logical_id),
-            str(intake_revision.revision_id),
-            taken_at,
-            "300",
-            "--reason-category",
-            str(restored.logical_id),
-        ]
-    ) == 0
+    assert (
+        main(
+            [
+                *intake,
+                "restore",
+                str(intake_record.logical_id),
+                str(intake_revision.revision_id),
+                str(regime_receipt.result.logical_id),
+                str(entry_id),
+                taken_at,
+                "300",
+                "--reason-category",
+                str(restored.logical_id),
+            ]
+        )
+        == 0
+    )
     capsys.readouterr()
     with HealthLab.open(config) as health_lab:
         restored_day = health_lab.load_medication_days(
@@ -255,6 +310,7 @@ def test_cli_runs_intake_reason_category_lifecycle(
     assert restored_day.as_needed_intakes[0].amount == Decimal("300")
 
 
+@pytest.mark.v03_adapter("cli", "ImportDetails")
 def test_cli_renders_import_details_as_human_text_and_json_3(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -311,22 +367,15 @@ def test_cli_renders_import_details_as_human_text_and_json_3(
     assert overview["schema_version"] == "3.0"
 
 
-@pytest.mark.v02_adapter(
+@pytest.mark.v03_adapter(
     "cli",
     "ContextAudit",
     "ContextRecords",
     "DailyContext",
     "ManualContextRevisionPlan",
     "ManualContextRevisionReceipt",
-    "MedicationRegimePlan",
-    "MedicationRegimeReceipt",
-    "MedicationDeviationPlan",
-    "MedicationDeviationReceipt",
-    "AsNeededIntakePlan",
-    "AsNeededIntakeReceipt",
-    "IntakeReasonCategoryPlan",
-    "IntakeReasonCategoryReceipt",
-    "IllnessRevisionPlan",
+    "MedicationRevisionPlan",
+    "MedicationRevisionReceipt",
     "NoChangeStatus",
     "ReviseContextCoverageStart",
     "ReviseCustomContextLabel",
@@ -338,6 +387,20 @@ def test_cli_renders_import_details_as_human_text_and_json_3(
     "ReviseMedicationDeviation",
     "ReviseAsNeededIntake",
     "ReviseIntakeReasonCategory",
+    "WriteNoChange",
+)
+@pytest.mark.v02_adapter(
+    "cli",
+    "AsNeededIntakePlan",
+    "AsNeededIntakeReceipt",
+    "IllnessRevisionPlan",
+    "IntakeReasonCategoryPlan",
+    "IntakeReasonCategoryReceipt",
+    "MedicationDeviationPlan",
+    "MedicationDeviationReceipt",
+    "MedicationRegimePlan",
+    "MedicationRegimeReceipt",
+    "NoChangeStatus",
     "WriteNoChange",
 )
 def test_cli_loads_context_projections(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -386,14 +449,308 @@ def test_cli_loads_context_projections(tmp_path: Path, capsys: pytest.CaptureFix
         )
         == 0
     )
-    assert json.loads(capsys.readouterr().out)["kind"] == "daily_context"
+    daily_context = json.loads(capsys.readouterr().out)
+    _assert_json_contract(daily_context)
+    assert daily_context["kind"] == "daily_context"
     assert main([*common, "records", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["kind"] == "context_records"
+    context_records = json.loads(capsys.readouterr().out)
+    _assert_json_contract(context_records)
+    assert context_records["kind"] == "context_records"
     assert main([*common, "audit", str(receipt.result.logical_id), "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["kind"] == "context_audit"
+    context_audit = json.loads(capsys.readouterr().out)
+    _assert_json_contract(context_audit)
+    assert context_audit["kind"] == "context_audit"
+
+
+@pytest.mark.v03_adapter(
+    "cli",
+    "ActivityDerivationPlan",
+    "ActivityDerivationReceipt",
+    "ActivitySettings",
+    "CreateActivityDerivationVersion",
+)
+def test_cli_traces_activity_settings_and_structured_write(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    common = [
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(tmp_path / "synthetic"),
+        "--real-store",
+        str(tmp_path / "real"),
+    ]
+    assert main([*common, "activity-settings", "show", "--json"]) == 0
+    settings = json.loads(capsys.readouterr().out)
+    _assert_json_contract(settings)
+    assert settings["kind"] == "activity_settings"
+    for command in (("sleep-days",), ("activity-days",), ("workouts",)):
+        assert main([*common, *command, "--json"]) == 0
+        _assert_json_contract(json.loads(capsys.readouterr().out))
+
+    document = tmp_path / "activity.json"
+    document.write_text(
+        json.dumps(
+            {
+                "schema_version": "3.0",
+                "type": "create_activity_derivation_version",
+                "intent": "create",
+                "coverage_gap_minutes": 180,
+            }
+        ),
+        encoding="utf-8",
+    )
+    exit_code = main(
+        [
+            *common,
+            "activity-settings",
+            "create-version",
+            "--input",
+            str(document),
+            "--json",
+        ]
+    )
+    assert exit_code in {0, 3}
+    output = json.loads(capsys.readouterr().out)
+    _assert_json_contract(output)
+    assert output["details"]["type"] == "create_activity_derivation_version"
+
+
+def test_json_3_input_rejects_unknown_and_mismatched_documents(tmp_path: Path) -> None:
+    common = [
+        "--mode",
+        "synthetic",
+        "--synthetic-store",
+        str(tmp_path / "synthetic"),
+        "--real-store",
+        str(tmp_path / "real"),
+        "activity-settings",
+        "create-version",
+    ]
+    documents = (
+        {
+            "schema_version": "3.0",
+            "type": "unknown_write",
+            "intent": "create",
+        },
+        {
+            "schema_version": "3.0",
+            "type": "revise_context_coverage_start",
+            "intent": "create",
+            "start_date": "2024-01-01",
+        },
+    )
+    for index, payload in enumerate(documents):
+        document = tmp_path / f"invalid-{index}.json"
+        document.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(SystemExit) as error:
+            main([*common, "--input", str(document), "--json"])
+        assert error.value.code == 2
+    assert not (tmp_path / "synthetic").exists()
+
+
+def test_json_3_decodes_every_structured_write_family() -> None:
+    context_id = "a" * 32
+    medication_id = "b" * 32
+    documents = {
+        "ReviseContextCoverageStart": {
+            "type": "revise_context_coverage_start",
+            "start_date": "2024-01-01",
+        },
+        "ReviseIllnessCategory": {"type": "revise_illness_category", "name": "Erkältung"},
+        "ReviseCustomContextLabel": {
+            "type": "revise_custom_context_label",
+            "name": "Reise",
+        },
+        "ReviseIllnessPeriod": {
+            "type": "revise_illness_period",
+            "category_logical_id": context_id,
+            "start_date": "2024-01-01",
+            "end_date": None,
+            "severity": "mild",
+        },
+        "ReviseDailyStress": {
+            "type": "revise_daily_stress",
+            "day": "2024-01-01",
+            "level": "average",
+        },
+        "ReviseCustomContextPeriod": {
+            "type": "revise_custom_context_period",
+            "label_logical_id": context_id,
+            "start_date": "2024-01-01",
+            "end_date": None,
+            "note": None,
+        },
+        "ReviseMedicationRegime": {
+            "type": "revise_medication_regime",
+            "starts_at": "2024-01-01T00:00:00+01:00",
+            "timezone": "Europe/Berlin",
+            "scheduled_doses": [
+                {
+                    "medication_name": "Test",
+                    "amount": "1",
+                    "unit": "mg",
+                    "local_time": "08:00:00",
+                    "weekdays": ["monday"],
+                }
+            ],
+            "as_needed_medications": [],
+        },
+        "ReviseMedicationDeviation": {
+            "type": "revise_medication_deviation",
+            "regime_logical_id": medication_id,
+            "scheduled_at": "2024-01-01T08:00:00+01:00",
+            "actual_intakes": [],
+        },
+        "ReviseAsNeededIntake": {
+            "type": "revise_as_needed_intake",
+            "regime_logical_id": medication_id,
+            "entry_id": "c" * 32,
+            "taken_at": "2024-01-01T08:00:00+01:00",
+            "amount": "1",
+            "reason_category_logical_id": None,
+        },
+        "ReviseIntakeReasonCategory": {
+            "type": "revise_intake_reason_category",
+            "name": "Kopfschmerz",
+        },
+        "CreateActivityDerivationVersion": {
+            "type": "create_activity_derivation_version",
+            "coverage_gap_minutes": 180,
+        },
+    }
+    for expected_name, fields in documents.items():
+        request = decode_write_request(
+            {"schema_version": "3.0", "intent": "create", **fields}
+        )
+        assert type(request).__name__ == expected_name
+        if expected_name == "CreateActivityDerivationVersion":
+            continue
+        withdrawal = {
+            "schema_version": "3.0",
+            "type": fields["type"],
+            "intent": "withdraw",
+            "logical_id": context_id if "Context" in expected_name else medication_id,
+            "expected_revision_id": "c" * 32,
+            "reason": "Korrektur",
+        }
+        assert type(decode_write_request(withdrawal)).__name__ == expected_name
+        revision_fields = dict(fields)
+        for intent in ("revise", "restore"):
+            revision = {
+                "schema_version": "3.0",
+                "intent": intent,
+                "logical_id": withdrawal["logical_id"],
+                "expected_revision_id": "c" * 32,
+                **revision_fields,
+            }
+            assert type(decode_write_request(revision)).__name__ == expected_name
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {
+            "schema_version": "3.0",
+            "type": "revise_illness_category",
+            "intent": "create",
+        },
+        {
+            "schema_version": "3.0",
+            "type": "revise_illness_category",
+            "intent": "create",
+            "name": "Erkältung",
+            "day": "2024-01-01",
+        },
+        {
+            "schema_version": "3.0",
+            "type": "revise_medication_regime",
+            "intent": "create",
+            "starts_at": "2024-01-01T00:00:00+01:00",
+            "timezone": "Europe/Berlin",
+            "scheduled_doses": [
+                {
+                    "medication_name": "A",
+                    "amount": "1",
+                    "unit": "mg",
+                    "local_time": "08:00:00",
+                    "weekdays": ["monday"],
+                    "personal_note": "must not pass",
+                }
+            ],
+            "as_needed_medications": [],
+        },
+        {
+            "schema_version": "3.0",
+            "type": "create_activity_derivation_version",
+            "intent": "create",
+            "coverage_gap_minutes": 1441,
+        },
+    ],
+)
+def test_json_3_input_schema_is_closed_and_complete(document: object) -> None:
+    with pytest.raises(ConfigurationError, match=r"JSON-3\.0"):
+        decode_write_request(document)
+
+
+def test_json_3_serializes_no_change_as_a_distinct_success() -> None:
+    receipt = WriteReceipt(
+        OperationId("a" * 32),
+        PlanFingerprint("b" * 64),
+        WriteNoChange(),
+        WritePreflight(WriteApproval(WriteApprovalStatus.NO_CHANGE)),
+    )
+    output = json.loads(json.dumps(_write_receipt_json(receipt, _EXPECTED_RUNTIME_CONFIG)))
+
+    _assert_json_contract(output)
+    assert output["result"] == {
+        "diagnostics": [],
+        "status": "no_change",
+        "type": "write_no_change",
+    }
+
+
+def test_json_3_closes_every_v03_plan_and_receipt_pair(tmp_path: Path) -> None:
+    config = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    fixture = generate_export("null-v1", 42, tmp_path / "fixture")
+    with HealthLab.open(config) as health_lab:
+        imported = ImportHealthExport(fixture.export_path)
+        health_lab.execute_write(
+            imported, expected_plan=health_lab.preview_write(imported).fingerprint
+        )
+        requests = (
+            ReviseContextCoverageStart(ContextCoverageStartCreate(date(2024, 1, 1))),
+            ReviseIntakeReasonCategory(IntakeReasonCategoryCreate("Kopfschmerz")),
+            CreateActivityDerivationVersion(180),
+        )
+        workspace = health_lab.load_workspace_status()
+        for request in requests:
+            plan = health_lab.preview_write(request)
+            plan_json = json.loads(
+                json.dumps(_write_plan_json(plan, _EXPECTED_RUNTIME_CONFIG, workspace))
+            )
+            _assert_json_contract(plan_json)
+            invalid_plan = dict(plan_json)
+            invalid_plan["details"] = {**plan_json["details"], "personal_value": "leak"}
+            with pytest.raises(ValidationError):
+                _assert_json_contract(invalid_plan)
+
+            receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+            receipt_json = json.loads(
+                json.dumps(_write_receipt_json(receipt, _EXPECTED_RUNTIME_CONFIG))
+            )
+            _assert_json_contract(receipt_json)
+            invalid_receipt = dict(receipt_json)
+            invalid_receipt["result"] = {
+                **receipt_json["result"],
+                "personal_value": "leak",
+            }
+            with pytest.raises(ValidationError):
+                _assert_json_contract(invalid_receipt)
 
 
 @pytest.mark.v02_adapter("cli", "WeightDayStatus")
+@pytest.mark.v03_adapter("cli", "WeightNutrition")
 def test_cli_renders_the_complete_weight_projection_as_human_text_and_json_3(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

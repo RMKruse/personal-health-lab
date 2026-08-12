@@ -15,7 +15,7 @@ from personal_health_lab.application import HealthLab, WritePlanDetails, WriteRe
 _V02_MATRIX = Path(__file__).parent / "acceptance/v02_matrix.toml"
 _V03_MATRIX = Path(__file__).parent / "acceptance/v03_matrix.toml"
 _PROHIBITED_ACTIVE_MARKERS = {"skip", "skipif", "xfail", "flaky", "rerun", "reruns"}
-_READ_PROJECTION_METHODS = {
+_V02_READ_PROJECTION_METHODS = {
     "load_data_review",
     "load_data_review_case",
     "load_context_audit",
@@ -27,16 +27,65 @@ _READ_PROJECTION_METHODS = {
     "load_recovery_status",
     "load_workspace_status",
 }
-_ADAPTER_VARIANTS = {
+_V03_VARIANTS = {
+    "ActivityDays",
+    "ActivityDerivationPlan",
+    "ActivityDerivationReceipt",
+    "ActivitySettings",
+    "CreateActivityDerivationVersion",
+    "ContextAudit",
+    "ContextRecords",
+    "DailyContext",
+    "ImportDetails",
+    "MedicationAudit",
+    "MedicationDays",
+    "MedicationPlan",
+    "MedicationRevisionPlan",
+    "MedicationRevisionReceipt",
+    "NoChangeStatus",
+    "SleepDays",
+    "WeightNutrition",
+    "Workouts",
+    "WriteNoChange",
+}
+_V03_VARIANTS |= {
+    "ReviseContextCoverageStart",
+    "ReviseIllnessCategory",
+    "ReviseCustomContextLabel",
+    "ReviseIllnessPeriod",
+    "ReviseDailyStress",
+    "ReviseCustomContextPeriod",
+    "ReviseMedicationRegime",
+    "ReviseMedicationDeviation",
+    "ReviseAsNeededIntake",
+    "ReviseIntakeReasonCategory",
+    "ManualContextRevisionPlan",
+    "ManualContextRevisionReceipt",
+    "WorkoutCorrection",
+    "LocalWorkoutExclusion",
+}
+_V03_VARIANTS |= {
+    name
+    for name in application.__all__
+    if name.endswith(("Create", "Revise", "Withdraw", "Restore"))
+    and name.startswith(
+        (
+            "ContextCoverageStart", "IllnessCategory", "CustomContextLabel",
+            "IllnessPeriod", "DailyStress", "CustomContextPeriod", "MedicationRegime",
+            "MedicationDeviation", "AsNeededIntake", "IntakeReasonCategory",
+        )
+    )
+}
+_PUBLIC_ADAPTER_VARIANTS = {
     variant.__name__
     for union in (WriteRequest, WritePlanDetails, WriteResult)
     for variant in get_args(union)
 }
-_ADAPTER_VARIANTS |= {
+_PUBLIC_ADAPTER_VARIANTS |= {
     get_type_hints(getattr(HealthLab, method))["return"].__name__
-    for method in _READ_PROJECTION_METHODS
+    for method in _V02_READ_PROJECTION_METHODS
 }
-_ADAPTER_VARIANTS |= {
+_PUBLIC_ADAPTER_VARIANTS |= {
     name
     for name in application.__all__
     if (
@@ -50,6 +99,20 @@ _ADAPTER_VARIANTS |= {
         )
     )
 }
+_V02_ADAPTER_VARIANTS = _PUBLIC_ADAPTER_VARIANTS - _V03_VARIANTS
+_V02_ADAPTER_VARIANTS |= {
+    "AsNeededIntakePlan",
+    "AsNeededIntakeReceipt",
+    "IllnessRevisionPlan",
+    "IntakeReasonCategoryPlan",
+    "IntakeReasonCategoryReceipt",
+    "MedicationDeviationPlan",
+    "MedicationDeviationReceipt",
+    "MedicationRegimePlan",
+    "MedicationRegimeReceipt",
+    "NoChangeStatus",
+    "WriteNoChange",
+}
 _ACTIVE_V02_NODES: set[str] = set()
 _ACTIVE_V03_NODES: set[str] = set()
 
@@ -58,6 +121,10 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
         "v02_adapter(side, *variants): behavioral evidence for public adapter variants",
+    )
+    config.addinivalue_line(
+        "markers",
+        "v03_adapter(side, *variants): behavioral evidence for V0.3 adapter variants",
     )
 
 
@@ -72,6 +139,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     v03_runners = {case["runner"] for case in v03_matrix["case"]}
     collected: dict[str, set[str]] = {}
     parity = {"cli": set(), "streamlit": set()}
+    v03_parity = {"cli": set(), "streamlit": set()}
     for item in items:
         runner = getattr(item, "originalname", None) or item.name.split("[", 1)[0]
         node_id = item.nodeid.split("[", 1)[0]
@@ -99,6 +167,11 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             if side not in parity:
                 raise pytest.UsageError(f"unknown V0.2 adapter side: {side}")
             parity[side].update(variants)
+        for marker in item.iter_markers("v03_adapter"):
+            side, *variants = marker.args
+            if side not in v03_parity:
+                raise pytest.UsageError(f"unknown V0.3 adapter side: {side}")
+            v03_parity[side].update(variants)
 
     missing = runners - collected.keys()
     duplicate = {
@@ -117,11 +190,18 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     except AssertionError as error:
         raise pytest.UsageError(str(error)) from error
     for side, variants in parity.items():
-        if variants != _ADAPTER_VARIANTS:
+        if variants != _V02_ADAPTER_VARIANTS:
             raise pytest.UsageError(
                 f"incomplete {side} V0.2 adapter parity; "
-                f"missing={sorted(_ADAPTER_VARIANTS - variants)}, "
-                f"unexpected={sorted(variants - _ADAPTER_VARIANTS)}"
+                f"missing={sorted(_V02_ADAPTER_VARIANTS - variants)}, "
+                f"unexpected={sorted(variants - _V02_ADAPTER_VARIANTS)}"
+            )
+    for side, variants in v03_parity.items():
+        if variants != _V03_VARIANTS:
+            raise pytest.UsageError(
+                f"incomplete {side} V0.3 adapter parity; "
+                f"missing={sorted(_V03_VARIANTS - variants)}, "
+                f"unexpected={sorted(variants - _V03_VARIANTS)}"
             )
 
 

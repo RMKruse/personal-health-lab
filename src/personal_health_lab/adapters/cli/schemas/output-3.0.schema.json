@@ -16,6 +16,9 @@
       "$ref": "#/$defs/activityDaysOutput"
     },
     {
+      "$ref": "#/$defs/activitySettingsOutput"
+    },
+    {
       "$ref": "#/$defs/workoutsOutput"
     },
     {
@@ -44,6 +47,18 @@
     }
   ],
   "$defs": {
+    "activitySettingsOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["active_version", "kind", "recommended_version", "runtime_config", "schema_version"],
+      "properties": {
+        "active_version": { "type": "object" },
+        "kind": { "const": "activity_settings" },
+        "recommended_version": { "type": "object" },
+        "runtime_config": { "type": "object" },
+        "schema_version": { "const": "3.0" }
+      }
+    },
     "medicationOutput": {
       "type": "object",
       "additionalProperties": false,
@@ -150,9 +165,14 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["coverage_start", "kind", "runtime_config", "schema_version", "snapshot_ref"],
+          "required": ["coverage_start", "illness_categories", "illness_periods", "daily_stress", "custom_labels", "custom_periods", "kind", "runtime_config", "schema_version", "snapshot_ref"],
           "properties": {
             "coverage_start": { "type": ["object", "null"] },
+            "illness_categories": { "type": "array", "items": { "type": "object" } },
+            "illness_periods": { "type": "array", "items": { "type": "object" } },
+            "daily_stress": { "type": "array", "items": { "type": "object" } },
+            "custom_labels": { "type": "array", "items": { "type": "object" } },
+            "custom_periods": { "type": "array", "items": { "type": "object" } },
             "kind": { "const": "context_records" },
             "runtime_config": { "type": "object" },
             "schema_version": { "const": "3.0" },
@@ -177,23 +197,29 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "coverage_gap_minutes",
         "days",
+        "derivation_version",
         "kind",
         "measurements",
         "runtime_config",
         "schema_version",
         "selection",
         "snapshot_ref",
+        "source_classifier_version",
         "status"
       ],
       "properties": {
+        "coverage_gap_minutes": { "type": "integer", "minimum": 1 },
         "days": { "type": "array", "items": { "type": "object" } },
+        "derivation_version": { "type": "string" },
         "kind": { "const": "activity_days" },
         "measurements": { "type": "array", "items": { "type": "object" } },
         "runtime_config": { "type": "object" },
         "schema_version": { "const": "3.0" },
         "selection": { "type": "object" },
         "snapshot_ref": { "$ref": "#/$defs/nullableString" },
+        "source_classifier_version": { "type": "string" },
         "status": { "type": "string" }
       }
     },
@@ -998,7 +1024,8 @@
           "enum": [
             "ready",
             "confirmation_required",
-            "blocked"
+            "blocked",
+            "no_change"
           ]
         }
       }
@@ -1289,6 +1316,16 @@
         "type": {
           "const": "write_not_started"
         }
+      }
+    },
+    "writeNoChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["diagnostics", "status", "type"],
+      "properties": {
+        "diagnostics": { "type": "array", "items": { "type": "string" } },
+        "status": { "const": "no_change" },
+        "type": { "const": "write_no_change" }
       }
     },
     "plausibilityRuleResult": {
@@ -1683,6 +1720,164 @@
         }
       }
     },
+    "v03ScheduledDose": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["medication_name", "amount", "unit", "local_time", "weekdays"],
+      "properties": {
+        "medication_name": { "type": "string" },
+        "amount": { "type": "string" },
+        "unit": { "type": "string" },
+        "local_time": { "type": "string", "format": "time" },
+        "weekdays": {
+          "type": "array",
+          "items": { "enum": ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"] }
+        }
+      }
+    },
+    "v03AsNeededMedication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["medication_name", "amount", "unit", "preferred_reason_category_ids", "entry_id"],
+      "properties": {
+        "medication_name": { "type": "string" },
+        "amount": { "type": "string" },
+        "unit": { "type": "string" },
+        "preferred_reason_category_ids": { "type": "array", "items": { "type": "string", "pattern": "^[0-9a-f]{32}$" } },
+        "entry_id": { "anyOf": [{ "type": "string", "pattern": "^[0-9a-f]{32}$" }, { "type": "null" }] }
+      }
+    },
+    "v03ActualIntake": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["taken_at", "amount"],
+      "properties": {
+        "taken_at": { "type": "string", "format": "date-time" },
+        "amount": { "type": "string" }
+      }
+    },
+    "manualContextRevisionPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "intent", "object_kind", "logical_id", "expected_revision_id", "name", "category_logical_id", "start_date", "end_date", "severity", "stress_level", "note", "withdrawal_reason", "base_snapshot_ref", "snapshot_as_of", "context_timezone", "context_as_of_date", "colliding_logical_ids", "referenced_logical_ids", "affected_start_date", "affected_end_date"],
+      "properties": {
+        "type": { "enum": ["revise_context_coverage_start", "revise_illness_category", "revise_custom_context_label", "revise_illness_period", "revise_daily_stress", "revise_custom_context_period"] },
+        "intent": { "enum": ["create", "revise", "withdraw", "restore"] },
+        "object_kind": { "enum": ["context_coverage_start", "illness_category", "custom_context_label", "illness_period", "daily_stress", "custom_context_period"] },
+        "logical_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "expected_revision_id": { "anyOf": [{ "type": "string", "pattern": "^[0-9a-f]{32}$" }, { "type": "null" }] },
+        "name": { "$ref": "#/$defs/nullableString" },
+        "category_logical_id": { "anyOf": [{ "type": "string", "pattern": "^[0-9a-f]{32}$" }, { "type": "null" }] },
+        "start_date": { "type": ["string", "null"], "format": "date" },
+        "end_date": { "type": ["string", "null"], "format": "date" },
+        "severity": { "enum": ["mild", "moderate", "severe", null] },
+        "stress_level": { "enum": ["very_low", "low", "average", "high", "very_high", null] },
+        "note": { "$ref": "#/$defs/nullableString" },
+        "withdrawal_reason": { "$ref": "#/$defs/nullableString" },
+        "base_snapshot_ref": { "$ref": "#/$defs/nullableString" },
+        "snapshot_as_of": { "type": "string", "format": "date-time" },
+        "context_timezone": { "type": "string" },
+        "context_as_of_date": { "type": "string", "format": "date" },
+        "colliding_logical_ids": { "type": "array", "items": { "type": "string", "pattern": "^[0-9a-f]{32}$" } },
+        "referenced_logical_ids": { "type": "array", "items": { "type": "string", "pattern": "^[0-9a-f]{32}$" } },
+        "affected_start_date": { "type": ["string", "null"], "format": "date" },
+        "affected_end_date": { "type": ["string", "null"], "format": "date" }
+      }
+    },
+    "medicationRevisionPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "intent", "object_kind", "logical_id", "expected_revision_id", "starts_at", "timezone", "scheduled_doses", "as_needed_medications", "regime_logical_id", "scheduled_at", "actual_intakes", "entry_id", "taken_at", "amount", "reason_category_logical_id", "name", "withdrawal_reason", "base_snapshot_ref", "medication_as_of", "colliding_logical_ids", "referenced_logical_ids", "affected_start_date", "affected_end_date"],
+      "properties": {
+        "type": { "enum": ["revise_medication_regime", "revise_medication_deviation", "revise_as_needed_intake", "revise_intake_reason_category"] },
+        "intent": { "enum": ["create", "revise", "withdraw", "restore"] },
+        "object_kind": { "enum": ["medication_regime", "medication_deviation", "as_needed_intake", "intake_reason_category"] },
+        "logical_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "expected_revision_id": { "anyOf": [{ "type": "string", "pattern": "^[0-9a-f]{32}$" }, { "type": "null" }] },
+        "starts_at": { "type": ["string", "null"], "format": "date-time" },
+        "timezone": { "$ref": "#/$defs/nullableString" },
+        "scheduled_doses": { "type": "array", "items": { "$ref": "#/$defs/v03ScheduledDose" } },
+        "as_needed_medications": { "type": "array", "items": { "$ref": "#/$defs/v03AsNeededMedication" } },
+        "regime_logical_id": { "anyOf": [{ "type": "string", "pattern": "^[0-9a-f]{32}$" }, { "type": "null" }] },
+        "scheduled_at": { "type": ["string", "null"], "format": "date-time" },
+        "actual_intakes": { "type": "array", "items": { "$ref": "#/$defs/v03ActualIntake" } },
+        "entry_id": { "anyOf": [{ "type": "string", "pattern": "^[0-9a-f]{32}$" }, { "type": "null" }] },
+        "taken_at": { "type": ["string", "null"], "format": "date-time" },
+        "amount": { "$ref": "#/$defs/nullableString" },
+        "reason_category_logical_id": { "anyOf": [{ "type": "string", "pattern": "^[0-9a-f]{32}$" }, { "type": "null" }] },
+        "name": { "$ref": "#/$defs/nullableString" },
+        "withdrawal_reason": { "$ref": "#/$defs/nullableString" },
+        "base_snapshot_ref": { "$ref": "#/$defs/nullableString" },
+        "medication_as_of": { "type": "string", "format": "date-time" },
+        "colliding_logical_ids": { "type": "array", "items": { "type": "string", "pattern": "^[0-9a-f]{32}$" } },
+        "referenced_logical_ids": { "type": "array", "items": { "type": "string", "pattern": "^[0-9a-f]{32}$" } },
+        "affected_start_date": { "type": ["string", "null"], "format": "date" },
+        "affected_end_date": { "type": ["string", "null"], "format": "date" }
+      }
+    },
+    "v03ActivityDerivationVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version_id", "coverage_gap_minutes", "source_classifier_version"],
+      "properties": {
+        "version_id": { "type": "string" },
+        "coverage_gap_minutes": { "type": "integer", "minimum": 1, "maximum": 1440 },
+        "source_classifier_version": { "type": "string" }
+      }
+    },
+    "activityDerivationPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "active_version", "proposed_version", "base_snapshot_ref", "affected_projections"],
+      "properties": {
+        "type": { "const": "create_activity_derivation_version" },
+        "active_version": { "$ref": "#/$defs/v03ActivityDerivationVersion" },
+        "proposed_version": { "$ref": "#/$defs/v03ActivityDerivationVersion" },
+        "base_snapshot_ref": { "$ref": "#/$defs/nullableString" },
+        "affected_projections": {
+          "type": "array",
+          "items": { "enum": ["activity_days", "workouts"] },
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true
+        }
+      }
+    },
+    "manualContextRevisionResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "status", "logical_id", "revision_id", "snapshot_ref"],
+      "properties": {
+        "type": { "const": "manual_context_revision" },
+        "status": { "const": "committed" },
+        "logical_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "revision_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "snapshot_ref": { "type": "string" }
+      }
+    },
+    "medicationRevisionResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "status", "logical_id", "revision_id", "snapshot_ref"],
+      "properties": {
+        "type": { "const": "medication_revision" },
+        "status": { "const": "committed" },
+        "logical_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "revision_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "snapshot_ref": { "type": "string" }
+      }
+    },
+    "activityDerivationResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "status", "version_id", "snapshot_ref"],
+      "properties": {
+        "type": { "const": "activity_derivation_version" },
+        "status": { "const": "committed" },
+        "version_id": { "type": "string" },
+        "snapshot_ref": { "type": "string" }
+      }
+    },
     "writePlanOutput": {
       "type": "object",
       "additionalProperties": false,
@@ -1720,6 +1915,9 @@
         },
         "details": {
           "oneOf": [
+            { "$ref": "#/$defs/manualContextRevisionPlan" },
+            { "$ref": "#/$defs/medicationRevisionPlan" },
+            { "$ref": "#/$defs/activityDerivationPlan" },
             {
               "type": "object",
               "additionalProperties": false,
@@ -2222,6 +2420,28 @@
             {
               "type": "object",
               "additionalProperties": false,
+              "required": ["type"],
+              "properties": {
+                "type": {
+                  "enum": [
+                    "revise_context_coverage_start",
+                    "revise_illness_category",
+                    "revise_custom_context_label",
+                    "revise_illness_period",
+                    "revise_daily_stress",
+                    "revise_custom_context_period",
+                    "revise_medication_regime",
+                    "revise_medication_deviation",
+                    "revise_as_needed_intake",
+                    "revise_intake_reason_category",
+                    "create_activity_derivation_version"
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
               "required": [
                 "package",
                 "type"
@@ -2361,11 +2581,17 @@
         },
         "result": {
           "oneOf": [
+            { "$ref": "#/$defs/manualContextRevisionResult" },
+            { "$ref": "#/$defs/medicationRevisionResult" },
+            { "$ref": "#/$defs/activityDerivationResult" },
             {
               "$ref": "#/$defs/importResult"
             },
             {
               "$ref": "#/$defs/writeNotStarted"
+            },
+            {
+              "$ref": "#/$defs/writeNoChange"
             },
             {
               "$ref": "#/$defs/plausibilityRuleResult"

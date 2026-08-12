@@ -6,15 +6,21 @@ import logging
 import pydoc
 import sys
 from collections.abc import Mapping, Sequence
+from dataclasses import fields, is_dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from enum import Enum
 from pathlib import Path
 
 from personal_health_lab.adapters._config import load_runtime_config
+from personal_health_lab.adapters.cli._v03_json import load_write_request
 from personal_health_lab.application import (
     AbortMetadataRestore,
     AbortMetadataRestorePlan,
     ActivityDays,
+    ActivityDerivationPlan,
+    ActivityDerivationReceipt,
+    ActivitySettings,
     AnalysisDefinitionId,
     AnalysisProvenance,
     AnalysisReceipt,
@@ -69,12 +75,16 @@ from personal_health_lab.application import (
     IntakeReasonCategoryWithdraw,
     LocalMeasurementExclusion,
     LocalWorkoutExclusion,
+    ManualContextRevisionPlan,
+    ManualContextRevisionReceipt,
     MeasurementVersionId,
     MedicationAuditRevision,
     MedicationDeviationAuditRevision,
     MedicationLogicalId,
     MedicationPlanEntryId,
     MedicationRevisionId,
+    MedicationRevisionPlan,
+    MedicationRevisionReceipt,
     MetadataBackupPlan,
     MetadataBackupReceipt,
     MetadataRestorePlan,
@@ -104,6 +114,7 @@ from personal_health_lab.application import (
     SleepInterval,
     SnapshotDateSelection,
     SnapshotRef,
+    SnapshotSelection,
     SourceConflictResolution,
     SourceConflictStrategy,
     SourceDeletionResolution,
@@ -118,6 +129,7 @@ from personal_health_lab.application import (
     WriteApprovalStatus,
     WriteBatchDecisionReceipt,
     WriteDecisionReceipt,
+    WriteNoChange,
     WriteNotStarted,
     WritePlan,
     WriteReceipt,
@@ -125,6 +137,43 @@ from personal_health_lab.application import (
 )
 
 _OUTPUT_SCHEMA_VERSION = "3.0"
+
+
+def _json_value(value: object) -> object:
+    if is_dataclass(value) and not isinstance(value, type):
+        value_fields = fields(value)
+        if len(value_fields) == 1 and value_fields[0].name == "_value":
+            return str(value)
+        return {field.name: _json_value(getattr(value, field.name)) for field in value_fields}
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list, frozenset)):
+        return [_json_value(item) for item in value]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return str(value)
+
+
+def _v03_type(value: object) -> str:
+    if isinstance(value, ManualContextRevisionPlan):
+        return f"revise_{value.object_kind}"
+    if isinstance(value, MedicationRevisionPlan):
+        return f"revise_{value.object_kind}"
+    if isinstance(value, ActivityDerivationPlan):
+        return "create_activity_derivation_version"
+    if isinstance(value, ManualContextRevisionReceipt):
+        return "manual_context_revision"
+    if isinstance(value, MedicationRevisionReceipt):
+        return "medication_revision"
+    if isinstance(value, ActivityDerivationReceipt):
+        return "activity_derivation_version"
+    raise TypeError("Nicht unterstützte V0.3-Schreibvariante.")
 
 
 def _medication_audit_revision_json(
@@ -178,8 +227,11 @@ def _medication_audit_revision_json(
         "previous_revision_id": None
         if item.previous_revision_id is None
         else str(item.previous_revision_id),
+        "state": item.state,
         "starts_at": item.starts_at.isoformat(),
         "timezone": item.timezone,
+        "scheduled_doses": _json_value(item.scheduled_doses),
+        "as_needed_medications": _json_value(item.as_needed_medications),
     }
 
 
@@ -198,6 +250,29 @@ def _provenance_json(provenance: AnalysisProvenance | None) -> dict[str, object]
         "result_ref": None if provenance.result_id is None else str(provenance.result_id),
         "snapshot_ref": str(provenance.snapshot_id),
     }
+
+
+def _add_structured_write_options(
+    command: argparse.ArgumentParser, request_type: str, intent: str
+) -> None:
+    command.add_argument("--input", required=True)
+    command.add_argument("--json", action="store_true", dest="as_json")
+    command.add_argument("--execute", action="store_true")
+    command.add_argument("--expect-plan", type=PlanFingerprint)
+    command.set_defaults(
+        structured_write=True, expected_request_type=request_type, expected_intent=intent
+    )
+
+
+def _add_structured_family(
+    commands: argparse._SubParsersAction[argparse.ArgumentParser],
+    name: str,
+    request_type: str,
+) -> None:
+    family = commands.add_parser(name)
+    actions = family.add_subparsers(dest="structured_action", required=True)
+    for intent in ("create", "revise", "withdraw", "restore"):
+        _add_structured_write_options(actions.add_parser(intent), request_type, intent)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -250,6 +325,15 @@ def _parser() -> argparse.ArgumentParser:
     context_audit = context_commands.add_parser("audit", help="Kontextaudit laden")
     context_audit.add_argument("logical_id", type=ContextLogicalId)
     context_audit.add_argument("--json", action="store_true", dest="as_json")
+    for name, request_type in {
+        "coverage-start": "revise_context_coverage_start",
+        "illness-category": "revise_illness_category",
+        "custom-label": "revise_custom_context_label",
+        "illness-period": "revise_illness_period",
+        "daily-stress": "revise_daily_stress",
+        "custom-period": "revise_custom_context_period",
+    }.items():
+        _add_structured_family(context_commands, name, request_type)
     medication = commands.add_parser("medication", help="Medikamentenplan laden")
     medication_commands = medication.add_subparsers(dest="medication_command", required=True)
     medication_days = medication_commands.add_parser("days", help="Tägliche Dosisvorkommen laden")
@@ -263,6 +347,13 @@ def _parser() -> argparse.ArgumentParser:
     medication_audit = medication_commands.add_parser("audit", help="Regimeaudit laden")
     medication_audit.add_argument("logical_id", type=MedicationLogicalId)
     medication_audit.add_argument("--json", action="store_true", dest="as_json")
+    for name, request_type in {
+        "regime": "revise_medication_regime",
+        "deviation": "revise_medication_deviation",
+        "as-needed-intake": "revise_as_needed_intake",
+        "intake-reason-category": "revise_intake_reason_category",
+    }.items():
+        _add_structured_family(medication_commands, name, request_type)
     medication_reason = medication_commands.add_parser(
         "reason", help="Einnahmegrund anlegen oder revidieren"
     )
@@ -294,6 +385,8 @@ def _parser() -> argparse.ArgumentParser:
         command = intake_actions.add_parser(action)
         command.add_argument("logical_id", type=MedicationLogicalId)
         command.add_argument("expected_revision_id", type=MedicationRevisionId)
+        command.add_argument("regime_logical_id", type=MedicationLogicalId)
+        command.add_argument("entry_id", type=MedicationPlanEntryId)
         command.add_argument("taken_at", type=datetime.fromisoformat)
         command.add_argument("amount", type=Decimal)
         command.add_argument("--reason-category", type=MedicationLogicalId)
@@ -301,6 +394,17 @@ def _parser() -> argparse.ArgumentParser:
     intake_withdraw.add_argument("logical_id", type=MedicationLogicalId)
     intake_withdraw.add_argument("expected_revision_id", type=MedicationRevisionId)
     intake_withdraw.add_argument("--reason", required=True)
+    activity_settings = commands.add_parser("activity-settings")
+    activity_settings_commands = activity_settings.add_subparsers(
+        dest="activity_settings_command", required=True
+    )
+    activity_settings_show = activity_settings_commands.add_parser("show")
+    activity_settings_show.add_argument("--json", action="store_true", dest="as_json")
+    _add_structured_write_options(
+        activity_settings_commands.add_parser("create-version"),
+        "create_activity_derivation_version",
+        "create",
+    )
     analysis = commands.add_parser("analyze", help="Verzögerungsprofil analysieren")
     analysis.add_argument("--definition", default="lag-signal-v2")
     analysis.add_argument("--start-date", type=date.fromisoformat)
@@ -936,6 +1040,18 @@ def _activity_days_json(
     }
 
 
+def _activity_settings_json(
+    projection: ActivitySettings, runtime_config: Mapping[str, object]
+) -> dict[str, object]:
+    return {
+        "active_version": _json_value(projection.active_version),
+        "kind": "activity_settings",
+        "recommended_version": _json_value(projection.recommended_version),
+        "runtime_config": dict(runtime_config),
+        "schema_version": _OUTPUT_SCHEMA_VERSION,
+    }
+
+
 def _workouts_json(
     projection: Workouts,
     selection: SnapshotDateSelection,
@@ -1039,6 +1155,34 @@ def _context_records_json(
             "revision_id": str(projection.coverage_start.revision_id),
             "start_date": projection.coverage_start.start_date.isoformat(),
         },
+        "illness_categories": [
+            {
+                "logical_id": str(item.logical_id),
+                "revision_id": str(item.revision_id),
+                "name": item.name,
+            }
+            for item in projection.illness_categories
+        ],
+        "illness_periods": [
+            {
+                "logical_id": str(item.logical_id),
+                "revision_id": str(item.revision_id),
+                "category_logical_id": str(item.category_logical_id),
+                "start_date": item.start_date.isoformat(),
+                "end_date": None if item.end_date is None else item.end_date.isoformat(),
+                "severity": item.severity.value,
+            }
+            for item in projection.illness_periods
+        ],
+        "daily_stress": [
+            {
+                "logical_id": str(item.logical_id),
+                "revision_id": str(item.revision_id),
+                "day": item.day.isoformat(),
+                "level": item.level.value,
+            }
+            for item in projection.daily_stress
+        ],
         "custom_labels": [
             {
                 "logical_id": str(item.logical_id),
@@ -1286,6 +1430,14 @@ def _write_plan_json(
             "type": "run_resting_heart_rate_analysis",
         }
         request_json = {"type": "run_resting_heart_rate_analysis"}
+    elif isinstance(
+        details, (ManualContextRevisionPlan, MedicationRevisionPlan, ActivityDerivationPlan)
+    ):
+        encoded_details = _json_value(details)
+        assert isinstance(encoded_details, dict)
+        request_type = _v03_type(details)
+        detail_json = {**encoded_details, "type": request_type}
+        request_json = {"type": request_type}
     else:
         raise TypeError("Nicht unterstützte Schreibplandetails.")
     return {
@@ -1431,6 +1583,19 @@ def _write_receipt_json(
             "status": result.status.value,
             "type": "run_resting_heart_rate_analysis",
         }
+    elif isinstance(result, WriteNoChange):
+        result_json = {
+            "diagnostics": result.diagnostics,
+            "status": result.status.value,
+            "type": "write_no_change",
+        }
+    elif isinstance(
+        result,
+        (ManualContextRevisionReceipt, MedicationRevisionReceipt, ActivityDerivationReceipt),
+    ):
+        encoded_result = _json_value(result)
+        assert isinstance(encoded_result, dict)
+        result_json = {**encoded_result, "type": _v03_type(result)}
     else:
         result_json = {
             "diagnostics": result.diagnostics,
@@ -1521,6 +1686,13 @@ def _print_write_plan(plan: WritePlan, workspace: WorkspaceStatus) -> None:
     elif isinstance(plan.details, AbortMetadataRestorePlan):
         print(f"Wiederherstellungs-ID: {plan.details.restore_id or '-'}")
         print(f"Sicherungs-ID: {plan.details.backup_id or '-'}")
+    elif isinstance(
+        plan.details, (ManualContextRevisionPlan, MedicationRevisionPlan, ActivityDerivationPlan)
+    ):
+        print(
+            "Plandetails: "
+            + json.dumps(_json_value(plan.details), ensure_ascii=False, sort_keys=True)
+        )
     filevault = plan.preflight.filevault
     print(
         "FileVault: "
@@ -1550,6 +1722,7 @@ def _print_write_plan(plan: WritePlan, workspace: WorkspaceStatus) -> None:
 def main(args: Sequence[str] | None = None) -> int:
     parser = _parser()
     parsed = parser.parse_args(args)
+    structured_write = bool(getattr(parsed, "structured_write", False))
     write_commands = {
         "analyze",
         "abort-restore",
@@ -1564,7 +1737,7 @@ def main(args: Sequence[str] | None = None) -> int:
         "review-resolve",
         "review-revoke",
     }
-    if parsed.command in write_commands:
+    if parsed.command in write_commands or structured_write:
         if parsed.execute and not parsed.as_json:
             parser.error("--execute ist nur zusammen mit --json zulässig.")
         if parsed.execute != (parsed.expect_plan is not None):
@@ -1577,7 +1750,7 @@ def main(args: Sequence[str] | None = None) -> int:
                 parsed.conflict_strategy is not None,
                 parsed.confirm,
                 parsed.correct is not None,
-                parsed.exclude_local,
+                parsed.exclude_local or parsed.workout_exclusion,
                 parsed.accept_source,
             )
         )
@@ -1589,9 +1762,17 @@ def main(args: Sequence[str] | None = None) -> int:
             parsed.correct is not None
             and ((not parsed.workout_correction and parsed.unit is None) or not parsed.reason)
         )
-        or (parsed.exclude_local and (parsed.case_id is None or not parsed.reason))
         or (
-            (parsed.correct is not None or parsed.exclude_local or parsed.accept_source)
+            (parsed.exclude_local or parsed.workout_exclusion)
+            and (parsed.case_id is None or not parsed.reason)
+        )
+        or (
+            (
+                parsed.correct is not None
+                or parsed.exclude_local
+                or parsed.workout_exclusion
+                or parsed.accept_source
+            )
             and parsed.measurement_version is None
         )
         or (parsed.case_id is None and parsed.correct is None)
@@ -1604,7 +1785,14 @@ def main(args: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
     decision_request: WriteRequest
     medication_write_request: ReviseAsNeededIntake | ReviseIntakeReasonCategory
+    structured_request: WriteRequest
     try:
+        if structured_write:
+            structured_request = load_write_request(
+                parsed.input,
+                expected_type=parsed.expected_request_type,
+                expected_intent=parsed.expected_intent,
+            )
         config = load_runtime_config(
             explicit_mode=parsed.mode,
             explicit_synthetic_store=parsed.synthetic_store,
@@ -1613,7 +1801,34 @@ def main(args: Sequence[str] | None = None) -> int:
         )
         with HealthLab.open(config) as health_lab:
             workspace_status = health_lab.load_workspace_status()
-            if parsed.command == "recovery-status":
+            if structured_write:
+                structured_plan = health_lab.preview_write(structured_request)
+                structured_receipt = None
+                if parsed.execute and structured_plan.approval.status in {
+                    WriteApprovalStatus.READY,
+                    WriteApprovalStatus.CONFIRMATION_REQUIRED,
+                }:
+                    assert parsed.expect_plan is not None
+                    structured_receipt = health_lab.execute_write(
+                        structured_request, expected_plan=parsed.expect_plan
+                    )
+                elif not parsed.as_json:
+                    _print_write_plan(structured_plan, workspace_status)
+                    if structured_plan.approval.status in {
+                        WriteApprovalStatus.READY,
+                        WriteApprovalStatus.CONFIRMATION_REQUIRED,
+                    } and input("Schreibvorgang ausführen? [j/N] ").strip().lower() in {
+                        "j",
+                        "ja",
+                    }:
+                        structured_receipt = health_lab.execute_write(
+                            structured_request, expected_plan=structured_plan.fingerprint
+                        )
+            elif (
+                parsed.command == "activity-settings" and parsed.activity_settings_command == "show"
+            ):
+                activity_settings = health_lab.load_activity_settings()
+            elif parsed.command == "recovery-status":
                 recovery_status = health_lab.load_recovery_status()
             elif parsed.command == "import-details":
                 import_details = health_lab.load_import_details(parsed.import_id)
@@ -1643,7 +1858,9 @@ def main(args: Sequence[str] | None = None) -> int:
                 )
                 daily_context = health_lab.load_daily_context(context_selection)
             elif parsed.command == "context" and parsed.context_command == "records":
-                context_records = health_lab.load_context_records(parsed.snapshot)
+                context_records = health_lab.load_context_records(
+                    SnapshotSelection(parsed.snapshot)
+                )
             elif parsed.command == "context" and parsed.context_command == "audit":
                 context_audit = health_lab.load_context_audit(parsed.logical_id)
             elif parsed.command == "medication" and parsed.medication_command == "days":
@@ -1652,7 +1869,9 @@ def main(args: Sequence[str] | None = None) -> int:
                 )
                 medication_days = health_lab.load_medication_days(medication_selection)
             elif parsed.command == "medication" and parsed.medication_command == "plan":
-                medication_plan = health_lab.load_medication_plan(parsed.snapshot)
+                medication_plan = health_lab.load_medication_plan(
+                    SnapshotSelection(parsed.snapshot)
+                )
             elif parsed.command == "medication" and parsed.medication_command == "audit":
                 medication_audit = health_lab.load_medication_audit(parsed.logical_id)
             elif parsed.command == "medication" and parsed.medication_command == "reason":
@@ -1718,6 +1937,8 @@ def main(args: Sequence[str] | None = None) -> int:
                     intake_intent = intake_type(
                         parsed.logical_id,
                         parsed.expected_revision_id,
+                        parsed.regime_logical_id,
+                        parsed.entry_id,
                         parsed.taken_at,
                         parsed.amount,
                         parsed.reason_category,
@@ -2074,7 +2295,43 @@ def main(args: Sequence[str] | None = None) -> int:
     }
     if not parsed.as_json:
         print("Konfiguration: " + json.dumps(runtime_config, ensure_ascii=False, sort_keys=True))
-    if parsed.command == "import-details" and parsed.as_json:
+    if structured_write and parsed.as_json:
+        output = (
+            _write_plan_json(structured_plan, runtime_config, workspace_status)
+            if structured_receipt is None
+            else _write_receipt_json(structured_receipt, runtime_config)
+        )
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+    elif structured_write:
+        if structured_receipt is None:
+            print("Schreibvorgang nicht ausgeführt.")
+        else:
+            print(f"Schreibvorgang: {structured_receipt.result.status.value}")
+            print(
+                "Schreibbeleg: "
+                + json.dumps(
+                    _json_value(structured_receipt.result), ensure_ascii=False, sort_keys=True
+                )
+            )
+    elif parsed.command == "activity-settings" and parsed.as_json:
+        print(
+            json.dumps(
+                _activity_settings_json(activity_settings, runtime_config),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    elif parsed.command == "activity-settings":
+        print(
+            f"Aktive Aktivitätsableitung: {activity_settings.active_version.version_id} · "
+            f"Lücke {activity_settings.active_version.coverage_gap_minutes} min"
+        )
+        print(
+            "Empfohlene Aktivitätsableitung: "
+            f"{activity_settings.recommended_version.version_id} · "
+            f"Lücke {activity_settings.recommended_version.coverage_gap_minutes} min"
+        )
+    elif parsed.command == "import-details" and parsed.as_json:
         print(
             json.dumps(
                 _import_details_json(import_details, runtime_config),
@@ -2218,19 +2475,7 @@ def main(args: Sequence[str] | None = None) -> int:
                 {
                     "kind": "context_audit",
                     "logical_id": str(context_audit.logical_id),
-                    "revisions": [
-                        {
-                            "previous_revision_id": None
-                            if item.previous_revision_id is None
-                            else str(item.previous_revision_id),
-                            "revision_id": str(item.revision_id),
-                            "start_date": None
-                            if item.start_date is None
-                            else item.start_date.isoformat(),
-                            "state": item.state,
-                        }
-                        for item in context_audit.revisions
-                    ],
+                    "revisions": [_json_value(item) for item in context_audit.revisions],
                     "runtime_config": dict(runtime_config),
                     "schema_version": _OUTPUT_SCHEMA_VERSION,
                 },
@@ -2848,6 +3093,10 @@ def main(args: Sequence[str] | None = None) -> int:
                 "Ausgeführt "
                 f"{historical.completed_at.isoformat() if historical.completed_at else '-'}"
             )
+    if structured_write:
+        if structured_receipt is None:
+            return 3 if structured_plan.approval.status is WriteApprovalStatus.BLOCKED else 0
+        return 3 if isinstance(structured_receipt.result, WriteNotStarted) else 0
     if parsed.command == "medication" and parsed.medication_command in {"reason", "intake"}:
         if medication_write_receipt is None:
             return 3 if medication_write_plan.approval.status is WriteApprovalStatus.BLOCKED else 0

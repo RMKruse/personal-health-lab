@@ -36,6 +36,10 @@ def test_v03_matrix_rejects_open_references_and_hashes() -> None:
     collected_node_ids = _collected_node_ids()
     mutations = []
 
+    missing_variant = copy.deepcopy(matrix)
+    missing_variant["write_requests"].pop()
+    mutations.append(missing_variant)
+
     duplicate = copy.deepcopy(matrix)
     duplicate["case"][1]["id"] = duplicate["case"][0]["id"]
     mutations.append(duplicate)

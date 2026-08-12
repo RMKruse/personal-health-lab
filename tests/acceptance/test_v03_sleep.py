@@ -108,6 +108,7 @@ def test_sleep_import_preserves_categories_offsets_overlap_and_source_eligibilit
 
 
 @pytest.mark.v02_adapter("cli", "SleepObservationStatus")
+@pytest.mark.v03_adapter("cli", "SleepDays")
 def test_sleep_days_cli_uses_the_shared_selection(tmp_path: Path, capsys) -> None:
     xml = "".join(
         (

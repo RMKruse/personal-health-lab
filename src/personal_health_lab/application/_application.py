@@ -291,6 +291,14 @@ class SnapshotDateSelection:
             raise ConfigurationError("Startdatum darf nicht nach dem Enddatum liegen.")
 
 
+@dataclass(frozen=True, slots=True)
+class SnapshotSelection:
+    snapshot_ref: SnapshotRef | None = None
+
+
+_ACTIVE_SNAPSHOT_SELECTION = SnapshotSelection()
+
+
 def _resolve_medication_local_datetime(day: date, local_time: time, timezone: str) -> datetime:
     zone = ZoneInfo(timezone)
     local = datetime.combine(day, local_time)
@@ -442,7 +450,33 @@ class MedicationRegimeRevise:
     as_needed_medications: tuple[AsNeededMedication, ...] = ()
 
 
-MedicationRegimeIntent = MedicationRegimeCreate | MedicationRegimeRevise
+@dataclass(frozen=True, slots=True)
+class MedicationRegimeWithdraw:
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ConfigurationError("Regimerücknahme verlangt einen Grund.")
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRegimeRestore:
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId
+    starts_at: datetime
+    timezone: str
+    scheduled_doses: tuple[ScheduledDose, ...]
+    as_needed_medications: tuple[AsNeededMedication, ...] = ()
+
+
+MedicationRegimeIntent = (
+    MedicationRegimeCreate
+    | MedicationRegimeRevise
+    | MedicationRegimeWithdraw
+    | MedicationRegimeRestore
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -452,6 +486,8 @@ class ReviseMedicationRegime:
     def __post_init__(self) -> None:
         if not isinstance(self.intent, get_args(MedicationRegimeIntent)):
             raise ConfigurationError("Unbekannte Medikamentenregimeabsicht.")
+        if isinstance(self.intent, MedicationRegimeWithdraw):
+            return
         try:
             ZoneInfo(self.intent.timezone)
         except Exception as error:
@@ -488,6 +524,8 @@ class MedicationDeviationCreate:
 class MedicationDeviationRevise:
     logical_id: MedicationLogicalId
     expected_revision_id: MedicationRevisionId
+    regime_logical_id: MedicationLogicalId
+    scheduled_at: datetime
     actual_intakes: tuple[MedicationActualIntake, ...]
 
 
@@ -506,6 +544,8 @@ class MedicationDeviationWithdraw:
 class MedicationDeviationRestore:
     logical_id: MedicationLogicalId
     expected_revision_id: MedicationRevisionId
+    regime_logical_id: MedicationLogicalId
+    scheduled_at: datetime
     actual_intakes: tuple[MedicationActualIntake, ...]
 
 
@@ -525,7 +565,7 @@ class ReviseMedicationDeviation:
         if not isinstance(self.intent, get_args(MedicationDeviationIntent)):
             raise ConfigurationError("Unbekannte Einnahmeabweichungsabsicht.")
         if (
-            isinstance(self.intent, MedicationDeviationCreate)
+            not isinstance(self.intent, MedicationDeviationWithdraw)
             and self.intent.scheduled_at.tzinfo is None
         ):
             raise ConfigurationError("Geplantes Dosisvorkommen muss zeitzonenbewusst sein.")
@@ -585,6 +625,8 @@ class AsNeededIntakeCreate:
 class AsNeededIntakeRevise:
     logical_id: MedicationLogicalId
     expected_revision_id: MedicationRevisionId
+    regime_logical_id: MedicationLogicalId
+    entry_id: MedicationPlanEntryId
     taken_at: datetime
     amount: Decimal
     reason_category_logical_id: MedicationLogicalId | None = None
@@ -935,9 +977,37 @@ class CustomContextPeriodRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class IllnessCategoryRecord:
+    logical_id: ContextLogicalId
+    revision_id: ContextRevisionId
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class IllnessPeriodRecord:
+    logical_id: ContextLogicalId
+    revision_id: ContextRevisionId
+    category_logical_id: ContextLogicalId
+    start_date: date
+    end_date: date | None
+    severity: IllnessSeverity
+
+
+@dataclass(frozen=True, slots=True)
+class DailyStressRecord:
+    logical_id: ContextLogicalId
+    revision_id: ContextRevisionId
+    day: date
+    level: StressLevel
+
+
+@dataclass(frozen=True, slots=True)
 class ContextRecords:
     snapshot_ref: SnapshotRef | None
     coverage_start: ContextCoverageStartRecord | None
+    illness_categories: tuple[IllnessCategoryRecord, ...] = ()
+    illness_periods: tuple[IllnessPeriodRecord, ...] = ()
+    daily_stress: tuple[DailyStressRecord, ...] = ()
     custom_labels: tuple[CustomContextLabelRecord, ...] = ()
     custom_periods: tuple[CustomContextPeriodRecord, ...] = ()
 
@@ -947,7 +1017,21 @@ class ContextAuditRevision:
     revision_id: ContextRevisionId
     previous_revision_id: ContextRevisionId | None
     state: Literal["active", "withdrawn"]
+    object_kind: Literal[
+        "context_coverage_start",
+        "illness_category",
+        "illness_period",
+        "daily_stress",
+        "custom_context_label",
+        "custom_context_period",
+    ]
     start_date: date | None
+    name: str | None = None
+    category_logical_id: ContextLogicalId | None = None
+    end_date: date | None = None
+    severity: IllnessSeverity | None = None
+    stress_level: StressLevel | None = None
+    note: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1021,9 +1105,11 @@ class MedicationPlan:
 class MedicationAuditRevision:
     revision_id: MedicationRevisionId
     previous_revision_id: MedicationRevisionId | None
+    state: Literal["active", "withdrawn"]
     starts_at: datetime
     timezone: str
     scheduled_doses: tuple[ScheduledDose, ...]
+    as_needed_medications: tuple[AsNeededMedication, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1944,6 +2030,7 @@ WriteRequest = (
     | CreatePlausibilityRuleVersion
     | RunHistoricalReview
     | RunRestingHeartRateAnalysis
+    | CreateActivityDerivationVersion
     | ReviseContextCoverageStart
     | ReviseIllnessCategory
     | ReviseIllnessPeriod
@@ -2106,71 +2193,8 @@ class HistoricalReviewPlan:
 @dataclass(frozen=True, slots=True)
 class ManualContextRevisionPlan:
     intent: Literal["create", "revise", "withdraw", "restore"]
-    logical_id: ContextLogicalId
-    expected_revision_id: ContextRevisionId | None
-    start_date: date | None
-    withdrawal_reason: str | None
-    base_snapshot_ref: SnapshotRef | None
-    snapshot_as_of: datetime
-    context_timezone: str
-
-
-@dataclass(frozen=True, slots=True)
-class MedicationRegimePlan:
-    intent: Literal["create", "revise"]
-    logical_id: MedicationLogicalId
-    expected_revision_id: MedicationRevisionId | None
-    starts_at: datetime
-    timezone: str
-    scheduled_doses: tuple[ScheduledDose, ...]
-    as_needed_medications: tuple[AsNeededMedication, ...]
-    base_snapshot_ref: SnapshotRef | None
-    medication_as_of: datetime
-
-
-@dataclass(frozen=True, slots=True)
-class MedicationDeviationPlan:
-    intent: Literal["create", "revise", "withdraw", "restore"]
-    logical_id: MedicationLogicalId
-    expected_revision_id: MedicationRevisionId | None
-    regime_logical_id: MedicationLogicalId
-    scheduled_at: datetime
-    actual_intakes: tuple[MedicationActualIntake, ...]
-    withdrawal_reason: str | None
-    base_snapshot_ref: SnapshotRef | None
-    medication_as_of: datetime
-
-
-@dataclass(frozen=True, slots=True)
-class AsNeededIntakePlan:
-    intent: Literal["create", "revise", "withdraw", "restore"]
-    logical_id: MedicationLogicalId
-    expected_revision_id: MedicationRevisionId | None
-    regime_logical_id: MedicationLogicalId
-    entry_id: MedicationPlanEntryId
-    taken_at: datetime
-    amount: Decimal
-    reason_category_logical_id: MedicationLogicalId | None
-    withdrawal_reason: str | None
-    base_snapshot_ref: SnapshotRef | None
-    medication_as_of: datetime
-
-
-@dataclass(frozen=True, slots=True)
-class IntakeReasonCategoryPlan:
-    intent: Literal["create", "revise", "withdraw", "restore"]
-    logical_id: MedicationLogicalId
-    expected_revision_id: MedicationRevisionId | None
-    name: str | None
-    withdrawal_reason: str | None
-    base_snapshot_ref: SnapshotRef | None
-    medication_as_of: datetime
-
-
-@dataclass(frozen=True, slots=True)
-class IllnessRevisionPlan:
-    intent: Literal["create", "revise", "withdraw", "restore"]
     object_kind: Literal[
+        "context_coverage_start",
         "illness_category",
         "illness_period",
         "daily_stress",
@@ -2190,6 +2214,74 @@ class IllnessRevisionPlan:
     base_snapshot_ref: SnapshotRef | None
     snapshot_as_of: datetime
     context_timezone: str
+    context_as_of_date: date
+    colliding_logical_ids: tuple[ContextLogicalId, ...]
+    referenced_logical_ids: tuple[ContextLogicalId, ...]
+    affected_start_date: date | None
+    affected_end_date: date | None
+
+
+@dataclass(frozen=True, slots=True)
+class MedicationRevisionPlan:
+    intent: Literal["create", "revise", "withdraw", "restore"]
+    object_kind: Literal[
+        "medication_regime",
+        "medication_deviation",
+        "as_needed_intake",
+        "intake_reason_category",
+    ]
+    logical_id: MedicationLogicalId
+    expected_revision_id: MedicationRevisionId | None
+    starts_at: datetime | None
+    timezone: str | None
+    scheduled_doses: tuple[ScheduledDose, ...]
+    as_needed_medications: tuple[AsNeededMedication, ...]
+    regime_logical_id: MedicationLogicalId | None
+    scheduled_at: datetime | None
+    actual_intakes: tuple[MedicationActualIntake, ...]
+    entry_id: MedicationPlanEntryId | None
+    taken_at: datetime | None
+    amount: Decimal | None
+    reason_category_logical_id: MedicationLogicalId | None
+    name: str | None
+    withdrawal_reason: str | None
+    base_snapshot_ref: SnapshotRef | None
+    medication_as_of: datetime
+    colliding_logical_ids: tuple[MedicationLogicalId, ...]
+    referenced_logical_ids: tuple[MedicationLogicalId, ...]
+    affected_start_date: date | None
+    affected_end_date: date | None
+
+
+MedicationRegimePlan = MedicationRevisionPlan
+MedicationDeviationPlan = MedicationRevisionPlan
+AsNeededIntakePlan = MedicationRevisionPlan
+IntakeReasonCategoryPlan = MedicationRevisionPlan
+IllnessRevisionPlan = ManualContextRevisionPlan
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityDerivationPlan:
+    active_version: ActivityDerivationVersion
+    proposed_version: ActivityDerivationVersion
+    base_snapshot_ref: SnapshotRef | None
+    affected_projections: tuple[Literal["activity_days", "workouts"], ...]
+
+    @property
+    def active_version_id(self) -> str:
+        return self.active_version.version_id
+
+    @property
+    def proposed_version_id(self) -> str:
+        return self.proposed_version.version_id
+
+    @property
+    def coverage_gap_minutes(self) -> int:
+        return self.proposed_version.coverage_gap_minutes
+
+    @property
+    def source_classifier_version(self) -> str:
+        return self.proposed_version.source_classifier_version
 
 
 @dataclass(frozen=True, slots=True)
@@ -2215,11 +2307,8 @@ WritePlanDetails = (
     | HistoricalReviewPlan
     | RestingHeartRateAnalysisPlan
     | ManualContextRevisionPlan
-    | MedicationRegimePlan
-    | MedicationDeviationPlan
-    | AsNeededIntakePlan
-    | IntakeReasonCategoryPlan
-    | IllnessRevisionPlan
+    | MedicationRevisionPlan
+    | ActivityDerivationPlan
 )
 
 
@@ -2509,52 +2598,31 @@ class HistoricalReviewReceipt:
 
 @dataclass(frozen=True, slots=True)
 class ManualContextRevisionReceipt:
-    operation_id: OperationId
     logical_id: ContextLogicalId
     revision_id: ContextRevisionId
     snapshot_ref: SnapshotRef
     status: ImportStatus = ImportStatus.COMMITTED
-    diagnostics: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
-class MedicationRegimeReceipt:
-    operation_id: OperationId
+class MedicationRevisionReceipt:
     logical_id: MedicationLogicalId
     revision_id: MedicationRevisionId
     snapshot_ref: SnapshotRef
     status: ImportStatus = ImportStatus.COMMITTED
-    diagnostics: tuple[str, ...] = ()
+
+
+MedicationRegimeReceipt = MedicationRevisionReceipt
+MedicationDeviationReceipt = MedicationRevisionReceipt
+AsNeededIntakeReceipt = MedicationRevisionReceipt
+IntakeReasonCategoryReceipt = MedicationRevisionReceipt
 
 
 @dataclass(frozen=True, slots=True)
-class MedicationDeviationReceipt:
-    operation_id: OperationId
-    logical_id: MedicationLogicalId
-    revision_id: MedicationRevisionId
+class ActivityDerivationReceipt:
+    version_id: str
     snapshot_ref: SnapshotRef
     status: ImportStatus = ImportStatus.COMMITTED
-    diagnostics: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class AsNeededIntakeReceipt:
-    operation_id: OperationId
-    logical_id: MedicationLogicalId
-    revision_id: MedicationRevisionId
-    snapshot_ref: SnapshotRef
-    status: ImportStatus = ImportStatus.COMMITTED
-    diagnostics: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class IntakeReasonCategoryReceipt:
-    operation_id: OperationId
-    logical_id: MedicationLogicalId
-    revision_id: MedicationRevisionId
-    snapshot_ref: SnapshotRef
-    status: ImportStatus = ImportStatus.COMMITTED
-    diagnostics: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -2594,10 +2662,8 @@ WriteResult = (
     | PlausibilityRuleVersionReceipt
     | HistoricalReviewReceipt
     | ManualContextRevisionReceipt
-    | MedicationRegimeReceipt
-    | MedicationDeviationReceipt
-    | AsNeededIntakeReceipt
-    | IntakeReasonCategoryReceipt
+    | MedicationRevisionReceipt
+    | ActivityDerivationReceipt
     | AnalysisReceipt
     | WriteNoChange
     | WriteNotStarted
@@ -2940,9 +3006,7 @@ class HealthLab:
             "steps": diagnostics.steps,
             "target_version": diagnostics.target_version,
             "snapshot_source_version": diagnostics.snapshot_source_version,
-            "snapshot_as_of": (
-                None if snapshot_as_of is None else snapshot_as_of.isoformat()
-            ),
+            "snapshot_as_of": (None if snapshot_as_of is None else snapshot_as_of.isoformat()),
             "snapshot_steps": diagnostics.snapshot_steps,
             "snapshot_target_version": diagnostics.snapshot_target_version,
             "existing_analyses_become_stale": active_snapshot is not None,
@@ -3246,7 +3310,9 @@ class HealthLab:
         self, request: CreateActivityDerivationVersion
     ) -> WritePlan:
         settings = self.load_activity_settings()
+        snapshot = self._store.load_active_snapshot_id() if self._store is not None else None
         payload = {
+            "base_snapshot_ref": None if snapshot is None else str(snapshot),
             "coverage_gap_minutes": request.coverage_gap_minutes,
             "previous_version_id": settings.active_version.version_id,
             "source_classifier_version": _ACTIVITY_SOURCE_CLASSIFIER_VERSION,
@@ -3254,17 +3320,20 @@ class HealthLab:
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return WritePlan(
             PlanFingerprint(hashlib.sha256(b"plan:" + encoded).hexdigest()),
-            PlausibilityRuleVersionPlan(
-                settings.active_version.version_id,
-                hashlib.sha256(b"activity-derivation:" + encoded).hexdigest(),
-                self._store.load_active_snapshot_id() if self._store is not None else None,
+            ActivityDerivationPlan(
+                settings.active_version,
+                ActivityDerivationVersion(
+                    hashlib.sha256(b"activity-derivation:" + encoded).hexdigest(),
+                    request.coverage_gap_minutes,
+                    _ACTIVITY_SOURCE_CLASSIFIER_VERSION,
+                ),
+                snapshot,
+                ("activity_days", "workouts"),
             ),
             WritePreflight(WriteApproval(WriteApprovalStatus.READY)),
         )
 
-    def _with_snapshot_capacity(
-        self, plan: WritePlan, method_id: CapacityMethodId
-    ) -> WritePlan:
+    def _with_snapshot_capacity(self, plan: WritePlan, method_id: CapacityMethodId) -> WritePlan:
         assert self._store is not None
         capacity = self._store.preflight_snapshot_write(
             method_id=method_id,
@@ -3388,6 +3457,13 @@ class HealthLab:
             "base_snapshot_ref": None if snapshot is None else str(snapshot),
             "snapshot_as_of": snapshot_as_of.isoformat(),
             "context_timezone": timezone,
+            "context_as_of_date": snapshot_as_of.date().isoformat(),
+            "collisions": (),
+            "references": (),
+            "affected_start_date": None
+            if start_date is None
+            else start_date.isoformat(),
+            "affected_end_date": snapshot_as_of.date().isoformat(),
             "preflight": {
                 "approval": "blocked" if blocked else ("no_change" if no_change else "ready"),
                 "diagnostics": diagnostics,
@@ -3399,13 +3475,25 @@ class HealthLab:
             ),
             ManualContextRevisionPlan(
                 kind,
+                "context_coverage_start",
                 logical_id,
                 expected_revision_id,
+                None,
+                None,
                 start_date,
+                None,
+                None,
+                None,
+                None,
                 withdrawal_reason,
                 snapshot,
                 snapshot_as_of,
                 timezone,
+                snapshot_as_of.date(),
+                (),
+                (),
+                start_date if start_date is not None else getattr(current, "start_date", None),
+                snapshot_as_of.date(),
             ),
             WritePreflight(
                 WriteApproval(
@@ -3423,17 +3511,60 @@ class HealthLab:
         snapshot = self._store.load_active_snapshot_id()
         intent = request.intent
         if isinstance(intent, MedicationRegimeCreate):
-            kind: Literal["create", "revise"] = "create"
+            kind: Literal["create", "revise", "withdraw", "restore"] = "create"
             expected = None
             logical_id = MedicationLogicalId(
                 hashlib.sha256(
                     repr((intent.starts_at, intent.timezone, intent.scheduled_doses)).encode()
                 ).hexdigest()[:32]
             )
+        elif isinstance(intent, MedicationRegimeRestore):
+            kind, logical_id, expected = "restore", intent.logical_id, intent.expected_revision_id
+        elif isinstance(intent, MedicationRegimeWithdraw):
+            kind, logical_id, expected = "withdraw", intent.logical_id, intent.expected_revision_id
         else:
             kind, logical_id, expected = "revise", intent.logical_id, intent.expected_revision_id
         medication_as_of = self._store.load_medication_as_of(snapshot)
         current = self._store.load_medication_regime(snapshot, str(logical_id))
+        audit = self._store.load_medication_regime_audit(str(logical_id))
+        if isinstance(intent, MedicationRegimeWithdraw):
+            starts_at = current.starts_at if current is not None else medication_as_of
+            timezone = current.timezone if current is not None else "UTC"
+            scheduled_doses = (
+                ()
+                if current is None
+                else tuple(
+                    ScheduledDose(
+                        name,
+                        Decimal(amount),
+                        unit,
+                        local_time,
+                        frozenset(map(Weekday, days)),
+                    )
+                    for name, amount, unit, local_time, days in current.scheduled_doses
+                )
+            )
+            requested_as_needed = (
+                ()
+                if current is None
+                else tuple(
+                    AsNeededMedication(
+                        name,
+                        Decimal(amount),
+                        unit,
+                        tuple(MedicationLogicalId(item) for item in reason_ids),
+                        MedicationPlanEntryId(entry_id),
+                    )
+                    for name, amount, unit, reason_ids, entry_id in current.as_needed_medications
+                )
+            )
+            withdrawal_reason = intent.reason.strip()
+        else:
+            starts_at = intent.starts_at
+            timezone = intent.timezone
+            scheduled_doses = intent.scheduled_doses
+            requested_as_needed = intent.as_needed_medications
+            withdrawal_reason = None
         as_needed_medications = tuple(
             item
             if item.entry_id is not None
@@ -3443,47 +3574,71 @@ class HealthLab:
                     hashlib.sha256(repr((logical_id, index, item)).encode()).hexdigest()[:32]
                 ),
             )
-            for index, item in enumerate(intent.as_needed_medications)
+            for index, item in enumerate(requested_as_needed)
         )
         active_regimes = self._store.load_active_medication_regimes(snapshot)
-        blocked = snapshot is None or intent.starts_at.astimezone(
-            UTC
-        ) > medication_as_of.astimezone(UTC)
+        blocked = snapshot is None or (
+            kind != "withdraw" and starts_at.astimezone(UTC) > medication_as_of.astimezone(UTC)
+        )
         diagnostics = ("medication_requires_snapshot",) if snapshot is None else ()
         if not blocked and (
-            (kind == "create" and current is not None)
-            or (kind == "revise" and (current is None or current.revision_id != str(expected)))
+            (kind == "create" and (current is not None or audit))
+            or (
+                kind in {"revise", "withdraw"}
+                and (current is None or current.revision_id != str(expected))
+            )
+            or (
+                kind == "restore"
+                and (
+                    current is not None
+                    or not audit
+                    or audit[-1].revision_id != str(expected)
+                    or audit[-1].state != "withdrawn"
+                )
+            )
         ):
             blocked, diagnostics = True, ("medication_revision_changed",)
         if (
             not blocked
             and kind == "create"
-            and any(regime.starts_at == intent.starts_at for regime in active_regimes)
+            and any(regime.starts_at == starts_at for regime in active_regimes)
         ):
             blocked, diagnostics = True, ("medication_start_exists",)
-        if not blocked and kind == "revise":
-            invalid_reference = any(
-                not any(
-                    _resolve_medication_local_datetime(
-                        deviation.scheduled_at.astimezone(ZoneInfo(intent.timezone)).date(),
-                        dose.local_time,
-                        intent.timezone,
-                    )
-                    == deviation.scheduled_at
-                    for dose in intent.scheduled_doses
-                    if Weekday(
-                        deviation.scheduled_at.astimezone(ZoneInfo(intent.timezone))
-                        .strftime("%A")
-                        .lower()
-                    )
-                    in dose.weekdays
-                )
+        if not blocked and kind in {"revise", "withdraw"}:
+            referenced_deviations = tuple(
+                deviation
                 for deviation in self._store.load_active_medication_deviations(snapshot)
                 if deviation.regime_logical_id == str(logical_id)
-            ) or any(
-                not any(str(item.entry_id) == intake.entry_id for item in as_needed_medications)
+            )
+            referenced_intakes = tuple(
+                intake
                 for intake in self._store.load_active_as_needed_intakes(snapshot)
                 if intake.regime_logical_id == str(logical_id)
+            )
+            invalid_reference = (
+                (kind == "withdraw" and bool(referenced_deviations or referenced_intakes))
+                or any(
+                    not any(
+                        _resolve_medication_local_datetime(
+                            deviation.scheduled_at.astimezone(ZoneInfo(timezone)).date(),
+                            dose.local_time,
+                            timezone,
+                        )
+                        == deviation.scheduled_at
+                        for dose in scheduled_doses
+                        if Weekday(
+                            deviation.scheduled_at.astimezone(ZoneInfo(timezone))
+                            .strftime("%A")
+                            .lower()
+                        )
+                        in dose.weekdays
+                    )
+                    for deviation in referenced_deviations
+                )
+                or any(
+                    not any(str(item.entry_id) == intake.entry_id for item in as_needed_medications)
+                    for intake in referenced_intakes
+                )
             )
             if invalid_reference:
                 blocked, diagnostics = True, ("medication_reference_invalid",)
@@ -3497,8 +3652,8 @@ class HealthLab:
             not blocked
             and kind == "revise"
             and current is not None
-            and current.starts_at == intent.starts_at
-            and current.timezone == intent.timezone
+            and current.starts_at == starts_at
+            and current.timezone == timezone
             and current.scheduled_doses
             == tuple(
                 (
@@ -3508,7 +3663,7 @@ class HealthLab:
                     dose.local_time,
                     tuple(sorted(day.value for day in dose.weekdays)),
                 )
-                for dose in intent.scheduled_doses
+                for dose in scheduled_doses
             )
             and current.as_needed_medications
             == tuple(
@@ -3526,8 +3681,8 @@ class HealthLab:
             "intent": kind,
             "logical_id": str(logical_id),
             "expected_revision_id": None if expected is None else str(expected),
-            "starts_at": intent.starts_at.isoformat(),
-            "timezone": intent.timezone,
+            "starts_at": starts_at.isoformat(),
+            "timezone": timezone,
             "doses": [
                 (
                     dose.medication_name,
@@ -3536,7 +3691,7 @@ class HealthLab:
                     dose.local_time.isoformat(),
                     sorted(dose.weekdays),
                 )
-                for dose in intent.scheduled_doses
+                for dose in scheduled_doses
             ],
             "as_needed": [
                 (
@@ -3548,8 +3703,14 @@ class HealthLab:
                 )
                 for item in as_needed_medications
             ],
+            "withdrawal_reason": withdrawal_reason,
             "base_snapshot_ref": None if snapshot is None else str(snapshot),
             "medication_as_of": medication_as_of.isoformat(),
+            "references": tuple(
+                str(category_id)
+                for item in as_needed_medications
+                for category_id in item.preferred_reason_category_ids
+            ),
             "diagnostics": diagnostics,
             "approval": "no_change" if no_change else ("blocked" if blocked else "ready"),
         }
@@ -3559,16 +3720,34 @@ class HealthLab:
                     json.dumps(payload, sort_keys=True, default=str).encode()
                 ).hexdigest()
             ),
-            MedicationRegimePlan(
+            MedicationRevisionPlan(
                 kind,
+                "medication_regime",
                 logical_id,
                 expected,
-                intent.starts_at,
-                intent.timezone,
-                intent.scheduled_doses,
+                starts_at,
+                timezone,
+                scheduled_doses,
                 as_needed_medications,
+                None,
+                None,
+                (),
+                None,
+                None,
+                None,
+                None,
+                None,
+                withdrawal_reason,
                 snapshot,
                 medication_as_of,
+                (),
+                tuple(
+                    category_id
+                    for item in as_needed_medications
+                    for category_id in item.preferred_reason_category_ids
+                ),
+                None if starts_at is None else starts_at.date(),
+                medication_as_of.date(),
             ),
             WritePreflight(
                 WriteApproval(
@@ -3612,11 +3791,16 @@ class HealthLab:
             if current is None and isinstance(intent, MedicationDeviationRestore):
                 audit = self._store.load_medication_deviation_audit(str(logical_id))
                 current = audit[-1] if audit else None
-            regime_id = MedicationLogicalId(current.regime_logical_id) if current else logical_id
-            scheduled_at = current.scheduled_at if current else as_of
-            actual_intakes = (
-                () if isinstance(intent, MedicationDeviationWithdraw) else intent.actual_intakes
-            )
+            if isinstance(intent, MedicationDeviationWithdraw):
+                regime_id = (
+                    MedicationLogicalId(current.regime_logical_id) if current else logical_id
+                )
+                scheduled_at = current.scheduled_at if current else as_of
+                actual_intakes = ()
+            else:
+                regime_id = intent.regime_logical_id
+                scheduled_at = intent.scheduled_at
+                actual_intakes = intent.actual_intakes
             withdrawal_reason = (
                 intent.reason if isinstance(intent, MedicationDeviationWithdraw) else None
             )
@@ -3685,6 +3869,7 @@ class HealthLab:
             ],
             "base_snapshot_ref": None if snapshot is None else str(snapshot),
             "medication_as_of": as_of.isoformat(),
+            "references": (str(regime_id),),
             "diagnostics": diagnostics,
             "approval": "no_change" if no_change else ("blocked" if blocked else "ready"),
         }
@@ -3692,16 +3877,30 @@ class HealthLab:
             PlanFingerprint(
                 hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
             ),
-            MedicationDeviationPlan(
+            MedicationRevisionPlan(
                 cast(Literal["create", "revise", "withdraw", "restore"], kind),
+                "medication_deviation",
                 logical_id,
                 expected,
+                None,
+                None,
+                (),
+                (),
                 regime_id,
                 scheduled_at,
                 actual_intakes,
+                None,
+                None,
+                None,
+                None,
+                None,
                 withdrawal_reason,
                 snapshot,
                 as_of,
+                (),
+                (regime_id,),
+                scheduled_at.date(),
+                scheduled_at.date(),
             ),
             WritePreflight(
                 WriteApproval(
@@ -3806,6 +4005,7 @@ class HealthLab:
             "withdrawal_reason": withdrawal_reason,
             "base_snapshot_ref": None if snapshot is None else str(snapshot),
             "medication_as_of": as_of.isoformat(),
+            "references": (),
             "diagnostics": diagnostics,
             "approval": "no_change" if no_change else ("blocked" if blocked else "ready"),
         }
@@ -3813,8 +4013,30 @@ class HealthLab:
             PlanFingerprint(
                 hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
             ),
-            IntakeReasonCategoryPlan(
-                kind, logical_id, expected, name, withdrawal_reason, snapshot, as_of
+            MedicationRevisionPlan(
+                kind,
+                "intake_reason_category",
+                logical_id,
+                expected,
+                None,
+                None,
+                (),
+                (),
+                None,
+                None,
+                (),
+                None,
+                None,
+                None,
+                None,
+                name,
+                withdrawal_reason,
+                snapshot,
+                as_of,
+                (),
+                (),
+                None,
+                as_of.date(),
             ),
             WritePreflight(
                 WriteApproval(
@@ -3859,15 +4081,17 @@ class HealthLab:
             current = self._store.load_as_needed_intake(snapshot, str(logical_id))
             audit = self._store.load_as_needed_intake_audit(str(logical_id))
             source = current if current is not None else (audit[-1] if audit else None)
-            regime_id = (
-                MedicationLogicalId(source.regime_logical_id) if source is not None else logical_id
-            )
-            entry_id = (
-                MedicationPlanEntryId(source.entry_id)
-                if source is not None
-                else MedicationPlanEntryId(str(logical_id))
-            )
             if isinstance(intent, AsNeededIntakeWithdraw):
+                regime_id = (
+                    MedicationLogicalId(source.regime_logical_id)
+                    if source is not None
+                    else logical_id
+                )
+                entry_id = (
+                    MedicationPlanEntryId(source.entry_id)
+                    if source is not None
+                    else MedicationPlanEntryId(str(logical_id))
+                )
                 taken_at = source.taken_at if source is not None else as_of
                 amount = Decimal(source.amount) if source is not None else Decimal("1")
                 category_id = (
@@ -3877,6 +4101,7 @@ class HealthLab:
                 )
                 withdrawal_reason = intent.reason.strip()
             else:
+                regime_id, entry_id = intent.regime_logical_id, intent.entry_id
                 taken_at, amount, category_id = (
                     intent.taken_at,
                     intent.amount,
@@ -3956,6 +4181,8 @@ class HealthLab:
             "withdrawal_reason": withdrawal_reason,
             "base_snapshot_ref": None if snapshot is None else str(snapshot),
             "medication_as_of": as_of.isoformat(),
+            "references": (str(regime_id),)
+            + (() if category_id is None else (str(category_id),)),
             "diagnostics": diagnostics,
             "approval": "no_change" if no_change else ("blocked" if blocked else "ready"),
         }
@@ -3963,18 +4190,30 @@ class HealthLab:
             PlanFingerprint(
                 hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
             ),
-            AsNeededIntakePlan(
+            MedicationRevisionPlan(
                 kind,
+                "as_needed_intake",
                 logical_id,
                 expected,
+                None,
+                None,
+                (),
+                (),
                 regime_id,
+                None,
+                (),
                 entry_id,
                 taken_at,
                 amount,
                 category_id,
+                None,
                 withdrawal_reason,
                 snapshot,
                 as_of,
+                (),
+                (regime_id,) + (() if category_id is None else (category_id,)),
+                taken_at.date(),
+                taken_at.date(),
             ),
             WritePreflight(
                 WriteApproval(
@@ -4056,6 +4295,7 @@ class HealthLab:
         active = self._store.load_active_illness(snapshot)
         current = next((value for value in active if value.logical_id == str(logical_id)), None)
         audit = self._store.load_illness_revisions(str(logical_id))
+        colliding_logical_ids: list[ContextLogicalId] = []
         blocked = snapshot is None
         diagnostics: tuple[str, ...] = ("context_requires_snapshot",) if blocked else ()
         if name is not None and (
@@ -4065,14 +4305,15 @@ class HealthLab:
         if note is not None and (len(note) > 1000 or any(ord(char) < 32 for char in note)):
             blocked, diagnostics = True, ("invalid_context_note",)
         if (
-            object_kind == "custom_context_label"
+            object_kind in {"illness_category", "custom_context_label"}
             and name is not None
-            and self._store.is_custom_context_label_name_reserved(
-                name,
-                excluding_logical_id=None if kind == "create" else str(logical_id),
-            )
+            and (
+                self._store.is_illness_category_name_reserved
+                if object_kind == "illness_category"
+                else self._store.is_custom_context_label_name_reserved
+            )(name, excluding_logical_id=None if kind == "create" else str(logical_id))
         ):
-            blocked, diagnostics = True, ("custom_context_label_reserved",)
+            blocked, diagnostics = True, (f"{object_kind}_reserved",)
         if start_date is not None and (
             start_date > snapshot_as_of.date() or (end_date is not None and start_date > end_date)
         ):
@@ -4103,18 +4344,22 @@ class HealthLab:
                             snapshot_as_of.date() if value.end_date is None else value.end_date
                         )
                         if value.start_date <= requested_end and start_date <= value_end:
+                            colliding_logical_ids.append(ContextLogicalId(value.logical_id))
                             blocked, diagnostics = True, ("context_period_overlap",)
                             break
         if object_kind == "daily_stress" and not blocked:
             if stress_level is None or start_date is None:
                 blocked, diagnostics = True, ("invalid_daily_stress",)
-            elif any(
-                value.object_kind == "daily_stress"
-                and value.start_date == start_date
-                and value.logical_id != str(logical_id)
-                for value in active
-            ):
-                blocked, diagnostics = True, ("daily_stress_exists",)
+            else:
+                colliding_logical_ids.extend(
+                    ContextLogicalId(value.logical_id)
+                    for value in active
+                    if value.object_kind == "daily_stress"
+                    and value.start_date == start_date
+                    and value.logical_id != str(logical_id)
+                )
+                if colliding_logical_ids:
+                    blocked, diagnostics = True, ("daily_stress_exists",)
         if not blocked:
             if kind == "create":
                 blocked = bool(audit)
@@ -4162,13 +4407,24 @@ class HealthLab:
             "severity": None if severity is None else severity.value,
             "stress": None if stress_level is None else stress_level.value,
             "note": note,
+            "withdrawal_reason": withdrawal_reason,
             "snapshot": None if snapshot is None else str(snapshot),
+            "snapshot_as_of": snapshot_as_of.isoformat(),
+            "timezone": timezone,
+            "collisions": tuple(map(str, colliding_logical_ids)),
+            "references": ()
+            if category_logical_id is None
+            else (str(category_logical_id),),
+            "affected_from": None if start_date is None else start_date.isoformat(),
+            "affected_to": (
+                end_date.isoformat() if end_date is not None else snapshot_as_of.date().isoformat()
+            ),
         }
         return WritePlan(
             PlanFingerprint(
                 hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
             ),
-            IllnessRevisionPlan(
+            ManualContextRevisionPlan(
                 kind,
                 cast(
                     Literal[
@@ -4193,6 +4449,11 @@ class HealthLab:
                 snapshot,
                 snapshot_as_of,
                 timezone,
+                snapshot_as_of.date(),
+                tuple(colliding_logical_ids),
+                () if category_logical_id is None else (category_logical_id,),
+                start_date,
+                end_date if end_date is not None else snapshot_as_of.date(),
             ),
             WritePreflight(
                 WriteApproval(
@@ -4786,6 +5047,8 @@ class HealthLab:
                 current_plan.diagnostics,
                 expected_plan,
             )
+        if current_plan.approval.status is WriteApprovalStatus.NO_CHANGE:
+            raise ConfigurationError("Unveränderte Schreibpläne werden nicht ausgeführt.")
         if isinstance(request, BeginMetadataRestore):
             return self._execute_metadata_restore(request, authorization_plan, expected_plan)
         if isinstance(request, AbortMetadataRestore):
@@ -5445,7 +5708,7 @@ class HealthLab:
         plan: WritePlan,
         expected_plan: PlanFingerprint,
     ) -> WriteReceipt:
-        if not isinstance(plan.details, PlausibilityRuleVersionPlan):
+        if not isinstance(plan.details, ActivityDerivationPlan):
             return self._not_started(
                 plan,
                 WriteNotStartedStatus.PLAN_CHANGED,
@@ -5470,18 +5733,17 @@ class HealthLab:
                 version_id=plan.details.proposed_version_id,
                 coverage_gap_minutes=request.coverage_gap_minutes,
                 source_classifier_version=_ACTIVITY_SOURCE_CLASSIFIER_VERSION,
-                expected_snapshot_id=plan.details.active_snapshot_ref,
+                expected_snapshot_id=plan.details.base_snapshot_ref,
             )
         except StoreError as error:
             raise HealthLabError("Aktivitätsableitung konnte nicht gespeichert werden.") from error
         finally:
             writer.close()
+        assert snapshot_ref is not None
         return WriteReceipt(
             operation_id,
             expected_plan,
-            PlausibilityRuleVersionReceipt(
-                operation_id, plan.details.proposed_version_id, snapshot_ref
-            ),
+            ActivityDerivationReceipt(plan.details.proposed_version_id, snapshot_ref),
             plan.preflight,
         )
 
@@ -5494,10 +5756,6 @@ class HealthLab:
         if not isinstance(plan.details, ManualContextRevisionPlan):
             return self._not_started(
                 plan, WriteNotStartedStatus.PLAN_CHANGED, ("plan_changed",), expected_plan
-            )
-        if plan.approval.status is WriteApprovalStatus.NO_CHANGE:
-            return WriteReceipt(
-                OperationId(uuid4().hex), expected_plan, WriteNoChange(), plan.preflight
             )
         if plan.details.base_snapshot_ref is None:
             return self._not_started(
@@ -5544,7 +5802,6 @@ class HealthLab:
             operation_id,
             expected_plan,
             ManualContextRevisionReceipt(
-                operation_id,
                 ContextLogicalId(str(publication.logical_id)),
                 ContextRevisionId(str(publication.revision_id)),
                 publication.snapshot_id,
@@ -5556,15 +5813,14 @@ class HealthLab:
         self, request: ReviseMedicationRegime, plan: WritePlan, expected_plan: PlanFingerprint
     ) -> WriteReceipt:
         if (
-            not isinstance(plan.details, MedicationRegimePlan)
+            not isinstance(plan.details, MedicationRevisionPlan)
+            or plan.details.object_kind != "medication_regime"
             or plan.details.base_snapshot_ref is None
+            or plan.details.starts_at is None
+            or plan.details.timezone is None
         ):
             return self._not_started(
                 plan, WriteNotStartedStatus.BLOCKED, plan.diagnostics, expected_plan
-            )
-        if plan.approval.status is WriteApprovalStatus.NO_CHANGE:
-            return WriteReceipt(
-                OperationId(uuid4().hex), expected_plan, WriteNoChange(), plan.preflight
             )
         try:
             writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
@@ -5612,6 +5868,7 @@ class HealthLab:
                         )
                         for item in plan.details.as_needed_medications
                     ),
+                    plan.details.withdrawal_reason,
                     plan.details.base_snapshot_ref,
                     plan.details.medication_as_of,
                 )
@@ -5626,7 +5883,6 @@ class HealthLab:
             operation_id,
             expected_plan,
             MedicationRegimeReceipt(
-                operation_id,
                 MedicationLogicalId(str(publication.logical_id)),
                 MedicationRevisionId(str(publication.revision_id)),
                 publication.snapshot_id,
@@ -5638,15 +5894,14 @@ class HealthLab:
         self, request: ReviseMedicationDeviation, plan: WritePlan, expected_plan: PlanFingerprint
     ) -> WriteReceipt:
         if (
-            not isinstance(plan.details, MedicationDeviationPlan)
+            not isinstance(plan.details, MedicationRevisionPlan)
+            or plan.details.object_kind != "medication_deviation"
             or plan.details.base_snapshot_ref is None
+            or plan.details.regime_logical_id is None
+            or plan.details.scheduled_at is None
         ):
             return self._not_started(
                 plan, WriteNotStartedStatus.BLOCKED, plan.diagnostics, expected_plan
-            )
-        if plan.approval.status is WriteApprovalStatus.NO_CHANGE:
-            return WriteReceipt(
-                OperationId(uuid4().hex), expected_plan, WriteNoChange(), plan.preflight
             )
         try:
             writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
@@ -5689,7 +5944,6 @@ class HealthLab:
             operation_id,
             expected_plan,
             MedicationDeviationReceipt(
-                operation_id,
                 MedicationLogicalId(str(publication.logical_id)),
                 MedicationRevisionId(str(publication.revision_id)),
                 publication.snapshot_id,
@@ -5701,15 +5955,12 @@ class HealthLab:
         self, request: ReviseIntakeReasonCategory, plan: WritePlan, expected_plan: PlanFingerprint
     ) -> WriteReceipt:
         if (
-            not isinstance(plan.details, IntakeReasonCategoryPlan)
+            not isinstance(plan.details, MedicationRevisionPlan)
+            or plan.details.object_kind != "intake_reason_category"
             or plan.details.base_snapshot_ref is None
         ):
             return self._not_started(
                 plan, WriteNotStartedStatus.BLOCKED, plan.diagnostics, expected_plan
-            )
-        if plan.approval.status is WriteApprovalStatus.NO_CHANGE:
-            return WriteReceipt(
-                OperationId(uuid4().hex), expected_plan, WriteNoChange(), plan.preflight
             )
         try:
             writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
@@ -5748,7 +5999,6 @@ class HealthLab:
             operation_id,
             expected_plan,
             IntakeReasonCategoryReceipt(
-                operation_id,
                 MedicationLogicalId(str(publication.logical_id)),
                 MedicationRevisionId(str(publication.revision_id)),
                 publication.snapshot_id,
@@ -5760,15 +6010,16 @@ class HealthLab:
         self, request: ReviseAsNeededIntake, plan: WritePlan, expected_plan: PlanFingerprint
     ) -> WriteReceipt:
         if (
-            not isinstance(plan.details, AsNeededIntakePlan)
+            not isinstance(plan.details, MedicationRevisionPlan)
+            or plan.details.object_kind != "as_needed_intake"
             or plan.details.base_snapshot_ref is None
+            or plan.details.regime_logical_id is None
+            or plan.details.entry_id is None
+            or plan.details.taken_at is None
+            or plan.details.amount is None
         ):
             return self._not_started(
                 plan, WriteNotStartedStatus.BLOCKED, plan.diagnostics, expected_plan
-            )
-        if plan.approval.status is WriteApprovalStatus.NO_CHANGE:
-            return WriteReceipt(
-                OperationId(uuid4().hex), expected_plan, WriteNoChange(), plan.preflight
             )
         try:
             writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
@@ -5813,7 +6064,6 @@ class HealthLab:
             operation_id,
             expected_plan,
             AsNeededIntakeReceipt(
-                operation_id,
                 MedicationLogicalId(str(publication.logical_id)),
                 MedicationRevisionId(str(publication.revision_id)),
                 publication.snapshot_id,
@@ -5831,13 +6081,12 @@ class HealthLab:
         plan: WritePlan,
         expected_plan: PlanFingerprint,
     ) -> WriteReceipt:
-        if not isinstance(plan.details, IllnessRevisionPlan):
+        if (
+            not isinstance(plan.details, ManualContextRevisionPlan)
+            or plan.details.object_kind == "context_coverage_start"
+        ):
             return self._not_started(
                 plan, WriteNotStartedStatus.PLAN_CHANGED, ("plan_changed",), expected_plan
-            )
-        if plan.approval.status is WriteApprovalStatus.NO_CHANGE:
-            return WriteReceipt(
-                OperationId(uuid4().hex), expected_plan, WriteNoChange(), plan.preflight
             )
         if plan.details.base_snapshot_ref is None:
             return self._not_started(
@@ -5862,7 +6111,16 @@ class HealthLab:
                 publication=IllnessPublication(
                     operation_id,
                     details.intent,
-                    details.object_kind,
+                    cast(
+                        Literal[
+                            "illness_category",
+                            "illness_period",
+                            "daily_stress",
+                            "custom_context_label",
+                            "custom_context_period",
+                        ],
+                        details.object_kind,
+                    ),
                     StoredContextLogicalId(str(details.logical_id)),
                     None
                     if details.expected_revision_id is None
@@ -5893,7 +6151,6 @@ class HealthLab:
             operation_id,
             expected_plan,
             ManualContextRevisionReceipt(
-                operation_id,
                 ContextLogicalId(str(publication.logical_id)),
                 ContextRevisionId(str(publication.revision_id)),
                 publication.snapshot_id,
@@ -6438,30 +6695,25 @@ class HealthLab:
     @staticmethod
     def _snapshot_capacity_start(plan: WritePlan) -> date | None:
         details = plan.details
-        if isinstance(details, (ManualContextRevisionPlan, IllnessRevisionPlan)):
+        if isinstance(details, ManualContextRevisionPlan):
             return details.start_date
-        if isinstance(details, MedicationRegimePlan):
-            return details.starts_at.date()
-        if isinstance(details, MedicationDeviationPlan):
-            return details.scheduled_at.date()
-        if isinstance(details, AsNeededIntakePlan):
-            return details.taken_at.date()
+        if isinstance(details, MedicationRevisionPlan):
+            value = (
+                details.starts_at
+                if details.object_kind == "medication_regime"
+                else details.scheduled_at
+                if details.object_kind == "medication_deviation"
+                else details.taken_at
+            )
+            return None if value is None else value.date()
         return None
 
     @staticmethod
     def _snapshot_capacity_end(plan: WritePlan) -> date | None:
         details = plan.details
-        if isinstance(details, (ManualContextRevisionPlan, IllnessRevisionPlan)):
+        if isinstance(details, ManualContextRevisionPlan):
             return details.snapshot_as_of.date()
-        if isinstance(
-            details,
-            (
-                MedicationRegimePlan,
-                MedicationDeviationPlan,
-                AsNeededIntakePlan,
-                IntakeReasonCategoryPlan,
-            ),
-        ):
+        if isinstance(details, MedicationRevisionPlan):
             return details.medication_as_of.date()
         return None
 
@@ -6918,16 +7170,58 @@ class HealthLab:
         )
         return DailyContext(snapshot_ref, context_as_of, timezone, days)
 
-    def load_context_records(self, snapshot_ref: SnapshotRef | None = None) -> ContextRecords:
+    def load_context_records(
+        self, selection: SnapshotSelection = _ACTIVE_SNAPSHOT_SELECTION
+    ) -> ContextRecords:
         self._require_ready()
         self._require_open()
         if self._store is None:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
-        selected = self._store.load_active_snapshot_id() if snapshot_ref is None else snapshot_ref
+        selected = (
+            self._store.load_active_snapshot_id()
+            if selection.snapshot_ref is None
+            else selection.snapshot_ref
+        )
         values = self._store.load_active_illness(selected)
         return ContextRecords(
             selected,
             self._context_record(self._store.load_context_coverage_start(selected)),
+            tuple(
+                IllnessCategoryRecord(
+                    ContextLogicalId(value.logical_id),
+                    ContextRevisionId(value.revision_id),
+                    value.name,
+                )
+                for value in values
+                if value.object_kind == "illness_category" and value.name is not None
+            ),
+            tuple(
+                IllnessPeriodRecord(
+                    ContextLogicalId(value.logical_id),
+                    ContextRevisionId(value.revision_id),
+                    ContextLogicalId(value.category_logical_id),
+                    value.start_date,
+                    value.end_date,
+                    IllnessSeverity(value.severity),
+                )
+                for value in values
+                if value.object_kind == "illness_period"
+                and value.category_logical_id is not None
+                and value.start_date is not None
+                and value.severity is not None
+            ),
+            tuple(
+                DailyStressRecord(
+                    ContextLogicalId(value.logical_id),
+                    ContextRevisionId(value.revision_id),
+                    value.start_date,
+                    StressLevel(value.stress_level),
+                )
+                for value in values
+                if value.object_kind == "daily_stress"
+                and value.start_date is not None
+                and value.stress_level is not None
+            ),
             tuple(
                 CustomContextLabelRecord(
                     ContextLogicalId(value.logical_id),
@@ -6959,11 +7253,23 @@ class HealthLab:
         if self._store is None:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
         coverage_revisions = self._store.load_context_coverage_audit(str(logical_id))
-        revisions = (
-            coverage_revisions
-            if coverage_revisions
-            else self._store.load_illness_revisions(str(logical_id))
-        )
+        if coverage_revisions:
+            return ContextAudit(
+                logical_id,
+                tuple(
+                    ContextAuditRevision(
+                        ContextRevisionId(value.revision_id),
+                        None
+                        if value.previous_revision_id is None
+                        else ContextRevisionId(value.previous_revision_id),
+                        value.state,
+                        "context_coverage_start",
+                        value.start_date,
+                    )
+                    for value in coverage_revisions
+                ),
+            )
+        revisions = self._store.load_illness_revisions(str(logical_id))
         return ContextAudit(
             logical_id,
             tuple(
@@ -6973,7 +7279,16 @@ class HealthLab:
                     if value.previous_revision_id is None
                     else ContextRevisionId(value.previous_revision_id),
                     value.state,
+                    value.object_kind,
                     value.start_date,
+                    value.name,
+                    None
+                    if value.category_logical_id is None
+                    else ContextLogicalId(value.category_logical_id),
+                    value.end_date,
+                    None if value.severity is None else IllnessSeverity(value.severity),
+                    None if value.stress_level is None else StressLevel(value.stress_level),
+                    value.note,
                 )
                 for value in revisions
             ),
@@ -7088,12 +7403,18 @@ class HealthLab:
             )
         return MedicationDays(snapshot, as_of, timezone, tuple(days))
 
-    def load_medication_plan(self, snapshot_ref: SnapshotRef | None = None) -> MedicationPlan:
+    def load_medication_plan(
+        self, selection: SnapshotSelection = _ACTIVE_SNAPSHOT_SELECTION
+    ) -> MedicationPlan:
         self._require_ready()
         self._require_open()
         if self._store is None:
             raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
-        selected = self._store.load_active_snapshot_id() if snapshot_ref is None else snapshot_ref
+        selected = (
+            self._store.load_active_snapshot_id()
+            if selection.snapshot_ref is None
+            else selection.snapshot_ref
+        )
         if selected is None:
             return MedicationPlan(None, None, ())
         return MedicationPlan(
@@ -7154,6 +7475,7 @@ class HealthLab:
                         None
                         if value.previous_revision_id is None
                         else MedicationRevisionId(value.previous_revision_id),
+                        value.state,
                         value.starts_at,
                         value.timezone,
                         tuple(
@@ -7165,6 +7487,18 @@ class HealthLab:
                                 frozenset(Weekday(day) for day in weekdays),
                             )
                             for name, amount, unit, local_time, weekdays in value.scheduled_doses
+                        ),
+                        tuple(
+                            AsNeededMedication(
+                                name,
+                                Decimal(amount),
+                                unit,
+                                tuple(MedicationLogicalId(item) for item in preferred),
+                                MedicationPlanEntryId(entry_id),
+                            )
+                            for name, amount, unit, preferred, entry_id in (
+                                value.as_needed_medications
+                            )
                         ),
                     )
                     for value in regimes

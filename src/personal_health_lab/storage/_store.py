@@ -1555,13 +1555,14 @@ class MedicationRevisionId:
 @dataclass(frozen=True, slots=True)
 class MedicationRegimePublication:
     operation_id: OperationId
-    intent: Literal["create", "revise"]
+    intent: Literal["create", "revise", "withdraw", "restore"]
     logical_id: MedicationLogicalId
     expected_revision_id: MedicationRevisionId | None
     starts_at: datetime
     timezone: str
     scheduled_doses: tuple[tuple[str, str, str, time, tuple[str, ...]], ...]
     as_needed_medications: tuple[tuple[str, str, str, tuple[str, ...], str], ...]
+    withdrawal_reason: str | None
     expected_snapshot_id: SnapshotId
     medication_as_of: datetime
 
@@ -1646,6 +1647,7 @@ class StoredMedicationRegime:
     logical_id: str
     revision_id: str
     previous_revision_id: str | None
+    state: Literal["active", "withdrawn"]
     starts_at: datetime
     timezone: str
     scheduled_doses: tuple[tuple[str, str, str, time, tuple[str, ...]], ...]
@@ -2120,7 +2122,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 80),
             name_key TEXT NOT NULL CHECK (length(name_key) BETWEEN 1 AND 80)
         ) STRICT;
-        CREATE UNIQUE INDEX IF NOT EXISTS illness_category_name_reserved
+        CREATE INDEX IF NOT EXISTS illness_category_name_reserved
         ON illness_category_values(name_key);
         CREATE TABLE IF NOT EXISTS daily_stress_values (
             revision_id TEXT PRIMARY KEY REFERENCES manual_context_revisions(revision_id),
@@ -2132,7 +2134,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 80),
             name_key TEXT NOT NULL CHECK (length(name_key) BETWEEN 1 AND 80)
         ) STRICT;
-        CREATE UNIQUE INDEX IF NOT EXISTS custom_context_label_name_reserved
+        CREATE INDEX IF NOT EXISTS custom_context_label_name_reserved
         ON custom_context_label_values(name_key);
         CREATE TABLE IF NOT EXISTS custom_context_period_values (
             revision_id TEXT PRIMARY KEY REFERENCES manual_context_revisions(revision_id),
@@ -3397,9 +3399,7 @@ class LocalStore:
                 ).fetchone()
                 if row is None:
                     return probe_capacity(self._root, None, method_id=method_id)
-                output_bound_bytes = max(
-                    output_bound_bytes, (int(row[0]) + int(row[1])) * 4 * _KIB
-                )
+                output_bound_bytes = max(output_bound_bytes, (int(row[0]) + int(row[1])) * 4 * _KIB)
         except (OSError, StoreError, duckdb.Error, TypeError, ValueError):
             return probe_capacity(self._root, None, method_id=method_id)
         estimate = _snapshot_write_estimate(
@@ -4291,10 +4291,7 @@ class LocalStore:
                 shutil.copyfile(restore_overlay, verified_overlay)
                 verified_overlay.chmod(0o400)
                 with verified_overlay.open("rb") as working:
-                    if (
-                        hashlib.file_digest(working, "sha256").hexdigest()
-                        != restore_overlay_sha256
-                    ):
+                    if hashlib.file_digest(working, "sha256").hexdigest() != restore_overlay_sha256:
                         raise StoreError("restore_working_copy_changed")
             return self._publish_import(
                 operation_id=operation_id,
@@ -4957,9 +4954,7 @@ class LocalStore:
                 )
             _allocation_checkpoint(self._root, "activated")
             if restore_overlay is not None:
-                _publication_fault_point(
-                    self._root, "restore-activation.before_sqlite_commit/v1"
-                )
+                _publication_fault_point(self._root, "restore-activation.before_sqlite_commit/v1")
             _publication_fault_point(self._root, "import.before_sqlite_commit/v1")
         _publication_fault_point(self._root, "import.after_sqlite_commit/v1")
         if restore_overlay is not None:
@@ -5100,7 +5095,9 @@ class LocalStore:
             )
             UNION ALL
             SELECT revision_id FROM medication_regime_revisions current
-            WHERE NOT EXISTS (
+            WHERE current.revision_id IN (
+                SELECT revision_id FROM manual_revision_intents WHERE intent != 'withdraw'
+            ) AND NOT EXISTS (
                 SELECT 1 FROM medication_regime_revisions next
                 WHERE next.previous_revision_id = current.revision_id
             )
@@ -5442,7 +5439,7 @@ class LocalStore:
                     str(row[0]),
                     str(row[1]),
                     str(row[2]),
-                    str(row[3]),
+                    cast(Literal["active", "withdrawn"], str(row[3])),
                     str(row[4]),
                     str(row[5]),
                     None if row[6] is None else float(row[6]),
@@ -6476,6 +6473,24 @@ class LocalStore:
                                                'walking_running_distance', 'active_energy')
                       AND ((v.source_name = 'Apple Watch' AND v.device = 'Apple Watch')
                            OR (v.source_name = 'iPhone' AND v.device = 'iPhone'))
+                    UNION ALL
+                    SELECT c.derived_record_id, 'activity_coverage', 'activity-coverage/v1',
+                           s.identity_candidate_id, s.measurement_version_id,
+                           'coverage_interval'
+                    FROM read_parquet('{paths["activity_coverage_segments"]}') c
+                    JOIN read_parquet('{paths["sleep_intervals"]}') s
+                      ON s.is_selected
+                     AND s.source_start_utc::TIMESTAMPTZ < c.end_utc::TIMESTAMPTZ
+                     AND c.start_utc::TIMESTAMPTZ < s.source_end_utc::TIMESTAMPTZ
+                    UNION ALL
+                    SELECT c.derived_record_id, 'activity_coverage', 'activity-coverage/v1',
+                           w.logical_workout_id, w.workout_version_id, 'coverage_interval'
+                    FROM read_parquet('{paths["activity_coverage_segments"]}') c
+                    JOIN read_parquet('{paths["workouts"]}') w
+                      ON w.source_start_utc::TIMESTAMPTZ < c.end_utc::TIMESTAMPTZ
+                     AND c.start_utc::TIMESTAMPTZ < w.source_end_utc::TIMESTAMPTZ
+                    JOIN read_parquet('{paths["resolved_workouts"]}') r
+                      ON r.selected_workout_version_id = w.workout_version_id
                     UNION ALL
                     SELECT f.derived_record_id, 'workout_feature', 'workout-feature/v1',
                            w.logical_workout_id, w.workout_version_id,
@@ -8820,7 +8835,24 @@ class LocalStore:
               AND v.canonical_type IN ('apple_exercise_time', 'step_count',
                                        'walking_running_distance', 'active_energy')
               AND ((v.source_name = 'Apple Watch' AND v.device = 'Apple Watch')
-                   OR (v.source_name = 'iPhone' AND v.device = 'iPhone'));
+                   OR (v.source_name = 'iPhone' AND v.device = 'iPhone'))
+            UNION ALL
+            SELECT DISTINCT c.derived_record_id, 'activity_coverage', 'activity-coverage/v1',
+                   s.identity_candidate_id, s.measurement_version_id,
+                   'coverage_interval', '{snapshot_ref}', '{derived_ref}'
+            FROM activity_coverage_segments c JOIN sleep_intervals s
+              ON s.is_selected
+             AND s.source_start_utc::TIMESTAMPTZ < c.end_utc::TIMESTAMPTZ
+             AND c.start_utc::TIMESTAMPTZ < s.source_end_utc::TIMESTAMPTZ
+            UNION ALL
+            SELECT DISTINCT c.derived_record_id, 'activity_coverage', 'activity-coverage/v1',
+                   w.logical_workout_id, w.workout_version_id,
+                   'coverage_interval', '{snapshot_ref}', '{derived_ref}'
+            FROM activity_coverage_segments c JOIN workouts w
+              ON w.source_start_utc::TIMESTAMPTZ < c.end_utc::TIMESTAMPTZ
+             AND c.start_utc::TIMESTAMPTZ < w.source_end_utc::TIMESTAMPTZ
+            JOIN resolved_workouts r
+              ON r.selected_workout_version_id = w.workout_version_id;
 
             INSERT INTO derivation_lineage
             SELECT f.derived_record_id, 'workout_feature', 'workout-feature/v1',
@@ -9503,8 +9535,10 @@ class LocalStore:
     ) -> tuple[StoredMedicationRegime, ...]:
         rows = self._metadata.execute(
             "SELECT revision.logical_id, revision.revision_id, revision.previous_revision_id, "
+            "CASE WHEN intent.intent = 'withdraw' THEN 'withdrawn' ELSE 'active' END, "
             "value.starts_at, value.timezone FROM medication_regime_revisions revision "
             "JOIN medication_regime_values value USING (revision_id) "
+            "JOIN manual_revision_intents intent USING (revision_id) "
             + where
             + " ORDER BY value.starts_at, revision.rowid",
             args,
@@ -9544,8 +9578,9 @@ class LocalStore:
                     str(row[0]),
                     str(row[1]),
                     None if row[2] is None else str(row[2]),
-                    datetime.fromisoformat(str(row[3])),
-                    str(row[4]),
+                    cast(Literal["active", "withdrawn"], str(row[3])),
+                    datetime.fromisoformat(str(row[4])),
+                    str(row[5]),
                     doses,
                     as_needed,
                 )
@@ -10065,6 +10100,15 @@ class LocalStore:
             ):
                 raise StoreError("Medikamentenregime existiert bereits.")
             previous = None
+        elif publication.intent == "restore":
+            if (
+                not audit
+                or current is not None
+                or audit[-1].revision_id != str(publication.expected_revision_id)
+                or audit[-1].state != "withdrawn"
+            ):
+                raise StoreError("Medikamentenrevision hat sich geändert.")
+            previous = audit[-1].revision_id
         else:
             if (
                 not audit
@@ -10085,6 +10129,8 @@ class LocalStore:
             ],
             "as_needed": publication.as_needed_medications,
         }
+        if publication.withdrawal_reason is not None:
+            payload["withdrawal_reason"] = publication.withdrawal_reason
         payload_sha256 = _manual_payload_sha256(payload)
         try:
             with self._metadata:
@@ -10105,8 +10151,8 @@ class LocalStore:
                     ),
                 )
                 self._metadata.execute(
-                    "INSERT INTO manual_revision_intents VALUES (?, ?, NULL)",
-                    (str(revision_id), publication.intent),
+                    "INSERT INTO manual_revision_intents VALUES (?, ?, ?)",
+                    (str(revision_id), publication.intent, publication.withdrawal_reason),
                 )
                 self._metadata.execute(
                     "INSERT INTO medication_regime_values VALUES (?, ?, ?)",
@@ -10175,10 +10221,11 @@ class LocalStore:
                     "WHERE logical_id = ?)",
                     (str(snapshot_id), str(publication.logical_id)),
                 )
-                self._metadata.execute(
-                    "INSERT INTO medication_snapshot_bindings VALUES (?, ?)",
-                    (str(snapshot_id), str(revision_id)),
-                )
+                if publication.intent != "withdraw":
+                    self._metadata.execute(
+                        "INSERT INTO medication_snapshot_bindings VALUES (?, ?)",
+                        (str(snapshot_id), str(revision_id)),
+                    )
                 audit_event_id = uuid4().hex
                 self._metadata.execute(
                     "INSERT INTO audit_events VALUES (?, ?, ?, 'manual_medication_revision', ?)",
@@ -10440,6 +10487,24 @@ class LocalStore:
                 """
                 SELECT 1
                 FROM custom_context_label_values value
+                JOIN manual_context_revisions revision USING (revision_id)
+                WHERE value.name_key = ?
+                  AND (? IS NULL OR revision.logical_id != ?)
+                """,
+                (_normalized_context_name(name), excluding_logical_id, excluding_logical_id),
+            ).fetchone()
+            is not None
+        )
+
+    def is_illness_category_name_reserved(
+        self, name: str, *, excluding_logical_id: str | None = None
+    ) -> bool:
+        self._require_open()
+        return (
+            self._metadata.execute(
+                """
+                SELECT 1
+                FROM illness_category_values value
                 JOIN manual_context_revisions revision USING (revision_id)
                 WHERE value.name_key = ?
                   AND (? IS NULL OR revision.logical_id != ?)
@@ -10716,9 +10781,7 @@ class LocalStore:
                 "start": None
                 if publication.start_date is None
                 else publication.start_date.isoformat(),
-                "end": None
-                if publication.end_date is None
-                else publication.end_date.isoformat(),
+                "end": None if publication.end_date is None else publication.end_date.isoformat(),
                 "severity": publication.severity,
                 "stress": publication.stress_level,
                 "note": publication.note,

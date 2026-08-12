@@ -86,6 +86,7 @@ def test_activity_import_preserves_typed_samples_and_assigns_cross_midnight_valu
     assert activity.days[1].exercise_time.value is None
 
 
+@pytest.mark.v03_adapter("cli", "ActivityDays")
 def test_activity_days_cli_projects_the_shared_selection(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -332,8 +333,17 @@ def test_activity_derivation_threshold_is_versioned_and_keeps_old_snapshot_reada
         )
         old_snapshot = imported.result.snapshot_ref
         change = CreateActivityDerivationVersion(coverage_gap_minutes=30)
+        stale_plan = health_lab.preview_write(change)
+        later_import = ImportHealthExport(
+            _package(tmp_path / "later-settings.zip", xml.replace('value="1"', 'value="2"'))
+        )
+        health_lab.execute_write(
+            later_import, expected_plan=health_lab.preview_write(later_import).fingerprint
+        )
+        current_plan = health_lab.preview_write(change)
+        assert current_plan.fingerprint != stale_plan.fingerprint
         receipt = health_lab.execute_write(
-            change, expected_plan=health_lab.preview_write(change).fingerprint
+            change, expected_plan=current_plan.fingerprint
         )
         old = health_lab.load_activity_days(SnapshotDateSelection(snapshot_ref=old_snapshot))
         current = health_lab.load_activity_days(SnapshotDateSelection())
@@ -341,4 +351,5 @@ def test_activity_derivation_threshold_is_versioned_and_keeps_old_snapshot_reada
     assert receipt.result.snapshot_ref != old_snapshot
     assert old.coverage_gap_minutes == 240
     assert current.coverage_gap_minutes == 30
-    assert len(old.measurements) == len(current.measurements) == 2
+    assert len(old.measurements) == 2
+    assert len(current.measurements) == 4

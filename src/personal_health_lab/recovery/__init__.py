@@ -557,6 +557,7 @@ def _manual_payloads_are_valid(connection: sqlite3.Connection) -> bool:
             if stored_intent != intent or not payload_is_valid(revision_id, payload):
                 return False
 
+    regime_intents: dict[str, str] = {}
     for revision_id, previous_id, starts_at, timezone_name in connection.execute(
         "SELECT revision.revision_id, revision.previous_revision_id, value.starts_at, "
         "value.timezone FROM medication_regime_revisions revision "
@@ -579,18 +580,28 @@ def _manual_payloads_are_valid(connection: sqlite3.Connection) -> bool:
                 (revision_id,),
             )
         ]
-        intent = "create" if previous_id is None else "revise"
-        if intents[revision_id] != (intent, None) or not payload_is_valid(
-            revision_id,
-            {
-                "intent": intent,
-                "starts_at": str(starts_at),
-                "timezone": str(timezone_name),
-                "doses": doses,
-                "as_needed": as_needed,
-            },
+        intent, withdrawal_reason = intents[revision_id]
+        previous_intent = None if previous_id is None else regime_intents.get(str(previous_id))
+        if (
+            (previous_id is None) != (intent == "create")
+            or (previous_id is not None and previous_intent is None)
+            or (intent == "restore" and previous_intent != "withdraw")
+            or (intent in {"revise", "withdraw"} and previous_intent == "withdraw")
+            or (intent == "withdraw") != (withdrawal_reason is not None)
         ):
             return False
+        regime_payload: dict[str, object] = {
+            "intent": intent,
+            "starts_at": str(starts_at),
+            "timezone": str(timezone_name),
+            "doses": doses,
+            "as_needed": as_needed,
+        }
+        if withdrawal_reason is not None:
+            regime_payload["withdrawal_reason"] = withdrawal_reason
+        if not payload_is_valid(revision_id, regime_payload):
+            return False
+        regime_intents[revision_id] = intent
     return True
 
 
@@ -655,7 +666,12 @@ def _manual_backup_is_valid(connection: sqlite3.Connection) -> bool:
     }
     expected_bindings: set[tuple[str, str]] = set()
     for kind, (table, has_state) in revision_tables.items():
-        state = "AND current.state = 'active'" if has_state else ""
+        state = (
+            "AND current.state = 'active'"
+            if has_state
+            else "AND NOT EXISTS (SELECT 1 FROM manual_revision_intents intent "
+            "WHERE intent.revision_id = current.revision_id AND intent.intent = 'withdraw')"
+        )
         if has_state and connection.execute(
             f"SELECT 1 FROM {table} WHERE state IS NULL "
             "OR state NOT IN ('active', 'withdrawn') LIMIT 1"

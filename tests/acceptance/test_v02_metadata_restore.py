@@ -33,6 +33,8 @@ from personal_health_lab.application import (
     ImportStatus,
     IntakeReasonCategoryCreate,
     MedicationRegimeCreate,
+    MedicationRegimeRestore,
+    MedicationRegimeWithdraw,
     MetadataRestorePlan,
     MetadataRestoreReceipt,
     MetadataRestoreStatus,
@@ -447,6 +449,55 @@ def test_v03_restore_accepts_a_closed_withdrawn_context_chain(tmp_path: Path) ->
         health_lab.execute_write(
             withdraw, expected_plan=health_lab.preview_write(withdraw).fingerprint
         )
+        request = CreateMetadataBackup(backup)
+        health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        )
+
+    assert _execute_begin(
+        _config(tmp_path / "target"), backup
+    ).status is MetadataRestoreStatus.PENDING
+
+
+@pytest.mark.parametrize("restore_regime", (False, True))
+def test_v03_restore_validates_withdrawn_and_restored_regime_chains(
+    tmp_path: Path, restore_regime: bool
+) -> None:
+    source = _config(tmp_path / "source")
+    package = _source_package(tmp_path / "source.zip", (("regime-chain", 60),))
+    backup = tmp_path / "metadata.sqlite3"
+    with HealthLab.open(source) as health_lab:
+        imported = ImportHealthExport(package)
+        health_lab.execute_write(
+            imported, expected_plan=health_lab.preview_write(imported).fingerprint
+        )
+        values = (
+            datetime.fromisoformat("2024-03-01T00:00:00+01:00"),
+            "Europe/Berlin",
+            (),
+            (),
+        )
+        create = ReviseMedicationRegime(MedicationRegimeCreate(*values))
+        created = health_lab.execute_write(
+            create, expected_plan=health_lab.preview_write(create).fingerprint
+        )
+        withdraw = ReviseMedicationRegime(
+            MedicationRegimeWithdraw(
+                created.result.logical_id, created.result.revision_id, "ended"
+            )
+        )
+        withdrawn = health_lab.execute_write(
+            withdraw, expected_plan=health_lab.preview_write(withdraw).fingerprint
+        )
+        if restore_regime:
+            restore = ReviseMedicationRegime(
+                MedicationRegimeRestore(
+                    withdrawn.result.logical_id, withdrawn.result.revision_id, *values
+                )
+            )
+            health_lab.execute_write(
+                restore, expected_plan=health_lab.preview_write(restore).fingerprint
+            )
         request = CreateMetadataBackup(backup)
         health_lab.execute_write(
             request, expected_plan=health_lab.preview_write(request).fingerprint

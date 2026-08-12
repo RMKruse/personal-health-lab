@@ -87,6 +87,7 @@ def test_workout_correction_persists_through_data_review(tmp_path: Path) -> None
         assert not corrected.workouts[0].review_case_ids
 
 
+@pytest.mark.v03_adapter("cli", "Workouts")
 def test_workouts_cli_serializes_the_shared_projection(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

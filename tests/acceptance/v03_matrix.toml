@@ -1,5 +1,19 @@
 schema_version = 1
 release = "v0.3-delta"
+write_requests = ["ReviseContextCoverageStart", "ReviseIllnessCategory", "ReviseCustomContextLabel", "ReviseIllnessPeriod", "ReviseDailyStress", "ReviseCustomContextPeriod", "ReviseMedicationRegime", "ReviseMedicationDeviation", "ReviseAsNeededIntake", "ReviseIntakeReasonCategory", "CreateActivityDerivationVersion"]
+read_operations = ["load_import_details", "load_weight_nutrition", "load_sleep_days", "load_activity_days", "load_workouts", "load_activity_settings", "load_daily_context", "load_context_records", "load_context_audit", "load_medication_days", "load_medication_plan", "load_medication_audit"]
+plan_variants = ["ManualContextRevisionPlan", "MedicationRevisionPlan", "ActivityDerivationPlan"]
+receipt_variants = ["ManualContextRevisionReceipt", "MedicationRevisionReceipt", "ActivityDerivationReceipt"]
+intent_variants = ["ContextCoverageStartCreate", "ContextCoverageStartRevise", "ContextCoverageStartWithdraw", "ContextCoverageStartRestore", "IllnessCategoryCreate", "IllnessCategoryRevise", "IllnessCategoryWithdraw", "IllnessCategoryRestore", "CustomContextLabelCreate", "CustomContextLabelRevise", "CustomContextLabelWithdraw", "CustomContextLabelRestore", "IllnessPeriodCreate", "IllnessPeriodRevise", "IllnessPeriodWithdraw", "IllnessPeriodRestore", "DailyStressCreate", "DailyStressRevise", "DailyStressWithdraw", "DailyStressRestore", "CustomContextPeriodCreate", "CustomContextPeriodRevise", "CustomContextPeriodWithdraw", "CustomContextPeriodRestore", "MedicationRegimeCreate", "MedicationRegimeRevise", "MedicationRegimeWithdraw", "MedicationRegimeRestore", "MedicationDeviationCreate", "MedicationDeviationRevise", "MedicationDeviationWithdraw", "MedicationDeviationRestore", "AsNeededIntakeCreate", "AsNeededIntakeRevise", "AsNeededIntakeWithdraw", "AsNeededIntakeRestore", "IntakeReasonCategoryCreate", "IntakeReasonCategoryRevise", "IntakeReasonCategoryWithdraw", "IntakeReasonCategoryRestore"]
+projection_variants = ["ImportDetails", "WeightNutrition", "SleepDays", "ActivityDays", "Workouts", "ActivitySettings", "DailyContext", "ContextRecords", "ContextAudit", "MedicationDays", "MedicationPlan", "MedicationAudit"]
+resolution_variants = ["WorkoutCorrection", "LocalWorkoutExclusion"]
+terminal_states = ["no_change", "plan_changed", "blocked", "store_busy"]
+
+[[contract]]
+id = "V03-C-RELEASE-SEAM-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/87"
+statement = "The V0.3 release has one closed application seam, JSON 3.0 input and output boundaries, behaviorally equivalent CLI and Streamlit tracers, a self-validating delta matrix, and commit-pinned evidence without personal values."
+evidence = ["positive", "negative", "parity", "security", "reproducibility"]
 
 [[contract]]
 id = "V03-C-CONTEXT-COVERAGE-START-V1"
@@ -1287,3 +1301,604 @@ expected_result = "backup_integrity_conflict"
 expected_effect = "the new real store remains ready and no restore session activates"
 forbidden_side_effects = "no best-effort chain repair, missing revision fabrication, or partial snapshot"
 evidence = ["negative"]
+
+[[case]]
+id = "V03-A-RELEASE-SURFACE-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_release_gate.py::test_v03_public_application_surface_is_exact_and_closed"
+initial_state = "final public application module"
+operation = "enumerate every public write request, plan, receipt, and required read"
+level = "meta"
+platform = "all"
+expected_result = "the closed final V0.3 variant sets match the normative issue"
+expected_effect = "none"
+forbidden_side_effects = "no unknown or adapter-owned application variant"
+evidence = ["positive", "negative"]
+
+[[case]]
+id = "V03-A-JSON-BOUNDARY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/adapters/test_cli.py::test_json_3_input_rejects_unknown_and_mismatched_documents"
+initial_state = "fresh synthetic workspace"
+operation = "submit unknown and route-mismatched JSON 3.0 write documents"
+level = "adapter"
+platform = "all"
+expected_result = "both documents terminate with usage exit code 2"
+expected_effect = "none"
+forbidden_side_effects = "no store mutation, fallback schema, or technical traceback"
+evidence = ["negative", "security", "parity"]
+
+[[case]]
+id = "V03-A-CLI-BOUNDARY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/adapters/test_cli.py::test_cli_traces_activity_settings_and_structured_write"
+initial_state = "fresh synthetic workspace"
+operation = "load activity settings and preview a typed JSON 3.0 write through the production CLI"
+level = "adapter"
+platform = "all"
+expected_result = "schema-valid complete activity settings and write-plan documents"
+expected_effect = "none before explicit execution"
+forbidden_side_effects = "no adapter-owned write model, fallback schema, or truncated plan"
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-STREAMLIT-BOUNDARY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/adapters/test_streamlit.py::test_streamlit_traces_activity_settings_and_structured_write"
+initial_state = "fresh synthetic workspace"
+operation = "load activity settings and preview a typed JSON 3.0 write through Streamlit"
+level = "adapter"
+platform = "all"
+expected_result = "the same application projection and plan fingerprint are rendered"
+expected_effect = "none before explicit execution"
+forbidden_side_effects = "no UI-owned write model or truncated plan"
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-EVIDENCE-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_evidence.py::test_v03_evidence_pins_release_inputs_without_personal_values"
+initial_state = "checked-out release commit"
+operation = "build the V0.3 evidence document twice"
+level = "meta"
+platform = "all"
+expected_result = "commit, environment, matrix, fixtures, methods, and gate hashes are stable"
+expected_effect = "none"
+forbidden_side_effects = "no personal values, local store paths, or open evidence references"
+evidence = ["positive", "reproducibility", "security"]
+
+[[fixture]]
+id = "V03-F-CORE-JOURNEY-V1"
+kind = "generated_domain_journey"
+generator = "scripts.v03_fixture_catalog.fixture_recipe"
+seed = 87
+options = { family = "core-journey", version = 1 }
+platform = "all"
+sha256 = "863e58dbbee7cbc5072b68eb6a21ce89242d1d0e52ea6a4af0b5f1f66244a22e"
+
+[[fixture]]
+id = "V03-F-ACTIVITY-COVERAGE-EDGES-V1"
+kind = "generated_domain_journey"
+generator = "scripts.v03_fixture_catalog.fixture_recipe"
+seed = 87
+options = { family = "activity-coverage-edges", version = 1 }
+platform = "all"
+sha256 = "b58b1dfd864a58123f5fbf58b3c5cc296cedd167784e6daca2f57629bfb83170"
+
+[[fixture]]
+id = "V03-F-CONTEXT-WORKFLOW-V1"
+kind = "typed_application_workflow"
+generator = "scripts.v03_fixture_catalog.fixture_recipe"
+seed = 87
+options = { family = "context-workflow", version = 1 }
+platform = "all"
+sha256 = "ace63e5d7ef6f6607f7cb02a5d146c831603efc47afd14cfa8751467cd8452ea"
+
+[[fixture]]
+id = "V03-F-MEDICATION-WORKFLOW-V1"
+kind = "typed_application_workflow"
+generator = "scripts.v03_fixture_catalog.fixture_recipe"
+seed = 87
+options = { family = "medication-workflow", version = 1 }
+platform = "all"
+sha256 = "461ba5688c2554ae187fe98fdbffd199f2ab08e44db1dd9879561fe091a54258"
+
+[[fixture]]
+id = "V03-F-PERSISTENCE-LIFECYCLE-V1"
+kind = "typed_persistence_workflow"
+generator = "scripts.v03_fixture_catalog.fixture_recipe"
+seed = 87
+options = { family = "persistence-lifecycle", version = 1 }
+platform = "all"
+sha256 = "6c6bc0b4406d5d126900ab61906f4395c7456733e804432448e173cfc317dbb7"
+
+[[fixture]]
+id = "V03-F-SECURITY-BOUNDARIES-V1"
+kind = "security_boundary"
+generator = "scripts.v03_fixture_catalog.fixture_recipe"
+seed = 87
+options = { family = "security-boundaries", version = 1 }
+platform = "all"
+sha256 = "99911c67526420aeb608293a58daf18b63869a56fe27ac41bdd0e1191840f1e5"
+
+[[case]]
+id = "V03-A-CORE-JOURNEY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = ["V03-F-CORE-JOURNEY-V1"]
+runner = "tests/acceptance/test_v03_fixture_families.py::test_core_journey_fixture_is_consumed_by_the_import_path"
+initial_state = "empty synthetic store and one deterministic cross-domain Golden Journey"
+operation = "run initial, identical-repeat, and cumulative Golden Journey imports"
+level = "application"
+platform = "all"
+expected_result = "one reproducible cross-domain projection after each effective import"
+expected_effect = "one atomic snapshot publication for initial and cumulative imports"
+forbidden_side_effects = "no adapter-owned or personal fixture data"
+evidence = ["positive", "reproducibility"]
+
+[[case]]
+id = "V03-A-ACTIVITY-COVERAGE-FAMILY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = ["V03-F-ACTIVITY-COVERAGE-EDGES-V1"]
+runner = "tests/acceptance/test_v03_fixture_families.py::test_activity_coverage_fixture_is_consumed_by_the_import_path"
+initial_state = "activity coverage edge fixture"
+operation = "materialize shared Watch coverage and iPhone fallback"
+level = "application"
+platform = "all"
+expected_result = "Watch coverage, iPhone fallback, suppression, and incomplete-day states remain explicit"
+expected_effect = "derived activity rows are snapshot bound"
+forbidden_side_effects = "no cross-metric duplication or partial quantity split"
+evidence = ["positive", "boundary"]
+
+[[case]]
+id = "V03-A-CONTEXT-WORKFLOW-FAMILY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = ["V03-F-CONTEXT-WORKFLOW-V1"]
+runner = "tests/acceptance/test_v03_fixture_families.py::test_context_workflow_fixture_drives_a_typed_revision"
+initial_state = "active snapshot and deterministic context workflow"
+operation = "create categories and colliding illness periods"
+level = "application"
+platform = "all"
+expected_result = "valid context commits and collisions block atomically"
+expected_effect = "revision, audit, and snapshot advance together"
+forbidden_side_effects = "no overlapping duplicate period or partial revision"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-WORKFLOW-FAMILY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = ["V03-F-MEDICATION-WORKFLOW-V1"]
+runner = "tests/acceptance/test_v03_fixture_families.py::test_medication_workflow_fixture_drives_a_typed_revision"
+initial_state = "deterministic medication workflow"
+operation = "validate closed medication entry identities and references"
+level = "application"
+platform = "all"
+expected_result = "only explicit unique typed entries are accepted"
+expected_effect = "none for invalid plans"
+forbidden_side_effects = "no fabricated entry identity or partial regime"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-PERSISTENCE-LIFECYCLE-FAMILY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = ["V03-F-PERSISTENCE-LIFECYCLE-V1"]
+runner = "tests/acceptance/test_v03_fixture_families.py::test_persistence_lifecycle_fixture_pins_the_target_version"
+initial_state = "V0.2 store with a complete source snapshot"
+operation = "plan the registered V0.3 copy-on-write lifecycle"
+level = "application"
+platform = "all"
+expected_result = "store and snapshot transitions remain independently versioned"
+expected_effect = "none before execution"
+forbidden_side_effects = "no in-place migration or mixed active state"
+evidence = ["positive", "transition", "reproducibility"]
+
+[[case]]
+id = "V03-A-SECURITY-BOUNDARIES-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = ["V03-F-SECURITY-BOUNDARIES-V1"]
+runner = "tests/acceptance/test_v03_fixture_families.py::test_security_boundary_fixture_is_rejected_without_publication"
+initial_state = "empty store and deterministic XXE archive"
+operation = "submit an external-entity attack archive"
+level = "application"
+platform = "all"
+expected_result = "the attack is rejected at the untrusted-input boundary"
+expected_effect = "active snapshot remains unchanged and staging is removed"
+forbidden_side_effects = "no network access, path escape, or personal-value log"
+evidence = ["negative", "security"]
+
+[[case]]
+id = "V03-A-MACOS-PLATFORM-PROBES-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/platform/test_macos_probes.py::test_real_macos_platform_probes_succeed_and_redact"
+initial_state = "macOS runner with real platform probe APIs"
+operation = "probe FileVault, filesystem identity, allocation accounting, and controlled storage"
+level = "platform"
+platform = "macos"
+expected_result = "all platform-specific probes succeed with closed typed results"
+expected_effect = "none"
+forbidden_side_effects = "no full-suite duplication, personal path, or health value"
+evidence = ["positive", "security", "reproducibility"]
+
+[[case]]
+id = "V03-A-WRITE-ADAPTER-PARITY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/adapters/test_streamlit.py::test_cli_and_streamlit_preview_the_same_v03_write"
+initial_state = "the same deterministic active snapshot and all eleven JSON 3.0 create requests"
+operation = "preview every request through CLI and headless Streamlit"
+level = "adapter"
+platform = "all"
+expected_result = "identical typed requests, fingerprints, approvals, diagnostics, and complete plans"
+expected_effect = "none before explicit execution"
+forbidden_side_effects = "no adapter-owned model, stale request, truncated plan, or implicit write"
+evidence = ["positive", "negative", "parity"]
+
+[[case]]
+id = "V03-A-CONTEXT-ADAPTER-PARITY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/adapters/test_streamlit.py::test_cli_and_streamlit_load_identical_context_projections"
+initial_state = "one active context revision"
+operation = "load daily context, records, and audit through both adapters"
+level = "adapter"
+platform = "all"
+expected_result = "identical selections, IDs, and full application projections"
+expected_effect = "none"
+forbidden_side_effects = "no adapter-side reconstruction, paging, or truncation"
+evidence = ["positive", "parity"]
+
+[[case]]
+id = "V03-A-MEDICATION-CLI-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/adapters/test_cli.py::test_cli_runs_intake_reason_category_lifecycle"
+initial_state = "active medication plan"
+operation = "load all medication projections and execute create, revise, withdraw, and restore"
+level = "adapter"
+platform = "all"
+expected_result = "complete typed plans, audits, days, and committed receipts"
+expected_effect = "each confirmed revision publishes atomically"
+forbidden_side_effects = "no personal values in receipts or implicit revision"
+evidence = ["positive", "transition", "parity"]
+
+[[case]]
+id = "V03-A-MEDICATION-STREAMLIT-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/adapters/test_streamlit.py::test_streamlit_exposes_as_needed_write_lifecycles"
+initial_state = "the same active medication plan"
+operation = "load all medication projections and execute the typed lifecycle through AppTest"
+level = "adapter"
+platform = "all"
+expected_result = "the same plan states, full projections, audit, and committed result"
+expected_effect = "each confirmed revision publishes atomically"
+forbidden_side_effects = "no stale request, UI-owned state, or truncated projection"
+evidence = ["positive", "transition", "parity"]
+
+[[case]]
+id = "V03-A-NO-CHANGE-ADAPTERS-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/adapters/test_streamlit.py::test_cli_and_streamlit_treat_no_change_as_terminal_without_a_receipt"
+initial_state = "an active context value and an identical normalized revision"
+operation = "preview and request execution through CLI and Streamlit"
+level = "adapter"
+platform = "all"
+expected_result = "both adapters show terminal no_change and exit successfully"
+expected_effect = "none"
+forbidden_side_effects = "no writer lock, receipt, operation ID, audit, or snapshot"
+evidence = ["positive", "negative", "parity", "transition"]
+
+[[case]]
+id = "V03-A-CONTEXT-NO-SNAPSHOT-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_context_matrix_contract[NO-SNAPSHOT]"
+initial_state = "deterministic context workflow fixture"
+operation = "blocked write without snapshot"
+level = "application"
+platform = "all"
+expected_result = "blocked write without snapshot"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-CONTEXT-COVERAGE-BASELINE-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_context_matrix_contract[COVERAGE-BASELINE]"
+initial_state = "deterministic context workflow fixture"
+operation = "coverage baseline and unknown earlier days"
+level = "application"
+platform = "all"
+expected_result = "coverage baseline and unknown earlier days"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-CONTEXT-OBSERVED-STRESS-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_context_matrix_contract[OBSERVED-STRESS]"
+initial_state = "deterministic context workflow fixture"
+operation = "observed average stress remains explicit"
+level = "application"
+platform = "all"
+expected_result = "observed average stress remains explicit"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-CONTEXT-ILLNESS-COLLISION-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_context_matrix_contract[ILLNESS-COLLISION]"
+initial_state = "deterministic context workflow fixture"
+operation = "same-category illness overlap is blocked"
+level = "application"
+platform = "all"
+expected_result = "same-category illness overlap is blocked"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-CONTEXT-OPEN-PERIOD-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_context_matrix_contract[OPEN-PERIOD]"
+initial_state = "deterministic context workflow fixture"
+operation = "open periods bind the snapshot date"
+level = "application"
+platform = "all"
+expected_result = "open periods bind the snapshot date"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-CONTEXT-CATALOG-RENAME-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_context_matrix_contract[CATALOG-RENAME]"
+initial_state = "deterministic context workflow fixture"
+operation = "custom catalog revisions preserve projections"
+level = "application"
+platform = "all"
+expected_result = "custom catalog revisions preserve projections"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-CONTEXT-WITHDRAW-RESTORE-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_context_matrix_contract[WITHDRAW-RESTORE]"
+initial_state = "deterministic context workflow fixture"
+operation = "withdrawal and restoration use revision checks"
+level = "application"
+platform = "all"
+expected_result = "withdrawal and restoration use revision checks"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-CONTEXT-CUSTOM-OVERLAP-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_context_matrix_contract[CUSTOM-OVERLAP]"
+initial_state = "deterministic context workflow fixture"
+operation = "same-label custom periods cannot overlap"
+level = "application"
+platform = "all"
+expected_result = "same-label custom periods cannot overlap"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-CONTEXT-ATOMIC-FAULT-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_context_matrix_contract[ATOMIC-FAULT]"
+initial_state = "deterministic context workflow fixture"
+operation = "context revision has no partial writer effect"
+level = "application"
+platform = "all"
+expected_result = "context revision has no partial writer effect"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-NO-SNAPSHOT-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[NO-SNAPSHOT]"
+initial_state = "deterministic medication workflow fixture"
+operation = "blocked medication write without snapshot"
+level = "application"
+platform = "all"
+expected_result = "blocked medication write without snapshot"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-EMPTY-PLAN-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[EMPTY-PLAN]"
+initial_state = "deterministic medication workflow fixture"
+operation = "unknown before first plan and explicit empty plan"
+level = "application"
+platform = "all"
+expected_result = "unknown before first plan and explicit empty plan"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-REGIME-REVISION-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[REGIME-REVISION]"
+initial_state = "deterministic medication workflow fixture"
+operation = "regime replacement and correction remain distinct"
+level = "application"
+platform = "all"
+expected_result = "regime replacement and correction remain distinct"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-DST-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[DST]"
+initial_state = "deterministic medication workflow fixture"
+operation = "weekday and DST schedule resolution is deterministic"
+level = "application"
+platform = "all"
+expected_result = "weekday and DST schedule resolution is deterministic"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-DEVIATION-FAMILY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[DEVIATION]"
+initial_state = "deterministic medication workflow fixture"
+operation = "all deviation forms and no_change share one model"
+level = "application"
+platform = "all"
+expected_result = "all deviation forms and no_change share one model"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-TIMEZONE-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[TIMEZONE]"
+initial_state = "deterministic medication workflow fixture"
+operation = "actual intake binds its instant and timezone"
+level = "application"
+platform = "all"
+expected_result = "actual intake binds its instant and timezone"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-AS-NEEDED-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[AS-NEEDED]"
+initial_state = "deterministic medication workflow fixture"
+operation = "as-needed intake uses explicit plan entry identity"
+level = "application"
+platform = "all"
+expected_result = "as-needed intake uses explicit plan entry identity"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-CATEGORY-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[CATEGORY]"
+initial_state = "deterministic medication workflow fixture"
+operation = "reason category revisions remain snapshot bound"
+level = "application"
+platform = "all"
+expected_result = "reason category revisions remain snapshot bound"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-REFERENCES-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[REFERENCES]"
+initial_state = "deterministic medication workflow fixture"
+operation = "invalid medication references block atomically"
+level = "application"
+platform = "all"
+expected_result = "invalid medication references block atomically"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-WITHDRAWALS-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[WITHDRAWALS]"
+initial_state = "deterministic medication workflow fixture"
+operation = "withdrawal and restoration preserve audit history"
+level = "application"
+platform = "all"
+expected_result = "withdrawal and restoration preserve audit history"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-AS-OF-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[AS-OF]"
+initial_state = "deterministic medication workflow fixture"
+operation = "medication as-of advances while old snapshots remain stable"
+level = "application"
+platform = "all"
+expected_result = "medication as-of advances while old snapshots remain stable"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+[[case]]
+id = "V03-A-MEDICATION-ATOMIC-FAULT-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_matrix_workflows.py::test_medication_matrix_contract[ATOMIC-FAULT]"
+initial_state = "deterministic medication workflow fixture"
+operation = "medication plan changes and faults have no partial effect"
+level = "application"
+platform = "all"
+expected_result = "medication plan changes and faults have no partial effect"
+expected_effect = "only the declared atomic domain transition"
+forbidden_side_effects = "no partial revision, audit, or snapshot publication"
+evidence = ["positive", "negative", "transition"]
+
+
+[[case]]
+id = "V03-A-STREAMLIT-PREVIEW-INVALIDATION-V1"
+contracts = ["V03-C-RELEASE-SEAM-V1"]
+fixtures = []
+runner = "tests/adapters/test_streamlit.py::test_streamlit_page_change_discards_pending_preview"
+initial_state = "a visible pending preview with locked inputs"
+operation = "change the active page"
+level = "adapter"
+platform = "all"
+expected_result = "request and preview are discarded before the next render"
+expected_effect = "none"
+forbidden_side_effects = "no stale or invisible execution target"
+evidence = ["negative", "transition", "parity"]

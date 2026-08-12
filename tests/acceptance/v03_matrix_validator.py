@@ -7,6 +7,8 @@ from collections.abc import Collection
 from pathlib import Path
 from typing import cast
 
+import personal_health_lab.application as application
+
 _EVIDENCE = {
     "positive",
     "negative",
@@ -50,6 +52,115 @@ def validate_matrix(
 ) -> None:
     assert matrix.get("schema_version") == 1
     assert matrix.get("release") == "v0.3-delta"
+    expected_lists = {
+        "write_requests": {
+            "ReviseContextCoverageStart",
+            "ReviseIllnessCategory",
+            "ReviseCustomContextLabel",
+            "ReviseIllnessPeriod",
+            "ReviseDailyStress",
+            "ReviseCustomContextPeriod",
+            "ReviseMedicationRegime",
+            "ReviseMedicationDeviation",
+            "ReviseAsNeededIntake",
+            "ReviseIntakeReasonCategory",
+            "CreateActivityDerivationVersion",
+        },
+        "read_operations": {
+            "load_import_details",
+            "load_weight_nutrition",
+            "load_sleep_days",
+            "load_activity_days",
+            "load_workouts",
+            "load_activity_settings",
+            "load_daily_context",
+            "load_context_records",
+            "load_context_audit",
+            "load_medication_days",
+            "load_medication_plan",
+            "load_medication_audit",
+        },
+        "plan_variants": {
+            "ManualContextRevisionPlan",
+            "MedicationRevisionPlan",
+            "ActivityDerivationPlan",
+        },
+        "receipt_variants": {
+            "ManualContextRevisionReceipt",
+            "MedicationRevisionReceipt",
+            "ActivityDerivationReceipt",
+        },
+        "intent_variants": {
+            "ContextCoverageStartCreate",
+            "ContextCoverageStartRevise",
+            "ContextCoverageStartWithdraw",
+            "ContextCoverageStartRestore",
+            "IllnessCategoryCreate",
+            "IllnessCategoryRevise",
+            "IllnessCategoryWithdraw",
+            "IllnessCategoryRestore",
+            "CustomContextLabelCreate",
+            "CustomContextLabelRevise",
+            "CustomContextLabelWithdraw",
+            "CustomContextLabelRestore",
+            "IllnessPeriodCreate",
+            "IllnessPeriodRevise",
+            "IllnessPeriodWithdraw",
+            "IllnessPeriodRestore",
+            "DailyStressCreate",
+            "DailyStressRevise",
+            "DailyStressWithdraw",
+            "DailyStressRestore",
+            "CustomContextPeriodCreate",
+            "CustomContextPeriodRevise",
+            "CustomContextPeriodWithdraw",
+            "CustomContextPeriodRestore",
+            "MedicationRegimeCreate",
+            "MedicationRegimeRevise",
+            "MedicationRegimeWithdraw",
+            "MedicationRegimeRestore",
+            "MedicationDeviationCreate",
+            "MedicationDeviationRevise",
+            "MedicationDeviationWithdraw",
+            "MedicationDeviationRestore",
+            "AsNeededIntakeCreate",
+            "AsNeededIntakeRevise",
+            "AsNeededIntakeWithdraw",
+            "AsNeededIntakeRestore",
+            "IntakeReasonCategoryCreate",
+            "IntakeReasonCategoryRevise",
+            "IntakeReasonCategoryWithdraw",
+            "IntakeReasonCategoryRestore",
+        },
+        "projection_variants": {
+            "ImportDetails",
+            "WeightNutrition",
+            "SleepDays",
+            "ActivityDays",
+            "Workouts",
+            "ActivitySettings",
+            "DailyContext",
+            "ContextRecords",
+            "ContextAudit",
+            "MedicationDays",
+            "MedicationPlan",
+            "MedicationAudit",
+        },
+        "resolution_variants": {"WorkoutCorrection", "LocalWorkoutExclusion"},
+        "terminal_states": {"no_change", "plan_changed", "blocked", "store_busy"},
+    }
+    for field, expected in expected_lists.items():
+        assert _references(matrix, field) == expected, f"invalid final V0.3 {field}"
+    assert all(hasattr(application.HealthLab, name) for name in expected_lists["read_operations"])
+    public_variants = set().union(
+        expected_lists["write_requests"],
+        expected_lists["plan_variants"],
+        expected_lists["receipt_variants"],
+        expected_lists["intent_variants"],
+        expected_lists["projection_variants"],
+        expected_lists["resolution_variants"],
+    )
+    assert all(hasattr(application, name) for name in public_variants)
     contracts = _rows(matrix, "contract")
     fixtures = _rows(matrix, "fixture")
     cases = _rows(matrix, "case")
@@ -140,7 +251,8 @@ def validate_matrix(
             )
         runner = case["runner"]
         assert isinstance(runner, str) and re.fullmatch(
-            r"tests/[a-zA-Z0-9_./-]+\.py::test_[a-zA-Z0-9_]+", runner
+            r"tests/[a-zA-Z0-9_./-]+\.py::test_[a-zA-Z0-9_]+(?:\[[a-zA-Z0-9_-]+\])?",
+            runner,
         ), f"runner must be a full Pytest node ID: {case_id}"
         assert runner not in runners, f"duplicate V0.3 runner: {runner}"
         runners.add(runner)
@@ -156,6 +268,8 @@ def validate_matrix(
             f"missing evidence for {contract_id}: {sorted(missing)}"
         )
 
-    collected = {node_id.split("[", 1)[0] for node_id in collected_node_ids}
+    collected = set(collected_node_ids) | {
+        node_id.split("[", 1)[0] for node_id in collected_node_ids
+    }
     missing_runners = runners - collected
     assert not missing_runners, f"invalid V0.3 runner registry; missing={sorted(missing_runners)}"
