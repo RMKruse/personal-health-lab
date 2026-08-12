@@ -25,6 +25,7 @@ from personal_health_lab.health_data import (
 from personal_health_lab.migration import plan_backup_migration
 from personal_health_lab.storage import (
     CapacityCheck,
+    CapacityMethodId,
     DataMode,
     ExportFact,
     LocalStore,
@@ -43,10 +44,10 @@ from personal_health_lab.storage import (
 )
 
 _BACKUP_SCHEMA_VERSION = 4
-_METHOD_ID = "metadata-backup/v1"
-_RESTORE_START_METHOD_ID = "restore-start/v1"
-_RESTORE_SOURCE_METHOD_ID = "restore-source-import/v1"
-_RESTORE_ACTIVATE_METHOD_ID = "restore-activate/v1"
+_METHOD_ID = CapacityMethodId.METADATA_BACKUP
+_RESTORE_START_METHOD_ID = CapacityMethodId.RESTORE_START
+_RESTORE_SOURCE_METHOD_ID = CapacityMethodId.RESTORE_SOURCE_IMPORT
+_RESTORE_ACTIVATE_METHOD_ID = CapacityMethodId.RESTORE_ACTIVATE
 _IDENTITY_RULE_VERSION = "healthkit-identity/v3"
 _SUPPORTED_IDENTITY_RULE_VERSIONS = {"healthkit-natural/v2", _IDENTITY_RULE_VERSION}
 _MAPPING_RULE_VERSION = "healthkit-canonical/v3"
@@ -1199,6 +1200,10 @@ def _restore_fault_point(target_root: Path, fault_point_id: str) -> None:
     """Private fault-injection seam for durable restore transitions."""
 
 
+def _backup_fault_point(target_root: Path, fault_point_id: str) -> None:
+    """Private fault-injection seam for durable backup publication."""
+
+
 def _read_restore_backup(path: Path) -> tuple[BackupId, StoreId, str, int, int]:
     try:
         with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True) as backup:
@@ -1824,6 +1829,7 @@ def begin_metadata_restore(
     working_directory.mkdir(parents=True)
     session_started = False
     try:
+        _restore_fault_point(target_root, "restore.before_working_copy/v1")
         shutil.copyfile(backup_path, temporary)
         if _backup_file_sha256(temporary) != current.original_backup_sha256:
             raise StoreError("restore_plan_changed")
@@ -1833,6 +1839,7 @@ def begin_metadata_restore(
         _restore_allocation_checkpoint(target_root, "migrated_copy")
         with temporary.open("rb") as file:
             os.fsync(file.fileno())
+        _restore_fault_point(target_root, "restore.before_working_copy_publish/v1")
         os.replace(temporary, working)
         directory = os.open(working_directory, os.O_RDONLY)
         try:
@@ -1875,6 +1882,7 @@ def begin_metadata_restore(
             current.target_schema_version,
             current.migration_steps,
         )
+        _restore_fault_point(target_root, "restore.before_pending_catalog/v1")
         store.start_restore_session(
             RestoreSessionFacts(
                 str(completed.restore_id),
@@ -2113,6 +2121,7 @@ def create_metadata_backup(store: LocalStore, target_path: Path) -> MetadataBack
             with temporary.open("rb") as file:
                 os.fsync(file.fileno())
             _allocation_checkpoint(target_path.parent, "temporary")
+            _backup_fault_point(target_path.parent, "backup.before_publish/v1")
             os.replace(temporary, target_path)
             directory = os.open(target_path.parent, os.O_RDONLY)
             try:
@@ -2120,6 +2129,7 @@ def create_metadata_backup(store: LocalStore, target_path: Path) -> MetadataBack
             finally:
                 os.close(directory)
             _allocation_checkpoint(target_path.parent, "published")
+            _backup_fault_point(target_path.parent, "backup.after_publish/v1")
         except (OSError, sqlite3.Error, StoreError):
             temporary.unlink(missing_ok=True)
             raise

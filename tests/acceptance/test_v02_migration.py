@@ -265,10 +265,12 @@ def test_populated_store_is_migrated_copy_on_write(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "fault_point",
     (
+        "migration.before_backup/v1",
         "migration.after_backup/v1",
         "migration.before_snapshot_move/v1",
         "migration.after_snapshot_move/v1",
         "migration.before_sqlite_commit/v1",
+        "migration.after_sqlite_commit/v1",
     ),
 )
 def test_migration_fault_keeps_old_snapshot_and_retry_starts_fresh(
@@ -299,6 +301,18 @@ def test_migration_fault_keeps_old_snapshot_and_retry_starts_fresh(
         with pytest.raises(RuntimeError, match="fault at"):
             health_lab.execute_write(request, expected_plan=plan.fingerprint)
 
+    if fault_point == "migration.after_sqlite_commit/v1":
+        with HealthLab.open(config):
+            pass
+        with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
+            assert metadata.execute(
+                "SELECT schema_version FROM store_identity WHERE singleton = 1"
+            ).fetchone() == (11,)
+            assert metadata.execute(
+                "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
+            ).fetchone() != (str(old_snapshot),)
+        return
+
     with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
         assert "'migrate_store'" not in metadata.execute(
             "SELECT sql FROM sqlite_schema WHERE name = 'write_operations'"
@@ -314,7 +328,11 @@ def test_migration_fault_keeps_old_snapshot_and_retry_starts_fresh(
 
     assert isinstance(retry.result, StoreMigrationReceipt)
     assert retry.result.status is MigrationStatus.COMPLETED
-    assert retry_plan.details.backup_file == "metadata-v3-to-v11-2.sqlite3"
+    assert retry_plan.details.backup_file == (
+        "metadata-v3-to-v11.sqlite3"
+        if fault_point == "migration.before_backup/v1"
+        else "metadata-v3-to-v11-2.sqlite3"
+    )
     with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
         active = metadata.execute(
             "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"

@@ -49,8 +49,25 @@ _PARQUET_DIRECTORY = "parquet"
 _QUERY_FILE = "query.duckdb"
 _STORE_SCHEMA_VERSION = 11
 _WRITER_LOCK_FILE = ".writer.lock"
-_FULL_SNAPSHOT_IMPORT_METHOD = "full-snapshot-import/v1"
-_STORE_MIGRATION_METHOD = "cow-migration/v1"
+
+
+class CapacityMethodId(StrEnum):
+    FULL_SNAPSHOT_IMPORT = "full-snapshot-import/v1"
+    MANUAL_SNAPSHOT = "manual-snapshot/v1"
+    ACTIVITY_DERIVATION = "activity-derivation/v1"
+    STORE_MIGRATION = "cow-migration/v1"
+    METADATA_BACKUP = "metadata-backup/v1"
+    RESTORE_START = "restore-start/v1"
+    RESTORE_SOURCE_IMPORT = "restore-source-import/v1"
+    RESTORE_ACTIVATE = "restore-activate/v1"
+
+
+_FULL_SNAPSHOT_IMPORT_METHOD = CapacityMethodId.FULL_SNAPSHOT_IMPORT
+_SNAPSHOT_WRITE_METHODS = {
+    CapacityMethodId.ACTIVITY_DERIVATION,
+    CapacityMethodId.MANUAL_SNAPSHOT,
+}
+_STORE_MIGRATION_METHOD = CapacityMethodId.STORE_MIGRATION
 _SNAPSHOT_SCHEMA_VERSION = 7
 _RESTORABLE_MANUAL_METADATA_TABLES = (
     "activity_derivation_versions",
@@ -521,7 +538,7 @@ class CapacityReason(StrEnum):
 class CapacityCheck:
     status: CapacityStatus
     target_volume: str
-    method_id: str
+    method_id: CapacityMethodId
     estimate_bytes: int | None
     safety_margin_bytes: int | None
     minimum_remaining_bytes: int
@@ -587,6 +604,25 @@ def cow_migration_estimate(
     return _DIRECTORY_OVERHEAD + backup_catalog_and_journal + snapshot_and_scratch
 
 
+def _snapshot_write_estimate(
+    output_bound_bytes: int,
+    metadata_bytes: int,
+    fragment_size: int,
+    *,
+    writer_bound: bool = True,
+    scratch_bound: bool = True,
+) -> int | None:
+    """Bound a V0.3 snapshot write without recounting hard-linked immutable artifacts."""
+    if not writer_bound or not scratch_bound:
+        return None
+    if output_bound_bytes < 0 or metadata_bytes < 0 or fragment_size <= 0:
+        raise ValueError("Kapazitätseingaben müssen nichtnegativ und Fragmente positiv sein.")
+    output = _round_up(max(2 * output_bound_bytes, 64 * _KIB), fragment_size)
+    scratch = _round_up(max(4 * output_bound_bytes, 64 * _KIB), fragment_size)
+    catalog_and_journal = _round_up(max(4 * metadata_bytes, 64 * _KIB), fragment_size)
+    return _DIRECTORY_OVERHEAD + output + scratch + catalog_and_journal
+
+
 def _allocation_checkpoint(root: Path, phase: str) -> None:
     """Private test seam for measuring the real writer's live allocation."""
 
@@ -623,7 +659,7 @@ def probe_capacity(
     path: Path,
     estimate_bytes: int | None,
     *,
-    method_id: str = _FULL_SNAPSHOT_IMPORT_METHOD,
+    method_id: CapacityMethodId = _FULL_SNAPSHOT_IMPORT_METHOD,
 ) -> CapacityCheck:
     minimum_remaining = _GIB
     try:
@@ -3313,6 +3349,68 @@ class LocalStore:
         )
         return probe_capacity(self._root, estimate)
 
+    def preflight_snapshot_write(
+        self,
+        *,
+        method_id: CapacityMethodId,
+        requested_start: date | None = None,
+        requested_end: date | None = None,
+        writer_bound: bool = True,
+        scratch_bound: bool = True,
+    ) -> CapacityCheck:
+        if not isinstance(method_id, CapacityMethodId) or method_id not in _SNAPSHOT_WRITE_METHODS:
+            raise ValueError("Unbekannte Kapazitätsmethode.")
+        active = self.load_active_snapshot_id()
+        if active is None:
+            return probe_capacity(self._root, None, method_id=method_id)
+        directory = self._root / _PARQUET_DIRECTORY / "snapshots" / str(active)
+        try:
+            rewritten_bytes = sum(
+                (directory / filename).stat().st_blocks * 512
+                for filename in _V6_DERIVATION_FILES | {"derivation_lineage.parquet"}
+            )
+            metadata_bytes = (self._root / "metadata.sqlite3").stat().st_blocks * 512
+            fragment_size = os.statvfs(self._root).f_frsize
+            output_bound_bytes = rewritten_bytes
+            if method_id is CapacityMethodId.MANUAL_SNAPSHOT and requested_start is not None:
+                if requested_end is None:
+                    return probe_capacity(self._root, None, method_id=method_id)
+                requested_days = max(0, (requested_end - requested_start).days + 1)
+                output_bound_bytes += requested_days * 4 * _KIB
+            elif method_id is CapacityMethodId.ACTIVITY_DERIVATION:
+                source_tables = " UNION ALL ".join(
+                    "SELECT source_start_utc, source_end_utc FROM read_parquet('"
+                    + str(directory / filename).replace("'", "''")
+                    + "')"
+                    for filename in (
+                        "measurement_versions.parquet",
+                        "sleep_intervals.parquet",
+                        "workouts.parquet",
+                    )
+                )
+                row = self._query.execute(
+                    "SELECT count(*), COALESCE(greatest(1, date_diff('day', "
+                    "min(CAST(source_start_utc AS TIMESTAMPTZ)), "
+                    "max(CAST(source_end_utc AS TIMESTAMPTZ))) + 1), 0) FROM ("
+                    + source_tables
+                    + ") AS source_intervals"
+                ).fetchone()
+                if row is None:
+                    return probe_capacity(self._root, None, method_id=method_id)
+                output_bound_bytes = max(
+                    output_bound_bytes, (int(row[0]) + int(row[1])) * 4 * _KIB
+                )
+        except (OSError, StoreError, duckdb.Error, TypeError, ValueError):
+            return probe_capacity(self._root, None, method_id=method_id)
+        estimate = _snapshot_write_estimate(
+            output_bound_bytes,
+            metadata_bytes,
+            fragment_size,
+            writer_bound=writer_bound,
+            scratch_bound=scratch_bound and self._scratch_bound,
+        )
+        return probe_capacity(self._root, estimate, method_id=method_id)
+
     def load_identity(self) -> StoreIdentity:
         columns = {
             str(row[1])
@@ -3444,6 +3542,7 @@ class LocalStore:
         if backup_path.exists() or temporary.exists():
             raise StoreError("migration_backup_failed")
         try:
+            _migration_fault_point(self._root, "migration.before_backup/v1")
             _migration_backup_fault_point(self._root)
             with sqlite3.connect(temporary) as backup:
                 self._metadata.backup(backup)
@@ -3648,6 +3747,7 @@ class LocalStore:
             raise StoreError("migration_validation_failed") from error
         finally:
             self._metadata.execute("PRAGMA foreign_keys = ON")
+        _migration_fault_point(self._root, "migration.after_sqlite_commit/v1")
         with suppress(OSError):
             marker.unlink(missing_ok=True)
         return self.load_identity()
@@ -4856,7 +4956,14 @@ class LocalStore:
                     (completed_at,),
                 )
             _allocation_checkpoint(self._root, "activated")
+            if restore_overlay is not None:
+                _publication_fault_point(
+                    self._root, "restore-activation.before_sqlite_commit/v1"
+                )
             _publication_fault_point(self._root, "import.before_sqlite_commit/v1")
+        _publication_fault_point(self._root, "import.after_sqlite_commit/v1")
+        if restore_overlay is not None:
+            _publication_fault_point(self._root, "restore-activation.after_sqlite_commit/v1")
         return PublishImportResult(
             status="committed",
             snapshot_id=snapshot_id,
@@ -7830,6 +7937,7 @@ class LocalStore:
         manifest_path.write_bytes(manifest_bytes)
         digest = hashlib.sha256(manifest_bytes).hexdigest()
         self._validate_snapshot(staging, str(snapshot_id), digest)
+        _allocation_checkpoint(self._root, "snapshot_staged")
         return digest
 
     def _activate_review_snapshot(
@@ -7920,6 +8028,7 @@ class LocalStore:
             "WHERE snapshot_id = ?",
             (str(snapshot_id), str(previous_snapshot_id)),
         )
+        _allocation_checkpoint(self._root, "snapshot_activated")
         _publication_fault_point(self._root, "snapshot.before_sqlite_commit/v1")
 
     def _refresh_v03_derivations(
@@ -9794,6 +9903,7 @@ class LocalStore:
                 self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id), ignore_errors=True
             )
             raise
+        _publication_fault_point(self._root, "snapshot.after_sqlite_commit/v1")
         return MedicationRootPublicationResult(publication.logical_id, revision_id, snapshot_id)
 
     def publish_as_needed_intake(
@@ -9935,6 +10045,7 @@ class LocalStore:
                 self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id), ignore_errors=True
             )
             raise
+        _publication_fault_point(self._root, "snapshot.after_sqlite_commit/v1")
         return MedicationRootPublicationResult(publication.logical_id, revision_id, snapshot_id)
 
     def publish_medication_regime(
@@ -10090,6 +10201,7 @@ class LocalStore:
                 self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id), ignore_errors=True
             )
             raise
+        _publication_fault_point(self._root, "snapshot.after_sqlite_commit/v1")
         return MedicationRegimePublicationResult(publication.logical_id, revision_id, snapshot_id)
 
     def publish_medication_deviation(
@@ -10235,6 +10347,7 @@ class LocalStore:
                 self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id), ignore_errors=True
             )
             raise
+        _publication_fault_point(self._root, "snapshot.after_sqlite_commit/v1")
         return MedicationDeviationPublicationResult(
             publication.logical_id, revision_id, snapshot_id
         )
@@ -10554,6 +10667,7 @@ class LocalStore:
                 self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id), ignore_errors=True
             )
             raise
+        _publication_fault_point(self._root, "snapshot.after_sqlite_commit/v1")
         return ContextCoverageStartPublicationResult(logical_id, revision_id, snapshot_id)
 
     def publish_illness(self, *, publication: IllnessPublication) -> IllnessPublicationResult:
@@ -10766,6 +10880,7 @@ class LocalStore:
                 self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id), ignore_errors=True
             )
             raise
+        _publication_fault_point(self._root, "snapshot.after_sqlite_commit/v1")
         return IllnessPublicationResult(publication.logical_id, revision_id, snapshot_id)
 
     def create_activity_derivation_version(
@@ -10840,6 +10955,7 @@ class LocalStore:
                     ignore_errors=True,
                 )
             raise
+        _publication_fault_point(self._root, "snapshot.after_sqlite_commit/v1")
         return snapshot_id
 
     def load_effective_confirmation_case_ids(self) -> frozenset[str]:

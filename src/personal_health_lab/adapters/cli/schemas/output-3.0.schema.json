@@ -1091,8 +1091,10 @@
             },
             "method_id": {
               "enum": [
+                "activity-derivation/v1",
                 "cow-migration/v1",
                 "full-snapshot-import/v1",
+                "manual-snapshot/v1",
                 "metadata-backup/v1",
                 "restore-activate/v1",
                 "restore-source-import/v1",

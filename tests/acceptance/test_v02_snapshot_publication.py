@@ -321,6 +321,7 @@ def test_each_snapshot_file_rejects_hash_schema_and_row_count_corruption(
         "import.before_snapshot_move/v1",
         "import.after_snapshot_move/v1",
         "import.before_sqlite_commit/v1",
+        "import.after_sqlite_commit/v1",
     ),
 )
 def test_publication_fault_keeps_old_snapshot_active_and_quarantines_remainder(
@@ -349,6 +350,15 @@ def test_publication_fault_keeps_old_snapshot_active_and_quarantines_remainder(
     monkeypatch.undo()
     with HealthLab.open(config) as health_lab:
         overview = health_lab.load_overview(OverviewSelection())
+
+    if fault_point == "import.after_sqlite_commit/v1":
+        assert overview.snapshot_count == 2
+        assert overview.measurement_version_count == 2
+        assert overview.quarantined_import_count == 0
+        with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
+            assert metadata.execute("SELECT count(*) FROM write_operations").fetchone() == (2,)
+            assert metadata.execute("SELECT count(*) FROM audit_events").fetchone() == (2,)
+        return
 
     assert overview.snapshot_count == 1
     assert overview.measurement_version_count == 1

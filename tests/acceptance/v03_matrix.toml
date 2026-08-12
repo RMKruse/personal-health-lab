@@ -278,6 +278,409 @@ expected_effect = "none"
 forbidden_side_effects = "no invalid registry accepted"
 evidence = ["negative"]
 
+[[contract]]
+id = "V03-C-WRITE-CAPACITY-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/86"
+statement = "Every V0.3 writer, derivation, migration, backup, and restore form uses the shared hard capacity preflight with a versioned conservative output and scratch bound; unknown blocks, unchanged hard-linked artifacts are not recounted, and late ENOSPC cannot commit."
+evidence = ["positive", "negative", "boundary", "fault", "transition"]
+
+[[contract]]
+id = "V03-C-ATOMIC-FAULT-CUTPOINTS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/86"
+statement = "Named cutpoints before and after artifact publication, SQLite commit, migration, backup, every restore gate, and final activation leave only the old state or one fully valid new state active."
+evidence = ["fault", "transition", "security"]
+
+[[fixture]]
+id = "V03-F-ALLOC-MANUAL-NORMAL-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "manual-snapshot/v1", scale = "normal" }
+platform = "all"
+sha256 = "aff7bc8b37f8e5a6b7f0e5ee21050957baa42eb2031435860c62744f65d8429d"
+
+[[fixture]]
+id = "V03-F-ALLOC-MANUAL-STRESS-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "manual-snapshot/v1", scale = "stress" }
+platform = "all"
+sha256 = "ef1b4e3bcdc7175f65ae22b0e68ef8e074f1391c3488ce86b2e883781b7bb106"
+
+[[fixture]]
+id = "V03-F-ALLOC-DERIVATION-NORMAL-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "activity-derivation/v1", scale = "normal" }
+platform = "all"
+sha256 = "e6b19780b895c3f5333d5389fb170bce77b43e2be74aff6dbaff33c77ec23c18"
+
+[[fixture]]
+id = "V03-F-ALLOC-DERIVATION-STRESS-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "activity-derivation/v1", scale = "stress" }
+platform = "all"
+sha256 = "38513fd2861447fee0adaf83a30977a184ce1f7426ace751c9430ac1be251026"
+
+[[fixture]]
+id = "V03-F-FAULT-CUTPOINTS-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { family = "artifact-sqlite-migration-backup-restore-activation" }
+platform = "all"
+sha256 = "ddc0b4a764312aec0f75c94232b21720d1392cc08d46c6e102d22ee8fd6ddce0"
+
+[[fixture]]
+id = "V03-F-ALLOC-IMPORT-NORMAL-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "full-snapshot-import/v1", scale = "normal" }
+platform = "all"
+sha256 = "ef3a969aafa179373166504526e7ef6e05f91d7357436338aa1bd95662f4e1b1"
+
+[[fixture]]
+id = "V03-F-ALLOC-IMPORT-STRESS-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "full-snapshot-import/v1", scale = "stress" }
+platform = "all"
+sha256 = "315ac6c900cd288839135431f725c7084e20424123aa024de9f97620675535f9"
+
+[[fixture]]
+id = "V03-F-ALLOC-MIGRATION-NORMAL-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "cow-migration/v1", scale = "normal" }
+platform = "all"
+sha256 = "e22a1e3bd4eda490150125eeb8d46aa59ae6ad1090c9feaf8b5dd4900cf6cd2e"
+
+[[fixture]]
+id = "V03-F-ALLOC-MIGRATION-STRESS-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "cow-migration/v1", scale = "stress" }
+platform = "all"
+sha256 = "b457626d0906e4c532885d66e8e2bad2b51e50580a336a6d595adf63b6efb00c"
+
+[[fixture]]
+id = "V03-F-ALLOC-BACKUP-NORMAL-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "metadata-backup/v1", scale = "normal" }
+platform = "all"
+sha256 = "152a7ad9bf45669624a7402814bcfd884ed556a5e21c5ede2d7a37a435151a56"
+
+[[fixture]]
+id = "V03-F-ALLOC-BACKUP-STRESS-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "metadata-backup/v1", scale = "stress" }
+platform = "all"
+sha256 = "570ce9255b2774b3ae781cc33128210fdb843bc2d32e295481f6fb253eff7b3e"
+
+[[fixture]]
+id = "V03-F-ALLOC-RESTORE-START-NORMAL-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "restore-start/v1", scale = "normal" }
+platform = "all"
+sha256 = "78904119d08b9251cecf6a37485a80a706cad8dedcf869f0731fc990eba068c2"
+
+[[fixture]]
+id = "V03-F-ALLOC-RESTORE-START-STRESS-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "restore-start/v1", scale = "stress" }
+platform = "all"
+sha256 = "ec9297dfa65957a979fb0657763c63ff6a841c46ce823297db00a5e3a9d5adae"
+
+[[fixture]]
+id = "V03-F-ALLOC-RESTORE-SOURCE-NORMAL-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "restore-source-import/v1", scale = "normal" }
+platform = "all"
+sha256 = "b499eef5177febf4f6cb676078f55f6ee9a3c0dde7a6d5383f6eaad42b1e3eaa"
+
+[[fixture]]
+id = "V03-F-ALLOC-RESTORE-SOURCE-STRESS-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "restore-source-import/v1", scale = "stress" }
+platform = "all"
+sha256 = "66155863b93f8162b3a54202401bdce47dd45d6a3f9c1e9fb7254ff093cfee43"
+
+[[fixture]]
+id = "V03-F-ALLOC-RESTORE-ACTIVATE-NORMAL-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "restore-activate/v1", scale = "normal" }
+platform = "all"
+sha256 = "80f1e9f9db1619d89c2376408267988104675ff10d722917c1da12e923a6539f"
+
+[[fixture]]
+id = "V03-F-ALLOC-RESTORE-ACTIVATE-STRESS-V1"
+kind = "system"
+generator = "tests.acceptance.test_v03_capacity_faults._allocation_fixture"
+seed = 86
+options = { method = "restore-activate/v1", scale = "stress" }
+platform = "all"
+sha256 = "ea0d133e884bf1336a452e037a0f328bb8ba8e0d5b6c9787d7df3aedb728e831"
+
+[[case]]
+id = "V03-A-WRITE-CAPACITY-BOUNDS-V1"
+contracts = ["V03-C-WRITE-CAPACITY-V1"]
+fixtures = ["V03-F-ALLOC-MANUAL-NORMAL-V1", "V03-F-ALLOC-MANUAL-STRESS-V1", "V03-F-ALLOC-DERIVATION-NORMAL-V1", "V03-F-ALLOC-DERIVATION-STRESS-V1"]
+runner = "tests/acceptance/test_v03_capacity_faults.py::test_v03_snapshot_methods_bound_normal_and_stress_fixtures"
+initial_state = "normal and stress snapshots with immutable hard-linked source artifacts"
+operation = "measure additional live allocation at each real manual and derivation writer phase"
+level = "application"
+platform = "all"
+expected_result = "manual-snapshot/v1 and activity-derivation/v1 conservatively bound st_blocks times 512"
+expected_effect = "one complete new snapshot"
+forbidden_side_effects = "no immutable source recount or APFS copy-on-write credit"
+evidence = ["positive", "boundary"]
+
+[[case]]
+id = "V03-A-IMPORT-CAPACITY-BOUNDS-V1"
+contracts = ["V03-C-WRITE-CAPACITY-V1"]
+fixtures = ["V03-F-ALLOC-IMPORT-NORMAL-V1", "V03-F-ALLOC-IMPORT-STRESS-V1"]
+runner = "tests/acceptance/test_v02_write_plan.py::test_full_snapshot_import_v1_measures_real_writer_phases"
+initial_state = "normal and stress populated snapshots"
+operation = "measure every full snapshot import writer phase"
+level = "application"
+platform = "all"
+expected_result = "full-snapshot-import/v1 bounds st_blocks times 512"
+expected_effect = "one complete imported snapshot"
+forbidden_side_effects = "no unbounded output or scratch"
+evidence = ["positive", "boundary"]
+
+[[case]]
+id = "V03-A-MIGRATION-CAPACITY-BOUNDS-V1"
+contracts = ["V03-C-WRITE-CAPACITY-V1"]
+fixtures = ["V03-F-ALLOC-MIGRATION-NORMAL-V1", "V03-F-ALLOC-MIGRATION-STRESS-V1"]
+runner = "tests/acceptance/test_v02_migration.py::test_cow_migration_v1_bounds_normal_and_stress_fixtures"
+initial_state = "normal and stress V0.2 stores"
+operation = "measure backup, staging, move, and activation allocation"
+level = "application"
+platform = "all"
+expected_result = "cow-migration/v1 bounds st_blocks times 512 without copy-on-write credit"
+expected_effect = "one complete migrated store"
+forbidden_side_effects = "no mixed schema or APFS copy-on-write credit"
+evidence = ["positive", "boundary"]
+
+[[case]]
+id = "V03-A-BACKUP-CAPACITY-BOUNDS-V1"
+contracts = ["V03-C-WRITE-CAPACITY-V1"]
+fixtures = ["V03-F-ALLOC-BACKUP-NORMAL-V1", "V03-F-ALLOC-BACKUP-STRESS-V1"]
+runner = "tests/acceptance/test_v02_metadata_backup.py::test_metadata_backup_v1_measures_populated_writer_phases"
+initial_state = "normal and stress populated stores"
+operation = "measure temporary and published metadata backup allocation"
+level = "application"
+platform = "all"
+expected_result = "metadata-backup/v1 bounds st_blocks times 512"
+expected_effect = "one complete portable backup"
+forbidden_side_effects = "no partial backup target"
+evidence = ["positive", "boundary"]
+
+[[case]]
+id = "V03-A-RESTORE-START-CAPACITY-BOUNDS-V1"
+contracts = ["V03-C-WRITE-CAPACITY-V1"]
+fixtures = ["V03-F-ALLOC-RESTORE-START-NORMAL-V1", "V03-F-ALLOC-RESTORE-START-STRESS-V1"]
+runner = "tests/acceptance/test_v02_metadata_restore.py::test_restore_start_v1_bounds_normal_and_stress_fixtures"
+initial_state = "new empty stores and normal or stress metadata backups"
+operation = "measure restore working-copy and pending-catalog gates"
+level = "application"
+platform = "all"
+expected_result = "restore-start/v1 bounds st_blocks times 512"
+expected_effect = "one complete restore-pending session"
+forbidden_side_effects = "no active or partial restore"
+evidence = ["positive", "boundary"]
+
+[[case]]
+id = "V03-A-RESTORE-SOURCE-CAPACITY-BOUNDS-V1"
+contracts = ["V03-C-WRITE-CAPACITY-V1"]
+fixtures = ["V03-F-ALLOC-RESTORE-SOURCE-NORMAL-V1", "V03-F-ALLOC-RESTORE-SOURCE-STRESS-V1"]
+runner = "tests/acceptance/test_v02_metadata_restore.py::test_restore_source_import_v1_bounds_normal_and_stress_fixtures"
+initial_state = "restore-pending stores with normal or stress source packages"
+operation = "measure durable restore-source package allocation"
+level = "application"
+platform = "all"
+expected_result = "restore-source-import/v1 bounds st_blocks times 512"
+expected_effect = "one complete source package"
+forbidden_side_effects = "no partial source package or activation"
+evidence = ["positive", "boundary"]
+
+[[case]]
+id = "V03-A-RESTORE-ACTIVATE-CAPACITY-BOUNDS-V1"
+contracts = ["V03-C-WRITE-CAPACITY-V1"]
+fixtures = ["V03-F-ALLOC-RESTORE-ACTIVATE-NORMAL-V1", "V03-F-ALLOC-RESTORE-ACTIVATE-STRESS-V1"]
+runner = "tests/acceptance/test_v02_metadata_restore.py::test_restore_activate_v1_bounds_snapshot_and_overlay_allocation"
+initial_state = "restore-pending stores with normal or stress overlays"
+operation = "measure complete snapshot materialization and overlay activation"
+level = "application"
+platform = "all"
+expected_result = "restore-activate/v1 bounds st_blocks times 512"
+expected_effect = "one completely activated restored snapshot"
+forbidden_side_effects = "no partial overlay or mixed snapshot"
+evidence = ["positive", "boundary"]
+
+[[case]]
+id = "V03-A-WRITE-CAPACITY-UNKNOWN-V1"
+contracts = ["V03-C-WRITE-CAPACITY-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_capacity_faults.py::test_unknown_manual_snapshot_bound_blocks_the_public_plan"
+initial_state = "snapshot writer without a closed output or scratch bound"
+operation = "preview the shared application write"
+level = "application"
+platform = "all"
+expected_result = "blocked capacity_estimate_unknown"
+expected_effect = "none"
+forbidden_side_effects = "no best-effort estimate or publication"
+evidence = ["negative"]
+
+[[case]]
+id = "V03-A-WRITE-CAPACITY-RECHECK-V1"
+contracts = ["V03-C-WRITE-CAPACITY-V1"]
+fixtures = []
+runner = "tests/acceptance/test_v03_capacity_faults.py::test_manual_snapshot_capacity_is_rechecked_under_the_writer_lock"
+initial_state = "ready preview whose target becomes insufficient before execution"
+operation = "execute the confirmed write under the common writer lock"
+level = "application"
+platform = "all"
+expected_result = "blocked capacity_insufficient"
+expected_effect = "old snapshot remains active"
+forbidden_side_effects = "no revision, audit event, or partial snapshot"
+evidence = ["negative", "transition"]
+
+[[case]]
+id = "V03-A-WRITE-CAPACITY-ENOSPC-V1"
+contracts = ["V03-C-WRITE-CAPACITY-V1"]
+fixtures = ["V03-F-FAULT-CUTPOINTS-V1"]
+runner = "tests/acceptance/test_v03_capacity_faults.py::test_late_manual_snapshot_enospc_never_reaches_the_commit_point"
+initial_state = "positive final preflight followed by late ENOSPC"
+operation = "fail after snapshot materialization and before SQLite commit"
+level = "application"
+platform = "all"
+expected_result = "old snapshot remains active"
+expected_effect = "none"
+forbidden_side_effects = "no revision, audit event, or active partial snapshot"
+evidence = ["fault", "transition"]
+
+[[case]]
+id = "V03-A-ATOMIC-SNAPSHOT-CUTPOINTS-V1"
+contracts = ["V03-C-ATOMIC-FAULT-CUTPOINTS-V1"]
+fixtures = ["V03-F-FAULT-CUTPOINTS-V1"]
+runner = "tests/acceptance/test_v03_capacity_faults.py::test_v03_fault_cutpoints_leave_only_old_or_complete_new_state"
+initial_state = "active snapshot before a manual or derivation write"
+operation = "inject before and after artifact publication and SQLite commit"
+level = "application"
+platform = "all"
+expected_result = "old state before commit or complete new state after commit"
+expected_effect = "at most one fully valid active snapshot"
+forbidden_side_effects = "no partial revision, audit, derivation, or mixed snapshot"
+evidence = ["fault", "transition", "security"]
+
+[[case]]
+id = "V03-A-ATOMIC-IMPORT-CUTPOINTS-V1"
+contracts = ["V03-C-ATOMIC-FAULT-CUTPOINTS-V1"]
+fixtures = ["V03-F-FAULT-CUTPOINTS-V1"]
+runner = "tests/acceptance/test_v02_snapshot_publication.py::test_publication_fault_keeps_old_snapshot_active_and_quarantines_remainder"
+initial_state = "one active snapshot and a second staged import"
+operation = "inject before and after artifact publication and SQLite commit"
+level = "application"
+platform = "all"
+expected_result = "old state before commit or complete imported state after commit"
+expected_effect = "uncataloged pre-commit output is quarantined"
+forbidden_side_effects = "no mixed snapshot or partial audit"
+evidence = ["fault", "transition"]
+
+[[case]]
+id = "V03-A-ATOMIC-MIGRATION-CUTPOINTS-V1"
+contracts = ["V03-C-ATOMIC-FAULT-CUTPOINTS-V1"]
+fixtures = ["V03-F-FAULT-CUTPOINTS-V1"]
+runner = "tests/acceptance/test_v02_migration.py::test_migration_fault_keeps_old_snapshot_and_retry_starts_fresh"
+initial_state = "V0.2 store ready for V0.3 copy-on-write migration"
+operation = "inject before and after backup, snapshot publication, and SQLite commit"
+level = "application"
+platform = "all"
+expected_result = "retryable old state before commit or complete V0.3 state after commit"
+expected_effect = "one complete migrated snapshot at most"
+forbidden_side_effects = "no mixed schema, partial audit, or resumed staging"
+evidence = ["fault", "transition"]
+
+[[case]]
+id = "V03-A-ATOMIC-BACKUP-CUTPOINTS-V1"
+contracts = ["V03-C-ATOMIC-FAULT-CUTPOINTS-V1"]
+fixtures = ["V03-F-FAULT-CUTPOINTS-V1"]
+runner = "tests/acceptance/test_v03_capacity_faults.py::test_v03_backup_fault_cutpoints_leave_no_file_or_one_complete_backup"
+initial_state = "validated metadata backup temporary file"
+operation = "inject immediately before and after durable publication"
+level = "application"
+platform = "all"
+expected_result = "no target before publication or one integrity-valid target after publication"
+expected_effect = "none on the source store"
+forbidden_side_effects = "no partial target or source mutation"
+evidence = ["fault", "transition"]
+
+[[case]]
+id = "V03-A-ATOMIC-RESTORE-GATES-V1"
+contracts = ["V03-C-ATOMIC-FAULT-CUTPOINTS-V1"]
+fixtures = ["V03-F-FAULT-CUTPOINTS-V1"]
+runner = "tests/acceptance/test_v02_metadata_restore.py::test_restore_faults_leave_empty_or_complete_pending_state"
+initial_state = "new empty real store and valid metadata backup"
+operation = "inject before and after working-copy, publication, and pending-catalog gates"
+level = "application"
+platform = "all"
+expected_result = "empty retryable store or one complete restore-pending session"
+expected_effect = "no active domain snapshot"
+forbidden_side_effects = "no partial restore session or overlay"
+evidence = ["fault", "transition"]
+
+[[case]]
+id = "V03-A-ATOMIC-RESTORE-SOURCE-V1"
+contracts = ["V03-C-ATOMIC-FAULT-CUTPOINTS-V1"]
+fixtures = ["V03-F-FAULT-CUTPOINTS-V1"]
+runner = "tests/acceptance/test_v02_metadata_restore.py::test_restore_source_publish_fault_is_retryable"
+initial_state = "restore-pending store awaiting an exact source package"
+operation = "inject before and after durable restore-source publication"
+level = "application"
+platform = "all"
+expected_result = "no source before publication or one complete retryable source after publication"
+expected_effect = "restore remains pending"
+forbidden_side_effects = "no partial package or early activation"
+evidence = ["fault", "transition"]
+
+[[case]]
+id = "V03-A-ATOMIC-RESTORE-ACTIVATION-V1"
+contracts = ["V03-C-ATOMIC-FAULT-CUTPOINTS-V1"]
+fixtures = ["V03-F-FAULT-CUTPOINTS-V1"]
+runner = "tests/acceptance/test_v02_metadata_restore.py::test_restore_activation_fault_rolls_back_overlay_and_retries"
+initial_state = "restore-pending store with all exact source references"
+operation = "inject immediately before and after final SQLite activation"
+level = "application"
+platform = "all"
+expected_result = "complete pending state before commit or complete ready state after commit"
+expected_effect = "one fully bound restored snapshot"
+forbidden_side_effects = "no partial overlay, audit, person binding, or mixed snapshot"
+evidence = ["fault", "transition"]
+
 [[case]]
 id = "V03-A-WEIGHT-PROJECTION-V1"
 contracts = ["V03-C-WEIGHT-SOURCE-V1", "V03-C-WEIGHT-DAILY-V1"]

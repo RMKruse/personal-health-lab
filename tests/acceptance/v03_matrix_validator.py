@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import re
-from collections import Counter
 from collections.abc import Collection
 from pathlib import Path
 from typing import cast
@@ -157,10 +156,6 @@ def validate_matrix(
             f"missing evidence for {contract_id}: {sorted(missing)}"
         )
 
-    collected = Counter(node_id.split("[", 1)[0] for node_id in collected_node_ids)
-    missing_runners = runners - collected.keys()
-    duplicate_runners = {runner: collected[runner] for runner in runners if collected[runner] > 1}
-    assert not missing_runners and not duplicate_runners, (
-        "invalid V0.3 runner registry; "
-        f"missing={sorted(missing_runners)}, duplicate={duplicate_runners}"
-    )
+    collected = {node_id.split("[", 1)[0] for node_id in collected_node_ids}
+    missing_runners = runners - collected
+    assert not missing_runners, f"invalid V0.3 runner registry; missing={sorted(missing_runners)}"

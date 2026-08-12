@@ -89,6 +89,7 @@ from personal_health_lab.resting_hr_analysis import (
 from personal_health_lab.storage import (
     AsNeededIntakePublication,
     CapacityCheck,
+    CapacityMethodId,
     CapacityStatus,
     ContextCoverageStartPublication,
     FileVaultCheck,
@@ -2671,15 +2672,25 @@ class HealthLab:
         if isinstance(request, CreateMetadataBackup):
             return self._build_metadata_backup_plan(request)
         if isinstance(request, ReviseContextCoverageStart):
-            return self._build_context_coverage_start_plan(request)
+            return self._with_snapshot_capacity(
+                self._build_context_coverage_start_plan(request), CapacityMethodId.MANUAL_SNAPSHOT
+            )
         if isinstance(request, ReviseMedicationRegime):
-            return self._build_medication_regime_plan(request)
+            return self._with_snapshot_capacity(
+                self._build_medication_regime_plan(request), CapacityMethodId.MANUAL_SNAPSHOT
+            )
         if isinstance(request, ReviseMedicationDeviation):
-            return self._build_medication_deviation_plan(request)
+            return self._with_snapshot_capacity(
+                self._build_medication_deviation_plan(request), CapacityMethodId.MANUAL_SNAPSHOT
+            )
         if isinstance(request, ReviseAsNeededIntake):
-            return self._build_as_needed_intake_plan(request)
+            return self._with_snapshot_capacity(
+                self._build_as_needed_intake_plan(request), CapacityMethodId.MANUAL_SNAPSHOT
+            )
         if isinstance(request, ReviseIntakeReasonCategory):
-            return self._build_intake_reason_category_plan(request)
+            return self._with_snapshot_capacity(
+                self._build_intake_reason_category_plan(request), CapacityMethodId.MANUAL_SNAPSHOT
+            )
         if isinstance(
             request,
             (
@@ -2690,7 +2701,9 @@ class HealthLab:
                 ReviseCustomContextPeriod,
             ),
         ):
-            return self._build_illness_plan(request)
+            return self._with_snapshot_capacity(
+                self._build_illness_plan(request), CapacityMethodId.MANUAL_SNAPSHOT
+            )
         if isinstance(request, RunRestingHeartRateAnalysis):
             return self._build_resting_heart_rate_analysis_plan(request)
         if isinstance(request, RunHistoricalReview):
@@ -2698,7 +2711,10 @@ class HealthLab:
         if isinstance(request, CreatePlausibilityRuleVersion):
             return self._build_plausibility_rule_plan(request)
         if isinstance(request, CreateActivityDerivationVersion):
-            return self._build_activity_derivation_plan(request)
+            return self._with_snapshot_capacity(
+                self._build_activity_derivation_plan(request),
+                CapacityMethodId.ACTIVITY_DERIVATION,
+            )
         if isinstance(
             request, (ResolveDataReviewCase, ConfirmDataReviewBatch, RevokeDataReviewDecision)
         ):
@@ -3244,6 +3260,43 @@ class HealthLab:
                 self._store.load_active_snapshot_id() if self._store is not None else None,
             ),
             WritePreflight(WriteApproval(WriteApprovalStatus.READY)),
+        )
+
+    def _with_snapshot_capacity(
+        self, plan: WritePlan, method_id: CapacityMethodId
+    ) -> WritePlan:
+        assert self._store is not None
+        capacity = self._store.preflight_snapshot_write(
+            method_id=method_id,
+            requested_start=self._snapshot_capacity_start(plan),
+            requested_end=self._snapshot_capacity_end(plan),
+        )
+        diagnostics = plan.diagnostics
+        approval = plan.approval
+        if (
+            approval.status is WriteApprovalStatus.READY
+            and capacity.status is not CapacityStatus.READY
+        ):
+            approval = WriteApproval(WriteApprovalStatus.BLOCKED)
+            diagnostics = (
+                "capacity_"
+                + (capacity.reason.value if capacity.reason is not None else capacity.status.value),
+            )
+        fingerprint = PlanFingerprint(
+            hashlib.sha256(
+                f"{plan.fingerprint}:{capacity.target_volume}:{capacity.method_id}:"
+                f"{capacity.estimate_bytes}:{capacity.status.value}".encode()
+            ).hexdigest()
+        )
+        return replace(
+            plan,
+            fingerprint=fingerprint,
+            preflight=replace(
+                plan.preflight,
+                approval=approval,
+                diagnostics=diagnostics,
+                capacity=capacity,
+            ),
         )
 
     def _build_context_coverage_start_plan(self, request: ReviseContextCoverageStart) -> WritePlan:
@@ -5406,6 +5459,11 @@ class HealthLab:
                 plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
             )
         try:
+            blocked = self._recheck_snapshot_capacity(
+                writer, plan, expected_plan, CapacityMethodId.ACTIVITY_DERIVATION
+            )
+            if blocked is not None:
+                return blocked
             operation_id = OperationId(uuid4().hex)
             snapshot_ref = writer.create_activity_derivation_version(
                 operation_id=operation_id,
@@ -5452,6 +5510,11 @@ class HealthLab:
                 plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
             )
         try:
+            blocked = self._recheck_snapshot_capacity(
+                writer, plan, expected_plan, CapacityMethodId.MANUAL_SNAPSHOT
+            )
+            if blocked is not None:
+                return blocked
             operation_id = OperationId(uuid4().hex)
             publication = writer.publish_context_coverage_start(
                 publication=ContextCoverageStartPublication(
@@ -5510,6 +5573,11 @@ class HealthLab:
                 plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
             )
         try:
+            blocked = self._recheck_snapshot_capacity(
+                writer, plan, expected_plan, CapacityMethodId.MANUAL_SNAPSHOT
+            )
+            if blocked is not None:
+                return blocked
             operation_id = OperationId(uuid4().hex)
             publication = writer.publish_medication_regime(
                 MedicationRegimePublication(
@@ -5587,6 +5655,11 @@ class HealthLab:
                 plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
             )
         try:
+            blocked = self._recheck_snapshot_capacity(
+                writer, plan, expected_plan, CapacityMethodId.MANUAL_SNAPSHOT
+            )
+            if blocked is not None:
+                return blocked
             operation_id = OperationId(uuid4().hex)
             publication = writer.publish_medication_deviation(
                 MedicationDeviationPublication(
@@ -5645,6 +5718,11 @@ class HealthLab:
                 plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
             )
         try:
+            blocked = self._recheck_snapshot_capacity(
+                writer, plan, expected_plan, CapacityMethodId.MANUAL_SNAPSHOT
+            )
+            if blocked is not None:
+                return blocked
             operation_id = OperationId(uuid4().hex)
             publication = writer.publish_intake_reason_category(
                 IntakeReasonCategoryPublication(
@@ -5699,6 +5777,11 @@ class HealthLab:
                 plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
             )
         try:
+            blocked = self._recheck_snapshot_capacity(
+                writer, plan, expected_plan, CapacityMethodId.MANUAL_SNAPSHOT
+            )
+            if blocked is not None:
+                return blocked
             operation_id = OperationId(uuid4().hex)
             publication = writer.publish_as_needed_intake(
                 AsNeededIntakePublication(
@@ -5769,6 +5852,11 @@ class HealthLab:
                 plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
             )
         try:
+            blocked = self._recheck_snapshot_capacity(
+                writer, plan, expected_plan, CapacityMethodId.MANUAL_SNAPSHOT
+            )
+            if blocked is not None:
+                return blocked
             operation_id = OperationId(uuid4().hex)
             publication = writer.publish_illness(
                 publication=IllnessPublication(
@@ -6321,6 +6409,61 @@ class HealthLab:
             ),
             diagnostics=diagnostics,
         )
+
+    def _recheck_snapshot_capacity(
+        self,
+        writer: LocalStore,
+        plan: WritePlan,
+        expected_plan: PlanFingerprint,
+        method_id: CapacityMethodId,
+    ) -> WriteReceipt | None:
+        capacity = writer.preflight_snapshot_write(
+            method_id=method_id,
+            requested_start=self._snapshot_capacity_start(plan),
+            requested_end=self._snapshot_capacity_end(plan),
+        )
+        if capacity.status is not CapacityStatus.READY:
+            diagnostic = "capacity_" + (
+                capacity.reason.value if capacity.reason is not None else capacity.status.value
+            )
+            return self._not_started_with_preflight(
+                plan,
+                WriteNotStartedStatus.BLOCKED,
+                (diagnostic,),
+                expected_plan,
+                capacity=capacity,
+            )
+        return None
+
+    @staticmethod
+    def _snapshot_capacity_start(plan: WritePlan) -> date | None:
+        details = plan.details
+        if isinstance(details, (ManualContextRevisionPlan, IllnessRevisionPlan)):
+            return details.start_date
+        if isinstance(details, MedicationRegimePlan):
+            return details.starts_at.date()
+        if isinstance(details, MedicationDeviationPlan):
+            return details.scheduled_at.date()
+        if isinstance(details, AsNeededIntakePlan):
+            return details.taken_at.date()
+        return None
+
+    @staticmethod
+    def _snapshot_capacity_end(plan: WritePlan) -> date | None:
+        details = plan.details
+        if isinstance(details, (ManualContextRevisionPlan, IllnessRevisionPlan)):
+            return details.snapshot_as_of.date()
+        if isinstance(
+            details,
+            (
+                MedicationRegimePlan,
+                MedicationDeviationPlan,
+                AsNeededIntakePlan,
+                IntakeReasonCategoryPlan,
+            ),
+        ):
+            return details.medication_as_of.date()
+        return None
 
     def _execute_resting_heart_rate_analysis(
         self,
