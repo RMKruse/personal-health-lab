@@ -340,6 +340,18 @@ _Avoid_: einzelne Gewichtsmessung, Veränderungsrate
 Die über ein Gewichtstrendfenster geschätzte Richtung und Geschwindigkeit der Gewichtsveränderung. Sie ist das primäre Outcome des ersten Gewichtsmodells und wird getrennt vom geglätteten Gewichtsniveau ausgewiesen.
 _Avoid_: Tagesdifferenz, geglättetes Gewichtsniveau
 
+**Apple-Ruheenergie (Schätzung)**:
+Die aus eindeutig als Apple Watch klassifizierten HealthKit-Samples des kumulativen Typs `basalEnergyBurned` abgeleitete Ruheenergie. Sie wird in kcal geführt und bleibt einschließlich Quelle, Gerät, Originaleinheit und beitragender Messungsidentitäten nachvollziehbar. Der Wert ist eine algorithmische Apple-Schätzung und keine direkte Kalorimetrie oder gemessene physiologische Wahrheit.
+_Avoid_: gemessene Ruheenergie, selbst berechneter Grundumsatz, direkte Kalorimetrie
+
+**Vollständig beobachteter Ruheenergietag**:
+Ein messlokaler Kalendertag, dessen tatsächliche lokale Dauer von 23, 24 oder 25 Stunden durch zulässige wirksame Ruheenergieintervalle lückenlos und ohne ungelöste Überlappung, Quellen- oder Identitätsfrage abgedeckt ist. Tagesbeiträge werden anhand ihrer tatsächlichen UTC-Überlappungsdauer zeitanteilig aus den kumulativen Samples abgeleitet. Ein unvollständiger Tageswert bleibt für Gewichtsmodelle und Energiebilanz fehlend und wird weder mit null gefüllt noch hochgerechnet; vollständige Abdeckung belegt nicht die Genauigkeit der Schätzung. Ein vollständig beobachteter Tag kann wegen eines offenen Datenprüffalls zugleich vorläufig sein.
+_Avoid_: gemessener Tagesenergieverbrauch, hochgerechnete Ruheenergie, vollständige Abdeckung als Genauigkeitsnachweis
+
+**Überlappende Ruheenergiemessungen**:
+Zwei verschiedene wirksame Ruheenergie-Samples mit positiver zeitlicher Überlappung. Sie werden weder automatisch priorisiert noch beschnitten oder addiert; die Überlappung öffnet einen Quellenkonflikt und macht alle betroffenen Ruheenergietage bis zu einer Korrektur oder einem lokalen Messungsausschluss unvollständig.
+_Avoid_: automatische Quellenpriorität, doppelt gezählte Ruheenergie, stilles zeitliches Beschneiden
+
 **Energiebilanz**:
 Eine abgeleitete Anzeigegröße aus aufgenommener Energie abzüglich aktiver Energie und Ruheenergie für denselben Zeitraum. Sie wird berechnet und visualisiert, während Gewichtsmodelle die drei Ausgangsgrößen getrennt verwenden.
 _Avoid_: eigenständige Messung, einziges Energiemerkmal des Modells
