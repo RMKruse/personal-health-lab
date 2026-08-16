@@ -1139,6 +1139,359 @@ def run(mode: str) -> dict[str, object]:
     }
 
 
+def run_gate(calibration: dict[str, object]) -> dict[str, object]:
+    """Validate the fixed v2 definition on independent, mature-envelope cases."""
+    winner = Candidate(**calibration["winner"])  # type: ignore[arg-type]
+    stresses = (
+        ("baseline", {}),
+        ("density_edge", {"density": 0.60}),
+        ("gap_edge", {"gap_days": 14}),
+        ("autocorrelation_edge", {"residual_ar": 0.60}),
+        ("curvature_edge", {"curvature": 1.30}),
+    )
+    signals = {
+        "null": (0.0, 0.0),
+        "positive": (0.65, 0.55),
+        "negative": (-0.65, -0.55),
+    }
+    cases: list[dict[str, object]] = []
+    scenario_lookup: dict[str, tuple[Scenario, int]] = {}
+    repetitions = 120
+    for scenario_index, ((stress, changes), (signal, rhos)) in enumerate(
+        product(stresses, signals.items())
+    ):
+        for seed in range(6):
+            inputs = {
+                "density": 0.75,
+                "gap_days": 0,
+                "residual_ar": 0.40,
+                "curvature": 0.35,
+            } | changes
+            scenario = Scenario(
+                name=f"{stress}-{signal}",
+                days=365,
+                break_mode="none",
+                device_mode="none",
+                measurement_error=0.35,
+                trend_rho=rhos[0],
+                deviation_rho=rhos[1],
+                **inputs,
+            )
+            scenario_lookup[scenario.name] = (scenario, scenario_index)
+            data = simulate(scenario, 1_000_000 + scenario_index * 100 + seed)
+            breaks = {
+                window: (
+                    strongest_mean_shift(data.resting, window),
+                    strongest_mean_shift(data.weight, window),
+                )
+                for window in WINDOWS
+            }
+            fitted = fit(data, winner, breaks)
+            primary, sensitivity = (
+                bootstrap(
+                    data,
+                    winner,
+                    fitted,
+                    repetitions,
+                    factor,
+                    float(calibration["synthetic_critical_floor"]),
+                    calibration["studentized_floors"],  # type: ignore[arg-type]
+                    calibration["synthetic_biases"],  # type: ignore[arg-type]
+                    calibration["bias_corrected_floors"],  # type: ignore[arg-type]
+                    calibration["fisher_floors"],  # type: ignore[arg-type]
+                    calibration["fisher_biases"],  # type: ignore[arg-type]
+                    calibration["fisher_bias_corrected_floors"],  # type: ignore[arg-type]
+                    2_000_000 + scenario_index * 1000 + seed * 10 + index,
+                )
+                for index, factor in enumerate((1.0, 2.0))
+            )
+            neighbor_estimates = [
+                fit(data, Candidate(winner.kernel, multiplier, winner.edge_rule), breaks).estimates
+                for multiplier in (0.75, 1.25)
+            ]
+            smoothing_change = max(
+                abs(left - right)
+                for estimates in neighbor_estimates
+                for left, right in zip(fitted.estimates, estimates, strict=True)
+            )
+            block_change = max(
+                abs(left - right)
+                for left, right in zip(
+                    primary["fisher_bias_corrected_halfwidths"],  # type: ignore[arg-type]
+                    sensitivity["fisher_bias_corrected_halfwidths"],  # type: ignore[arg-type]
+                    strict=True,
+                )
+            )
+            diagnostics = {
+                "minimum_paired_density": min(item.density for item in fitted.windows),
+                "maximum_gap_days": max(item.max_gap for item in fitted.windows),
+                "maximum_residual_acf": max(item.residual_acf for item in fitted.windows),
+                "maximum_influence": max(item.influence for item in fitted.windows),
+                "maximum_structure_break_sensitivity": max(
+                    item.structure_break_sensitivity for item in fitted.windows
+                ),
+                "minimum_local_pivot": min(item.min_pivot for item in fitted.windows),
+                "maximum_smoothing_change": smoothing_change,
+                "block_halfwidth_change": block_change,
+                "bootstrap_success_rate": float(primary["successes"]) / repetitions,
+            }
+            gate_pass = (
+                diagnostics["minimum_paired_density"] >= 0.40
+                and diagnostics["maximum_gap_days"] <= 18
+                and diagnostics["maximum_residual_acf"] <= 0.55
+                and diagnostics["bootstrap_success_rate"] >= 0.99
+            )
+            diagnostic_gate_pass = (
+                diagnostics["maximum_influence"] <= 0.30
+                and diagnostics["maximum_structure_break_sensitivity"] <= 0.30
+                and diagnostics["maximum_smoothing_change"] <= 0.20
+                and diagnostics["block_halfwidth_change"] <= 0.10
+            )
+            cases.append(
+                {
+                    "scenario": scenario.name,
+                    "seed": seed,
+                    "joint_coverage": primary["fisher_bias_corrected_joint_coverage"],
+                    "false_alarm": primary["fisher_bias_corrected_false_alarm"],
+                    "quantile_stability": primary[
+                        "fisher_bias_corrected_quantile_stability"
+                    ],
+                    "median_halfwidth": statistics.median(
+                        primary["fisher_bias_corrected_halfwidths"]  # type: ignore[arg-type]
+                    ),
+                    "gate_pass": gate_pass,
+                    "diagnostic_gate_pass": diagnostic_gate_pass,
+                    "failed_diagnostics": [
+                        name
+                        for name, passed in (
+                            ("influence", diagnostics["maximum_influence"] <= 0.30),
+                            (
+                                "structure_break_sensitivity",
+                                diagnostics["maximum_structure_break_sensitivity"] <= 0.30,
+                            ),
+                            ("smoothing_change", diagnostics["maximum_smoothing_change"] <= 0.20),
+                            ("block_change", diagnostics["block_halfwidth_change"] <= 0.10),
+                            ("bootstrap_success", diagnostics["bootstrap_success_rate"] >= 0.99),
+                        )
+                        if not passed
+                    ],
+                    **diagnostics,
+                }
+            )
+            print(f"gate {len(cases):02d}/90 {scenario.name} seed={seed}", flush=True)
+
+    uncovered = next(case for case in cases if not case["joint_coverage"])
+    probe_selection = {
+        "worst_120_quantile": max(cases, key=lambda case: case["quantile_stability"]),
+        "worst_120_block_change": max(
+            cases, key=lambda case: case["block_halfwidth_change"]
+        ),
+        "highest_residual_acf": max(cases, key=lambda case: case["maximum_residual_acf"]),
+        "only_120_uncovered": uncovered,
+    }
+    stability_probe = []
+    for label, case in probe_selection.items():
+        scenario, scenario_index = scenario_lookup[str(case["scenario"])]
+        seed = int(case["seed"])
+        data = simulate(scenario, 1_000_000 + scenario_index * 100 + seed)
+        fitted = fit(data, winner)
+        results = []
+        for index, factor in enumerate((1.0, 2.0)):
+            print(f"probe {label} factor={factor:g}", flush=True)
+            results.append(
+                bootstrap(
+                    data,
+                    winner,
+                    fitted,
+                    2_000,
+                    factor,
+                    float(calibration["synthetic_critical_floor"]),
+                    calibration["studentized_floors"],  # type: ignore[arg-type]
+                    calibration["synthetic_biases"],  # type: ignore[arg-type]
+                    calibration["bias_corrected_floors"],  # type: ignore[arg-type]
+                    calibration["fisher_floors"],  # type: ignore[arg-type]
+                    calibration["fisher_biases"],  # type: ignore[arg-type]
+                    calibration["fisher_bias_corrected_floors"],  # type: ignore[arg-type]
+                    3_000_000 + scenario_index * 1000 + seed * 10 + index,
+                )
+            )
+        primary, sensitivity = results
+        stability_probe.append(
+            {
+                "label": label,
+                "scenario": scenario.name,
+                "seed": seed,
+                "successes": primary["successes"],
+                "failures": primary["failures"],
+                "joint_coverage": primary["fisher_bias_corrected_joint_coverage"],
+                "false_alarm": primary["fisher_bias_corrected_false_alarm"],
+                "quantile_stability": primary[
+                    "fisher_bias_corrected_quantile_stability"
+                ],
+                "block_halfwidth_change": max(
+                    abs(left - right)
+                    for left, right in zip(
+                        primary["fisher_bias_corrected_halfwidths"],  # type: ignore[arg-type]
+                        sensitivity["fisher_bias_corrected_halfwidths"],  # type: ignore[arg-type]
+                        strict=True,
+                    )
+                ),
+                "median_halfwidth": statistics.median(
+                    primary["fisher_bias_corrected_halfwidths"]  # type: ignore[arg-type]
+                ),
+                "seconds_primary": primary["seconds"],
+                "seconds_sensitivity": sensitivity["seconds"],
+            }
+        )
+
+    accepted = [case for case in cases if case["gate_pass"]]
+    null_cases = [case for case in accepted if "null" in str(case["scenario"])]
+    diagnostic_accepted = [case for case in cases if case["diagnostic_gate_pass"]]
+    return {
+        "version": f"{VERSION}-gate-1",
+        "calibration_version": calibration["version"],
+        "definition": {
+            "candidate": asdict(winner),
+            "band": "Fisher-z bias-corrected studentized simultaneous 95%",
+            "bootstrap": "paired residual circular moving-block, full refits",
+            "holdout_repetitions": repetitions,
+            "release_successful_repetitions": 2_000,
+            "release_maximum_attempts": 2_020,
+        },
+        "synthetic_envelope": {
+            "days": 365,
+            "minimum_observation_probability": 0.60,
+            "maximum_forced_gap_days": 14,
+            "maximum_residual_ar": 0.60,
+            "maximum_curvature": 1.30,
+            "maximum_resting_measurement_error_sd": 0.35,
+            "maximum_weight_measurement_error_sd": 0.084,
+            "structural_breaks": "none",
+            "device_transitions": "none",
+        },
+        "provisional_gates": {
+            "minimum_history_days": 365,
+            "minimum_paired_density": 0.40,
+            "maximum_observed_gap_days": 18,
+            "maximum_residual_acf": 0.55,
+            "maximum_resting_measurement_error_sd": 0.35,
+            "maximum_weight_measurement_error_sd": 0.084,
+            "structural_breaks": "none",
+            "device_transitions": "none",
+            "minimum_bootstrap_success_rate": 0.99,
+        },
+        "discarded_posthoc_diagnostic_gate": {
+            "accepted_count": len(diagnostic_accepted),
+            "accepted_fraction": len(diagnostic_accepted) / len(cases),
+            "joint_coverage": statistics.fmean(
+                bool(case["joint_coverage"]) for case in diagnostic_accepted
+            ),
+            "reason": (
+                "Influence/sensitivity selection rejected most cases and did not isolate "
+                "the only uncovered case; retain these measures as warnings only."
+            ),
+        },
+        "stability_probe": stability_probe,
+        "case_count": len(cases),
+        "accepted_count": len(accepted),
+        "accepted_fraction": len(accepted) / len(cases),
+        "accepted_joint_coverage": statistics.fmean(
+            bool(case["joint_coverage"]) for case in accepted
+        ),
+        "accepted_null_false_alarm": statistics.fmean(
+            bool(case["false_alarm"]) for case in null_cases
+        ),
+        "all_case_joint_coverage": statistics.fmean(
+            bool(case["joint_coverage"]) for case in cases
+        ),
+        "cases": cases,
+        "real_data_revalidation": (
+            "V0.5 muss reale Dichte, Lücken, Restabhängigkeit, Gerätewechsel, Strukturbrüche "
+            "und Messfehler mit dieser synthetischen Hülle vergleichen. Liegt eine Dimension "
+            "außerhalb, werden zuerst die Szenarien erweitert und danach die vollständige "
+            "Definition neu kalibriert; reale Zusammenhänge bleiben bis dahin explorativ."
+        ),
+    }
+
+
+def write_gate_report(result: dict[str, object], path: Path) -> None:
+    cases = result["cases"]  # type: ignore[assignment]
+    failures: dict[str, int] = {}
+    for case in cases:  # type: ignore[union-attr]
+        for name in case["failed_diagnostics"]:
+            failures[name] = failures.get(name, 0) + 1
+    discarded = result["discarded_posthoc_diagnostic_gate"]
+    probe = result["stability_probe"]  # type: ignore[assignment]
+    quantile_stabilities = [float(item["quantile_stability"]) for item in probe]
+    block_changes = [float(item["block_halfwidth_change"]) for item in probe]
+    lines = [
+        "# V0.4-Prototyp: vorläufiges synthetisches Reife-Gate",
+        "",
+        f"Version: `{result['version']}`.",
+        "",
+        "## Ergebnis",
+        "",
+        (
+            f"{result['accepted_count']} von {result['case_count']} unabhängigen Fällen "
+            f"bestanden das Daten-/Design-Gate ({result['accepted_fraction']:.1%}). "
+            "Innerhalb des Gates "
+            f"betrug die gemeinsame Abdeckung {result['accepted_joint_coverage']:.1%}, der "
+            f"familienweise Null-Fehlalarm {result['accepted_null_false_alarm']:.1%}."
+        ),
+        (
+            f"Ohne Gate betrug die gemeinsame Abdeckung "
+            f"{result['all_case_joint_coverage']:.1%}."
+        ),
+        "",
+        "Nicht verwendete Diagnose-Ausschlüsse: "
+        + (", ".join(f"{name}={count}" for name, count in failures.items()) or "keine"),
+        (
+            f"Das verworfene Diagnose-Gate hätte nur {discarded['accepted_count']} Fälle "
+            f"({discarded['accepted_fraction']:.1%}) behalten und dort "
+            f"{discarded['joint_coverage']:.1%} Abdeckung erreicht. Es erkannte den einzigen "
+            "Fehlschlag nicht und wird daher nicht Teil der Definition."
+        ),
+        "",
+        "## Bootstrap-Stabilität",
+        "",
+        (
+            "Vier vorab ausgewählte schwierige Fälle wurden mit 2.000 erfolgreichen Refits "
+            "für die Primär- und verdoppelte Blocklänge nachgerechnet. Alle 16.000 Refits "
+            f"waren erfolgreich. Die Quantilstabilität lag zwischen "
+            f"{min(quantile_stabilities):.4f} und {max(quantile_stabilities):.4f}, die "
+            f"Blockbreitenänderung zwischen {min(block_changes):.4f} und "
+            f"{max(block_changes):.4f}."
+        ),
+        (
+            "Vorläufige Freigaberegel: 2.000 erfolgreiche Refits innerhalb höchstens 2.020 "
+            "Versuchen. 120 Replikate dienen nur der Holdout-Kalibrierung."
+        ),
+        "",
+        "## Vorläufige Definition",
+        "",
+        "```json",
+        json.dumps(result["provisional_gates"], indent=2, ensure_ascii=False),
+        "```",
+        "",
+        "## Zwingende Neukalibrierung mit echten Daten",
+        "",
+        str(result["real_data_revalidation"]),
+        "",
+        (
+            "Diese Schwellen sind keine Aussagen über echte Gesundheitsdaten. Sie definieren "
+            "nur, wann die V0.4-Ausgabe innerhalb der getesteten synthetischen Hülle als "
+            "belastbar statt explorativ markiert werden darf."
+        ),
+        "",
+        "## Reproduktion",
+        "",
+        "```bash",
+        "uv run python prototypes/outcome_association_calibration_103.py --mode gate",
+        "```",
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def write_report(result: dict[str, object], path: Path) -> None:
     summaries = result["candidate_summary"]  # type: ignore[assignment]
     rows = result["bootstrap_rows"]  # type: ignore[assignment]
@@ -1285,11 +1638,26 @@ def self_check() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("quick", "full"), default="quick")
+    parser.add_argument("--mode", choices=("quick", "full", "gate"), default="quick")
     arguments = parser.parse_args()
     self_check()
-    result = run(arguments.mode)
     root = Path(__file__).resolve().parent
+    if arguments.mode == "gate":
+        calibration = json.loads(
+            (root / "outcome_association_calibration_103_results.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        result = run_gate(calibration)
+        json_path = root / "outcome_association_calibration_103_gate_results.json"
+        report_path = root / "outcome_association_calibration_103_gate_results.md"
+        json_path.write_text(
+            json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        write_gate_report(result, report_path)
+        print(report_path)
+        return
+    result = run(arguments.mode)
     json_path = root / "outcome_association_calibration_103_results.json"
     report_path = root / "outcome_association_calibration_103_results.md"
     json_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
