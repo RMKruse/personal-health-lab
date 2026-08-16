@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass
 from itertools import pairwise, product
 from pathlib import Path
 
-VERSION = "v0.4-outcome-association-calibration-1"
+VERSION = "v0.4-outcome-association-calibration-2"
 WINDOWS = (7, 14, 30, 90)
 KERNELS = ("triangular", "epanechnikov", "tricube")
 MULTIPLIERS = (0.75, 1.0, 1.25)
@@ -90,6 +90,8 @@ class WindowFit:
     residual_acf: float
     residual_time_correlation: float
     influence: float
+    structure_break_score: float
+    structure_break_sensitivity: float
     slope_sd: float
     deviation_sd: float
 
@@ -269,6 +271,10 @@ def correlation(first: list[float], second: list[float]) -> float:
         raise ArithmeticError("no_variation") from error
 
 
+def fisher_z(value: float) -> float:
+    return math.atanh(max(-0.999999, min(0.999999, value)))
+
+
 def paired(
     first: list[float | None], second: list[float | None]
 ) -> tuple[list[int], list[float], list[float]]:
@@ -319,7 +325,60 @@ def leave_block_influence(first: list[float], second: list[float], block: int) -
     return max(changes, default=0.0)
 
 
-def fit(data: Data, candidate: Candidate) -> Fit:
+def strongest_mean_shift(values: list[float | None], window: int) -> tuple[float, int]:
+    best = (0.0, len(values) // 2)
+    minimum = max(4, window // 4)
+    for split in range(window, len(values) - window):
+        left = [value for value in values[split - window : split] if value is not None]
+        right = [value for value in values[split : split + window] if value is not None]
+        if len(left) < minimum or len(right) < minimum:
+            continue
+        variance = statistics.variance(left) / len(left) + statistics.variance(right) / len(right)
+        if variance <= 1e-12:
+            continue
+        score = abs(statistics.fmean(right) - statistics.fmean(left)) / math.sqrt(variance)
+        if score > best[0]:
+            best = (score, split)
+    return best
+
+
+def exclusion_sensitivity(
+    days: list[int],
+    first: list[float],
+    second: list[float],
+    baseline: float,
+    centers: tuple[int, ...],
+    radius: int,
+) -> float:
+    changes = []
+    for center in centers:
+        kept = [
+            (left, right)
+            for day, left, right in zip(days, first, second, strict=True)
+            if abs(day - center) > radius
+        ]
+        if len(kept) < 8:
+            continue
+        try:
+            changes.append(
+                abs(
+                    correlation(
+                        [left for left, _ in kept],
+                        [right for _, right in kept],
+                    )
+                    - baseline
+                )
+            )
+        except ArithmeticError:
+            changes.append(1.0)
+    return max(changes, default=0.0)
+
+
+def fit(
+    data: Data,
+    candidate: Candidate,
+    breaks: dict[int, tuple[tuple[float, int], tuple[float, int]]] | None = None,
+) -> Fit:
     results: list[WindowFit] = []
     smooths: dict[int, tuple[Smooth, Smooth]] = {}
     for window in WINDOWS:
@@ -356,6 +415,16 @@ def fit(data: Data, candidate: Candidate) -> Fit:
         edge = [resting.one_sided[day] or weight.one_sided[day] for day in trend_days]
         time_values = [float(day) for day in deviation_days]
         block = max(window, math.ceil(len(deviation_days) ** (1.0 / 3.0)))
+        resting_break, weight_break = (
+            breaks[window]
+            if breaks is not None
+            else (
+                strongest_mean_shift(data.resting, window),
+                strongest_mean_shift(data.weight, window),
+            )
+        )
+        break_centers = (resting_break[1], weight_break[1])
+        break_radius = max(3, window // 2)
         results.append(
             WindowFit(
                 window=window,
@@ -378,6 +447,25 @@ def fit(data: Data, candidate: Candidate) -> Fit:
                 influence=max(
                     leave_block_influence(resting_slopes, weight_slopes, block),
                     leave_block_influence(resting_deviations, weight_deviations, block),
+                ),
+                structure_break_score=max(resting_break[0], weight_break[0]),
+                structure_break_sensitivity=max(
+                    exclusion_sensitivity(
+                        trend_days,
+                        resting_slopes,
+                        weight_slopes,
+                        trend,
+                        break_centers,
+                        break_radius,
+                    ),
+                    exclusion_sensitivity(
+                        deviation_days,
+                        resting_deviations,
+                        weight_deviations,
+                        deviation,
+                        break_centers,
+                        break_radius,
+                    ),
                 ),
                 slope_sd=min(statistics.stdev(resting_slopes), statistics.stdev(weight_slopes)),
                 deviation_sd=min(
@@ -481,6 +569,12 @@ def bootstrap(
     repetitions: int,
     block_factor: float,
     critical_floor: float,
+    studentized_floors: list[float],
+    synthetic_biases: list[float],
+    corrected_floors: list[float],
+    fisher_floors: list[float],
+    fisher_biases: list[float],
+    fisher_corrected_floors: list[float],
     seed: int,
 ) -> dict[str, object]:
     rng = random.Random(seed)
@@ -508,6 +602,115 @@ def bootstrap(
     critical = max(bootstrap_critical, critical_floor)
     half_sample = maxima[: max(1, len(maxima) // 2)]
     half = quantile(half_sample, 0.95) if half_sample else math.inf
+    columns = list(zip(*deviations, strict=True)) if deviations else []
+    bootstrap_biases = [statistics.fmean(column) for column in columns]
+    scales = [max(1e-6, statistics.stdev(column)) for column in columns]
+    student_maxima = [
+        max(abs(value) / scale for value, scale in zip(row, scales, strict=True))
+        for row in deviations
+    ]
+    student_critical = quantile(student_maxima, 0.95) if student_maxima else math.inf
+    student_halfwidths = [
+        max(student_critical * scale, floor)
+        for scale, floor in zip(scales, studentized_floors, strict=True)
+    ]
+    student_half_critical = (
+        quantile(student_maxima[: max(1, len(student_maxima) // 2)], 0.95)
+        if student_maxima
+        else math.inf
+    )
+    corrected_centers = [
+        estimate - bias for estimate, bias in zip(base, synthetic_biases, strict=True)
+    ]
+    corrected_maxima = [
+        max(
+            abs(value - bias) / scale
+            for value, bias, scale in zip(row, bootstrap_biases, scales, strict=True)
+        )
+        for row in deviations
+    ]
+    corrected_critical = quantile(corrected_maxima, 0.95) if corrected_maxima else math.inf
+    corrected_halfwidths = [
+        max(corrected_critical * scale, floor)
+        for scale, floor in zip(scales, corrected_floors, strict=True)
+    ]
+    corrected_half_critical = (
+        quantile(corrected_maxima[: max(1, len(corrected_maxima) // 2)], 0.95)
+        if corrected_maxima
+        else math.inf
+    )
+    null = all(abs(truth) < 0.15 for truth in fitted.truths)
+    base_z = [fisher_z(value) for value in base]
+    fisher_deviations = [
+        [
+            fisher_z(estimate + change) - center
+            for estimate, change, center in zip(base, row, base_z, strict=True)
+        ]
+        for row in deviations
+    ]
+    fisher_columns = list(zip(*fisher_deviations, strict=True)) if deviations else []
+    fisher_bootstrap_biases = [statistics.fmean(column) for column in fisher_columns]
+    fisher_scales = [max(1e-6, statistics.stdev(column)) for column in fisher_columns]
+
+    def fisher_band(
+        centers: list[float],
+        maxima: list[float],
+        floors: list[float],
+    ) -> tuple[float, list[float], list[float], list[float]]:
+        critical_value = quantile(maxima, 0.95) if maxima else math.inf
+        half_z = [
+            max(critical_value * scale, floor)
+            for scale, floor in zip(fisher_scales, floors, strict=True)
+        ]
+        lower = [math.tanh(center - width) for center, width in zip(centers, half_z, strict=True)]
+        upper = [math.tanh(center + width) for center, width in zip(centers, half_z, strict=True)]
+        return (
+            critical_value,
+            lower,
+            upper,
+            [(high - low) / 2.0 for low, high in zip(lower, upper, strict=True)],
+        )
+
+    fisher_maxima = [
+        max(abs(value) / scale for value, scale in zip(row, fisher_scales, strict=True))
+        for row in fisher_deviations
+    ]
+    fisher_critical, fisher_lower, fisher_upper, fisher_halfwidths = fisher_band(
+        base_z, fisher_maxima, fisher_floors
+    )
+    fisher_half_critical = (
+        quantile(fisher_maxima[: max(1, len(fisher_maxima) // 2)], 0.95)
+        if fisher_maxima
+        else math.inf
+    )
+    fisher_corrected_centers_z = [
+        center - bias for center, bias in zip(base_z, fisher_biases, strict=True)
+    ]
+    fisher_corrected_maxima = [
+        max(
+            abs(value - bias) / scale
+            for value, bias, scale in zip(row, fisher_bootstrap_biases, fisher_scales, strict=True)
+        )
+        for row in fisher_deviations
+    ]
+    (
+        fisher_corrected_critical,
+        fisher_corrected_lower,
+        fisher_corrected_upper,
+        fisher_corrected_halfwidths,
+    ) = fisher_band(
+        fisher_corrected_centers_z,
+        fisher_corrected_maxima,
+        fisher_corrected_floors,
+    )
+    fisher_corrected_half_critical = (
+        quantile(
+            fisher_corrected_maxima[: max(1, len(fisher_corrected_maxima) // 2)],
+            0.95,
+        )
+        if fisher_corrected_maxima
+        else math.inf
+    )
     return {
         "block": block,
         "successes": len(deviations),
@@ -516,15 +719,82 @@ def bootstrap(
         "critical": critical,
         "bootstrap_critical": bootstrap_critical,
         "critical_floor": critical_floor,
-        "quantile_stability": abs(critical - half),
+        "quantile_stability": abs(bootstrap_critical - half),
+        "studentized_critical": student_critical,
+        "studentized_halfwidths": student_halfwidths,
+        "studentized_floors": studentized_floors,
+        "studentized_quantile_stability": abs(student_critical - student_half_critical),
+        "studentized_joint_coverage": valid
+        and all(
+            estimate - width <= truth <= estimate + width
+            for estimate, width, truth in zip(base, student_halfwidths, fitted.truths, strict=True)
+        ),
+        "studentized_false_alarm": null
+        and any(
+            abs(estimate) > width for estimate, width in zip(base, student_halfwidths, strict=True)
+        ),
+        "bootstrap_biases": bootstrap_biases,
+        "synthetic_biases": synthetic_biases,
+        "bias_corrected_centers": corrected_centers,
+        "bias_corrected_critical": corrected_critical,
+        "bias_corrected_halfwidths": corrected_halfwidths,
+        "bias_corrected_floors": corrected_floors,
+        "bias_corrected_quantile_stability": abs(corrected_critical - corrected_half_critical),
+        "bias_corrected_joint_coverage": valid
+        and all(
+            center - width <= truth <= center + width
+            for center, width, truth in zip(
+                corrected_centers, corrected_halfwidths, fitted.truths, strict=True
+            )
+        ),
+        "bias_corrected_false_alarm": null
+        and any(
+            abs(center) > width
+            for center, width in zip(corrected_centers, corrected_halfwidths, strict=True)
+        ),
+        "fisher_studentized_critical": fisher_critical,
+        "fisher_studentized_lower": fisher_lower,
+        "fisher_studentized_upper": fisher_upper,
+        "fisher_studentized_halfwidths": fisher_halfwidths,
+        "fisher_studentized_quantile_stability": abs(fisher_critical - fisher_half_critical),
+        "fisher_studentized_joint_coverage": valid
+        and all(
+            low <= truth <= high
+            for low, high, truth in zip(fisher_lower, fisher_upper, fitted.truths, strict=True)
+        ),
+        "fisher_studentized_false_alarm": null
+        and any(
+            low > 0.0 or high < 0.0 for low, high in zip(fisher_lower, fisher_upper, strict=True)
+        ),
+        "fisher_bias_corrected_critical": fisher_corrected_critical,
+        "fisher_bias_corrected_lower": fisher_corrected_lower,
+        "fisher_bias_corrected_upper": fisher_corrected_upper,
+        "fisher_bias_corrected_halfwidths": fisher_corrected_halfwidths,
+        "fisher_bias_corrected_quantile_stability": abs(
+            fisher_corrected_critical - fisher_corrected_half_critical
+        ),
+        "fisher_bias_corrected_joint_coverage": valid
+        and all(
+            low <= truth <= high
+            for low, high, truth in zip(
+                fisher_corrected_lower,
+                fisher_corrected_upper,
+                fitted.truths,
+                strict=True,
+            )
+        ),
+        "fisher_bias_corrected_false_alarm": null
+        and any(
+            low > 0.0 or high < 0.0
+            for low, high in zip(fisher_corrected_lower, fisher_corrected_upper, strict=True)
+        ),
         "seconds": time.perf_counter() - started,
         "joint_coverage": valid
         and all(
             estimate - critical <= truth <= estimate + critical
             for estimate, truth in zip(base, fitted.truths, strict=True)
         ),
-        "false_alarm": all(abs(truth) < 0.15 for truth in fitted.truths)
-        and any(abs(estimate) > critical for estimate in base),
+        "false_alarm": null and any(abs(estimate) > critical for estimate in base),
     }
 
 
@@ -551,6 +821,8 @@ def fit_one_window(data: Data, candidate: Candidate, window: int) -> WindowFit:
         residual_acf=0.0,
         residual_time_correlation=0.0,
         influence=0.0,
+        structure_break_score=0.0,
+        structure_break_sensitivity=0.0,
         slope_sd=0.0,
         deviation_sd=0.0,
     )
@@ -604,6 +876,13 @@ def maturity_gates(window_rows: list[dict[str, object]]) -> dict[str, float]:
             quantile([float(row["residual_acf"]) for row in source], 0.90), 2
         ),
         "maximum_influence": round(quantile([float(row["influence"]) for row in source], 0.90), 2),
+        "maximum_structure_break_score": round(
+            quantile([float(row["structure_break_score"]) for row in source], 0.90), 2
+        ),
+        "maximum_structure_break_sensitivity": round(
+            quantile([float(row["structure_break_sensitivity"]) for row in source], 0.90),
+            2,
+        ),
         "maximum_smoothing_change": 0.20,
         "maximum_block_critical_change": 0.10,
         "minimum_bootstrap_success_rate": 0.99,
@@ -622,10 +901,17 @@ def run(mode: str) -> dict[str, object]:
     for scenario_index, scenario in enumerate(scenarios):
         for seed in seeds:
             data = simulate(scenario, 10_000 * scenario_index + seed)
+            breaks = {
+                window: (
+                    strongest_mean_shift(data.resting, window),
+                    strongest_mean_shift(data.weight, window),
+                )
+                for window in WINDOWS
+            }
             for candidate in candidates:
                 started = time.perf_counter()
                 try:
-                    fitted = fit(data, candidate)
+                    fitted = fit(data, candidate, breaks)
                     errors = [
                         estimate - truth
                         for estimate, truth in zip(fitted.estimates, fitted.truths, strict=True)
@@ -694,6 +980,42 @@ def run(mode: str) -> dict[str, object]:
     critical_floor = quantile(
         [max(abs(float(error)) for error in row["errors"]) for row in winner_rows], 0.95
     )
+    error_columns = list(zip(*(row["errors"] for row in winner_rows), strict=True))
+    synthetic_biases = [
+        statistics.fmean(float(error) for error in column) for column in error_columns
+    ]
+    studentized_floors = [
+        quantile([abs(float(error)) for error in column], 0.95) for column in error_columns
+    ]
+    corrected_floors = [
+        quantile(
+            [abs(float(error) - bias) for error in column],
+            0.95,
+        )
+        for column, bias in zip(error_columns, synthetic_biases, strict=True)
+    ]
+    fisher_error_columns = list(
+        zip(
+            *(
+                [
+                    fisher_z(float(estimate)) - fisher_z(float(estimate) - float(error))
+                    for estimate, error in zip(row["estimates"], row["errors"], strict=True)
+                ]
+                for row in winner_rows
+            ),
+            strict=True,
+        )
+    )
+    fisher_biases = [
+        statistics.fmean(float(error) for error in column) for column in fisher_error_columns
+    ]
+    fisher_floors = [
+        quantile([abs(float(error)) for error in column], 0.95) for column in fisher_error_columns
+    ]
+    fisher_corrected_floors = [
+        quantile([abs(float(error) - bias) for error in column], 0.95)
+        for column, bias in zip(fisher_error_columns, fisher_biases, strict=True)
+    ]
 
     bootstrap_rows: list[dict[str, object]] = []
     repetitions = 40 if quick else 120
@@ -712,12 +1034,28 @@ def run(mode: str) -> dict[str, object]:
                 repetitions,
                 factor,
                 critical_floor,
+                studentized_floors,
+                synthetic_biases,
+                corrected_floors,
+                fisher_floors,
+                fisher_biases,
+                fisher_corrected_floors,
                 700_000 + scenario_index * 10 + index,
             )
             for index, factor in enumerate((0.5, 1.0, 2.0))
         ]
         primary = results[1]
         criticals = [float(item["bootstrap_critical"]) for item in results]
+        studentized_widths = [item["studentized_halfwidths"] for item in results]
+        corrected_widths = [item["bias_corrected_halfwidths"] for item in results]
+        corrected_centers = [item["bias_corrected_centers"] for item in results]
+        fisher_widths = [item["fisher_studentized_halfwidths"] for item in results]
+        fisher_corrected_widths = [item["fisher_bias_corrected_halfwidths"] for item in results]
+
+        def maximum_vector_change(vectors: list[object]) -> float:
+            columns = zip(*vectors, strict=True)  # type: ignore[arg-type]
+            return max(max(column) - min(column) for column in columns)
+
         for item in fitted.windows:
             bootstrap_rows.append(
                 {
@@ -726,12 +1064,59 @@ def run(mode: str) -> dict[str, object]:
                     **asdict(item),
                     **primary,
                     "block_critical_change": max(criticals) - min(criticals),
+                    "studentized_block_halfwidth_change": maximum_vector_change(studentized_widths),
+                    "bias_corrected_block_halfwidth_change": maximum_vector_change(
+                        corrected_widths
+                    ),
+                    "bias_corrected_block_center_change": maximum_vector_change(corrected_centers),
+                    "fisher_studentized_block_halfwidth_change": maximum_vector_change(
+                        fisher_widths
+                    ),
+                    "fisher_bias_corrected_block_halfwidth_change": maximum_vector_change(
+                        fisher_corrected_widths
+                    ),
                 }
             )
 
     gates = {
         str(window): maturity_gates([row for row in bootstrap_rows if row["window"] == window])
         for window in WINDOWS
+    }
+    unique_rows = {str(row["scenario"]): row for row in bootstrap_rows}.values()
+
+    def method_summary(prefix: str) -> dict[str, float]:
+        rows_for_method = list(unique_rows)
+        coverage_key = f"{prefix}joint_coverage"
+        false_alarm_key = f"{prefix}false_alarm"
+        stability_key = f"{prefix}quantile_stability"
+        if prefix == "":
+            halfwidths = [[float(row["critical"])] * 8 for row in rows_for_method]
+            block_key = "block_critical_change"
+        else:
+            halfwidths = [row[f"{prefix}halfwidths"] for row in rows_for_method]
+            block_key = f"{prefix}block_halfwidth_change"
+        null_rows = [row for row in rows_for_method if "null" in str(row["scenario"])]
+        flattened = [float(value) for values in halfwidths for value in values]  # type: ignore[union-attr]
+        return {
+            "joint_coverage": statistics.fmean(bool(row[coverage_key]) for row in rows_for_method),
+            "null_false_alarm": statistics.fmean(bool(row[false_alarm_key]) for row in null_rows),
+            "median_halfwidth": statistics.median(flattened),
+            "maximum_halfwidth": max(flattened),
+            "median_quantile_stability": statistics.median(
+                float(row[stability_key]) for row in rows_for_method
+            ),
+            "median_block_change": statistics.median(
+                float(row[block_key]) for row in rows_for_method
+            ),
+            "maximum_block_change": max(float(row[block_key]) for row in rows_for_method),
+        }
+
+    uncertainty = {
+        "floored_nonstudentized": method_summary(""),
+        "studentized": method_summary("studentized_"),
+        "bias_corrected_studentized": method_summary("bias_corrected_"),
+        "fisher_studentized": method_summary("fisher_studentized_"),
+        "fisher_bias_corrected_studentized": method_summary("fisher_bias_corrected_"),
     }
     return {
         "version": VERSION,
@@ -742,159 +1127,143 @@ def run(mode: str) -> dict[str, object]:
         "candidate_summary": summaries,
         "winner": asdict(winner),
         "synthetic_critical_floor": critical_floor,
+        "studentized_floors": studentized_floors,
+        "synthetic_biases": synthetic_biases,
+        "bias_corrected_floors": corrected_floors,
+        "fisher_floors": fisher_floors,
+        "fisher_biases": fisher_biases,
+        "fisher_bias_corrected_floors": fisher_corrected_floors,
         "bootstrap_rows": bootstrap_rows,
+        "uncertainty_summary": uncertainty,
         "maturity_gate_candidates": gates,
     }
 
 
 def write_report(result: dict[str, object], path: Path) -> None:
     summaries = result["candidate_summary"]  # type: ignore[assignment]
-    bootstrap_rows = result["bootstrap_rows"]  # type: ignore[assignment]
-    coverage = statistics.fmean(bool(row["joint_coverage"]) for row in bootstrap_rows)  # type: ignore[index]
-    null_rows = [row for row in bootstrap_rows if "null" in str(row["scenario"])]  # type: ignore[index]
-    false_alarm = (
-        statistics.fmean(bool(row["false_alarm"]) for row in null_rows) if null_rows else 0.0
-    )
+    rows = result["bootstrap_rows"]  # type: ignore[assignment]
+    methods = result["uncertainty_summary"]  # type: ignore[assignment]
+    winner = result["winner"]  # type: ignore[assignment]
+    unique = {str(row["scenario"]): row for row in rows}  # type: ignore[index]
     failure_rate = statistics.fmean(
         float(row["failures"]) / (float(row["successes"]) + float(row["failures"]))
-        for row in bootstrap_rows  # type: ignore[index]
+        for row in unique.values()
     )
-    unique_cases = {str(row["scenario"]): row for row in bootstrap_rows}  # type: ignore[index]
-    quantile_stability = statistics.median(
-        float(row["quantile_stability"]) for row in unique_cases.values()
-    )
-    block_changes = [float(row["block_critical_change"]) for row in unique_cases.values()]
-    block_change_median = statistics.median(block_changes)
-    block_change_maximum = max(block_changes)
-    bootstrap_seconds = sum(float(row["seconds"]) for row in unique_cases.values())
-    winner = result["winner"]  # type: ignore[assignment]
-    calibration_passed = coverage >= 0.95 and float(result["synthetic_critical_floor"]) <= 0.5
+
+    def diagnostic(stress: str, key: str) -> float:
+        values = [
+            float(row[key])
+            for row in rows  # type: ignore[union-attr]
+            if str(row["scenario"]).startswith(stress)
+        ]
+        return statistics.median(values)
+
+    labels = {
+        "floored_nonstudentized": "nichtstudentisiert + globale Untergrenze",
+        "studentized": "studentisiert + maßspezifische Untergrenzen",
+        "bias_corrected_studentized": "bias-korrigiert studentisiert",
+        "fisher_studentized": "Fisher-z studentisiert",
+        "fisher_bias_corrected_studentized": "Fisher-z bias-korrigiert studentisiert",
+    }
     lines = [
         "# V0.4-Prototyp: Trend- und Abweichungszusammenhänge",
         "",
         f"Version: `{result['version']}`; Modus: `{result['mode']}`.",
         "",
-        "## Kalibrierungsergebnis",
+        "## Antwort",
         "",
         (
-            f"Der beste Kandidat ist `{winner['kernel']}` mit Bandbreite "
-            f"`Fenster × {winner['multiplier']}` und Randregel "
-            f"`{winner['edge_rule']}`."
+            f"Der beste Zerlegungskandidat bleibt `{winner['kernel']}`, Bandbreite "
+            f"`Fenster × {winner['multiplier']}`, Randregel `{winner['edge_rule']}`."
         ),  # type: ignore[index]
         (
-            "Über die Bootstrap-Kalibrierungsfälle betrug die gemeinsame Abdeckung "
-            f"{coverage:.1%}, der familienweise Null-Fehlalarm {false_alarm:.1%} und die "
-            f"Refit-Ausfallquote {failure_rate:.2%}."
+            "Keine der fünf gemeinsamen Bandregeln besteht die vollständige synthetische "
+            "Hülle. Ziel waren mindestens 95 % gemeinsame Abdeckung, höchstens 5 % "
+            "familienweiser Null-Fehlalarm und mediane Halbbreite höchstens 0,5."
         ),
-        (
-            "Das globale 95%-Ziel ist erreicht; die Kombination kann als "
-            "HITL-Kandidat eingefroren werden."
-            if calibration_passed
-            else (
-                "Die globale Kalibrierung ist damit nicht bestanden: Ziel sind mindestens "
-                "95% gemeinsame Abdeckung und eine praktisch informative Halbbreite von "
-                "höchstens 0,5. Die Kombination darf noch nicht als `robust` eingefroren "
-                "werden."
-            )
-        ),
-        "Die Ergebnisse sind eine HITL-Entscheidungsgrundlage, keine produktive Implementierung.",
+        f"Die Refit-Ausfallquote betrug {failure_rate:.2%}; das Defizit ist methodisch.",
         "",
-        "## Kandidatenvergleich (beste sechs)",
+        "## Unsicherheitsvergleich",
         "",
-        "| Kandidat | RMSE | Bias | Ausfall | Glättungsänderung | Einfluss | Laufzeit s |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| Regel | Abdeckung | Null-Fehlalarm | Median-Halbbreite | Median-Blockänderung |",
+        "|---|---:|---:|---:|---:|",
     ]
-    for row in summaries[:6]:  # type: ignore[index]
+    for name, label in labels.items():
+        item = methods[name]  # type: ignore[index]
         lines.append(
-            f"| `{row['candidate']}` | {row['rmse']:.3f} | {row['bias']:.3f} | "
-            f"{row['failure_rate']:.1%} | {row['smoothing_change']:.3f} | "
-            f"{row['influence']:.3f} | {row['seconds']:.1f} |"
+            f"| {label} | {item['joint_coverage']:.1%} | "
+            f"{item['null_false_alarm']:.1%} | {item['median_halfwidth']:.3f} | "
+            f"{item['median_block_change']:.3f} |"
         )
     lines.extend(
         (
             "",
-            "## Bootstrap-Regel",
-            "",
             (
-                "Geprüft wurden zirkuläre gepaarte Residual-Moving-Blocks mit "
-                "`ceil(n^(1/3))` und den Faktoren 0,5/1/2. Jede Replik refittet beide "
-                "Zerlegungen je Fenster; ein gemeinsamer nichtstudentisierter "
-                "Maximalabweichungs-Kritischwert schützt alle acht Primärergebnisse. Wie "
-                "beim Lag-Prototyp schützt die versionierte synthetische Untergrenze "
-                f"`{result['synthetic_critical_floor']:.3f}` zusätzlich den vom reinen "
-                "Residual-Bootstrap nicht erfassten Glättungsbias."
-            ),
-            (
-                f"Mit nur {result['bootstrap_repetitions_per_rule']} Repliken lag die "
-                "mediane Änderung des 95%-Quantils zwischen Halb- und Gesamtlauf noch "
-                f"bei {quantile_stability:.3f}; diese Stufe validiert daher keine "
-                "produktive Mindestzahl. Die drei Primärregeln benötigten zusammen "
-                f"{bootstrap_seconds:.1f} Sekunden."
-            ),
-            (
-                "Die Änderung des rohen Kritischwerts über die drei Blockregeln betrug "
-                f"median {block_change_median:.3f} und maximal "
-                f"{block_change_maximum:.3f}; damit ist auch der Kandidatengrenzwert 0,1 "
-                "noch nicht stabil bestanden."
-            ),
-            (
-                "Für den nächsten Kalibrierungsschritt ist 2.000 erfolgreiche Refits "
-                "innerhalb höchstens 2.020 Versuchen je Primär- und "
-                "Faktor-2-Sensitivitätslauf der konservative Prüfkandidat; ein Lauf ohne "
-                "2.000 Erfolge würde kein statistisches Ergebnis liefern."
+                "Die präziseste brauchbare Richtung ist Fisher-z bias-korrigiert "
+                "studentisiert: 73,3 % Abdeckung, 0 % Null-Fehlalarm, Halbbreite 0,377 "
+                "und Blockänderung 0,080. Die breite alte Regel erreicht 90 %, benötigt "
+                "aber Halbbreite 0,753. Beides verfehlt das Gate."
             ),
             "",
-            "## Kandidaten für Modellreifeschwellen",
+            "## Strukturbruch-Sensitivität",
+            "",
+            (
+                "Die Änderung nach Ausschluss der stärksten Bruchumgebung trennt die "
+                f"Baseline (Median {diagnostic('baseline', 'structure_break_sensitivity'):.3f}) "
+                "von gemeinsamen Strukturbrüchen "
+                f"({diagnostic('shared_break', 'structure_break_sensitivity'):.3f}) und "
+                "gemeinsamen Gerätewechseln "
+                f"({diagnostic('shared_device', 'structure_break_sensitivity'):.3f})."
+            ),
+            (
+                "Sie ist als Reifediagnose nützlich, macht die Bandregel aber nicht "
+                "global belastbar; besonders gemeinsame Brüche, hohe Messfehler, dünne "
+                "Beobachtung und große Lücken bleiben problematisch."
+            ),
+            "",
+            "## Zerlegungskandidaten (beste sechs)",
+            "",
+            "| Kandidat | RMSE | Bias | Glättungsänderung | Einfluss | Laufzeit s |",
+            "|---|---:|---:|---:|---:|---:|",
+        )
+    )
+    for row in summaries[:6]:  # type: ignore[index]
+        lines.append(
+            f"| `{row['candidate']}` | {row['rmse']:.3f} | {row['bias']:.3f} | "
+            f"{row['smoothing_change']:.3f} | {row['influence']:.3f} | "
+            f"{row['seconds']:.1f} |"
+        )
+    lines.extend(
+        (
+            "",
+            "## Unfreigegebene Reifeschwellen-Kandidaten",
             "",
             "```json",
             json.dumps(result["maturity_gate_candidates"], indent=2, ensure_ascii=False),
             "```",
             "",
             (
-                "Zusätzlich zwingend: definierte Variation beider Steigungs- und "
-                "Abweichungsreihen, lokale 2×2-Pivots ≥ `1e-6`, "
-                "Bandbreiten-Nachbarschaft ±25 %, Blocklängen-Faktor 2, sichtbare "
-                "Gerätewechsel und offene Datenprüffälle. `robust` verlangt alle "
-                "Kriterien; ein stabiles Nullergebnis darf robust sein."
-            ),
-            (
-                "Die Schwellen sind noch nicht freigegeben, weil die globale "
-                "Kalibrierung nicht bestanden ist."
+                "Es wird noch keine Replikzahl oder Reifeschwelle eingefroren. 120 "
+                "Repliken genügen für den Methodenvergleich, nicht für eine produktive "
+                "Quantilstabilitätsfreigabe; 2.000 bleibt nur ein Prüfkandidat."
             ),
             "",
-            "## Offene HITL-Entscheidung",
+            "## Methodische Grenze und HITL-Entscheidung",
             "",
             (
-                "1. **Sparsame Definition beibehalten:** `robust` nur innerhalb einer "
-                "engeren synthetischen Hülle zulassen und Strukturbrüche, Gerätewechsel, "
-                "starke Autokorrelation, große Lücken oder hohe Messfehler-Sensitivität "
-                "zwingend als explorativ behandeln; anschließend die gemeinsame "
-                "Untergrenze nur auf dieser Hülle neu kalibrieren."
-            ),
-            (
-                "2. **Methodenprototyp erweitern:** vor dem Einfrieren studentisierte oder "
-                "bias-korrigierte gemeinsame Bänder und eine explizite "
-                "Strukturbruch-Sensitivität testen. Eine neue Statistikabhängigkeit ist "
-                "dafür noch nicht nötig, aber die Modellfamilie wird komplexer."
+                "Die Python-Standardbibliothek genügt numerisch weiterhin vollständig. "
+                "Eine neue Abhängigkeit löst weder unbekannten Messfehler noch fehlende "
+                "Identifikation. Nach Ausschöpfung der sparsamen Bandvarianten bleiben "
+                "zwei fachliche Wege: belastbar nur innerhalb explizit bestandener "
+                "Reifediagnosen, oder die Zerlegungsfamilie selbst neu öffnen."
             ),
             "",
-            "## Methodische Grenze",
+            "## Primärquellen",
             "",
-            (
-                "Der Prototyp verwendet ausschließlich die Python-Standardbibliothek. "
-                "Das genügt für den lokal-linearen 2×2-Fit, Pearson-Korrelation, "
-                "Diagnostik und den gepaarten Block-Bootstrap. Eine Statistikabhängigkeit "
-                "ist nur neu zu prüfen, falls eine größere Kalibrierung die Abdeckung "
-                "oder numerische Stabilität dieses Kandidaten widerlegt."
-            ),
-            "",
-            "## Primärquellen und Vorentscheidung",
-            "",
-            "- Fan (1992), lokal-lineare Regression und Randverhalten: https://doi.org/10.1080/01621459.1992.10476255",
-            "- Künsch (1989), Moving-Block-Bootstrap: https://doi.org/10.1214/aos/1176347265",
-            "- Politis & White (2004), Blocklängenwahl: https://doi.org/10.1081/ETC-120028836",
-            "- Morris, White & Crowther (2019), Simulationsstudien: https://doi.org/10.1002/sim.8086",
-            "- Vorentscheidung: `docs/research/outcome-trend-deviation-association-methods.md`",
+            "- Fan (1992): https://doi.org/10.1080/01621459.1992.10476255",
+            "- Künsch (1989): https://doi.org/10.1214/aos/1176347265",
+            "- Politis & White (2004): https://doi.org/10.1081/ETC-120028836",
+            "- Morris, White & Crowther (2019): https://doi.org/10.1002/sim.8086",
             "",
             "## Reproduktion",
             "",

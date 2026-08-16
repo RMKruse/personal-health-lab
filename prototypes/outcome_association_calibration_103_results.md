@@ -1,33 +1,42 @@
 # V0.4-Prototyp: Trend- und Abweichungszusammenhänge
 
-Version: `v0.4-outcome-association-calibration-1`; Modus: `full`.
+Version: `v0.4-outcome-association-calibration-2`; Modus: `full`.
 
-## Kalibrierungsergebnis
+## Antwort
 
-Der beste Kandidat ist `triangular` mit Bandbreite `Fenster × 1.0` und Randregel `truncate`.
-Über die Bootstrap-Kalibrierungsfälle betrug die gemeinsame Abdeckung 90.0%, der familienweise Null-Fehlalarm 0.0% und die Refit-Ausfallquote 0.00%.
-Die globale Kalibrierung ist damit nicht bestanden: Ziel sind mindestens 95% gemeinsame Abdeckung und eine praktisch informative Halbbreite von höchstens 0,5. Die Kombination darf noch nicht als `robust` eingefroren werden.
-Die Ergebnisse sind eine HITL-Entscheidungsgrundlage, keine produktive Implementierung.
+Der beste Zerlegungskandidat bleibt `triangular`, Bandbreite `Fenster × 1.0`, Randregel `truncate`.
+Keine der fünf gemeinsamen Bandregeln besteht die vollständige synthetische Hülle. Ziel waren mindestens 95 % gemeinsame Abdeckung, höchstens 5 % familienweiser Null-Fehlalarm und mediane Halbbreite höchstens 0,5.
+Die Refit-Ausfallquote betrug 0.00%; das Defizit ist methodisch.
 
-## Kandidatenvergleich (beste sechs)
+## Unsicherheitsvergleich
 
-| Kandidat | RMSE | Bias | Ausfall | Glättungsänderung | Einfluss | Laufzeit s |
-|---|---:|---:|---:|---:|---:|---:|
-| `triangular-1-truncate` | 0.224 | 0.004 | 0.0% | 0.138 | 0.172 | 12.8 |
-| `epanechnikov-1-truncate` | 0.223 | 0.005 | 0.0% | 0.147 | 0.174 | 13.3 |
-| `tricube-1-truncate` | 0.226 | 0.000 | 0.0% | 0.135 | 0.166 | 15.4 |
-| `tricube-1-two_sided` | 0.227 | 0.009 | 0.0% | 0.186 | 0.208 | 14.5 |
-| `tricube-1.25-truncate` | 0.223 | 0.008 | 0.0% | 0.206 | 0.178 | 18.4 |
-| `triangular-1.25-truncate` | 0.222 | 0.011 | 0.0% | 0.212 | 0.182 | 15.3 |
+| Regel | Abdeckung | Null-Fehlalarm | Median-Halbbreite | Median-Blockänderung |
+|---|---:|---:|---:|---:|
+| nichtstudentisiert + globale Untergrenze | 90.0% | 0.0% | 0.753 | 0.107 |
+| studentisiert + maßspezifische Untergrenzen | 76.7% | 0.0% | 0.494 | 0.132 |
+| bias-korrigiert studentisiert | 73.3% | 0.0% | 0.489 | 0.135 |
+| Fisher-z studentisiert | 70.0% | 0.0% | 0.377 | 0.088 |
+| Fisher-z bias-korrigiert studentisiert | 73.3% | 0.0% | 0.377 | 0.080 |
 
-## Bootstrap-Regel
+Die präziseste brauchbare Richtung ist Fisher-z bias-korrigiert studentisiert: 73,3 % Abdeckung, 0 % Null-Fehlalarm, Halbbreite 0,377 und Blockänderung 0,080. Die breite alte Regel erreicht 90 %, benötigt aber Halbbreite 0,753. Beides verfehlt das Gate.
 
-Geprüft wurden zirkuläre gepaarte Residual-Moving-Blocks mit `ceil(n^(1/3))` und den Faktoren 0,5/1/2. Jede Replik refittet beide Zerlegungen je Fenster; ein gemeinsamer nichtstudentisierter Maximalabweichungs-Kritischwert schützt alle acht Primärergebnisse. Wie beim Lag-Prototyp schützt die versionierte synthetische Untergrenze `0.753` zusätzlich den vom reinen Residual-Bootstrap nicht erfassten Glättungsbias.
-Mit nur 120 Repliken lag die mediane Änderung des 95%-Quantils zwischen Halb- und Gesamtlauf noch bei 0.154; diese Stufe validiert daher keine produktive Mindestzahl. Die drei Primärregeln benötigten zusammen 129.7 Sekunden.
-Die Änderung des rohen Kritischwerts über die drei Blockregeln betrug median 0.107 und maximal 0.304; damit ist auch der Kandidatengrenzwert 0,1 noch nicht stabil bestanden.
-Für den nächsten Kalibrierungsschritt ist 2.000 erfolgreiche Refits innerhalb höchstens 2.020 Versuchen je Primär- und Faktor-2-Sensitivitätslauf der konservative Prüfkandidat; ein Lauf ohne 2.000 Erfolge würde kein statistisches Ergebnis liefern.
+## Strukturbruch-Sensitivität
 
-## Kandidaten für Modellreifeschwellen
+Die Änderung nach Ausschluss der stärksten Bruchumgebung trennt die Baseline (Median 0.033) von gemeinsamen Strukturbrüchen (0.166) und gemeinsamen Gerätewechseln (0.114).
+Sie ist als Reifediagnose nützlich, macht die Bandregel aber nicht global belastbar; besonders gemeinsame Brüche, hohe Messfehler, dünne Beobachtung und große Lücken bleiben problematisch.
+
+## Zerlegungskandidaten (beste sechs)
+
+| Kandidat | RMSE | Bias | Glättungsänderung | Einfluss | Laufzeit s |
+|---|---:|---:|---:|---:|---:|
+| `triangular-1-truncate` | 0.224 | 0.004 | 0.138 | 0.172 | 12.8 |
+| `epanechnikov-1-truncate` | 0.223 | 0.005 | 0.147 | 0.174 | 13.3 |
+| `tricube-1-truncate` | 0.226 | 0.000 | 0.135 | 0.166 | 15.5 |
+| `tricube-1-two_sided` | 0.227 | 0.009 | 0.186 | 0.208 | 14.5 |
+| `tricube-1.25-truncate` | 0.223 | 0.008 | 0.206 | 0.178 | 18.5 |
+| `triangular-1.25-truncate` | 0.222 | 0.011 | 0.212 | 0.182 | 15.3 |
+
+## Unfreigegebene Reifeschwellen-Kandidaten
 
 ```json
 {
@@ -38,6 +47,8 @@ Für den nächsten Kalibrierungsschritt ist 2.000 erfolgreiche Refits innerhalb 
     "maximum_gap_days": 33.0,
     "maximum_residual_acf": 0.31,
     "maximum_influence": 0.09,
+    "maximum_structure_break_score": 10.47,
+    "maximum_structure_break_sensitivity": 0.04,
     "maximum_smoothing_change": 0.2,
     "maximum_block_critical_change": 0.1,
     "minimum_bootstrap_success_rate": 0.99
@@ -49,6 +60,8 @@ Für den nächsten Kalibrierungsschritt ist 2.000 erfolgreiche Refits innerhalb 
     "maximum_gap_days": 20.0,
     "maximum_residual_acf": 0.35,
     "maximum_influence": 0.11,
+    "maximum_structure_break_score": 8.6,
+    "maximum_structure_break_sensitivity": 0.11,
     "maximum_smoothing_change": 0.2,
     "maximum_block_critical_change": 0.1,
     "minimum_bootstrap_success_rate": 0.99
@@ -60,6 +73,8 @@ Für den nächsten Kalibrierungsschritt ist 2.000 erfolgreiche Refits innerhalb 
     "maximum_gap_days": 20.0,
     "maximum_residual_acf": 0.43,
     "maximum_influence": 0.2,
+    "maximum_structure_break_score": 10.21,
+    "maximum_structure_break_sensitivity": 0.28,
     "maximum_smoothing_change": 0.2,
     "maximum_block_critical_change": 0.1,
     "minimum_bootstrap_success_rate": 0.99
@@ -71,6 +86,8 @@ Für den nächsten Kalibrierungsschritt ist 2.000 erfolgreiche Refits innerhalb 
     "maximum_gap_days": 20.0,
     "maximum_residual_acf": 0.52,
     "maximum_influence": 0.88,
+    "maximum_structure_break_score": 12.92,
+    "maximum_structure_break_sensitivity": 0.46,
     "maximum_smoothing_change": 0.2,
     "maximum_block_critical_change": 0.1,
     "minimum_bootstrap_success_rate": 0.99
@@ -78,25 +95,18 @@ Für den nächsten Kalibrierungsschritt ist 2.000 erfolgreiche Refits innerhalb 
 }
 ```
 
-Zusätzlich zwingend: definierte Variation beider Steigungs- und Abweichungsreihen, lokale 2×2-Pivots ≥ `1e-6`, Bandbreiten-Nachbarschaft ±25 %, Blocklängen-Faktor 2, sichtbare Gerätewechsel und offene Datenprüffälle. `robust` verlangt alle Kriterien; ein stabiles Nullergebnis darf robust sein.
-Die Schwellen sind noch nicht freigegeben, weil die globale Kalibrierung nicht bestanden ist.
+Es wird noch keine Replikzahl oder Reifeschwelle eingefroren. 120 Repliken genügen für den Methodenvergleich, nicht für eine produktive Quantilstabilitätsfreigabe; 2.000 bleibt nur ein Prüfkandidat.
 
-## Offene HITL-Entscheidung
+## Methodische Grenze und HITL-Entscheidung
 
-1. **Sparsame Definition beibehalten:** `robust` nur innerhalb einer engeren synthetischen Hülle zulassen und Strukturbrüche, Gerätewechsel, starke Autokorrelation, große Lücken oder hohe Messfehler-Sensitivität zwingend als explorativ behandeln; anschließend die gemeinsame Untergrenze nur auf dieser Hülle neu kalibrieren.
-2. **Methodenprototyp erweitern:** vor dem Einfrieren studentisierte oder bias-korrigierte gemeinsame Bänder und eine explizite Strukturbruch-Sensitivität testen. Eine neue Statistikabhängigkeit ist dafür noch nicht nötig, aber die Modellfamilie wird komplexer.
+Die Python-Standardbibliothek genügt numerisch weiterhin vollständig. Eine neue Abhängigkeit löst weder unbekannten Messfehler noch fehlende Identifikation. Nach Ausschöpfung der sparsamen Bandvarianten bleiben zwei fachliche Wege: belastbar nur innerhalb explizit bestandener Reifediagnosen, oder die Zerlegungsfamilie selbst neu öffnen.
 
-## Methodische Grenze
+## Primärquellen
 
-Der Prototyp verwendet ausschließlich die Python-Standardbibliothek. Das genügt für den lokal-linearen 2×2-Fit, Pearson-Korrelation, Diagnostik und den gepaarten Block-Bootstrap. Eine Statistikabhängigkeit ist nur neu zu prüfen, falls eine größere Kalibrierung die Abdeckung oder numerische Stabilität dieses Kandidaten widerlegt.
-
-## Primärquellen und Vorentscheidung
-
-- Fan (1992), lokal-lineare Regression und Randverhalten: https://doi.org/10.1080/01621459.1992.10476255
-- Künsch (1989), Moving-Block-Bootstrap: https://doi.org/10.1214/aos/1176347265
-- Politis & White (2004), Blocklängenwahl: https://doi.org/10.1081/ETC-120028836
-- Morris, White & Crowther (2019), Simulationsstudien: https://doi.org/10.1002/sim.8086
-- Vorentscheidung: `docs/research/outcome-trend-deviation-association-methods.md`
+- Fan (1992): https://doi.org/10.1080/01621459.1992.10476255
+- Künsch (1989): https://doi.org/10.1214/aos/1176347265
+- Politis & White (2004): https://doi.org/10.1081/ETC-120028836
+- Morris, White & Crowther (2019): https://doi.org/10.1002/sim.8086
 
 ## Reproduktion
 
