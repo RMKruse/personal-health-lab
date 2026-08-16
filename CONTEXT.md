@@ -299,12 +299,32 @@ Eine aus qualitätsgeprüften HealthKit-Ernährungssamples abgeleitete Modellgr�
 _Avoid_: einzelnes Ernährungssample, vollständiges Nährstoffmodell
 
 **Fehlender Ernährungswert**:
-Eine fehlende Beobachtung für ein Ernährungsmerkmal an einem Tag ohne Sample dieses Nährstofftyps. Sie wird weder als Nullaufnahme noch durch Fortschreibung oder Interpolation ersetzt.
+Eine fehlende Beobachtung für ein Ernährungsmerkmal an einem Tag ohne wirksames Sample dieses Nährstofftyps. Sie wird weder als Nullaufnahme noch durch Fortschreibung oder Interpolation ersetzt; insbesondere wird nicht unterschieden, ob nichts konsumiert oder das Protokollieren vergessen wurde.
 _Avoid_: Nullaufnahme, geschätzte Tagesernährung
 
+**Ernährungstagsbestätigung**:
+Die bewusste Nutzerangabe, dass alles an einem messlokalen Kalendertag Konsumierte protokolliert wurde. Mehrere ausdrücklich angezeigte Tage dürfen gemeinsam bestätigt werden, gelten fachlich aber als einzelne Tagesbestätigungen. Jede Bestätigung bindet die beitragenden Messungsidentitäten und -versionen, Werte, Korrekturen, Ausschlüsse und Tageszuordnungen; ändert sich davon etwas, verlangt ein danach aufgelöster Datenstand eine neue Bestätigung, auch wenn seine Tagessumme gleich bleibt. Ein erneut importiertes identisches Sample ändert die Bestätigung nicht, und frühere Datenstände bleiben unverändert.
+_Avoid_: aus vorhandenen Samples abgeleitete Vollständigkeit, Genauigkeitsnachweis
+
+**Ernährungsquellenabdeckung**:
+Die je Ernährungstag und Ernährungsmerkmal sichtbare Herkunft der beitragenden ursprünglichen Apps, Quellsamples und Messungsversionen. Sie beschreibt Provenienz statt zeitlicher Tagesabdeckung; gemischte Quellen verhindern für sich allein keine vollständige Beobachtung und belegen sie auch nicht.
+_Avoid_: 24-Stunden-Abdeckung, aus Quellen abgeleitete Vollständigkeit, gleichrangige Ernährungsquellen
+
+**Ernährungsbeobachtungsstatus**:
+Die nach einer benannten Vollständigkeitsregelversion vorgenommene Einordnung eines Ernährungstags als `missing`, `partial` oder `complete` samt konkreten Gründen wie fehlendem Merkmal, fehlender Bestätigung oder Änderung seit der Bestätigung. Die erste Regelversion verlangt Gesamtenergie, Protein, Kohlenhydrate, Fett und eine gültige Tagesbestätigung; eine spätere Änderung der Pflichtmerkmale erzeugt eine neue Regelversion und deutet frühere Eingänge oder Ergebnisse nicht um. Der Status weist Bestätigungs- und Quellenbelege aus, aber weder eine geschätzte Vollständigkeitswahrscheinlichkeit noch eine Qualitätsnote; statistische Modellunsicherheit bleibt davon getrennt und gilt bedingt auf die selbst berichtete Vollständigkeit. Auch der Datenqualitätsstatus bleibt unabhängig: Ein vollständig beobachteter Tag kann wegen eines offenen Datenprüffalls zugleich vorläufig sein.
+_Avoid_: Vollständigkeitsscore, geschätzte Protokollierungswahrscheinlichkeit, statistisches Unsicherheitsintervall
+
+**Vollständig beobachteter Ernährungstag**:
+Ein Ernährungstag, an dem Gesamtenergie, Protein, Kohlenhydrate und Fett beobachtet sind und eine für den wirksamen Tagesinhalt gültige Ernährungstagsbestätigung vorliegt. Die Bestätigung ersetzt keinen fehlenden Ernährungswert und belegt nicht die Genauigkeit der protokollierten Mengen.
+_Avoid_: automatisch aus vorhandenen Samples geschlossener Ernährungstag, garantiert genaue Tagesernährung
+
 **Teilweise beobachteter Ernährungstag**:
-Ein Tag, an dem nur ein Teil der Ernährungsmerkmale durch Samples belegt ist. Jedes Merkmal bleibt unabhängig beobachtet oder fehlend; aus fehlenden Samples lässt sich nicht unterscheiden, ob nichts konsumiert oder nichts protokolliert wurde.
-_Avoid_: vollständiger Ernährungstag, fehlendes Merkmal als Null
+Ein Ernährungstag mit mindestens einem beobachteten Ernährungsmerkmal, der nicht vollständig beobachtet ist, weil mindestens ein benötigtes Ernährungsmerkmal oder eine gültige Ernährungstagsbestätigung fehlt. Jedes Merkmal bleibt unabhängig beobachtet oder fehlend.
+_Avoid_: vollständig beobachteter Ernährungstag, fehlendes Merkmal als Null
+
+**Fehlender Ernährungstag**:
+Ein Tag ohne beobachtetes Ernährungsmerkmal. Ob nichts konsumiert oder das Protokollieren vollständig vergessen wurde, bleibt unbekannt und wird nicht unterschieden.
+_Avoid_: Fastentag, Nullaufnahme
 
 ### Gewichtstrends und Energie
 
@@ -319,6 +339,18 @@ _Avoid_: einzelne Gewichtsmessung, Veränderungsrate
 **Gewichtsveränderungsrate**:
 Die über ein Gewichtstrendfenster geschätzte Richtung und Geschwindigkeit der Gewichtsveränderung. Sie ist das primäre Outcome des ersten Gewichtsmodells und wird getrennt vom geglätteten Gewichtsniveau ausgewiesen.
 _Avoid_: Tagesdifferenz, geglättetes Gewichtsniveau
+
+**Apple-Ruheenergie (Schätzung)**:
+Die aus eindeutig als Apple Watch klassifizierten HealthKit-Samples des kumulativen Typs `basalEnergyBurned` abgeleitete Ruheenergie. Sie wird in kcal geführt und bleibt einschließlich Quelle, Gerät, Originaleinheit und beitragender Messungsidentitäten nachvollziehbar. Der Wert ist eine algorithmische Apple-Schätzung und keine direkte Kalorimetrie oder gemessene physiologische Wahrheit.
+_Avoid_: gemessene Ruheenergie, selbst berechneter Grundumsatz, direkte Kalorimetrie
+
+**Vollständig beobachteter Ruheenergietag**:
+Ein messlokaler Kalendertag, dessen tatsächliche lokale Dauer von 23, 24 oder 25 Stunden durch zulässige wirksame Ruheenergieintervalle lückenlos und ohne ungelöste Überlappung, Quellen- oder Identitätsfrage abgedeckt ist. Tagesbeiträge werden anhand ihrer tatsächlichen UTC-Überlappungsdauer zeitanteilig aus den kumulativen Samples abgeleitet. Ein unvollständiger Tageswert bleibt für Gewichtsmodelle und Energiebilanz fehlend und wird weder mit null gefüllt noch hochgerechnet; vollständige Abdeckung belegt nicht die Genauigkeit der Schätzung. Ein vollständig beobachteter Tag kann wegen eines offenen Datenprüffalls zugleich vorläufig sein.
+_Avoid_: gemessener Tagesenergieverbrauch, hochgerechnete Ruheenergie, vollständige Abdeckung als Genauigkeitsnachweis
+
+**Überlappende Ruheenergiemessungen**:
+Zwei verschiedene wirksame Ruheenergie-Samples mit positiver zeitlicher Überlappung. Sie werden weder automatisch priorisiert noch beschnitten oder addiert; die Überlappung öffnet einen Quellenkonflikt und macht alle betroffenen Ruheenergietage bis zu einer Korrektur oder einem lokalen Messungsausschluss unvollständig.
+_Avoid_: automatische Quellenpriorität, doppelt gezählte Ruheenergie, stilles zeitliches Beschneiden
 
 **Energiebilanz**:
 Eine abgeleitete Anzeigegröße aus aufgenommener Energie abzüglich aktiver Energie und Ruheenergie für denselben Zeitraum. Sie wird berechnet und visualisiert, während Gewichtsmodelle die drei Ausgangsgrößen getrennt verwenden.
