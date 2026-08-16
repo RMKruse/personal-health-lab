@@ -28,6 +28,14 @@ _Avoid_: Tagesgewicht, kurzfristige Gewichtsreaktion
 Eine Analyse mit genau einer primären Zielgröße. Ruhepuls und Gewichtstrend werden im MVP in getrennten Outcome-Analysen untersucht, auch wenn ihre Ergebnisse später gemeinsam betrachtet werden.
 _Avoid_: Gesundheits-Impact-Analyse, Gesamtwirkung
 
+**Anzeigezeitraum**:
+Der in einer Ansicht sichtbare zeitliche Ausschnitt eines bereits berechneten Ergebnisses oder einer Datenprojektion. Seine Änderung startet keinen neuen Modelllauf.
+_Avoid_: Analysezeitraum, automatische Neuberechnung
+
+**Analysezeitraum**:
+Der beim Start eines Modelllaufs ausdrücklich gewählte und mit ihm gespeicherte Zeitraum der geeigneten Eingabedaten. Er wird unabhängig vom Anzeigezeitraum auf Modellreife geprüft; standardmäßig umfasst er die gesamte geeignete Historie.
+_Avoid_: Anzeigezeitraum, flüchtiger Diagrammausschnitt
+
 **Gesamtübersicht**:
 Eine gemeinsame oder eng gekoppelte Zeitansicht der getrennten Outcome-Analysen für Ruhepuls und Gewichtstrend. Sie ergänzt die Einzelanalysen um eine einfache statistische Beschreibung ihres Zusammenhangs, ohne eine Wirkrichtung zu behaupten.
 _Avoid_: Kausalmodell, Gesamtwirkung
@@ -119,16 +127,24 @@ Der als HealthKit-Datentyp `restingHeartRate` bereitgestellte, von Apple geschä
 _Avoid_: selbst berechneter Ruhepuls, Herzfrequenz im Sitzen
 
 **Verzögerungsprofil**:
-Die getrennte Beschreibung der Assoziation zwischen den Aktivitätsmerkmalen eines Tages und dem Apple-Ruhepuls an jedem der folgenden sieben Tage. Es beschreibt zeitliche Zusammenhänge und keine Wirkungsdauer.
+Die getrennte Beschreibung der Assoziation zwischen den Aktivitätsmerkmalen eines Tages und dem Apple-Ruhepuls an den folgenden Tagen eines versionierten Analysehorizonts. Es beschreibt zeitliche Zusammenhänge und keine Wirkungsdauer.
 _Avoid_: Wirkungsprofil, Effektkurve
 
+**Kurzfristiges Verzögerungsprofil**:
+Ein eigenständiges Verzögerungsprofil für die folgenden Tage 1 bis 7. Es besitzt eine eigene Modellreife und bleibt vom langfristigen Verzögerungsprofil getrennt.
+_Avoid_: Kurzansicht des langfristigen Verzögerungsprofils, frei gewähltes Lag-Fenster
+
+**Langfristiges Verzögerungsprofil**:
+Ein eigenständiges Verzögerungsprofil für die folgenden Tage 1 bis 30. Es besitzt eine eigene Regularisierung, Modellreife und Diagnostik und ist keine bloße Erweiterung des kurzfristigen Modelllaufs.
+_Avoid_: frei gewähltes Lag-Fenster, Tag-30-Einzelanalyse
+
 **Überlappende Aktivität**:
-Die Situation, in der innerhalb des siebentägigen Verzögerungsfensters mehrere Aktivitätstage liegen und daher mehreren früheren Tagen derselbe spätere Ruhepuls gegenübersteht.
+Die Situation, in der innerhalb des versionierten Verzögerungsfensters mehrere Aktivitätstage liegen und daher mehreren früheren Tagen derselbe spätere Ruhepuls gegenübersteht.
 _Avoid_: additiver Effekt
 
 **Gemeinsames Verzögerungsprofil**:
-Ein Verzögerungsprofil, das die Aktivität an den einzelnen Vortagen 1 bis 7 gleichzeitig berücksichtigt. Es trennt die zeitlichen Assoziationen unter überlappender Aktivität, ohne sie als einzelne kausale Beiträge zu interpretieren.
-_Avoid_: sieben unabhängige Analysen, additiver Effekt
+Ein Verzögerungsprofil, das die Aktivität an den einzelnen Vortagen seines versionierten Analysehorizonts gleichzeitig berücksichtigt. Es trennt die zeitlichen Assoziationen unter überlappender Aktivität, ohne sie als einzelne kausale Beiträge zu interpretieren.
+_Avoid_: unabhängige Einzelanalysen je Lag-Tag, additiver Effekt
 
 **Gemeinsames Aktivitätsmodell**:
 Eine Outcome-Analyse, die mehrere getrennte Aktivitätsmerkmale wie Trainingsdauer und aktive Energie gleichzeitig berücksichtigt. Ihre geschätzten Parameter beschreiben bedingte Assoziationen und sind keine Gewichte eines Aktivitätsscores; Merkmalsauswahl und Modellform dürfen nach statistischer Prüfung geändert werden.

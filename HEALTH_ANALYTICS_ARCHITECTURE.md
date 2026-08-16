@@ -1170,7 +1170,7 @@ Der Kern-MVP wird nicht als horizontaler Big Bang umgesetzt. Die erste ausführb
 
 ### V0.4: Vollständige Kernanalysen und Oberfläche
 
-- [ ] Gemeinsames Verzögerungsprofil mit mehreren Aktivitätsmerkmalen und überlappenden Trainingstagen modellieren.
+- [ ] Getrennte gemeinsame Kurz- und Langfristprofile für Tag 1 bis 7 beziehungsweise Tag 1 bis 30 mit mehreren Aktivitätsmerkmalen und überlappenden Trainingstagen modellieren.
 - [ ] Trainingsdauer und -energie nach analytischer Trainingsart berücksichtigen; seltene Arten unter „Sonstige“ bündeln.
 - [ ] Schlaf-, Krankheits-, Stress- und Medikamentenmerkmale als Kontext berücksichtigen.
 - [ ] Gewichtsniveau und Gewichtsveränderungsrate über 1 Woche, 2 Wochen, 1 Monat und 3 Monate darstellen.
