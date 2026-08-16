@@ -573,7 +573,10 @@ def evaluate_run(
         }
     fit_values = list(run["fits"].values())
     diagnostics = {
-        "common_coverage": float(np.mean(case.data.common_complete)),
+        "overall_common_coverage": float(np.mean(case.data.common_complete)),
+        "minimum_window_common_coverage": min(
+            design.mean_coverage for design in case.designs.values()
+        ),
         "maximum_common_gap": max_gap(case.data.common_complete),
         "weight_density": float(np.mean(np.isfinite(case.data.weight))),
         "minimum_anchors": min(len(design.outcome) for design in case.designs.values()),
@@ -710,7 +713,7 @@ def gate_passes(row: dict[str, object], values: tuple[float, ...]) -> bool:
     coverage, gap, anchors, condition, acf, ridge, prediction, width = values
     diagnostic = row["diagnostics"]
     return bool(
-        diagnostic["common_coverage"] >= coverage
+        diagnostic["minimum_window_common_coverage"] >= coverage
         and diagnostic["maximum_common_gap"] <= gap
         and diagnostic["minimum_anchors"] >= anchors
         and diagnostic["maximum_unpenalized_condition"] <= condition
@@ -767,7 +770,7 @@ def calibrate_gate(
         raise ArithmeticError("no_maturity_gate")
     score, values, kept, calibration = best
     names = (
-        "minimum_common_coverage",
+        "minimum_common_coverage_per_window",
         "maximum_common_gap_days",
         "minimum_anchors",
         "maximum_unpenalized_condition",
@@ -789,7 +792,7 @@ def calibrate_gate(
 def apply_gate(rows: list[dict[str, object]], gate: dict[str, object]) -> list[dict[str, object]]:
     thresholds = gate["thresholds"]
     values = (
-        thresholds["minimum_common_coverage"],
+        thresholds["minimum_common_coverage_per_window"],
         thresholds["maximum_common_gap_days"],
         thresholds["minimum_anchors"],
         thresholds["maximum_unpenalized_condition"],

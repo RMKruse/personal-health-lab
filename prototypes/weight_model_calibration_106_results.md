@@ -28,7 +28,7 @@ PROTOTYPE — synthetic evidence only; real personal data require V0.5 revalidat
 
 ## Candidate maturity gate
 
-- `minimum_common_coverage`: `0.35`
+- `minimum_common_coverage_per_window`: `0.35`
 - `maximum_common_gap_days`: `35.0`
 - `minimum_anchors`: `100.0`
 - `maximum_unpenalized_condition`: `1000.0`
