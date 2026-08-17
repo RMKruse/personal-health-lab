@@ -29,16 +29,44 @@ Eine Analyse mit genau einer primären Zielgröße. Ruhepuls und Gewichtstrend w
 _Avoid_: Gesundheits-Impact-Analyse, Gesamtwirkung
 
 **Anzeigezeitraum**:
-Der in einer Ansicht sichtbare zeitliche Ausschnitt eines bereits berechneten Ergebnisses oder einer Datenprojektion. Seine Änderung startet keinen neuen Modelllauf.
-_Avoid_: Analysezeitraum, automatische Neuberechnung
+Der global gewählte zeitliche Ausschnitt kalenderbezogener Ansichten eines Datensatz-Snapshots sowie bereits berechneter Ergebnisse. Seine Änderung gilt bereichsübergreifend und startet keinen neuen Modelllauf; nicht kalenderbasierte Ergebnisachsen wie Verzögerungstage bleiben davon unberührt.
+_Avoid_: Analysezeitraum, bereichslokaler Zeitraum, automatische Neuberechnung
 
 **Analysezeitraum**:
 Der beim Start eines Modelllaufs ausdrücklich gewählte und mit ihm gespeicherte Zeitraum der geeigneten Eingabedaten. Er wird unabhängig vom Anzeigezeitraum auf Modellreife geprüft; standardmäßig umfasst er die gesamte geeignete Historie.
 _Avoid_: Anzeigezeitraum, flüchtiger Diagrammausschnitt
 
+**Analysedefinition**:
+Die unveränderlich versionierte fachliche Festlegung eines eingebauten Modells einschließlich Eingaben, Ergebnisfamilie, Methode, Unsicherheit, Diagnostik und Modellreifeprüfung. Eine methodische Änderung erzeugt eine neue Analysedefinition; freie Formeln und während des Laufs gewählte Modellparameter gehören nicht zu V0.4.
+_Avoid_: frei konfigurierbare Modellformel, still geänderte Methodik
+
+**Modelllauf**:
+Die tatsächlich gestartete Anwendung genau einer Analysedefinition auf einen festgehaltenen Datensatz-Snapshot und Analysezeitraum. Jeder Modelllauf hält sein Analyseeingangsbündel und seinen Ausgang unveränderlich fest; nur ein berechenbarer Lauf erzeugt seine zusammengehörige Ergebnisfamilie mit genau einem gemeinsamen Modellreifestatus. Die Wiederverwendung eines vorhandenen Laufs, eine Anzeigeauswahl oder einzelne Ergebnisfenster sind keine eigenen Modellläufe.
+_Avoid_: wiederverwendeter Duplikatlauf, Diagrammaktualisierung, einzelnes Ergebnisfenster, automatische Neuberechnung
+
+**Ausgewählter Modelllauf**:
+Der für eine Analysedefinition und den gewählten Datensatz-Snapshot betrachtete Modelllauf. Standard ist der zuletzt gestartete Lauf einschließlich eines noch laufenden oder ergebnislosen Laufs; ein älteres erfolgreiches Ergebnis wird niemals still als Ersatz verwendet, bleibt aber ausdrücklich auswählbar.
+_Avoid_: stiller Rückfall auf das letzte erfolgreiche Ergebnis, jeweils neuestes Ergebnis unabhängig vom Snapshot
+
+**Analyseeingangsbündel**:
+Die unveränderlich festgehaltene Menge aller Werte, Fehlbeobachtungen, Regelversionen, Quellenbelege und Skalierungen, die ein Modelllauf aus seinem Datensatz-Snapshot und Analysezeitraum tatsächlich verwendet. Spätere Daten- oder Ableitungsänderungen verändern sie nicht.
+_Avoid_: nachträglich rekonstruierter Analyseeingang, flüchtige Feature-Matrix
+
 **Gesamtübersicht**:
 Eine gemeinsame oder eng gekoppelte Zeitansicht der getrennten Outcome-Analysen für Ruhepuls und Gewichtstrend. Sie ergänzt die Einzelanalysen um eine einfache statistische Beschreibung ihres Zusammenhangs, ohne eine Wirkrichtung zu behaupten.
 _Avoid_: Kausalmodell, Gesamtwirkung
+
+**Kohärente Ergebnisauswahl**:
+Die gemeinsame Auswahl von Analyseergebnissen, die ausnahmslos an denselben ausdrücklich gewählten Datensatz-Snapshot gebunden sind. Fehlt für eine Analysedefinition ein Ergebnis dieses Snapshots, bleibt die entsprechende Stelle als fehlend oder veraltet kenntlich, statt ein Ergebnis eines anderen Snapshots einzumischen.
+_Avoid_: jeweils neuestes Ergebnis unabhängig vom Snapshot, gemischter Datenstand
+
+**Aktive Snapshot-Auswahl**:
+Die normale bereichsübergreifende Auswahl, die stets dem jeweils aktiven Datensatz-Snapshot folgt. Veröffentlicht ein erfolgreicher Schreibvorgang einen neuen aktiven Snapshot, wechselt die Auswahl mit und macht daran nicht gebundene Analyseergebnisse als veraltet sichtbar; nur der historische Reproduktionsmodus bleibt auf eine konkrete frühere Snapshot-ID festgelegt.
+_Avoid_: festgepinnter ehemaliger aktiver Snapshot, still gemischter Datenstand
+
+**Historischer Reproduktionsmodus**:
+Die schreibgeschützte Betrachtung eines ausdrücklich gewählten früheren Datensatz-Snapshots über alle fachlichen Ansichten hinweg. Sie verändert weder den aktiven Snapshot noch dessen Aktualitätsdimension; Import, Datenentscheidungen, Kontext- und Medikamentenschreibvorgänge sowie neue Modellläufe bleiben gesperrt, bis wieder der aktive Snapshot gewählt ist.
+_Avoid_: Reaktivierung durch Betrachtung, bereichslokaler historischer Datenstand
 
 **Trendzusammenhang**:
 Die statistisch beschriebene Gemeinsamkeit der langfristigen Verläufe zweier Outcomes. Ein Trendzusammenhang allein sagt nicht aus, ob kurzfristige Veränderungen gemeinsam auftreten oder ein Outcome das andere verursacht.
@@ -119,7 +147,7 @@ Die pro Trainingstag und Trainingsart getrennt aggregierte Trainingsdauer oder T
 _Avoid_: undifferenzierte Trainingssumme, globaler Aktivitätsscore
 
 **Analytische Trainingsart**:
-Die für eine Modellversion verwendete Gruppierung originaler HealthKit-Trainingsarten. Ausreichend häufige Arten bleiben getrennt; seltene Arten werden vorläufig unter „Sonstige“ gebündelt, ohne ihre Originalkategorie zu verlieren.
+Die für eine Modellversion verwendete Gruppierung originaler HealthKit-Trainingsarten. Arten mit mindestens zehn positiven Tagen im Analysezeitraum bleiben getrennt; seltenere Arten werden unter „Sonstige“ gebündelt, ohne ihre Originalkategorie zu verlieren. Hat auch „Sonstige“ weniger als zehn positive Tage, bleibt das Merkmal sichtbar im Modell und verhindert dessen belastbare Modellreife, statt still entfernt zu werden.
 _Avoid_: überschriebene HealthKit-Trainingsart, dauerhaft feste Gruppierung
 
 **Apple-Ruhepuls**:
