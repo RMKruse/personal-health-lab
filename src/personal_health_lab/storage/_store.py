@@ -1236,6 +1236,16 @@ class StoredMeasurement:
 
 
 @dataclass(frozen=True, slots=True)
+class StoredActivityDayValue:
+    day: date
+    data_type: CanonicalHealthType
+    unit: CanonicalUnit
+    effective_value: float
+    quality_status: DataQualityStatus
+    measurement_version_ids: tuple[MeasurementVersionId, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class StoredWorkout:
     logical_workout_id: LogicalMeasurementId
     workout_version_id: MeasurementVersionId
@@ -9091,6 +9101,80 @@ class LocalStore:
     ) -> tuple[SnapshotId | None, tuple[StoredMeasurement, ...]]:
         return self._load_measurements(snapshot_id, start_date, end_date, "TRUE")
 
+    def load_analysis_activity_inputs(
+        self,
+        snapshot_id: SnapshotId,
+        start_date: date | None,
+        end_date: date | None,
+    ) -> tuple[SnapshotId, tuple[StoredActivityDayValue, ...], bool]:
+        self._require_open()
+        directory = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
+        activity = directory / "activity_days.parquet"
+        lineage = directory / "derivation_lineage.parquet"
+        coverage = directory / "activity_coverage_segments.parquet"
+        if not activity.exists() or not lineage.exists():
+            return snapshot_id, (), False
+        activity_path = str(activity).replace("'", "''")
+        lineage_path = str(lineage).replace("'", "''")
+        clauses: list[str] = []
+        parameters: list[date] = []
+        if start_date is not None:
+            clauses.append("d.day >= ?")
+            parameters.append(start_date)
+        if end_date is not None:
+            clauses.append("d.day <= ?")
+            parameters.append(end_date)
+        where = "" if not clauses else "WHERE " + " AND ".join(clauses)
+        rows = self._query.execute(
+            f"""
+            SELECT d.day, d.metric, d.canonical_unit, d.effective_value,
+                   d.quality_status,
+                   coalesce(list(l.source_version_id ORDER BY l.source_version_id)
+                            FILTER (WHERE l.source_version_id IS NOT NULL), [])
+            FROM read_parquet('{activity_path}') d
+            LEFT JOIN read_parquet('{lineage_path}') l
+              ON l.derived_record_id = d.derived_record_id
+             AND l.derived_family = 'activity_day'
+            {where}
+            GROUP BY ALL
+            ORDER BY d.day, d.metric
+            """,
+            parameters,
+        ).fetchall()
+        coverage_incomplete = False
+        if coverage.exists():
+            coverage_path = str(coverage).replace("'", "''")
+            coverage_clauses = ["coverage_kind = 'unobserved'"]
+            coverage_parameters: list[date] = []
+            if start_date is not None:
+                coverage_clauses.append("CAST(end_utc AS TIMESTAMPTZ)::DATE >= ?")
+                coverage_parameters.append(start_date - timedelta(days=1))
+            if end_date is not None:
+                coverage_clauses.append("CAST(start_utc AS TIMESTAMPTZ)::DATE <= ?")
+                coverage_parameters.append(end_date + timedelta(days=1))
+            coverage_incomplete = (
+                self._query.execute(
+                    f"SELECT 1 FROM read_parquet('{coverage_path}') WHERE "
+                    + " AND ".join(coverage_clauses)
+                    + " LIMIT 1",
+                    coverage_parameters,
+                ).fetchone()
+                is not None
+            )
+        return snapshot_id, tuple(
+            StoredActivityDayValue(
+                day=row[0],
+                data_type=CanonicalHealthType(str(row[1])),
+                unit=CanonicalUnit(str(row[2])),
+                effective_value=float(row[3]),
+                quality_status=DataQualityStatus(str(row[4])),
+                measurement_version_ids=tuple(
+                    MeasurementVersionId(str(item)) for item in row[5]
+                ),
+            )
+            for row in rows
+        ), coverage_incomplete
+
     def load_activity_measurements(
         self,
         snapshot_id: SnapshotId | None,
@@ -9329,8 +9413,18 @@ class LocalStore:
                 str(row[12]),
                 None if row[13] is None else str(row[13]),
                 None if row[14] is None else float(row[14]),
-                None if row[15] is None else float(row[15]),
-                None if row[16] is None else float(row[16]),
+                (
+                    resolved[str(row[1])].distance_kilometers
+                    if str(row[1]) in resolved
+                    and resolved[str(row[1])].selected_workout_version_id == str(row[0])
+                    else None if row[15] is None else float(row[15])
+                ),
+                (
+                    resolved[str(row[1])].active_energy_kilocalories
+                    if str(row[1]) in resolved
+                    and resolved[str(row[1])].selected_workout_version_id == str(row[0])
+                    else None if row[16] is None else float(row[16])
+                ),
                 (
                     resolved[str(row[1])].selected_workout_version_id == str(row[0])
                     and resolved[str(row[1])].disposition.startswith("included")

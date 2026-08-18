@@ -19,10 +19,13 @@ from personal_health_lab.application import (
     ImportHealthExport,
     ImportReceipt,
     OverviewSelection,
+    ResolveDataReviewCase,
     RunAnalysis,
     RunAnalysisPlan,
     RunRestingHeartRateAnalysis,
     RuntimeConfig,
+    SnapshotDateSelection,
+    WorkoutCorrection,
     WriteApprovalStatus,
     WriteNotStarted,
     WriteNotStartedStatus,
@@ -38,6 +41,11 @@ def _package(path: Path, *, day: int, value: int = 1) -> Path:
             f'''<HealthData><ExportDate value="2024-01-{day:02d} 12:00:00 +0100"/>
             <Record type="HKQuantityTypeIdentifierStepCount" unit="count" value="{value}"
             sourceName="Apple Watch" sourceVersion="1" device="Apple Watch"
+            creationDate="2024-01-{day:02d} 12:00:00 +0100"
+            startDate="2024-01-{day:02d} 12:00:00 +0100"
+            endDate="2024-01-{day:02d} 12:01:00 +0100"/>
+            <Record type="HKQuantityTypeIdentifierStepCount" unit="count" value="100"
+            sourceName="iPhone" sourceVersion="1" device="iPhone"
             creationDate="2024-01-{day:02d} 12:00:00 +0100"
             startDate="2024-01-{day:02d} 12:00:00 +0100"
             endDate="2024-01-{day:02d} 12:01:00 +0100"/>
@@ -178,13 +186,17 @@ def test_started_run_freezes_input_and_persists_insufficient_data_without_result
     assert payload["analysis_run_id"] == str(first.analysis_run_id)
     assert payload["snapshot_id"] == str(first.snapshot_ref)
     assert payload["calendar"] == ["2024-01-02"]
+    assert payload["activity_coverage_incomplete"] is True
     assert {value["input_id"] for value in payload["values"]} >= {
         "active_energy",
         "steps",
         "outcome_day_context",
     }
     assert any(
-        value["input_id"] == "steps" and value["value"] == 1.0 and value["measurement_version_ids"]
+        value["input_id"] == "steps"
+        and value["value"] == 1.0
+        and len(value["measurement_version_ids"]) == 1
+        and value["source_evidence"][0]["source_name"] == "Apple Watch"
         for value in payload["values"]
     )
     assert any(
@@ -209,6 +221,7 @@ def test_started_run_freezes_input_and_persists_insufficient_data_without_result
         for value in payload["values"]
     )
     assert payload["scalings"]
+    assert all(item["population_standard_deviation"] is None for item in payload["scalings"])
     with HealthLab.open(runtime) as health_lab:
         _import(health_lab, _package(tmp_path / "later.zip", day=3, value=2))
     assert artifact.read_bytes() == frozen_input
@@ -269,3 +282,48 @@ def test_analysis_fault_never_exposes_a_partial_run_after_reopen(
             assert metadata.execute("SELECT count(*) FROM analysis_runs").fetchone() == (1,)
         inputs = runtime.active_store / "parquet" / "analysis-inputs"
         assert not inputs.exists() or list(inputs.iterdir()) == []
+
+
+def test_analysis_bundle_uses_corrected_workout_energy(tmp_path: Path) -> None:
+    package = tmp_path / "workout.zip"
+    with ZipFile(package, "w") as archive:
+        archive.writestr(
+            "apple_health_export/export.xml",
+            """<HealthData><ExportDate value="2024-01-03 12:00:00 +0100"/>
+            <Workout workoutActivityType="HKWorkoutActivityTypeRunning" duration="90"
+              durationUnit="min" totalEnergyBurned="200" totalEnergyBurnedUnit="kcal"
+              sourceName="Apple Watch" sourceVersion="1" device="Apple Watch"
+              creationDate="2024-01-02 20:31:00 +0100"
+              startDate="2024-01-02 20:00:00 +0100"
+              endDate="2024-01-02 20:30:00 +0100"/></HealthData>""",
+        )
+    runtime = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    with HealthLab.open(runtime) as health_lab:
+        _import(health_lab, package)
+        workout = health_lab.load_workouts(SnapshotDateSelection()).workouts[0]
+        correction = ResolveDataReviewCase(
+            workout.review_case_ids[0],
+            WorkoutCorrection(workout.workout_version_id, 30, None, 50, "source typo"),
+        )
+        health_lab.execute_write(
+            correction,
+            expected_plan=health_lab.preview_write(correction).fingerprint,
+        )
+        request = _request()
+        receipt = health_lab.execute_write(
+            request,
+            expected_plan=health_lab.preview_write(request).fingerprint,
+        ).result
+    assert isinstance(receipt, AnalysisReceipt)
+    payload = json.loads(
+        (
+            runtime.active_store
+            / "parquet"
+            / "analysis-inputs"
+            / f"{receipt.analysis_run_id}.json"
+        ).read_bytes()
+    )
+    assert any(
+        value["input_id"] == "workout_energy_by_type" and value["value"] == 50.0
+        for value in payload["values"]
+    )
