@@ -1,0 +1,70 @@
+schema_version = 1
+release = "v0.4-delta"
+analysis_definition_ids = [
+  "rhr-activity-lag-1-7-v1",
+  "rhr-activity-lag-1-30-v1",
+  "weight-core-7-14-30-90-v1",
+  "rhr-weight-association-7-14-30-90-v1",
+]
+read_operations = ["load_analysis_catalog"]
+projection_variants = ["AnalysisCatalog"]
+
+[[contract]]
+id = "V04-C-ANALYSIS-CATALOG-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/112"
+statement = "HealthLab projects exactly four immutable versioned analysis definitions with fixed result families, horizons, and method facts without requiring a dataset snapshot."
+
+[[contract]]
+id = "V04-C-MATRIX-VALIDATION-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/112"
+statement = "The growing V0.4 delta matrix rejects open definition IDs, case IDs, runners, and hash references."
+
+[[hash_reference]]
+id = "V04-H-ANALYSIS-DEFINITIONS-V1"
+artifact = "src/personal_health_lab/analysis/__init__.py"
+sha256 = "05d77947ed0537d620edb7a49b0c7036b8b938cd9651faec7286749bddf89a07"
+
+[[hash_reference]]
+id = "V04-H-LAG-CALIBRATION-V1"
+artifact = "prototypes/lag_calibration_102_results.json"
+sha256 = "4c883e6465181421550736a1be1c21d405aac9e73c725b897b6b4c7de6898004"
+
+[[hash_reference]]
+id = "V04-H-OUTCOME-ASSOCIATION-CALIBRATION-V1"
+artifact = "prototypes/outcome_association_calibration_103_gate_results.json"
+sha256 = "c6af4f3eb40e4569280243840be770d2e1aa089debe5085efa6c6ce43cd0171b"
+
+[[hash_reference]]
+id = "V04-H-WEIGHT-CALIBRATION-V1"
+artifact = "prototypes/weight_model_calibration_106_results.json"
+sha256 = "0d6c1636bf08c9ee0de6a30429f5b1bc409b9e13f672b1d8adb7e28e2f99e88b"
+
+[[case]]
+id = "V04-A-ANALYSIS-CATALOG-V1"
+contracts = ["V04-C-ANALYSIS-CATALOG-V1"]
+hash_references = [
+  "V04-H-ANALYSIS-DEFINITIONS-V1",
+  "V04-H-LAG-CALIBRATION-V1",
+  "V04-H-OUTCOME-ASSOCIATION-CALIBRATION-V1",
+  "V04-H-WEIGHT-CALIBRATION-V1",
+]
+runner = "tests/acceptance/test_v04_analysis_catalog.py::test_analysis_catalog_projects_four_fixed_definitions_without_a_snapshot"
+level = "application"
+platform = "all"
+expected_result = "four fixed definitions and one positive versioned projection"
+forbidden_side_effects = "no snapshot, runtime registry, generic engine, free formula, or runtime parameter"
+
+[[case]]
+id = "V04-A-MATRIX-VALIDATION-V1"
+contracts = ["V04-C-MATRIX-VALIDATION-V1"]
+hash_references = [
+  "V04-H-ANALYSIS-DEFINITIONS-V1",
+  "V04-H-LAG-CALIBRATION-V1",
+  "V04-H-OUTCOME-ASSOCIATION-CALIBRATION-V1",
+  "V04-H-WEIGHT-CALIBRATION-V1",
+]
+runner = "tests/acceptance/test_v04_matrix.py::test_v04_matrix_rejects_open_ids_cases_and_hash_references"
+level = "meta"
+platform = "all"
+expected_result = "closed IDs, cases, runners, and current SHA-256 references"
+forbidden_side_effects = "no open reference, stale calibration artifact, or unregistered runner"

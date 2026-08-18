@@ -143,6 +143,7 @@ def test_public_application_surface_is_exact_and_closed(tmp_path: Path) -> None:
         "execute_write",
         "load_activity_days",
         "load_activity_settings",
+        "load_analysis_catalog",
         "load_context_audit",
         "load_context_records",
         "load_daily_context",

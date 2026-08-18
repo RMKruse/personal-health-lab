@@ -1,0 +1,121 @@
+import hashlib
+import re
+from collections.abc import Collection
+from pathlib import Path
+from typing import cast
+
+import personal_health_lab.application as application
+from personal_health_lab.analysis import analysis_definitions
+
+_DEFINITION_IDS = {
+    "rhr-activity-lag-1-7-v1",
+    "rhr-activity-lag-1-30-v1",
+    "weight-core-7-14-30-90-v1",
+    "rhr-weight-association-7-14-30-90-v1",
+}
+_CONTRACT_IDS = {
+    "V04-C-ANALYSIS-CATALOG-V1",
+    "V04-C-MATRIX-VALIDATION-V1",
+}
+_CASE_IDS = {
+    "V04-A-ANALYSIS-CATALOG-V1",
+    "V04-A-MATRIX-VALIDATION-V1",
+}
+_HASH_IDS = {
+    "V04-H-ANALYSIS-DEFINITIONS-V1",
+    "V04-H-LAG-CALIBRATION-V1",
+    "V04-H-OUTCOME-ASSOCIATION-CALIBRATION-V1",
+    "V04-H-WEIGHT-CALIBRATION-V1",
+}
+
+
+def _rows(matrix: dict[str, object], name: str) -> list[dict[str, object]]:
+    rows = matrix.get(name)
+    assert isinstance(rows, list) and all(isinstance(row, dict) for row in rows)
+    return cast(list[dict[str, object]], rows)
+
+
+def _references(row: dict[str, object], field: str) -> set[str]:
+    references = row.get(field)
+    assert isinstance(references, list) and all(isinstance(item, str) for item in references)
+    reference_set = set(cast(list[str], references))
+    assert len(reference_set) == len(references)
+    return reference_set
+
+
+def _ids(rows: list[dict[str, object]], prefix: str) -> set[str]:
+    identifiers = {row.get("id") for row in rows}
+    assert all(
+        isinstance(identifier, str) and re.fullmatch(rf"{prefix}[A-Z0-9-]+-V1", identifier)
+        for identifier in identifiers
+    )
+    assert len(identifiers) == len(rows)
+    return cast(set[str], identifiers)
+
+
+def validate_matrix(
+    matrix: dict[str, object], *, root: Path, collected_node_ids: Collection[str]
+) -> None:
+    assert matrix.get("schema_version") == 1
+    assert matrix.get("release") == "v0.4-delta"
+    assert _references(matrix, "analysis_definition_ids") == _DEFINITION_IDS
+    assert _references(matrix, "read_operations") == {"load_analysis_catalog"}
+    assert _references(matrix, "projection_variants") == {"AnalysisCatalog"}
+    assert {str(item.analysis_definition_id) for item in analysis_definitions()} == _DEFINITION_IDS
+    assert hasattr(application.HealthLab, "load_analysis_catalog")
+    assert hasattr(application, "AnalysisCatalog")
+
+    contracts = _rows(matrix, "contract")
+    hash_references = _rows(matrix, "hash_reference")
+    cases = _rows(matrix, "case")
+    assert _ids(contracts, "V04-C-") == _CONTRACT_IDS
+    assert _ids(hash_references, "V04-H-") == _HASH_IDS
+    assert _ids(cases, "V04-A-") == _CASE_IDS
+
+    for contract in contracts:
+        assert isinstance(contract.get("source"), str) and contract["source"]
+        assert isinstance(contract.get("statement"), str) and contract["statement"]
+
+    root = root.resolve()
+    for reference in hash_references:
+        artifact = reference.get("artifact")
+        digest = reference.get("sha256")
+        assert isinstance(artifact, str)
+        assert isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)
+        path = (root / artifact).resolve()
+        assert path.is_relative_to(root) and path.is_file()
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+
+    required_case_fields = {
+        "id",
+        "contracts",
+        "hash_references",
+        "runner",
+        "level",
+        "platform",
+        "expected_result",
+        "forbidden_side_effects",
+    }
+    runners: set[str] = set()
+    referenced_contracts: set[str] = set()
+    referenced_hashes: set[str] = set()
+    for case in cases:
+        assert required_case_fields <= case.keys()
+        contracts = _references(case, "contracts")
+        assert contracts and contracts <= _CONTRACT_IDS
+        referenced_contracts.update(contracts)
+        hashes = _references(case, "hash_references")
+        assert hashes and hashes <= _HASH_IDS
+        referenced_hashes.update(hashes)
+        assert case["level"] in {"application", "meta"}
+        assert case["platform"] == "all"
+        runner = case["runner"]
+        assert isinstance(runner, str) and re.fullmatch(
+            r"tests/[a-zA-Z0-9_./-]+\.py::test_[a-zA-Z0-9_]+", runner
+        )
+        runners.add(runner)
+
+    assert referenced_contracts == _CONTRACT_IDS
+    assert referenced_hashes == _HASH_IDS
+    collected = set(collected_node_ids)
+    assert not runners - collected, f"unregistered V0.4 runners: {sorted(runners - collected)}"

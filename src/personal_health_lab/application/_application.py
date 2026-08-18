@@ -17,6 +17,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from personal_health_lab import DataMode
+from personal_health_lab.analysis import AnalysisDefinition, analysis_definitions
 from personal_health_lab.data_quality import (
     DataQualityError,
     HistoricalReviewRequest,
@@ -297,6 +298,17 @@ class SnapshotSelection:
 
 
 _ACTIVE_SNAPSHOT_SELECTION = SnapshotSelection()
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisCatalog:
+    definitions: tuple[AnalysisDefinition, ...]
+    projection_id: Literal["analysis-catalog"] = "analysis-catalog"
+    projection_version: int = 1
+
+    def __post_init__(self) -> None:
+        if self.projection_id != "analysis-catalog" or self.projection_version <= 0:
+            raise ValueError("Analysekatalogprojektion ist ungültig.")
 
 
 def _resolve_medication_local_datetime(day: date, local_time: time, timezone: str) -> datetime:
@@ -6788,6 +6800,11 @@ class HealthLab:
         self._require_ready()
         reader = self._require_open()
         return reader.load(selection)
+
+    def load_analysis_catalog(self) -> AnalysisCatalog:
+        self._require_ready()
+        self._require_open()
+        return AnalysisCatalog(analysis_definitions())
 
     def load_import_details(self, import_id: ImportId) -> ImportDetails:
         self._require_ready()

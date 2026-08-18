@@ -9,6 +9,7 @@ from typing import Any, cast, get_args, get_origin, get_type_hints
 import pytest
 
 import personal_health_lab as package_root
+import personal_health_lab.analysis as analysis
 import personal_health_lab.application as application
 import personal_health_lab.health_data as health_data
 import personal_health_lab.health_import as health_import
@@ -63,6 +64,7 @@ def _assert_module_exports_are_typed(module: ModuleType) -> None:
 def test_public_module_exports_are_fully_typed_without_any() -> None:
     for module in (
         package_root,
+        analysis,
         application,
         health_data,
         health_import,
@@ -89,6 +91,7 @@ def test_public_overview_values_are_immutable() -> None:
 
 def test_public_application_values_are_immutable_and_storage_neutral() -> None:
     projection_methods = (
+        "load_analysis_catalog",
         "load_data_review",
         "load_data_review_case",
         "load_activity_days",

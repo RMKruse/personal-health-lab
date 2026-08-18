@@ -6,6 +6,7 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).parents[2] / "src/personal_health_lab"
 MODULES = {
     "adapters",
+    "analysis",
     "application",
     "data_quality",
     "health_data",
@@ -21,7 +22,9 @@ MODULES = {
 }
 ALLOWED_DEPENDENCIES = {
     "adapters": {"application", "package_root", "synthetic_export"},
+    "analysis": {"storage"},
     "application": {
+        "analysis",
         "health_import",
         "migration",
         "health_data",
