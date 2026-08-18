@@ -1060,6 +1060,7 @@ class InsufficientAnalysisRunPublication:
     input_artifact: bytes
     diagnostics: tuple[str, ...]
     data_status: DataQualityStatus
+    data_status_reasons: tuple[AnalysisDataStatusReason, ...]
 
 
 def _analysis_provenance(row: tuple[object, ...]) -> AnalysisProvenance:
@@ -11799,6 +11800,9 @@ class LocalStore:
             or configuration.analysis_definition_id != provenance.analysis_definition_id
             or configuration.schema_version != provenance.config_schema_version
             or configuration.content_hash != provenance.config_hash
+            or (
+                publication.data_status is DataQualityStatus.PROVISIONAL
+            ) != bool(publication.data_status_reasons)
         ):
             raise StoreError("Unvollständige Analyseprovenienz.")
         run_id = str(provenance.analysis_run_id)
@@ -11835,7 +11839,7 @@ class LocalStore:
                         maturity_criteria, reproducibility, diagnostics, status, completed_at
                     ) VALUES (
                         ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL,
-                        ?, '[]', '[]', ?, ?, 'insufficient_data', ?
+                        ?, ?, '[]', ?, ?, 'insufficient_data', ?
                     )
                     """,
                     (
@@ -11858,6 +11862,15 @@ class LocalStore:
                         provenance.environment_lock_hash,
                         provenance.reuse_key,
                         publication.data_status.value,
+                        json.dumps(
+                            [
+                                {
+                                    "code": reason.code.value,
+                                    "evidence_ids": reason.evidence_ids,
+                                }
+                                for reason in publication.data_status_reasons
+                            ]
+                        ),
                         (
                             ReproducibilityStatus.LOCAL_DEVELOPMENT.value
                             if provenance.code_dirty

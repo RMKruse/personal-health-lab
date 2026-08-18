@@ -69,7 +69,7 @@ statement = "Analysis input and technical outcome become visible together; injec
 [[hash_reference]]
 id = "V04-H-ANALYSIS-DEFINITIONS-V1"
 artifact = "src/personal_health_lab/analysis/__init__.py"
-sha256 = "4dd7f15af0c388b52bd2a2ab8d04dd3a043ecc32568464f4d87ff8fe76caf3b1"
+sha256 = "b08051cda70b2edb5edbbc1cbf85a238b3cfb8ee404ab38f671ccb8ef3313216"
 
 [[hash_reference]]
 id = "V04-H-LAG-CALIBRATION-V1"

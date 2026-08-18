@@ -169,12 +169,16 @@ def test_started_run_freezes_input_and_persists_insufficient_data_without_result
 
     with sqlite3.connect(runtime.active_store / "metadata.sqlite3") as metadata:
         row = metadata.execute(
-            "SELECT result_id, status, data_status FROM analysis_runs "
+            "SELECT result_id, status, data_status, data_status_reasons FROM analysis_runs "
             "WHERE analysis_run_id = ?",
             (str(first.analysis_run_id),),
         ).fetchone()
     assert row is not None
-    assert row == (None, "insufficient_data", "provisional")
+    assert row[:3] == (None, "insufficient_data", "provisional")
+    assert {reason["code"] for reason in json.loads(row[3])} == {
+        "open_review_case",
+        "passive_coverage_gap",
+    }
     artifact = (
         runtime.active_store
         / "parquet"
@@ -350,9 +354,10 @@ def test_analysis_bundle_omits_unrelated_input_quality_facts(tmp_path: Path) -> 
     assert isinstance(receipt, AnalysisReceipt)
     with sqlite3.connect(runtime.active_store / "metadata.sqlite3") as metadata:
         assert metadata.execute(
-            "SELECT data_status FROM analysis_runs WHERE analysis_run_id = ?",
+            "SELECT data_status, data_status_reasons FROM analysis_runs "
+            "WHERE analysis_run_id = ?",
             (str(receipt.analysis_run_id),),
-        ).fetchone() == ("reviewed",)
+        ).fetchone() == ("reviewed", "[]")
     payload = json.loads(
         (
             runtime.active_store

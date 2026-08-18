@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from personal_health_lab.storage import (
     ActivityDerivationRecord,
+    AnalysisDataStatusReason,
     AnalysisDefinitionId,
     AnalysisProvenance,
     AnalysisResultId,
@@ -21,6 +22,7 @@ from personal_health_lab.storage import (
     CanonicalHealthType,
     CanonicalUnit,
     DataQualityStatus,
+    DataStatusReasonCode,
     InsufficientAnalysisRunPublication,
     LocalStore,
     MeasurementVersionId,
@@ -563,6 +565,10 @@ _ACTIVITY_INPUTS = {
     AnalysisInput.STEPS,
     AnalysisInput.WALKING_RUNNING_DISTANCE,
 }
+_WORKOUT_INPUTS = {
+    AnalysisInput.WORKOUT_DURATION_BY_TYPE,
+    AnalysisInput.WORKOUT_ENERGY_BY_TYPE,
+}
 _POINT_INPUTS = {
     AnalysisInput.APPLE_RESTING_HEART_RATE,
     AnalysisInput.PREFERRED_DAILY_WEIGHT,
@@ -899,10 +905,7 @@ def build_analysis_input_bundle(
                     for component, value in deterministic
                 )
                 continue
-            if input_id in {
-                AnalysisInput.WORKOUT_DURATION_BY_TYPE,
-                AnalysisInput.WORKOUT_ENERGY_BY_TYPE,
-            }:
+            if input_id in _WORKOUT_INPUTS:
                 components: tuple[str | None, ...] = workout_components or (None,)
                 values.extend(
                     _workout_value(
@@ -975,14 +978,7 @@ def build_analysis_input_bundle(
         f"plausibility/{rule.data_type}/{rule.version_id}" for rule in plausibility_rules
     )
     if activity_derivation is not None and any(
-        item
-        in {
-            AnalysisInput.ACTIVE_ENERGY,
-            AnalysisInput.TRAINING_TIME,
-            AnalysisInput.STEPS,
-            AnalysisInput.WALKING_RUNNING_DISTANCE,
-        }
-        for item in required
+        item in _ACTIVITY_INPUTS for item in required
     ):
         rule_versions.extend(
             (
@@ -1108,14 +1104,7 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
         plan.eligible_end_date,
         required_data_types,
     )
-    uses_workouts = any(
-        item
-        in {
-            AnalysisInput.WORKOUT_DURATION_BY_TYPE,
-            AnalysisInput.WORKOUT_ENERGY_BY_TYPE,
-        }
-        for item in required
-    )
+    uses_workouts = any(item in _WORKOUT_INPUTS for item in required)
     workout_snapshot_id, workouts = (
         store.load_workouts(
             plan.base_snapshot_ref,
@@ -1183,6 +1172,25 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
         f"calendar_days={len(bundle.calendar)}",
         f"observed_values={observed}",
     )
+    data_status_reasons = (
+        (
+            AnalysisDataStatusReason(
+                DataStatusReasonCode.OPEN_REVIEW_CASE,
+                tuple(str(item) for item in bundle.data_quality_fact_ids),
+            ),
+        )
+        if bundle.data_quality_fact_ids
+        else ()
+    ) + (
+        (
+            AnalysisDataStatusReason(
+                DataStatusReasonCode.PASSIVE_COVERAGE_GAP,
+                ("activity-coverage/v1",),
+            ),
+        )
+        if bundle.activity_coverage_incomplete
+        else ()
+    )
     store.persist_insufficient_analysis_run(
         InsufficientAnalysisRunPublication(
             operation_id,
@@ -1194,14 +1202,10 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
             diagnostics,
             (
                 DataQualityStatus.PROVISIONAL
-                if bundle.data_quality_fact_ids
-                or bundle.activity_coverage_incomplete
-                or any(
-                    item.quality_status is DataQualityStatus.PROVISIONAL
-                    for item in bundle.values
-                )
+                if data_status_reasons
                 else DataQualityStatus.REVIEWED
             ),
+            data_status_reasons,
         )
     )
     return AnalysisExecution(
