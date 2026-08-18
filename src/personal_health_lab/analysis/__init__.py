@@ -287,6 +287,11 @@ class AnalysisMissingnessReason(StrEnum):
     INPUT_NOT_AVAILABLE = "input_not_available"
 
 
+class AnalysisScalingStatus(StrEnum):
+    OBSERVED = "observed"
+    INSUFFICIENT_OBSERVATIONS = "insufficient_observations"
+
+
 @dataclass(frozen=True, slots=True)
 class AnalysisSourceEvidence:
     measurement_version_id: MeasurementVersionId
@@ -315,7 +320,7 @@ class AnalysisScaling:
     input_id: AnalysisInput
     component: str | None
     population_standard_deviation: float | None
-    status: str
+    status: AnalysisScalingStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -860,7 +865,11 @@ def build_analysis_input_bundle(
                 input_id,
                 component,
                 statistics.pstdev(observed) if len(observed) >= 2 else None,
-                "observed" if len(observed) >= 2 else "insufficient_observations",
+                (
+                    AnalysisScalingStatus.OBSERVED
+                    if len(observed) >= 2
+                    else AnalysisScalingStatus.INSUFFICIENT_OBSERVATIONS
+                ),
             )
         )
     quality_ids = tuple(
@@ -923,7 +932,7 @@ def _bundle_payload(bundle: AnalysisInputBundle, *, include_run_id: bool) -> dic
                 "component": item.component,
                 "input_id": item.input_id.value,
                 "population_standard_deviation": item.population_standard_deviation,
-                "status": item.status,
+                "status": item.status.value,
             }
             for item in bundle.scalings
         ],
@@ -1082,6 +1091,7 @@ __all__ = [
     "AnalysisResultFamily",
     "AnalysisReuseCandidate",
     "AnalysisScaling",
+    "AnalysisScalingStatus",
     "AnalysisSourceEvidence",
     "AssociationMeasure",
     "BootstrapBlockLengthFacts",
