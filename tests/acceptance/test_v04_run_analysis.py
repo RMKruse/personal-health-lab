@@ -1,4 +1,6 @@
 import fcntl
+import json
+import sqlite3
 from datetime import date
 from pathlib import Path
 from typing import get_args
@@ -8,9 +10,12 @@ import pytest
 
 from personal_health_lab.application import (
     AnalysisDefinitionId,
+    AnalysisReceipt,
+    AnalysisStatus,
     ConfigurationError,
     DataMode,
     HealthLab,
+    HealthLabError,
     ImportHealthExport,
     ImportReceipt,
     OverviewSelection,
@@ -110,8 +115,6 @@ def test_run_analysis_nonstart_paths_never_create_a_model_run(tmp_path: Path) ->
             busy = health_lab.execute_write(request, expected_plan=ready_plan.fingerprint).result
         _import(health_lab, _package(tmp_path / "second.zip", day=3, value=2))
         changed = health_lab.execute_write(request, expected_plan=ready_plan.fingerprint).result
-        current_plan = health_lab.preview_write(request)
-        pending = health_lab.execute_write(request, expected_plan=current_plan.fingerprint).result
         overview = health_lab.load_overview(OverviewSelection())
 
     assert isinstance(blocked, WriteNotStarted)
@@ -121,7 +124,94 @@ def test_run_analysis_nonstart_paths_never_create_a_model_run(tmp_path: Path) ->
     assert busy.status is WriteNotStartedStatus.STORE_BUSY
     assert isinstance(changed, WriteNotStarted)
     assert changed.status is WriteNotStartedStatus.PLAN_CHANGED
-    assert isinstance(pending, WriteNotStarted)
-    assert pending.status is WriteNotStartedStatus.BLOCKED
-    assert pending.diagnostics == ("analysis_start_not_available",)
     assert overview.analysis_history == ()
+
+
+def test_started_run_freezes_input_and_persists_insufficient_data_without_result(
+    tmp_path: Path,
+) -> None:
+    runtime = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    request = _request()
+
+    with HealthLab.open(runtime) as health_lab:
+        _import(health_lab, _package(tmp_path / "snapshot.zip", day=2))
+        plan = health_lab.preview_write(request)
+        first = health_lab.execute_write(request, expected_plan=plan.fingerprint).result
+        second_plan = health_lab.preview_write(request)
+        second = health_lab.execute_write(request, expected_plan=second_plan.fingerprint).result
+
+    assert isinstance(first, AnalysisReceipt)
+    assert first.status is AnalysisStatus.INSUFFICIENT_DATA
+    assert first.result_ref is None
+    assert first.model_maturity is None
+    assert isinstance(second, AnalysisReceipt)
+    assert second.analysis_run_id != first.analysis_run_id
+
+    with sqlite3.connect(runtime.active_store / "metadata.sqlite3") as metadata:
+        row = metadata.execute(
+            "SELECT result_id, status, input_artifact_path FROM analysis_runs "
+            "WHERE analysis_run_id = ?",
+            (str(first.analysis_run_id),),
+        ).fetchone()
+    assert row is not None
+    assert row[:2] == (None, "insufficient_data")
+    artifact = runtime.active_store / str(row[2])
+    frozen_input = artifact.read_bytes()
+    payload = json.loads(frozen_input)
+    assert payload["analysis_run_id"] == str(first.analysis_run_id)
+    assert payload["snapshot_id"] == str(first.snapshot_ref)
+    assert payload["calendar"] == ["2024-01-02"]
+    assert {value["input_id"] for value in payload["values"]} >= {
+        "active_energy",
+        "steps",
+        "outcome_day_context",
+    }
+    assert any(
+        value["input_id"] == "steps" and value["value"] == 1.0 and value["measurement_version_ids"]
+        for value in payload["values"]
+    )
+    assert payload["rule_versions"]
+    assert payload["scalings"]
+    with HealthLab.open(runtime) as health_lab:
+        _import(health_lab, _package(tmp_path / "later.zip", day=3, value=2))
+    assert artifact.read_bytes() == frozen_input
+
+
+def test_analysis_fault_never_exposes_a_partial_run_after_reopen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for index, fault_point in enumerate(
+        (
+            "analysis.after_input_write/v1",
+            "analysis.after_input_publish/v1",
+            "analysis.before_catalog_commit/v1",
+        )
+    ):
+        runtime = RuntimeConfig(
+            DataMode.SYNTHETIC, tmp_path / f"store-{index}", tmp_path / "real"
+        )
+        request = _request()
+        with monkeypatch.context() as fault, HealthLab.open(runtime) as health_lab:
+            _import(health_lab, _package(tmp_path / f"snapshot-{index}.zip", day=2))
+            plan = health_lab.preview_write(request)
+
+            def fail_at_analysis_point(
+                _root: Path, current: str, expected: str = fault_point
+            ) -> None:
+                if current == expected:
+                    raise OSError("injected analysis publication fault")
+
+            fault.setattr(
+                "personal_health_lab.storage._store._publication_fault_point",
+                fail_at_analysis_point,
+            )
+            with pytest.raises(HealthLabError):
+                health_lab.execute_write(request, expected_plan=plan.fingerprint)
+
+        with HealthLab.open(runtime):
+            pass
+        with sqlite3.connect(runtime.active_store / "metadata.sqlite3") as metadata:
+            assert metadata.execute("SELECT count(*) FROM analysis_runs").fetchone() == (0,)
+            assert metadata.execute("SELECT count(*) FROM analysis_receipts").fetchone() == (0,)
+        inputs = runtime.active_store / "parquet" / "analysis-inputs"
+        assert not inputs.exists() or list(inputs.iterdir()) == []

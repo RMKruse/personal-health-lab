@@ -999,6 +999,7 @@ class AnalysisProvenance:
     code_dirty: bool
     code_diff_hash: str | None
     environment_lock_hash: str
+    input_content_hash: str = ""
 
     @property
     def reuse_key(self) -> str:
@@ -1012,6 +1013,8 @@ class AnalysisProvenance:
             "environment_lock_hash": self.environment_lock_hash,
             "snapshot_id": str(self.snapshot_id),
         }
+        if self.input_content_hash:
+            values["input_content_hash"] = self.input_content_hash
         return hashlib.sha256(
             json.dumps(values, separators=(",", ":"), sort_keys=True).encode()
         ).hexdigest()
@@ -2636,7 +2639,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             CREATE TABLE analysis_runs (
                 analysis_run_id TEXT PRIMARY KEY,
                 operation_id TEXT NOT NULL,
-                result_id TEXT NOT NULL UNIQUE,
+                result_id TEXT UNIQUE,
                 snapshot_id TEXT NOT NULL,
                 analysis_definition_id TEXT NOT NULL,
                 analysis_start_date TEXT,
@@ -2648,8 +2651,10 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                 code_dirty INTEGER NOT NULL,
                 code_diff_hash TEXT,
                 environment_lock_hash TEXT NOT NULL,
+                input_content_hash TEXT,
+                input_artifact_path TEXT,
                 reuse_key TEXT NOT NULL,
-                model_maturity TEXT NOT NULL,
+                model_maturity TEXT,
                 data_status TEXT NOT NULL,
                 data_status_reasons TEXT NOT NULL,
                 maturity_criteria TEXT NOT NULL,
@@ -2672,6 +2677,8 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
         "code_dirty": "INTEGER NOT NULL DEFAULT 0",
         "code_diff_hash": "TEXT",
         "environment_lock_hash": "TEXT NOT NULL DEFAULT ''",
+        "input_content_hash": "TEXT",
+        "input_artifact_path": "TEXT",
         "reuse_key": "TEXT NOT NULL DEFAULT ''",
         "model_maturity": "TEXT",
         "data_status": "TEXT NOT NULL DEFAULT 'reviewed'",
@@ -2683,6 +2690,55 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
     for column, declaration in migrations.items():
         if column not in analysis_columns:
             metadata.execute(f"ALTER TABLE analysis_runs ADD COLUMN {column} {declaration}")
+    analysis_nullability = {
+        str(row[1]): bool(row[3])
+        for row in metadata.execute("PRAGMA table_info(analysis_runs)").fetchall()
+    }
+    if analysis_nullability.get("result_id") or analysis_nullability.get("model_maturity"):
+        metadata.execute("ALTER TABLE analysis_runs RENAME TO legacy_analysis_runs")
+        metadata.execute(
+            """
+            CREATE TABLE analysis_runs (
+                analysis_run_id TEXT PRIMARY KEY,
+                operation_id TEXT NOT NULL,
+                result_id TEXT UNIQUE,
+                snapshot_id TEXT NOT NULL,
+                analysis_definition_id TEXT NOT NULL,
+                analysis_start_date TEXT,
+                analysis_end_date TEXT,
+                config_json TEXT NOT NULL,
+                config_hash TEXT NOT NULL,
+                config_schema_version TEXT NOT NULL,
+                code_commit TEXT NOT NULL,
+                code_dirty INTEGER NOT NULL,
+                code_diff_hash TEXT,
+                environment_lock_hash TEXT NOT NULL,
+                input_content_hash TEXT,
+                input_artifact_path TEXT,
+                reuse_key TEXT NOT NULL,
+                model_maturity TEXT,
+                data_status TEXT NOT NULL,
+                data_status_reasons TEXT NOT NULL,
+                maturity_criteria TEXT NOT NULL,
+                reproducibility TEXT NOT NULL,
+                diagnostics TEXT NOT NULL,
+                status TEXT NOT NULL,
+                completed_at TEXT NOT NULL
+            )
+            """
+        )
+        columns = (
+            "analysis_run_id, operation_id, result_id, snapshot_id, analysis_definition_id, "
+            "analysis_start_date, analysis_end_date, config_json, config_hash, "
+            "config_schema_version, code_commit, code_dirty, code_diff_hash, "
+            "environment_lock_hash, input_content_hash, input_artifact_path, reuse_key, "
+            "model_maturity, data_status, data_status_reasons, maturity_criteria, "
+            "reproducibility, diagnostics, status, completed_at"
+        )
+        metadata.execute(
+            f"INSERT INTO analysis_runs ({columns}) SELECT {columns} FROM legacy_analysis_runs"
+        )
+        metadata.execute("DROP TABLE legacy_analysis_runs")
     migration_columns = {
         str(row[1]) for row in metadata.execute("PRAGMA table_info(migration_publications)")
     }
@@ -9038,6 +9094,14 @@ class LocalStore:
             "(versions.canonical_type = 'body_mass' OR versions.canonical_type LIKE 'dietary_%')",
         )
 
+    def load_analysis_measurements(
+        self,
+        snapshot_id: SnapshotId,
+        start_date: date | None,
+        end_date: date | None,
+    ) -> tuple[SnapshotId | None, tuple[StoredMeasurement, ...]]:
+        return self._load_measurements(snapshot_id, start_date, end_date, "TRUE")
+
     def load_activity_measurements(
         self,
         snapshot_id: SnapshotId | None,
@@ -11640,6 +11704,139 @@ class LocalStore:
             diagnostics=tuple(cast(list[str], json.loads(str(diagnostics)))),
         )
 
+    def persist_insufficient_analysis_run(
+        self,
+        *,
+        operation_id: OperationId,
+        provenance: AnalysisProvenance,
+        start_date: date | None,
+        end_date: date | None,
+        config_json: str,
+        input_json: str,
+        diagnostics: tuple[str, ...],
+        data_status: Literal["reviewed", "provisional"],
+    ) -> None:
+        self._require_open()
+        self._require_writer()
+        if provenance.result_id is not None or not provenance.input_content_hash:
+            raise StoreError("Unvollständige Analyseprovenienz.")
+        try:
+            payload = cast(dict[str, object], json.loads(input_json))
+            run_id = str(provenance.analysis_run_id)
+            content = dict(payload)
+            content.pop("analysis_run_id")
+            if (
+                payload.get("analysis_run_id") != run_id
+                or payload.get("snapshot_id") != str(provenance.snapshot_id)
+                or payload.get("analysis_definition_id")
+                != str(provenance.analysis_definition_id)
+                or payload.get("input_schema_version") != 1
+                or hashlib.sha256(
+                    json.dumps(content, separators=(",", ":"), sort_keys=True).encode()
+                ).hexdigest()
+                != provenance.input_content_hash
+            ):
+                raise ValueError
+        except (AttributeError, json.JSONDecodeError, TypeError, ValueError) as error:
+            raise StoreError("Analyseeingangsbündel ist ungültig.") from error
+
+        staging = self._root / "analysis-staging" / run_id
+        # ponytail: one canonical JSON input until #116 adds final JSONL schemas/publication.
+        relative = Path(_PARQUET_DIRECTORY) / "analysis-inputs" / f"{run_id}.json"
+        destination = self._root / relative
+        if staging.exists() or destination.exists():
+            raise StoreError("Analyseartefakt existiert bereits.")
+        created_at = datetime.now().astimezone().isoformat()
+        try:
+            staging.mkdir(parents=True)
+            staged = staging / "input.json"
+            with staged.open("x", encoding="utf-8") as artifact:
+                artifact.write(input_json)
+                artifact.flush()
+                os.fsync(artifact.fileno())
+            _fsync_directory(staging)
+            _publication_fault_point(self._root, "analysis.after_input_write/v1")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(staged, destination)
+            _fsync_directory(destination.parent)
+            _publication_fault_point(self._root, "analysis.after_input_publish/v1")
+            with self._metadata:
+                self._metadata.execute(
+                    """
+                    INSERT INTO analysis_runs(
+                        analysis_run_id, operation_id, result_id, snapshot_id,
+                        analysis_definition_id, analysis_start_date, analysis_end_date,
+                        config_json, config_hash, config_schema_version,
+                        code_commit, code_dirty, code_diff_hash, environment_lock_hash,
+                        input_content_hash, input_artifact_path, reuse_key, model_maturity,
+                        data_status, data_status_reasons, maturity_criteria, reproducibility,
+                        diagnostics, status, completed_at
+                    ) VALUES (
+                        ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL,
+                        ?, '[]', '[]', ?, ?, 'insufficient_data', ?
+                    )
+                    """,
+                    (
+                        run_id,
+                        str(operation_id),
+                        str(provenance.snapshot_id),
+                        str(provenance.analysis_definition_id),
+                        None if start_date is None else start_date.isoformat(),
+                        None if end_date is None else end_date.isoformat(),
+                        config_json,
+                        provenance.config_hash,
+                        provenance.config_schema_version,
+                        provenance.code_commit,
+                        provenance.code_dirty,
+                        provenance.code_diff_hash,
+                        provenance.environment_lock_hash,
+                        provenance.input_content_hash,
+                        str(relative),
+                        provenance.reuse_key,
+                        data_status,
+                        (
+                            ReproducibilityStatus.LOCAL_DEVELOPMENT.value
+                            if provenance.code_dirty
+                            else ReproducibilityStatus.REPRODUCIBLE.value
+                        ),
+                        json.dumps(diagnostics),
+                        created_at,
+                    ),
+                )
+                self._metadata.execute(
+                    """
+                    INSERT INTO analysis_receipts(
+                        operation_id, analysis_run_id, status, result_id, snapshot_id,
+                        analysis_definition_id, config_json, config_hash,
+                        config_schema_version, code_commit, code_dirty, code_diff_hash,
+                        environment_lock_hash, diagnostics, created_at
+                    ) VALUES (?, ?, 'insufficient_data', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(operation_id),
+                        run_id,
+                        str(provenance.snapshot_id),
+                        str(provenance.analysis_definition_id),
+                        config_json,
+                        provenance.config_hash,
+                        provenance.config_schema_version,
+                        provenance.code_commit,
+                        provenance.code_dirty,
+                        provenance.code_diff_hash,
+                        provenance.environment_lock_hash,
+                        json.dumps(diagnostics),
+                        created_at,
+                    ),
+                )
+                _publication_fault_point(self._root, "analysis.before_catalog_commit/v1")
+        except BaseException as error:
+            destination.unlink(missing_ok=True)
+            self._remove_tree(staging)
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise StoreError("Analyselauf konnte nicht persistiert werden.") from error
+        self._remove_tree(staging)
+
     def persist_analysis_receipt(
         self,
         *,
@@ -12164,10 +12361,12 @@ class LocalStore:
             "SELECT analysis_run_id, result_id FROM analysis_runs WHERE status = 'running'"
         ).fetchall()
         for analysis_run_id, result_id in running_analyses:
-            for path in (
-                self._root / "analysis-staging" / str(analysis_run_id),
-                self._root / _PARQUET_DIRECTORY / "analyses" / str(result_id),
-            ):
+            analysis_paths = [self._root / "analysis-staging" / str(analysis_run_id)]
+            if result_id is not None:
+                analysis_paths.append(
+                    self._root / _PARQUET_DIRECTORY / "analyses" / str(result_id)
+                )
+            for path in analysis_paths:
                 if path.exists():
                     self._remove_tree(path)
         if running_analyses:
@@ -12191,6 +12390,18 @@ class LocalStore:
             for path in analyses.iterdir():
                 if path.is_dir() and path.name not in published:
                     self._remove_tree(path)
+        analysis_inputs = self._root / _PARQUET_DIRECTORY / "analysis-inputs"
+        if analysis_inputs.exists():
+            published_inputs = {
+                Path(str(row[0])).name
+                for row in self._metadata.execute(
+                    "SELECT input_artifact_path FROM analysis_runs "
+                    "WHERE input_artifact_path IS NOT NULL"
+                )
+            }
+            for path in analysis_inputs.iterdir():
+                if path.is_file() and path.name not in published_inputs:
+                    path.unlink()
 
         active = self._metadata.execute(
             "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"

@@ -51,10 +51,25 @@ id = "V04-C-RUN-ANALYSIS-LEGACY-V1"
 source = "https://github.com/RMKruse/personal-health-lab/issues/114"
 statement = "The old resting-heart-rate request remains executable only as JSON 3.0 adapter compatibility and is absent from the canonical V0.4 WriteRequest union."
 
+[[contract]]
+id = "V04-C-RUN-ANALYSIS-START-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/115"
+statement = "Each started RunAnalysis attempt receives a new AnalysisRunId while non-started paths create no run."
+
+[[contract]]
+id = "V04-C-ANALYSIS-INPUT-BUNDLE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/115"
+statement = "A started attempt freezes its calendar, values, missingness, rule versions, source evidence, data-quality facts, and scalings; insufficient_data persists no result identity or statistical result."
+
+[[contract]]
+id = "V04-C-ANALYSIS-RUN-ATOMICITY-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/115"
+statement = "Analysis input and technical outcome become visible together; injected faults expose no partial run after reopen and V0.3 remains readable."
+
 [[hash_reference]]
 id = "V04-H-ANALYSIS-DEFINITIONS-V1"
 artifact = "src/personal_health_lab/analysis/__init__.py"
-sha256 = "525e75404ef968d95fac66e5907cf57fb5b1a63dd0446dcff26c4a859d6c5f72"
+sha256 = "ce04fe484a9796d50d0ed37d22586a721218f70d139595467fc991aee1b92b14"
 
 [[hash_reference]]
 id = "V04-H-LAG-CALIBRATION-V1"
@@ -200,3 +215,23 @@ level = "application"
 platform = "all"
 expected_result = "the existing JSON 3.0 resting-heart-rate adapter path remains executable"
 forbidden_side_effects = "no legacy request variant in the canonical V0.4 WriteRequest union"
+
+[[case]]
+id = "V04-A-ANALYSIS-INPUT-BUNDLE-V1"
+contracts = ["V04-C-RUN-ANALYSIS-START-V1", "V04-C-ANALYSIS-INPUT-BUNDLE-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1"]
+runner = "tests/acceptance/test_v04_run_analysis.py::test_started_run_freezes_input_and_persists_insufficient_data_without_result"
+level = "application"
+platform = "all"
+expected_result = "fresh run identity, immutable complete input bundle, and insufficient_data without a result identity"
+forbidden_side_effects = "no reused run identity, AnalysisResultId, statistical result, mutable input, or health-value duplication in SQLite"
+
+[[case]]
+id = "V04-A-ANALYSIS-RUN-ATOMICITY-V1"
+contracts = ["V04-C-ANALYSIS-RUN-ATOMICITY-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1"]
+runner = "tests/acceptance/test_v04_run_analysis.py::test_analysis_fault_never_exposes_a_partial_run_after_reopen"
+level = "application"
+platform = "all"
+expected_result = "fault cutpoints leave no visible run or input after reopen"
+forbidden_side_effects = "no partial run, receipt, result, or orphaned published input"

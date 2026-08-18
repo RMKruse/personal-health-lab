@@ -21,6 +21,7 @@ from personal_health_lab.analysis import (
     AnalysisDefinition,
     RunAnalysisPlan,
     analysis_definitions,
+    execute_analysis_run,
     plan_analysis,
 )
 from personal_health_lab.data_quality import (
@@ -7022,11 +7023,28 @@ class HealthLab:
                     locked_plan.diagnostics,
                     expected_plan,
                 )
-            return self._not_started(
-                locked_plan,
-                WriteNotStartedStatus.BLOCKED,
-                ("analysis_start_not_available",),
+            assert isinstance(locked_plan.details, RunAnalysisPlan)
+            try:
+                result = execute_analysis_run(writer, locked_plan.details)
+            except (OSError, StoreError, ValueError) as error:
+                raise HealthLabError("Analyselauf konnte nicht abgeschlossen werden.") from error
+            receipt = AnalysisReceipt(
+                operation_id=result.operation_id,
+                analysis_run_id=result.analysis_run_id,
+                status=AnalysisStatus.INSUFFICIENT_DATA,
+                snapshot_ref=result.snapshot_id,
+                analysis_definition_id=result.analysis_definition_id,
+                model_maturity=None,
+                result_ref=None,
+                diagnostics=result.diagnostics,
+                provenance=result.provenance,
+            )
+            return WriteReceipt(
+                result.operation_id,
                 expected_plan,
+                receipt,
+                locked_plan.preflight,
+                result.diagnostics,
             )
         finally:
             writer.close()
