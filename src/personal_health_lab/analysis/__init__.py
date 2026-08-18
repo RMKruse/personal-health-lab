@@ -9,21 +9,23 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 from personal_health_lab.storage import (
     ActivityDerivationRecord,
     AnalysisDataStatusReason,
     AnalysisDefinitionId,
+    AnalysisJsonlArtifact,
     AnalysisProvenance,
     AnalysisResultId,
     AnalysisRunConfiguration,
     AnalysisRunId,
+    AnalysisRunPublication,
     CanonicalHealthType,
     CanonicalUnit,
     DataQualityStatus,
     DataStatusReasonCode,
-    InsufficientAnalysisRunPublication,
     LocalStore,
     MeasurementVersionId,
     OperationId,
@@ -33,6 +35,7 @@ from personal_health_lab.storage import (
     StoredActivityDayValue,
     StoredMeasurement,
     StoredWorkout,
+    StoreError,
 )
 
 _PROJECT_ROOT = Path(__file__).parents[3]
@@ -73,6 +76,33 @@ class AnalysisDiagnostic(StrEnum):
     SENSITIVITY = "sensitivity"
     STRUCTURAL_BREAK = "structural_break"
     BOOTSTRAP = "bootstrap"
+
+
+class AnalysisMaturityCriterionCode(StrEnum):
+    AUGMENTED_CONDITION_NUMBER = "augmented_condition_number"
+    BLOCKED_PREDICTION_GAIN = "blocked_prediction_gain"
+    BOOTSTRAP_SUCCESS = "bootstrap_success"
+    CALENDAR_DAYS = "calendar_days"
+    COMMON_COMPLETE_FRACTION = "common_complete_fraction"
+    CONTEXT_SENSITIVITY = "context_sensitivity"
+    EFFECTIVE_BLOCKS = "effective_blocks"
+    FULL_RANK = "full_rank"
+    INPUT_COMPLETENESS = "input_completeness"
+    LJUNG_BOX = "ljung_box"
+    MAXIMUM_COMMON_GAP_DAYS = "maximum_common_gap_days"
+    MAXIMUM_GAP_DAYS = "maximum_gap_days"
+    MAXIMUM_OBSERVED_GAP_DAYS = "maximum_observed_gap_days"
+    MEAN_BAND_HALFWIDTH = "mean_band_halfwidth"
+    MINIMUM_FIT_ROWS = "minimum_fit_rows"
+    MODEL_ANCHORS = "model_anchors"
+    PAIR_DENSITY = "pair_density"
+    POSITIVE_TRAINING_DAYS = "positive_training_days"
+    RESIDUAL_ACF = "residual_acf"
+    RHR_MEASUREMENT_ERROR = "rhr_measurement_error"
+    RIDGE_SENSITIVITY = "ridge_sensitivity"
+    STRUCTURAL_BREAK_OR_SOURCE_CHANGE = "structural_break_or_source_change"
+    UNPENALIZED_CONDITION_NUMBER = "unpenalized_condition_number"
+    WEIGHT_MEASUREMENT_ERROR = "weight_measurement_error"
 
 
 class AnalysisBootstrapMethod(StrEnum):
@@ -344,6 +374,152 @@ class AnalysisInputBundle:
     scalings: tuple[AnalysisScaling, ...]
     activity_coverage_incomplete: bool = False
     schema_version: int = 1
+
+
+_INPUT_KEYS = {
+    "activity_coverage_incomplete",
+    "analysis_definition_id",
+    "analysis_period",
+    "analysis_run_id",
+    "calendar",
+    "data_quality_fact_ids",
+    "input_schema_version",
+    "rule_versions",
+    "scalings",
+    "snapshot_id",
+    "values",
+}
+_INPUT_VALUE_KEYS = {
+    "component",
+    "data_quality_fact_ids",
+    "day",
+    "input_id",
+    "measurement_version_ids",
+    "missingness",
+    "missingness_reason",
+    "quality_status",
+    "source_evidence",
+    "unit",
+    "value",
+}
+_SOURCE_EVIDENCE_KEYS = {
+    "disposition",
+    "is_selected",
+    "measurement_version_id",
+    "source_name",
+    "source_updated_at",
+    "source_version",
+}
+_SCALING_KEYS = {"component", "input_id", "population_standard_deviation", "status"}
+_RESULT_LIST_FIELDS = {
+    AnalysisResultFamily.RHR_ACTIVITY_LAG_1_7: {
+        "bootstrap_facts",
+        "contrasts",
+        "diagnostics",
+        "lag_estimates",
+        "maturity_criteria",
+    },
+    AnalysisResultFamily.RHR_ACTIVITY_LAG_1_30: {
+        "bootstrap_facts",
+        "contrasts",
+        "diagnostics",
+        "lag_estimates",
+        "maturity_criteria",
+    },
+    AnalysisResultFamily.WEIGHT_CORE: {
+        "bootstrap_facts",
+        "diagnostics",
+        "maturity_criteria",
+        "models",
+        "predictions",
+        "trends",
+    },
+    AnalysisResultFamily.RHR_WEIGHT_ASSOCIATION: {
+        "associations",
+        "bootstrap_facts",
+        "diagnostics",
+        "maturity_criteria",
+    },
+}
+_RESULT_PRIMARY_FIELDS = {
+    AnalysisResultFamily.RHR_ACTIVITY_LAG_1_7: "lag_estimates",
+    AnalysisResultFamily.RHR_ACTIVITY_LAG_1_30: "lag_estimates",
+    AnalysisResultFamily.WEIGHT_CORE: "trends",
+    AnalysisResultFamily.RHR_WEIGHT_ASSOCIATION: "associations",
+}
+_RESULT_ITEM_KEYS = {
+    "lag_estimates": {
+        "estimate_bpm_per_natural_scale",
+        "estimate_bpm_per_personal_sd",
+        "feature_id",
+        "lag_day",
+        "natural_scale",
+        "natural_unit",
+        "pointwise_interval",
+        "simultaneous_band",
+    },
+    "contrasts": {
+        "end_day",
+        "estimate_bpm_per_natural_scale",
+        "estimate_bpm_per_personal_sd",
+        "feature_id",
+        "natural_scale",
+        "natural_unit",
+        "pointwise_interval",
+        "simultaneous_band",
+        "start_day",
+    },
+    "trends": {
+        "day",
+        "failure_reason",
+        "level_kg",
+        "local_support",
+        "numerical_pivot",
+        "rate_kg_per_week",
+        "support_status",
+        "window_days",
+    },
+    "models": {
+        "blocked_prediction_gain",
+        "coefficient",
+        "estimate_kg_per_week_per_natural_scale",
+        "estimate_kg_per_week_per_personal_sd",
+        "feature_id",
+        "model_family",
+        "natural_scale",
+        "natural_unit",
+        "pointwise_interval",
+        "simultaneous_band",
+        "window_days",
+    },
+    "predictions": {
+        "day",
+        "model_family",
+        "observed_kg_per_week",
+        "predicted_kg_per_week",
+        "residual_kg_per_week",
+        "window_days",
+    },
+    "associations": {
+        "estimate",
+        "measure",
+        "paired_days",
+        "pointwise_interval",
+        "simultaneous_band",
+        "window_days",
+    },
+    "bootstrap_facts": {
+        "attempts",
+        "block_length",
+        "failure_counts",
+        "quantile_stability",
+        "seed",
+        "successful_refits",
+        "variant",
+    },
+    "diagnostics": {"code", "facts"},
+    "maturity_criteria": {"code", "observed_value", "passed", "threshold"},
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -640,9 +816,7 @@ def _measurement_value(
             key=str,
         )
     )
-    quality_status = (
-        DataQualityStatus.PROVISIONAL if quality_ids else DataQualityStatus.REVIEWED
-    )
+    quality_status = DataQualityStatus.PROVISIONAL if quality_ids else DataQualityStatus.REVIEWED
     if not measurements:
         return AnalysisInputValue(
             day,
@@ -716,9 +890,7 @@ def _workout_value(
     quality_ids = tuple(
         sorted({case for item in workouts for case in item.review_case_ids}, key=str)
     )
-    quality_status = (
-        DataQualityStatus.PROVISIONAL if quality_ids else DataQualityStatus.REVIEWED
-    )
+    quality_status = DataQualityStatus.PROVISIONAL if quality_ids else DataQualityStatus.REVIEWED
     eligible = tuple(
         item
         for item in workouts
@@ -816,11 +988,7 @@ def _activity_value(
                 if measurements
                 else AnalysisMissingnessReason.NO_OBSERVATION
             ),
-            (
-                DataQualityStatus.PROVISIONAL
-                if quality_ids
-                else DataQualityStatus.REVIEWED
-            ),
+            (DataQualityStatus.PROVISIONAL if quality_ids else DataQualityStatus.REVIEWED),
         )
     contributor_ids = set(activity.measurement_version_ids)
     contributors = tuple(
@@ -841,11 +1009,7 @@ def _activity_value(
         AnalysisMissingness.OBSERVED,
         _source_evidence(contributors),
         quality_ids,
-        quality_status=(
-            DataQualityStatus.PROVISIONAL
-            if quality_ids
-            else activity.quality_status
-        ),
+        quality_status=(DataQualityStatus.PROVISIONAL if quality_ids else activity.quality_status),
     )
 
 
@@ -874,9 +1038,9 @@ def build_analysis_input_bundle(
         mapped = _MEASUREMENT_INPUTS.get(measurement.data_type.value)
         if mapped is not None:
             input_id, component = mapped
-            grouped.setdefault(
-                (measurement.measurement_local_day, input_id, component), []
-            ).append(measurement)
+            grouped.setdefault((measurement.measurement_local_day, input_id, component), []).append(
+                measurement
+            )
     workout_components = tuple(sorted({item.original_activity_type for item in workouts}))
     workouts_by_day_and_type: dict[tuple[date, str], list[StoredWorkout]] = {}
     for workout in workouts:
@@ -884,8 +1048,7 @@ def build_analysis_input_bundle(
             (workout.measurement_local_day, workout.original_activity_type), []
         ).append(workout)
     activity_by_day_and_input = {
-        (item.day, _MEASUREMENT_INPUTS[item.data_type.value][0]): item
-        for item in activity_values
+        (item.day, _MEASUREMENT_INPUTS[item.data_type.value][0]): item for item in activity_values
     }
     required = plan.analysis_definition.method_facts.inputs
     values: list[AnalysisInputValue] = []
@@ -977,9 +1140,7 @@ def build_analysis_input_bundle(
     rule_versions.extend(
         f"plausibility/{rule.data_type}/{rule.version_id}" for rule in plausibility_rules
     )
-    if activity_derivation is not None and any(
-        item in _ACTIVITY_INPUTS for item in required
-    ):
+    if activity_derivation is not None and any(item in _ACTIVITY_INPUTS for item in required):
         rule_versions.extend(
             (
                 activity_derivation.version_id,
@@ -1037,9 +1198,7 @@ def _bundle_payload(bundle: AnalysisInputBundle, *, include_run_id: bool) -> dic
                 ],
                 "missingness": item.missingness.value,
                 "missingness_reason": (
-                    None
-                    if item.missingness_reason is None
-                    else item.missingness_reason.value
+                    None if item.missingness_reason is None else item.missingness_reason.value
                 ),
                 "quality_status": item.quality_status.value,
                 "source_evidence": [
@@ -1062,6 +1221,380 @@ def _bundle_payload(bundle: AnalysisInputBundle, *, include_run_id: bool) -> dic
     if include_run_id:
         payload["analysis_run_id"] = str(bundle.analysis_run_id)
     return payload
+
+
+def _artifact_rows(artifact: AnalysisJsonlArtifact) -> tuple[dict[str, object], ...]:
+    if (
+        artifact.schema_version <= 0
+        or artifact.size_bytes != len(artifact.payload)
+        or artifact.sha256 != hashlib.sha256(artifact.payload).hexdigest()
+        or len(artifact.content_hash) != 64
+        or any(character not in "0123456789abcdef" for character in artifact.content_hash)
+        or not artifact.payload.endswith(b"\n")
+    ):
+        raise StoreError("Analyseartefakt verletzt Größen- oder Hashvertrag.")
+    try:
+        rows = tuple(json.loads(row) for row in artifact.payload.decode().splitlines())
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise StoreError("Analyseartefakt verletzt das JSONL-Schema.") from error
+    if (
+        len(rows) != artifact.row_count
+        or not rows
+        or any(not isinstance(row, dict) for row in rows)
+    ):
+        raise StoreError("Analyseartefakt verletzt das JSONL-Schema.")
+    return cast(tuple[dict[str, object], ...], rows)
+
+
+def _validate_input_artifact(
+    artifact: AnalysisJsonlArtifact, provenance: AnalysisProvenance
+) -> None:
+    rows = _artifact_rows(artifact)
+    if (
+        artifact.schema_id != "analysis-input-bundle"
+        or artifact.schema_version != 1
+        or len(rows) != 1
+    ):
+        raise StoreError("Unbekanntes Analyseeingangsschema.")
+    record = rows[0]
+    period = record.get("analysis_period")
+    calendar = record.get("calendar")
+    values = record.get("values")
+    scalings = record.get("scalings")
+    rule_versions = record.get("rule_versions")
+    quality_ids = record.get("data_quality_fact_ids")
+    if (
+        set(record) != _INPUT_KEYS
+        or record.get("input_schema_version") != 1
+        or record.get("analysis_run_id") != str(provenance.analysis_run_id)
+        or record.get("snapshot_id") != str(provenance.snapshot_id)
+        or record.get("analysis_definition_id") != str(provenance.analysis_definition_id)
+        or not isinstance(record.get("activity_coverage_incomplete"), bool)
+        or not isinstance(period, dict)
+        or set(period) != {"start_date", "end_date"}
+        or not isinstance(calendar, list)
+        or not isinstance(values, list)
+        or not isinstance(scalings, list)
+        or not isinstance(rule_versions, list)
+        or not all(isinstance(item, str) for item in rule_versions)
+        or not isinstance(quality_ids, list)
+        or not all(isinstance(item, str) for item in quality_ids)
+    ):
+        raise StoreError("Analyseeingang verletzt das Schema.")
+    try:
+        start = date.fromisoformat(str(period["start_date"]))
+        end = date.fromisoformat(str(period["end_date"]))
+        days = tuple(date.fromisoformat(str(item)) for item in calendar)
+    except ValueError as error:
+        raise StoreError("Analyseeingang verletzt das Datumsschema.") from error
+    if start > end or days != tuple(sorted(set(days))):
+        raise StoreError("Analyseeingang verletzt das Kalenderraster.")
+    for value in values:
+        if not isinstance(value, dict) or set(value) != _INPUT_VALUE_KEYS:
+            raise StoreError("Analysewert verletzt das Schema.")
+        evidence = value["source_evidence"]
+        numeric = value["value"]
+        if (
+            not isinstance(value["day"], str)
+            or not isinstance(value["input_id"], str)
+            or not value["input_id"]
+            or (value["component"] is not None and not isinstance(value["component"], str))
+            or (
+                value["unit"] is not None
+                and value["unit"] not in {item.value for item in CanonicalUnit}
+            )
+            or (
+                numeric is not None
+                and (
+                    not isinstance(numeric, (int, float))
+                    or isinstance(numeric, bool)
+                    or not math.isfinite(numeric)
+                )
+            )
+            or value["missingness"] not in {item.value for item in AnalysisMissingness}
+            or (
+                value["missingness_reason"] is not None
+                and value["missingness_reason"]
+                not in {item.value for item in AnalysisMissingnessReason}
+            )
+            or value["quality_status"] not in {item.value for item in DataQualityStatus}
+            or not isinstance(evidence, list)
+            or not isinstance(value["measurement_version_ids"], list)
+            or not all(isinstance(item, str) for item in value["measurement_version_ids"])
+            or not isinstance(value["data_quality_fact_ids"], list)
+            or not all(isinstance(item, str) for item in value["data_quality_fact_ids"])
+        ):
+            raise StoreError("Analysewert verletzt das Schema.")
+        try:
+            date.fromisoformat(value["day"])
+        except ValueError as error:
+            raise StoreError("Analysewert verletzt das Datumsschema.") from error
+        for source in evidence:
+            if (
+                not isinstance(source, dict)
+                or set(source) != _SOURCE_EVIDENCE_KEYS
+                or not isinstance(source["measurement_version_id"], str)
+                or not isinstance(source["source_name"], str)
+                or not isinstance(source["source_version"], str)
+                or not isinstance(source["source_updated_at"], str)
+                or not isinstance(source["is_selected"], bool)
+                or (
+                    source["disposition"] is not None and not isinstance(source["disposition"], str)
+                )
+            ):
+                raise StoreError("Analysequellenbeleg verletzt das Schema.")
+            try:
+                if datetime.fromisoformat(source["source_updated_at"]).tzinfo is None:
+                    raise ValueError
+            except ValueError as error:
+                raise StoreError("Analysequellenbeleg verletzt das Zeitschema.") from error
+    for scaling in scalings:
+        if not isinstance(scaling, dict) or set(scaling) != _SCALING_KEYS:
+            raise StoreError("Analyseskalierung verletzt das Schema.")
+        standard_deviation = scaling["population_standard_deviation"]
+        if (
+            not isinstance(scaling["input_id"], str)
+            or not scaling["input_id"]
+            or (scaling["component"] is not None and not isinstance(scaling["component"], str))
+            or (
+                standard_deviation is not None
+                and (
+                    not isinstance(standard_deviation, (int, float))
+                    or isinstance(standard_deviation, bool)
+                    or not math.isfinite(standard_deviation)
+                    or standard_deviation <= 0
+                )
+            )
+            or scaling["status"] not in {item.value for item in AnalysisScalingStatus}
+        ):
+            raise StoreError("Analyseskalierung verletzt das Schema.")
+    content = dict(record)
+    del content["analysis_run_id"]
+    if (
+        hashlib.sha256(
+            json.dumps(content, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+        != artifact.content_hash
+    ):
+        raise StoreError("Analyseeingang verletzt den Inhaltshash.")
+
+
+def _validate_input_publication(publication: AnalysisRunPublication) -> None:
+    _validate_input_artifact(publication.input_artifact, publication.provenance)
+
+
+def _is_json_value(value: object) -> bool:
+    if value is None or isinstance(value, (str, bool)):
+        return True
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return math.isfinite(value)
+    if isinstance(value, list):
+        return all(_is_json_value(item) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _is_json_value(item) for key, item in value.items())
+    return False
+
+
+def _validate_result_item(field: str, item: object) -> None:
+    if not isinstance(item, dict) or set(item) != _RESULT_ITEM_KEYS[field]:
+        raise StoreError("Analyseergebnis verletzt das geschlossene Familienschema.")
+    if not _is_json_value(item):
+        raise StoreError("Analyseergebnis enthält keinen endlichen JSON-Wert.")
+    code = item.get("code")
+    if field == "diagnostics" and code not in {value.value for value in AnalysisDiagnostic}:
+        raise StoreError("Analyseergebnis enthält einen unbekannten Diagnosecode.")
+    if field == "maturity_criteria" and code not in {
+        value.value for value in AnalysisMaturityCriterionCode
+    }:
+        raise StoreError("Analyseergebnis enthält einen unbekannten Reifekriteriumscode.")
+    for key, value in item.items():
+        if key in {
+            "code",
+            "feature_id",
+            "measure",
+            "model_family",
+            "natural_unit",
+            "support_status",
+            "variant",
+        }:
+            if not isinstance(value, str) or not value:
+                raise StoreError("Analyseergebnis verletzt das geschlossene Familienschema.")
+        elif key in {
+            "lag_day",
+            "start_day",
+            "end_day",
+            "window_days",
+            "attempts",
+            "block_length",
+            "seed",
+            "successful_refits",
+            "paired_days",
+            "local_support",
+        }:
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise StoreError("Analyseergebnis verletzt das geschlossene Familienschema.")
+        elif (
+            (key == "passed" and not isinstance(value, bool))
+            or (
+                key in {"observed_value", "threshold"}
+                and (
+                    not isinstance(value, (int, float, str))
+                    or isinstance(value, bool)
+                    or (isinstance(value, float) and not math.isfinite(value))
+                    or (isinstance(value, str) and not value)
+                )
+            )
+            or (
+                key == "failure_counts"
+                and (
+                    not isinstance(value, dict)
+                    or not all(
+                        isinstance(code, str)
+                        and code
+                        and isinstance(count, int)
+                        and not isinstance(count, bool)
+                        and count >= 0
+                        for code, count in value.items()
+                    )
+                )
+            )
+            or (
+                key == "facts"
+                and (
+                    not isinstance(value, dict)
+                    or not all(isinstance(name, str) and name for name in value)
+                )
+            )
+        ):
+            raise StoreError("Analyseergebnis verletzt das geschlossene Familienschema.")
+        elif (
+            key
+            in {
+                "blocked_prediction_gain",
+                "coefficient",
+                "estimate",
+                "estimate_bpm_per_natural_scale",
+                "estimate_bpm_per_personal_sd",
+                "estimate_kg_per_week_per_natural_scale",
+                "estimate_kg_per_week_per_personal_sd",
+                "level_kg",
+                "natural_scale",
+                "numerical_pivot",
+                "observed_kg_per_week",
+                "predicted_kg_per_week",
+                "quantile_stability",
+                "rate_kg_per_week",
+                "residual_kg_per_week",
+            }
+            and value is not None
+        ):
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+            ):
+                raise StoreError("Analyseergebnis verletzt das geschlossene Familienschema.")
+        elif key in {"pointwise_interval", "simultaneous_band"}:
+            if not isinstance(value, dict) or set(value) != {"lower", "upper"}:
+                raise StoreError("Analyseergebnis verletzt das geschlossene Familienschema.")
+            bounds = tuple(value.values())
+            if any(
+                not isinstance(bound, (int, float))
+                or isinstance(bound, bool)
+                or not math.isfinite(bound)
+                for bound in bounds
+            ):
+                raise StoreError("Analyseergebnis verletzt das geschlossene Familienschema.")
+            interval = cast(dict[str, float], value)
+            if interval["lower"] > interval["upper"]:
+                raise StoreError("Analyseergebnisintervall ist umgekehrt.")
+        elif key == "day":
+            if not isinstance(value, str):
+                raise StoreError("Analyseergebnis verletzt das Datumsschema.")
+            try:
+                date.fromisoformat(value)
+            except ValueError as error:
+                raise StoreError("Analyseergebnis verletzt das Datumsschema.") from error
+
+
+def _validate_result_artifact(publication: AnalysisRunPublication) -> None:
+    artifact = publication.result_artifact
+    result_id = publication.provenance.result_id
+    try:
+        family = AnalysisResultFamily(str(publication.result_family))
+    except ValueError as error:
+        raise StoreError("Unbekannte Analyseergebnisfamilie.") from error
+    definition = next(
+        (
+            item
+            for item in analysis_definitions()
+            if item.analysis_definition_id == publication.provenance.analysis_definition_id
+        ),
+        None,
+    )
+    if (
+        artifact is None
+        or result_id is None
+        or definition is None
+        or definition.result_family is not family
+        or artifact.schema_id != f"analysis-result-{family.value}"
+        or artifact.schema_version != 1
+    ):
+        raise StoreError("Unbekanntes Analyseergebnisschema.")
+    rows = _artifact_rows(artifact)
+    list_fields = _RESULT_LIST_FIELDS[family]
+    expected_keys = list_fields | {
+        "analysis_definition_id",
+        "analysis_result_id",
+        "analysis_run_id",
+        "result_family",
+        "result_schema_version",
+    }
+    if len(rows) != 1:
+        raise StoreError("Analyseergebnis muss genau einen JSONL-Datensatz enthalten.")
+    record = rows[0]
+    if (
+        set(record) != expected_keys
+        or record.get("analysis_run_id") != str(publication.provenance.analysis_run_id)
+        or record.get("analysis_result_id") != str(result_id)
+        or record.get("analysis_definition_id") != str(definition.analysis_definition_id)
+        or record.get("result_family") != family.value
+        or record.get("result_schema_version") != 1
+        or any(not isinstance(record.get(field), list) for field in list_fields)
+        or not record.get(_RESULT_PRIMARY_FIELDS[family])
+    ):
+        raise StoreError("Analyseergebnis verletzt das geschlossene Familienschema.")
+    for field in list_fields:
+        for item in cast(list[object], record[field]):
+            _validate_result_item(field, item)
+    content = dict(record)
+    del content["analysis_run_id"]
+    del content["analysis_result_id"]
+    if (
+        hashlib.sha256(
+            json.dumps(content, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+        != artifact.content_hash
+    ):
+        raise StoreError("Analyseergebnis verletzt den Inhaltshash.")
+
+
+def _publish_analysis_run(store: LocalStore, publication: AnalysisRunPublication) -> None:
+    _validate_input_artifact(publication.input_artifact, publication.provenance)
+    if publication.result_artifact is not None:
+        _validate_result_artifact(publication)
+    staging = store.prepare_analysis_staging(publication.provenance.analysis_run_id)
+    paths = [(staging / "input.jsonl", publication.input_artifact.payload)]
+    if publication.result_artifact is not None:
+        result = staging / "result"
+        result.mkdir()
+        paths.append((result / "result.jsonl", publication.result_artifact.payload))
+    for path, payload in paths:
+        with path.open("xb") as artifact:
+            artifact.write(payload)
+            artifact.flush()
+            os.fsync(artifact.fileno())
+    store.persist_analysis_run(publication)
 
 
 def _reproduction_facts() -> tuple[str, bool, str | None, str]:
@@ -1144,9 +1677,29 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
         ),
         activity_derivation=store.load_activity_derivation_version(plan.base_snapshot_ref),
     )
-    artifact = json.dumps(
-        _bundle_payload(bundle, include_run_id=True), separators=(",", ":"), sort_keys=True
-    ).encode()
+    artifact_payload = (
+        json.dumps(
+            _bundle_payload(bundle, include_run_id=True), separators=(",", ":"), sort_keys=True
+        ).encode()
+        + b"\n"
+    )
+    input_content_hash = hashlib.sha256(
+        json.dumps(
+            _bundle_payload(bundle, include_run_id=False),
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+    artifact = AnalysisJsonlArtifact(
+        "analysis-input-bundle",
+        bundle.schema_version,
+        input_content_hash,
+        hashlib.sha256(artifact_payload).hexdigest(),
+        len(artifact_payload),
+        1,
+        artifact_payload,
+        _validate_input_publication,
+    )
     configuration = AnalysisRunConfiguration(
         plan.analysis_definition.analysis_definition_id,
         plan.requested_start_date,
@@ -1191,8 +1744,9 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
         if bundle.activity_coverage_incomplete
         else ()
     )
-    store.persist_insufficient_analysis_run(
-        InsufficientAnalysisRunPublication(
+    _publish_analysis_run(
+        store,
+        AnalysisRunPublication(
             operation_id,
             provenance,
             plan.eligible_start_date,
@@ -1200,13 +1754,9 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
             configuration,
             artifact,
             diagnostics,
-            (
-                DataQualityStatus.PROVISIONAL
-                if data_status_reasons
-                else DataQualityStatus.REVIEWED
-            ),
+            (DataQualityStatus.PROVISIONAL if data_status_reasons else DataQualityStatus.REVIEWED),
             data_status_reasons,
-        )
+        ),
     )
     return AnalysisExecution(
         operation_id,
@@ -1227,6 +1777,7 @@ __all__ = [
     "AnalysisInputBundle",
     "AnalysisInputValue",
     "AnalysisIntervalMethod",
+    "AnalysisMaturityCriterionCode",
     "AnalysisMethodFacts",
     "AnalysisMissingness",
     "AnalysisMissingnessReason",

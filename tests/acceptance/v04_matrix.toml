@@ -66,10 +66,30 @@ id = "V04-C-ANALYSIS-RUN-ATOMICITY-V1"
 source = "https://github.com/RMKruse/personal-health-lab/issues/115"
 statement = "Analysis input and technical outcome become visible together; injected faults expose no partial run after reopen and V0.3 remains readable."
 
+[[contract]]
+id = "V04-C-ANALYSIS-ARTIFACT-SCHEMAS-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/116"
+statement = "Input bundles and all four result families use separate closed JSONL schema version 1 manifests while SQLite stores only identities, hashes, sizes, and internal locations."
+
+[[contract]]
+id = "V04-C-ANALYSIS-PUBLICATION-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/116"
+statement = "AnalysisRunPublication validates and publishes input, optional result, run, receipt, and artifact catalog atomically under the shared writer lock."
+
+[[contract]]
+id = "V04-C-ANALYSIS-LEGACY-MIGRATION-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/116"
+statement = "The store upgrade idempotently registers untouched V0.1-V0.3 result artifacts as legacy and never reinterprets their definitions as V0.4 definitions."
+
 [[hash_reference]]
 id = "V04-H-ANALYSIS-DEFINITIONS-V1"
 artifact = "src/personal_health_lab/analysis/__init__.py"
-sha256 = "b08051cda70b2edb5edbbc1cbf85a238b3cfb8ee404ab38f671ccb8ef3313216"
+sha256 = "2427f129b1140fbef51d3a3284bddb205c6560a2e126776b7b5873799c5de42e"
+
+[[hash_reference]]
+id = "V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1"
+artifact = "src/personal_health_lab/storage/_store.py"
+sha256 = "be4fbde57129a8d81cf0757284a0161f8ff6027c2819a1784eefe0593911e1e3"
 
 [[hash_reference]]
 id = "V04-H-LAG-CALIBRATION-V1"
@@ -235,3 +255,33 @@ level = "application"
 platform = "all"
 expected_result = "fault cutpoints leave no visible run or input after reopen"
 forbidden_side_effects = "no partial run, receipt, result, or orphaned published input"
+
+[[case]]
+id = "V04-A-ANALYSIS-PUBLICATION-V1"
+contracts = ["V04-C-ANALYSIS-ARTIFACT-SCHEMAS-V1", "V04-C-ANALYSIS-PUBLICATION-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1", "V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1"]
+runner = "tests/acceptance/test_v04_run_analysis.py::test_analysis_run_publication_commits_input_and_result_family_together"
+level = "application"
+platform = "all"
+expected_result = "one catalog transaction publishes separate input and typed result-family JSONL artifacts"
+forbidden_side_effects = "no partial run, receipt, input, result, manifest, or catalog row at any fault cutpoint"
+
+[[case]]
+id = "V04-A-ANALYSIS-PUBLICATION-VALIDATION-V1"
+contracts = ["V04-C-ANALYSIS-ARTIFACT-SCHEMAS-V1", "V04-C-ANALYSIS-PUBLICATION-V1"]
+hash_references = ["V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1"]
+runner = "tests/acceptance/test_v04_run_analysis.py::test_analysis_publication_rejects_schema_size_hash_and_snapshot_violations"
+level = "application"
+platform = "all"
+expected_result = "schema, size, hash, and snapshot-reference violations are rejected before activation"
+forbidden_side_effects = "no run, receipt, artifact catalog row, or published artifact"
+
+[[case]]
+id = "V04-A-ANALYSIS-LEGACY-MIGRATION-V1"
+contracts = ["V04-C-ANALYSIS-LEGACY-MIGRATION-V1"]
+hash_references = ["V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1"]
+runner = "tests/acceptance/test_v04_run_analysis.py::test_store_upgrade_registers_legacy_analysis_artifacts_idempotently"
+level = "application"
+platform = "all"
+expected_result = "idempotent catalog registration keeps legacy Parquet readable and records the absent historical input bundle"
+forbidden_side_effects = "no legacy Parquet rewrite, invented input bundle, V0.4 definition reinterpretation, or duplicate catalog fact"

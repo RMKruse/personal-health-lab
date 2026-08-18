@@ -291,7 +291,7 @@ def test_persistence_lifecycle_fixture_pins_the_target_version(tmp_path: Path) -
         health_lab.execute_write(
             request, expected_plan=health_lab.preview_write(request).fingerprint
         )
-    migration._set_schema_versions(config, store=11, snapshot=6)
+    migration._set_schema_versions(config, store=12, snapshot=6)
     with HealthLab.open(config) as health_lab:
         request = MigrateStore()
         receipt = health_lab.execute_write(

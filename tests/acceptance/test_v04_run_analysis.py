@@ -1,23 +1,31 @@
 import fcntl
+import hashlib
 import json
 import sqlite3
+from copy import deepcopy
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 from typing import get_args
+from uuid import uuid4
 from zipfile import ZipFile
 
 import pytest
 
+import personal_health_lab.analysis as analysis_module
 from personal_health_lab.application import (
     AnalysisDefinitionId,
     AnalysisReceipt,
     AnalysisStatus,
     ConfigurationError,
     DataMode,
+    DataQualityStatus,
     HealthLab,
     HealthLabError,
     ImportHealthExport,
     ImportReceipt,
+    MigrateStore,
+    ModelMaturityStatus,
     OverviewSelection,
     ResolveDataReviewCase,
     RunAnalysis,
@@ -25,11 +33,23 @@ from personal_health_lab.application import (
     RunRestingHeartRateAnalysis,
     RuntimeConfig,
     SnapshotDateSelection,
+    StoreMigrationReceipt,
     WorkoutCorrection,
     WriteApprovalStatus,
     WriteNotStarted,
     WriteNotStartedStatus,
     WriteRequest,
+)
+from personal_health_lab.storage import (
+    AnalysisJsonlArtifact,
+    AnalysisProvenance,
+    AnalysisResultId,
+    AnalysisRunConfiguration,
+    AnalysisRunId,
+    AnalysisRunPublication,
+    LocalStore,
+    OperationId,
+    StoreError,
 )
 from personal_health_lab.synthetic_export import generate_export
 
@@ -179,14 +199,54 @@ def test_started_run_freezes_input_and_persists_insufficient_data_without_result
         "open_review_case",
         "passive_coverage_gap",
     }
-    artifact = (
-        runtime.active_store
-        / "parquet"
-        / "analysis-inputs"
-        / f"{first.analysis_run_id}.json"
+    artifact_directory = (
+        runtime.active_store / "parquet" / "analysis-runs" / str(first.analysis_run_id)
     )
+    artifact = artifact_directory / "input.jsonl"
+    manifest_path = artifact_directory / "input-manifest.json"
     frozen_input = artifact.read_bytes()
+    assert frozen_input.endswith(b"\n")
     payload = json.loads(frozen_input)
+    manifest = json.loads(manifest_path.read_bytes())
+    assert manifest == {
+        "analysis_definition_id": str(request.analysis_definition_id),
+        "analysis_result_id": None,
+        "analysis_run_id": str(first.analysis_run_id),
+        "artifact_kind": "input",
+        "content_hash": manifest["content_hash"],
+        "files": [
+            {
+                "name": "input.jsonl",
+                "row_count": 1,
+                "sha256": manifest["files"][0]["sha256"],
+                "size_bytes": len(frozen_input),
+            }
+        ],
+        "manifest_schema_version": 1,
+        "result_family": None,
+        "schema_version": 1,
+    }
+    assert len(manifest["content_hash"]) == 64
+    assert len(manifest["files"][0]["sha256"]) == 64
+    with sqlite3.connect(runtime.active_store / "metadata.sqlite3") as metadata:
+        catalog = metadata.execute(
+            "SELECT artifact_kind, schema_id, schema_version, content_hash, "
+            "manifest_sha256, artifact_path, artifact_size_bytes "
+            "FROM analysis_artifacts WHERE analysis_run_id = ?",
+            (str(first.analysis_run_id),),
+        ).fetchone()
+    assert catalog is not None
+    assert catalog[:4] == (
+        "input",
+        "analysis-input-bundle",
+        1,
+        manifest["content_hash"],
+    )
+    assert len(catalog[4]) == 64
+    assert catalog[5:] == (
+        f"parquet/analysis-runs/{first.analysis_run_id}",
+        len(frozen_input) + len(manifest_path.read_bytes()),
+    )
     assert payload["analysis_run_id"] == str(first.analysis_run_id)
     assert payload["snapshot_id"] == str(first.snapshot_ref)
     assert payload["calendar"] == ["2024-01-02"]
@@ -247,11 +307,7 @@ def test_analysis_fault_never_exposes_a_partial_run_after_reopen(
     assert isinstance(legacy, AnalysisReceipt)
     assert legacy.result_ref is not None
     legacy_artifact = (
-        runtime.active_store
-        / "parquet"
-        / "analyses"
-        / str(legacy.result_ref)
-        / "result.parquet"
+        runtime.active_store / "parquet" / "analyses" / str(legacy.result_ref) / "result.parquet"
     )
     legacy_bytes = legacy_artifact.read_bytes()
 
@@ -285,8 +341,455 @@ def test_analysis_fault_never_exposes_a_partial_run_after_reopen(
         assert legacy_artifact.read_bytes() == legacy_bytes
         with sqlite3.connect(runtime.active_store / "metadata.sqlite3") as metadata:
             assert metadata.execute("SELECT count(*) FROM analysis_runs").fetchone() == (1,)
-        inputs = runtime.active_store / "parquet" / "analysis-inputs"
+        inputs = runtime.active_store / "parquet" / "analysis-runs"
         assert not inputs.exists() or list(inputs.iterdir()) == []
+
+
+def test_analysis_publication_rejects_schema_size_hash_and_snapshot_violations(
+    tmp_path: Path,
+) -> None:
+    runtime = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    request = _request()
+    with HealthLab.open(runtime) as health_lab:
+        _import(health_lab, _package(tmp_path / "snapshot.zip", day=2))
+        first = health_lab.execute_write(
+            request,
+            expected_plan=health_lab.preview_write(request).fingerprint,
+        ).result
+    assert isinstance(first, AnalysisReceipt)
+
+    source = json.loads(
+        (
+            runtime.active_store
+            / "parquet"
+            / "analysis-runs"
+            / str(first.analysis_run_id)
+            / "input.jsonl"
+        ).read_bytes()
+    )
+
+    def publication(*, violation: str) -> AnalysisRunPublication:
+        run_id = AnalysisRunId(uuid4().hex)
+        payload = {**deepcopy(source), "analysis_run_id": str(run_id)}
+        if violation == "schema":
+            payload["values"][0]["unexpected"] = True
+        encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+        content = dict(payload)
+        del content["analysis_run_id"]
+        artifact = AnalysisJsonlArtifact(
+            "analysis-input-bundle",
+            1,
+            hashlib.sha256(
+                json.dumps(content, separators=(",", ":"), sort_keys=True).encode()
+            ).hexdigest(),
+            hashlib.sha256(encoded).hexdigest(),
+            len(encoded),
+            1,
+            encoded,
+            analysis_module._validate_input_publication,
+        )
+        if violation == "size":
+            artifact = replace(artifact, size_bytes=artifact.size_bytes + 1)
+        if violation == "hash":
+            artifact = replace(artifact, sha256="0" * 64)
+        configuration = AnalysisRunConfiguration(request.analysis_definition_id, None, None, "1.0")
+        return AnalysisRunPublication(
+            OperationId(uuid4().hex),
+            AnalysisProvenance(
+                run_id,
+                None,
+                (
+                    first.snapshot_ref
+                    if violation != "snapshot"
+                    else type(first.snapshot_ref)(uuid4().hex)
+                ),
+                request.analysis_definition_id,
+                configuration.content_hash,
+                "1.0",
+                "a" * 40,
+                False,
+                None,
+                "b" * 64,
+            ),
+            date(2024, 1, 2),
+            date(2024, 1, 2),
+            configuration,
+            artifact,
+            ("insufficient_data",),
+            DataQualityStatus.REVIEWED,
+            (),
+        )
+
+    for violation in ("schema", "size", "hash", "snapshot"):
+        invalid = publication(violation=violation)
+        writer = LocalStore.open_writer(root=runtime.active_store, mode=runtime.mode)
+        try:
+            with pytest.raises(StoreError):
+                analysis_module._publish_analysis_run(writer, invalid)
+        finally:
+            writer.close()
+        assert not (
+            runtime.active_store
+            / "parquet"
+            / "analysis-runs"
+            / str(invalid.provenance.analysis_run_id)
+        ).exists()
+
+    with sqlite3.connect(runtime.active_store / "metadata.sqlite3") as metadata:
+        assert metadata.execute("SELECT count(*) FROM analysis_runs").fetchone() == (1,)
+        assert metadata.execute("SELECT count(*) FROM analysis_artifacts").fetchone() == (1,)
+
+
+def test_store_upgrade_registers_legacy_analysis_artifacts_idempotently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    fixture = generate_export("lag-signal-v1", 42, tmp_path / "fixture")
+    request = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v2"))
+    with HealthLab.open(runtime) as health_lab:
+        _import(health_lab, fixture.export_path)
+        legacy = health_lab.execute_write(
+            request,
+            expected_plan=health_lab.preview_write(request).fingerprint,
+        ).result
+        current_request = _request()
+        current = health_lab.execute_write(
+            current_request,
+            expected_plan=health_lab.preview_write(current_request).fingerprint,
+        ).result
+    assert isinstance(legacy, AnalysisReceipt)
+    assert legacy.result_ref is not None
+    assert isinstance(current, AnalysisReceipt)
+    result_path = (
+        runtime.active_store / "parquet" / "analyses" / str(legacy.result_ref) / "result.parquet"
+    )
+    result_bytes = result_path.read_bytes()
+    interrupted_run_id = uuid4().hex
+
+    with sqlite3.connect(runtime.active_store / "metadata.sqlite3") as metadata:
+        columns = [str(row[1]) for row in metadata.execute("PRAGMA table_info(analysis_runs)")]
+        interrupted = list(
+            metadata.execute(
+                "SELECT * FROM analysis_runs WHERE analysis_run_id = ?",
+                (str(legacy.analysis_run_id),),
+            ).fetchone()
+        )
+        interrupted[columns.index("analysis_run_id")] = interrupted_run_id
+        interrupted[columns.index("result_id")] = uuid4().hex
+        interrupted[columns.index("status")] = "interrupted"
+        metadata.execute(
+            f"INSERT INTO analysis_runs VALUES ({','.join('?' for _ in columns)})",
+            interrupted,
+        )
+        metadata.execute("DROP TABLE analysis_artifact_files")
+        metadata.execute("DROP TABLE analysis_artifacts")
+        metadata.execute("DROP TABLE analysis_run_facts")
+        metadata.execute("UPDATE store_identity SET schema_version = 11 WHERE singleton = 1")
+
+    with monkeypatch.context() as fault:
+
+        def fail_before_commit(_root: Path, point: str) -> None:
+            if point == "migration.before_sqlite_commit/v1":
+                raise RuntimeError("injected migration fault")
+
+        fault.setattr(
+            "personal_health_lab.storage._store._migration_fault_point",
+            fail_before_commit,
+        )
+        with HealthLab.open(runtime) as health_lab:
+            migration = MigrateStore()
+            with pytest.raises(RuntimeError, match="injected migration fault"):
+                health_lab.execute_write(
+                    migration,
+                    expected_plan=health_lab.preview_write(migration).fingerprint,
+                )
+    with HealthLab.open(runtime):
+        pass
+    assert not result_path.with_name("manifest.json").exists()
+
+    for _ in range(2):
+        with HealthLab.open(runtime) as health_lab:
+            migration = MigrateStore()
+            receipt = health_lab.execute_write(
+                migration,
+                expected_plan=health_lab.preview_write(migration).fingerprint,
+            ).result
+        assert isinstance(receipt, StoreMigrationReceipt)
+
+    assert result_path.read_bytes() == result_bytes
+    manifest_path = result_path.with_name("manifest.json")
+    manifest = json.loads(manifest_path.read_bytes())
+    assert manifest["artifact_kind"] == "result"
+    assert manifest["result_family"] == "legacy_resting_hr_analysis"
+    assert manifest["files"] == [
+        {
+            "name": "result.parquet",
+            "row_count": 8,
+            "sha256": hashlib.sha256(result_bytes).hexdigest(),
+            "size_bytes": len(result_bytes),
+        }
+    ]
+    with sqlite3.connect(runtime.active_store / "metadata.sqlite3") as metadata:
+        artifact = metadata.execute(
+            "SELECT artifact_kind, result_id, result_family, schema_id, schema_version, "
+            "content_hash, artifact_path, artifact_size_bytes, is_legacy "
+            "FROM analysis_artifacts WHERE analysis_run_id = ?",
+            (str(legacy.analysis_run_id),),
+        ).fetchone()
+        facts = metadata.execute(
+            "SELECT fact_code FROM analysis_run_facts WHERE analysis_run_id = ?",
+            (str(legacy.analysis_run_id),),
+        ).fetchall()
+        definition = metadata.execute(
+            "SELECT analysis_definition_id FROM analysis_runs WHERE analysis_run_id = ?",
+            (str(legacy.analysis_run_id),),
+        ).fetchone()
+        current_artifact = metadata.execute(
+            "SELECT artifact_kind, schema_id, schema_version, is_legacy "
+            "FROM analysis_artifacts WHERE analysis_run_id = ?",
+            (str(current.analysis_run_id),),
+        ).fetchone()
+        current_facts = metadata.execute(
+            "SELECT fact_code FROM analysis_run_facts WHERE analysis_run_id = ?",
+            (str(current.analysis_run_id),),
+        ).fetchall()
+        interrupted_artifacts = metadata.execute(
+            "SELECT * FROM analysis_artifacts WHERE analysis_run_id = ?",
+            (interrupted_run_id,),
+        ).fetchall()
+    assert artifact is not None
+    assert artifact[:5] == (
+        "result",
+        str(legacy.result_ref),
+        "legacy_resting_hr_analysis",
+        "legacy-resting-hr-result",
+        1,
+    )
+    assert len(artifact[5]) == 64
+    assert artifact[6:] == (
+        f"parquet/analyses/{legacy.result_ref}",
+        len(result_bytes) + len(manifest_path.read_bytes()),
+        1,
+    )
+    assert facts == [("legacy_input_bundle_not_persisted",)]
+    assert definition == ("lag-signal-v2",)
+    assert current_artifact == ("input", "analysis-input-bundle", 1, 0)
+    assert current_facts == []
+    assert interrupted_artifacts == []
+
+    with HealthLab.open(runtime) as health_lab:
+        overview = health_lab.load_overview(OverviewSelection())
+    assert overview.analysis_history
+    assert overview.analysis_history[0].provenance is not None
+    assert overview.analysis_history[0].provenance.analysis_run_id == legacy.analysis_run_id
+
+
+def test_analysis_run_publication_commits_input_and_result_family_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    request = _request()
+    with HealthLab.open(runtime) as health_lab:
+        _import(health_lab, _package(tmp_path / "snapshot.zip", day=2))
+        source = health_lab.execute_write(
+            request,
+            expected_plan=health_lab.preview_write(request).fingerprint,
+        ).result
+    assert isinstance(source, AnalysisReceipt)
+    input_record = json.loads(
+        (
+            runtime.active_store
+            / "parquet"
+            / "analysis-runs"
+            / str(source.analysis_run_id)
+            / "input.jsonl"
+        ).read_bytes()
+    )
+
+    def artifact(
+        record: dict[str, object], schema_id: str, *, identity_fields: tuple[str, ...]
+    ) -> AnalysisJsonlArtifact:
+        encoded = json.dumps(record, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+        content = dict(record)
+        for field in identity_fields:
+            del content[field]
+        return AnalysisJsonlArtifact(
+            schema_id,
+            1,
+            hashlib.sha256(
+                json.dumps(content, separators=(",", ":"), sort_keys=True).encode()
+            ).hexdigest(),
+            hashlib.sha256(encoded).hexdigest(),
+            len(encoded),
+            1,
+            encoded,
+            (
+                analysis_module._validate_input_publication
+                if schema_id == "analysis-input-bundle"
+                else analysis_module._validate_result_artifact
+            ),
+        )
+
+    def publication() -> AnalysisRunPublication:
+        run_id = AnalysisRunId(uuid4().hex)
+        result_id = AnalysisResultId(uuid4().hex)
+        configuration = AnalysisRunConfiguration(request.analysis_definition_id, None, None, "1.0")
+        result_record: dict[str, object] = {
+            "analysis_definition_id": str(request.analysis_definition_id),
+            "analysis_result_id": str(result_id),
+            "analysis_run_id": str(run_id),
+            "bootstrap_facts": [],
+            "contrasts": [],
+            "diagnostics": [],
+            "lag_estimates": [
+                {
+                    "estimate_bpm_per_natural_scale": -0.1,
+                    "estimate_bpm_per_personal_sd": -0.2,
+                    "feature_id": "active_energy",
+                    "lag_day": 1,
+                    "natural_scale": 100.0,
+                    "natural_unit": "kcal",
+                    "pointwise_interval": {"lower": -0.2, "upper": 0.0},
+                    "simultaneous_band": {"lower": -0.3, "upper": 0.1},
+                }
+            ],
+            "maturity_criteria": [],
+            "result_family": "rhr_activity_lag_1_7",
+            "result_schema_version": 1,
+        }
+        return AnalysisRunPublication(
+            OperationId(uuid4().hex),
+            AnalysisProvenance(
+                run_id,
+                result_id,
+                source.snapshot_ref,
+                request.analysis_definition_id,
+                configuration.content_hash,
+                "1.0",
+                "a" * 40,
+                False,
+                None,
+                "b" * 64,
+            ),
+            date(2024, 1, 2),
+            date(2024, 1, 2),
+            configuration,
+            artifact(
+                {**deepcopy(input_record), "analysis_run_id": str(run_id)},
+                "analysis-input-bundle",
+                identity_fields=("analysis_run_id",),
+            ),
+            ("completed",),
+            DataQualityStatus.REVIEWED,
+            (),
+            "completed",
+            "rhr_activity_lag_1_7",
+            artifact(
+                result_record,
+                "analysis-result-rhr_activity_lag_1_7",
+                identity_fields=("analysis_run_id", "analysis_result_id"),
+            ),
+            ModelMaturityStatus.EXPLORATORY,
+        )
+
+    malformed = publication()
+    assert malformed.result_artifact is not None
+    malformed_record = json.loads(malformed.result_artifact.payload)
+    malformed_record["lag_estimates"] = [True]
+    malformed = replace(
+        malformed,
+        result_artifact=artifact(
+            malformed_record,
+            "analysis-result-rhr_activity_lag_1_7",
+            identity_fields=("analysis_run_id", "analysis_result_id"),
+        ),
+    )
+    writer = LocalStore.open_writer(root=runtime.active_store, mode=runtime.mode)
+    try:
+        with pytest.raises(StoreError, match="Familienschema"):
+            analysis_module._publish_analysis_run(writer, malformed)
+    finally:
+        writer.close()
+
+    unvalidated = publication()
+    unvalidated = replace(
+        unvalidated,
+        input_artifact=replace(unvalidated.input_artifact, schema_validator=None),
+    )
+    writer = LocalStore.open_writer(root=runtime.active_store, mode=runtime.mode)
+    try:
+        staging = writer.prepare_analysis_staging(unvalidated.provenance.analysis_run_id)
+        (staging / "input.jsonl").write_bytes(unvalidated.input_artifact.payload)
+        with pytest.raises(StoreError, match="fachliches Schema"):
+            writer.persist_analysis_run(unvalidated)
+    finally:
+        writer.close()
+    assert staging.is_dir()
+    assert not (
+        runtime.active_store
+        / "parquet"
+        / "analysis-runs"
+        / str(unvalidated.provenance.analysis_run_id)
+    ).exists()
+
+    complete = publication()
+    writer = LocalStore.open_writer(root=runtime.active_store, mode=runtime.mode)
+    try:
+        analysis_module._publish_analysis_run(writer, complete)
+    finally:
+        writer.close()
+    directory = (
+        runtime.active_store
+        / "parquet"
+        / "analysis-runs"
+        / str(complete.provenance.analysis_run_id)
+    )
+    assert (directory / "input.jsonl").is_file()
+    assert (directory / "result" / "result.jsonl").is_file()
+    assert (directory / "result" / "result-manifest.json").is_file()
+    with sqlite3.connect(runtime.active_store / "metadata.sqlite3") as metadata:
+        assert metadata.execute(
+            "SELECT artifact_kind, result_family FROM analysis_artifacts "
+            "WHERE analysis_run_id = ? ORDER BY artifact_kind",
+            (str(complete.provenance.analysis_run_id),),
+        ).fetchall() == [("input", None), ("result", "rhr_activity_lag_1_7")]
+
+    failed = publication()
+
+    def fail_after_result(_root: Path, point: str) -> None:
+        if point == "analysis.after_result_write/v1":
+            raise OSError("injected result publication fault")
+
+    monkeypatch.setattr(
+        "personal_health_lab.storage._store._publication_fault_point", fail_after_result
+    )
+    writer = LocalStore.open_writer(root=runtime.active_store, mode=runtime.mode)
+    try:
+        with pytest.raises(StoreError):
+            analysis_module._publish_analysis_run(writer, failed)
+    finally:
+        writer.close()
+    assert not (
+        runtime.active_store / "parquet" / "analysis-runs" / str(failed.provenance.analysis_run_id)
+    ).exists()
+
+    orphan_id = uuid4().hex
+    orphan = runtime.active_store / "parquet" / "analysis-runs" / orphan_id
+    orphan.mkdir(parents=True)
+    (orphan / "input.jsonl").write_text("{}\n", encoding="utf-8")
+    stale_id = uuid4().hex
+    stale = runtime.active_store / "analysis-staging" / stale_id
+    stale.mkdir(parents=True)
+    with HealthLab.open(runtime):
+        pass
+    assert not orphan.exists()
+    assert not stale.exists()
+    assert (runtime.active_store / "quarantine" / "analyses" / orphan_id).is_dir()
+    with sqlite3.connect(runtime.active_store / "metadata.sqlite3") as metadata:
+        assert metadata.execute(
+            "SELECT count(*) FROM analysis_runs WHERE analysis_run_id = ?",
+            (str(failed.provenance.analysis_run_id),),
+        ).fetchone() == (0,)
 
 
 def test_analysis_bundle_uses_corrected_workout_energy(tmp_path: Path) -> None:
@@ -329,8 +832,9 @@ def test_analysis_bundle_uses_corrected_workout_energy(tmp_path: Path) -> None:
         (
             runtime.active_store
             / "parquet"
-            / "analysis-inputs"
-            / f"{receipt.analysis_run_id}.json"
+            / "analysis-runs"
+            / str(receipt.analysis_run_id)
+            / "input.jsonl"
         ).read_bytes()
     )
     assert any(
@@ -354,16 +858,16 @@ def test_analysis_bundle_omits_unrelated_input_quality_facts(tmp_path: Path) -> 
     assert isinstance(receipt, AnalysisReceipt)
     with sqlite3.connect(runtime.active_store / "metadata.sqlite3") as metadata:
         assert metadata.execute(
-            "SELECT data_status, data_status_reasons FROM analysis_runs "
-            "WHERE analysis_run_id = ?",
+            "SELECT data_status, data_status_reasons FROM analysis_runs WHERE analysis_run_id = ?",
             (str(receipt.analysis_run_id),),
         ).fetchone() == ("reviewed", "[]")
     payload = json.loads(
         (
             runtime.active_store
             / "parquet"
-            / "analysis-inputs"
-            / f"{receipt.analysis_run_id}.json"
+            / "analysis-runs"
+            / str(receipt.analysis_run_id)
+            / "input.jsonl"
         ).read_bytes()
     )
     assert {value["input_id"] for value in payload["values"]} == {

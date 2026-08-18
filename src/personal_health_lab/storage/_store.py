@@ -11,7 +11,7 @@ import sqlite3
 import subprocess
 from collections.abc import Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta, timezone
 from enum import StrEnum
 from itertools import pairwise
@@ -47,7 +47,7 @@ from personal_health_lab.health_data import (
 _METADATA_FILE = "metadata.sqlite3"
 _PARQUET_DIRECTORY = "parquet"
 _QUERY_FILE = "query.duckdb"
-_STORE_SCHEMA_VERSION = 11
+_STORE_SCHEMA_VERSION = 12
 _WRITER_LOCK_FILE = ".writer.lock"
 
 
@@ -1030,9 +1030,7 @@ class AnalysisRunConfiguration:
             {
                 "analysis_definition_id": str(self.analysis_definition_id),
                 "end_date": (
-                    None
-                    if self.requested_end_date is None
-                    else self.requested_end_date.isoformat()
+                    None if self.requested_end_date is None else self.requested_end_date.isoformat()
                 ),
                 "schema_version": self.schema_version,
                 "start_date": (
@@ -1051,16 +1049,96 @@ class AnalysisRunConfiguration:
 
 
 @dataclass(frozen=True, slots=True)
-class InsufficientAnalysisRunPublication:
+class AnalysisJsonlArtifact:
+    schema_id: str
+    schema_version: int
+    content_hash: str
+    sha256: str
+    size_bytes: int
+    row_count: int
+    payload: bytes
+    schema_validator: Callable[[AnalysisRunPublication], None] | None = field(
+        default=None, repr=False, compare=False
+    )
+
+    def validate_schema(self, publication: AnalysisRunPublication) -> None:
+        if self.schema_validator is None:
+            raise StoreError("Analyseartefakt wurde nicht gegen sein fachliches Schema validiert.")
+        self.schema_validator(publication)
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisRunPublication:
     operation_id: OperationId
     provenance: AnalysisProvenance
     start_date: date | None
     end_date: date | None
     configuration: AnalysisRunConfiguration
-    input_artifact: bytes
+    input_artifact: AnalysisJsonlArtifact
     diagnostics: tuple[str, ...]
     data_status: DataQualityStatus
     data_status_reasons: tuple[AnalysisDataStatusReason, ...]
+    status: Literal["completed", "insufficient_data", "unstable"] = "insufficient_data"
+    result_family: str | None = None
+    result_artifact: AnalysisJsonlArtifact | None = None
+    model_maturity: ModelMaturityStatus | None = None
+    maturity_criteria: tuple[ModelMaturityCriterion, ...] = ()
+
+
+def _analysis_jsonl_rows(artifact: AnalysisJsonlArtifact) -> tuple[dict[str, object], ...]:
+    if (
+        artifact.schema_version <= 0
+        or artifact.size_bytes != len(artifact.payload)
+        or artifact.sha256 != hashlib.sha256(artifact.payload).hexdigest()
+        or not _is_lower_hex(artifact.content_hash, 64)
+        or not _is_lower_hex(artifact.sha256, 64)
+        or not artifact.payload.endswith(b"\n")
+    ):
+        raise StoreError("Analyseartefakt verletzt Größen- oder Hashvertrag.")
+    try:
+        raw_rows = artifact.payload.decode("utf-8").splitlines()
+        rows = tuple(json.loads(row) for row in raw_rows)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise StoreError("Analyseartefakt verletzt das JSONL-Schema.") from error
+    if (
+        len(rows) != artifact.row_count
+        or not rows
+        or any(not isinstance(row, dict) for row in rows)
+    ):
+        raise StoreError("Analyseartefakt verletzt das JSONL-Schema.")
+    return cast(tuple[dict[str, object], ...], rows)
+
+
+def _analysis_artifact_manifest(
+    publication: AnalysisRunPublication,
+    artifact: AnalysisJsonlArtifact,
+    *,
+    kind: Literal["input", "result"],
+    file_name: str,
+) -> bytes:
+    manifest = {
+        "analysis_definition_id": str(publication.provenance.analysis_definition_id),
+        "analysis_result_id": (
+            None
+            if kind == "input" or publication.provenance.result_id is None
+            else str(publication.provenance.result_id)
+        ),
+        "analysis_run_id": str(publication.provenance.analysis_run_id),
+        "artifact_kind": kind,
+        "content_hash": artifact.content_hash,
+        "files": [
+            {
+                "name": file_name,
+                "row_count": artifact.row_count,
+                "sha256": artifact.sha256,
+                "size_bytes": artifact.size_bytes,
+            }
+        ],
+        "manifest_schema_version": 1,
+        "result_family": publication.result_family if kind == "result" else None,
+        "schema_version": artifact.schema_version,
+    }
+    return json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode()
 
 
 def _analysis_provenance(row: tuple[object, ...]) -> AnalysisProvenance:
@@ -2716,29 +2794,86 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             )
             """
         )
-        return
-    analysis_columns = {str(row[1]) for row in metadata.execute("PRAGMA table_info(analysis_runs)")}
-    migrations = {
-        "analysis_start_date": "TEXT",
-        "analysis_end_date": "TEXT",
-        "config_json": "TEXT NOT NULL DEFAULT '{}'",
-        "config_hash": "TEXT NOT NULL DEFAULT ''",
-        "config_schema_version": "TEXT NOT NULL DEFAULT '1.0'",
-        "code_commit": "TEXT NOT NULL DEFAULT ''",
-        "code_dirty": "INTEGER NOT NULL DEFAULT 0",
-        "code_diff_hash": "TEXT",
-        "environment_lock_hash": "TEXT NOT NULL DEFAULT ''",
-        "reuse_key": "TEXT NOT NULL DEFAULT ''",
-        "model_maturity": "TEXT",
-        "data_status": "TEXT NOT NULL DEFAULT 'reviewed'",
-        "data_status_reasons": "TEXT NOT NULL DEFAULT '[]'",
-        "maturity_criteria": "TEXT NOT NULL DEFAULT '[]'",
-        "reproducibility": "TEXT NOT NULL DEFAULT 'not_recorded'",
-        "diagnostics": "TEXT NOT NULL DEFAULT '[]'",
-    }
-    for column, declaration in migrations.items():
-        if column not in analysis_columns:
-            metadata.execute(f"ALTER TABLE analysis_runs ADD COLUMN {column} {declaration}")
+    else:
+        analysis_columns = {
+            str(row[1]) for row in metadata.execute("PRAGMA table_info(analysis_runs)")
+        }
+        migrations = {
+            "analysis_start_date": "TEXT",
+            "analysis_end_date": "TEXT",
+            "config_json": "TEXT NOT NULL DEFAULT '{}'",
+            "config_hash": "TEXT NOT NULL DEFAULT ''",
+            "config_schema_version": "TEXT NOT NULL DEFAULT '1.0'",
+            "code_commit": "TEXT NOT NULL DEFAULT ''",
+            "code_dirty": "INTEGER NOT NULL DEFAULT 0",
+            "code_diff_hash": "TEXT",
+            "environment_lock_hash": "TEXT NOT NULL DEFAULT ''",
+            "reuse_key": "TEXT NOT NULL DEFAULT ''",
+            "model_maturity": "TEXT",
+            "data_status": "TEXT NOT NULL DEFAULT 'reviewed'",
+            "data_status_reasons": "TEXT NOT NULL DEFAULT '[]'",
+            "maturity_criteria": "TEXT NOT NULL DEFAULT '[]'",
+            "reproducibility": "TEXT NOT NULL DEFAULT 'not_recorded'",
+            "diagnostics": "TEXT NOT NULL DEFAULT '[]'",
+        }
+        for column, declaration in migrations.items():
+            if column not in analysis_columns:
+                metadata.execute(f"ALTER TABLE analysis_runs ADD COLUMN {column} {declaration}")
+    _execute_script(
+        metadata,
+        """
+        CREATE TABLE IF NOT EXISTS analysis_artifacts (
+            analysis_run_id TEXT NOT NULL REFERENCES analysis_runs(analysis_run_id),
+            artifact_kind TEXT NOT NULL CHECK (artifact_kind IN ('input', 'result')),
+            result_id TEXT,
+            result_family TEXT,
+            schema_id TEXT NOT NULL,
+            schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+            content_hash TEXT NOT NULL CHECK (
+                length(content_hash) = 64 AND content_hash NOT GLOB '*[^0-9a-f]*'
+            ),
+            manifest_sha256 TEXT NOT NULL CHECK (
+                length(manifest_sha256) = 64 AND manifest_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            manifest_size_bytes INTEGER NOT NULL CHECK (manifest_size_bytes > 0),
+            artifact_path TEXT NOT NULL UNIQUE CHECK (
+                length(artifact_path) > 0
+                AND artifact_path NOT LIKE '/%'
+                AND artifact_path NOT LIKE '%..%'
+            ),
+            artifact_size_bytes INTEGER NOT NULL CHECK (artifact_size_bytes > 0),
+            is_legacy INTEGER NOT NULL CHECK (is_legacy IN (0, 1)),
+            PRIMARY KEY (analysis_run_id, artifact_kind),
+            CHECK (
+                (artifact_kind = 'input' AND result_id IS NULL AND result_family IS NULL)
+                OR (artifact_kind = 'result'
+                    AND result_id IS NOT NULL AND result_family IS NOT NULL)
+            )
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS analysis_artifact_files (
+            analysis_run_id TEXT NOT NULL,
+            artifact_kind TEXT NOT NULL,
+            file_name TEXT NOT NULL CHECK (
+                length(file_name) > 0
+                AND file_name NOT LIKE '%/%'
+                AND file_name NOT LIKE '%..%'
+            ),
+            sha256 TEXT NOT NULL CHECK (
+                length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
+            row_count INTEGER NOT NULL CHECK (row_count > 0),
+            PRIMARY KEY (analysis_run_id, artifact_kind, file_name),
+            FOREIGN KEY (analysis_run_id, artifact_kind)
+                REFERENCES analysis_artifacts(analysis_run_id, artifact_kind)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS analysis_run_facts (
+            analysis_run_id TEXT NOT NULL REFERENCES analysis_runs(analysis_run_id),
+            fact_code TEXT NOT NULL CHECK (fact_code = 'legacy_input_bundle_not_persisted'),
+            PRIMARY KEY (analysis_run_id, fact_code)
+        ) STRICT;
+        """,
+    )
     migration_columns = {
         str(row[1]) for row in metadata.execute("PRAGMA table_info(migration_publications)")
     }
@@ -3140,9 +3275,7 @@ class LocalStore:
                     f"'{str(directory / filename).replace(chr(39), chr(39) * 2)}')"
                     for filename, column in sources
                 )
-                bounds = self._query.execute(
-                    f"SELECT min(day), max(day) FROM ({days})"
-                ).fetchone()
+                bounds = self._query.execute(f"SELECT min(day), max(day) FROM ({days})").fetchone()
                 assert bounds is not None
                 facts.append(
                     SnapshotCatalogFact(
@@ -3709,7 +3842,11 @@ class LocalStore:
             snapshot = self._root / _PARQUET_DIRECTORY / "snapshots" / str(new_snapshot)
             marker.write_text(
                 json.dumps(
-                    {"operation_id": str(operation_id), "snapshot_id": str(new_snapshot)},
+                    {
+                        "analysis_paths": [],
+                        "operation_id": str(operation_id),
+                        "snapshot_id": str(new_snapshot),
+                    },
                     separators=(",", ":"),
                     sort_keys=True,
                 ),
@@ -3737,6 +3874,22 @@ class LocalStore:
                 self._quarantine_migration_artifacts(operation_id, staging, snapshot)
                 raise StoreError("migration_validation_failed") from error
 
+        if source_version < 12 and not marker.exists():
+            marker.parent.mkdir(exist_ok=True)
+            marker.write_text(
+                json.dumps(
+                    {
+                        "analysis_paths": [],
+                        "operation_id": str(operation_id),
+                        "snapshot_id": None,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            _fsync_directory(marker.parent)
+
         self._metadata.commit()
         self._metadata.execute("PRAGMA foreign_keys = OFF")
         try:
@@ -3745,6 +3898,8 @@ class LocalStore:
                 _upgrade_v03_constraints(self._metadata)
                 _upgrade_migration_publication_schema(self._metadata)
                 _ensure_current_tables(self._metadata)
+                if source_version < 12:
+                    self._register_legacy_analysis_artifacts(marker)
                 self._metadata.execute("ALTER TABLE store_identity RENAME TO legacy_store_identity")
                 self._metadata.execute(_STORE_IDENTITY_DDL)
                 self._metadata.execute(
@@ -4032,13 +4187,43 @@ class LocalStore:
     ) -> None:
         quarantine = self._root / "quarantine" / "migrations" / str(operation_id)
         quarantine.mkdir(parents=True, exist_ok=True)
+        marker = self._root / "migration-staging" / f"{operation_id}.json"
+        if marker.exists():
+            try:
+                values = json.loads(marker.read_bytes())
+                raw_paths = values.get("analysis_paths", [])
+                analysis_paths = (
+                    tuple(cast(list[str], raw_paths))
+                    if isinstance(raw_paths, list)
+                    and all(isinstance(path, str) for path in raw_paths)
+                    else ()
+                )
+            except (OSError, json.JSONDecodeError):
+                analysis_paths = ()
+            for relative in analysis_paths:
+                analysis_source = self._root / relative
+                if analysis_source.exists():
+                    target = quarantine / "analysis" / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(analysis_source, target)
+                    parent = analysis_source.parent
+                    analysis_root = self._root / _PARQUET_DIRECTORY / "analysis-runs"
+                    while parent != analysis_root and parent.is_relative_to(analysis_root):
+                        try:
+                            parent.rmdir()
+                        except OSError:
+                            break
+                        parent = parent.parent
+        analysis_staging = marker.parent / f"{operation_id}-analysis"
+        if analysis_staging.exists():
+            os.replace(analysis_staging, quarantine / "analysis-staging")
         for source, label in ((staging, "staging"), (snapshot, "snapshot")):
             if source is not None and source.exists():
                 os.replace(source, quarantine / label)
         (quarantine / "diagnostic.json").write_text(
             json.dumps({"diagnostic": "migration_not_activated"}), encoding="utf-8"
         )
-        (self._root / "migration-staging" / f"{operation_id}.json").unlink(missing_ok=True)
+        marker.unlink(missing_ok=True)
 
     def _recover_migrations(self) -> None:
         backup_root = self._root / "migration-backups"
@@ -4057,12 +4242,22 @@ class LocalStore:
                 values = json.loads(marker.read_bytes())
                 raw_operation_id = values["operation_id"]
                 raw_snapshot_id = values["snapshot_id"]
-                if not _is_lower_hex(raw_operation_id, 32) or not _is_lower_hex(
-                    raw_snapshot_id, 32
+                raw_analysis_paths = values.get("analysis_paths", [])
+                if (
+                    not _is_lower_hex(raw_operation_id, 32)
+                    or (raw_snapshot_id is not None and not _is_lower_hex(raw_snapshot_id, 32))
+                    or not isinstance(raw_analysis_paths, list)
+                    or not all(
+                        isinstance(path, str)
+                        and path
+                        and not Path(path).is_absolute()
+                        and ".." not in Path(path).parts
+                        for path in raw_analysis_paths
+                    )
                 ):
                     raise ValueError
                 operation_id = OperationId(str(raw_operation_id))
-                snapshot_id = SnapshotId(str(raw_snapshot_id))
+                snapshot_id = None if raw_snapshot_id is None else SnapshotId(str(raw_snapshot_id))
             except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
                 quarantine = self._root / "quarantine" / "migrations" / uuid4().hex
                 quarantine.mkdir(parents=True)
@@ -4071,16 +4266,18 @@ class LocalStore:
                     json.dumps({"diagnostic": "invalid_migration_marker"}), encoding="utf-8"
                 )
                 continue
-            cataloged = self._metadata.execute(
-                "SELECT 1 FROM dataset_snapshots WHERE snapshot_id = ?", (str(snapshot_id),)
-            ).fetchone()
-            if cataloged is not None:
+            current = self.load_identity().is_current
+            if current:
                 marker.unlink(missing_ok=True)
                 continue
             self._quarantine_migration_artifacts(
                 operation_id,
                 marker_root / str(operation_id),
-                self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id),
+                (
+                    None
+                    if snapshot_id is None
+                    else self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
+                ),
             )
         if marker_root.exists():
             for staging in tuple(path for path in marker_root.iterdir() if path.is_dir()):
@@ -4115,6 +4312,7 @@ class LocalStore:
             store = cls._open(root, mode, initialize=True)
             if store.load_identity().is_current:
                 store._recover_imports()
+                store._recover_analysis_publications()
             store._recover_migrations()
             store._validate_store()
             return store
@@ -4135,6 +4333,7 @@ class LocalStore:
             store = cls._open(root, mode, initialize=True, writer_lock=writer_lock)
             if store.load_identity().is_current:
                 store._recover_imports()
+                store._recover_analysis_publications()
             store._recover_migrations()
             store._validate_store()
             return store
@@ -9103,9 +9302,11 @@ class LocalStore:
     ) -> tuple[SnapshotId | None, tuple[StoredMeasurement, ...]]:
         if not data_types:
             return snapshot_id, ()
-        type_clause = "versions.canonical_type IN (" + ", ".join(
-            f"'{item.value}'" for item in data_types
-        ) + ")"
+        type_clause = (
+            "versions.canonical_type IN ("
+            + ", ".join(f"'{item.value}'" for item in data_types)
+            + ")"
+        )
         return self._load_measurements(snapshot_id, start_date, end_date, type_clause)
 
     def load_analysis_activity_inputs(
@@ -9168,19 +9369,23 @@ class LocalStore:
                 ).fetchone()
                 is not None
             )
-        return snapshot_id, tuple(
-            StoredActivityDayValue(
-                day=row[0],
-                data_type=CanonicalHealthType(str(row[1])),
-                unit=CanonicalUnit(str(row[2])),
-                effective_value=float(row[3]),
-                quality_status=DataQualityStatus(str(row[4])),
-                measurement_version_ids=tuple(
-                    MeasurementVersionId(str(item)) for item in row[5]
-                ),
-            )
-            for row in rows
-        ), coverage_incomplete
+        return (
+            snapshot_id,
+            tuple(
+                StoredActivityDayValue(
+                    day=row[0],
+                    data_type=CanonicalHealthType(str(row[1])),
+                    unit=CanonicalUnit(str(row[2])),
+                    effective_value=float(row[3]),
+                    quality_status=DataQualityStatus(str(row[4])),
+                    measurement_version_ids=tuple(
+                        MeasurementVersionId(str(item)) for item in row[5]
+                    ),
+                )
+                for row in rows
+            ),
+            coverage_incomplete,
+        )
 
     def load_activity_measurements(
         self,
@@ -9428,12 +9633,16 @@ class LocalStore:
                 (
                     selected.distance_kilometers
                     if selected is not None
-                    else None if row[15] is None else float(str(row[15]))
+                    else None
+                    if row[15] is None
+                    else float(str(row[15]))
                 ),
                 (
                     selected.active_energy_kilocalories
                     if selected is not None
-                    else None if row[16] is None else float(str(row[16]))
+                    else None
+                    if row[16] is None
+                    else float(str(row[16]))
                 ),
                 (
                     selected.disposition.startswith("included")
@@ -11786,45 +11995,341 @@ class LocalStore:
             diagnostics=tuple(cast(list[str], json.loads(str(diagnostics)))),
         )
 
-    def persist_insufficient_analysis_run(
-        self,
-        publication: InsufficientAnalysisRunPublication,
-    ) -> None:
+    def _record_migration_analysis_path(self, marker: Path, path: Path) -> None:
+        values = json.loads(marker.read_bytes())
+        paths = values.get("analysis_paths")
+        if not isinstance(paths, list):
+            raise StoreError("Migrationsjournal ist ungültig.")
+        relative = path.relative_to(self._root).as_posix()
+        if relative in paths or any(
+            isinstance(existing, str) and relative.startswith(f"{existing}/") for existing in paths
+        ):
+            return
+        paths.append(relative)
+        temporary = marker.with_suffix(".json.tmp")
+        with temporary.open("xb") as target:
+            target.write(json.dumps(values, separators=(",", ":"), sort_keys=True).encode())
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, marker)
+        _fsync_directory(marker.parent)
+
+    def _publish_migration_analysis_file(self, marker: Path, path: Path, payload: bytes) -> None:
+        relative = path.relative_to(self._root)
+        staging_root = marker.parent / f"{marker.stem}-analysis"
+        staged = staging_root / relative
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        with staged.open("xb") as target:
+            target.write(payload)
+            target.flush()
+            os.fsync(target.fileno())
+        if staged.read_bytes() != payload:
+            raise StoreError("Migriertes Analyseartefakt ist ungültig.")
+        _fsync_directory(staged.parent)
+        self._record_migration_analysis_path(marker, path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staged, path)
+        _fsync_directory(path.parent)
+        shutil.rmtree(staging_root)
+
+    def _register_legacy_analysis_artifacts(self, marker: Path) -> None:
+        input_rows = self._metadata.execute(
+            "SELECT analysis_run_id, snapshot_id, analysis_definition_id, config_hash, "
+            "config_schema_version, code_commit, code_dirty, code_diff_hash, "
+            "environment_lock_hash FROM analysis_runs"
+        ).fetchall()
+        for row in input_rows:
+            run_id = str(row[0])
+            destination = self._root / _PARQUET_DIRECTORY / "analysis-runs" / run_id
+            input_path = destination / "input.jsonl"
+            draft_path = self._root / _PARQUET_DIRECTORY / "analysis-inputs" / f"{run_id}.json"
+            if input_path.is_file():
+                payload = input_path.read_bytes()
+            elif draft_path.is_file():
+                payload = draft_path.read_bytes().rstrip(b"\n") + b"\n"
+                self._publish_migration_analysis_file(marker, input_path, payload)
+            else:
+                continue
+            try:
+                record = json.loads(payload)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise StoreError("V0.4-Analyseeingang ist ungültig.") from error
+            if not isinstance(record, dict):
+                raise StoreError("V0.4-Analyseeingang ist ungültig.")
+            content = dict(record)
+            content.pop("analysis_run_id", None)
+            artifact = AnalysisJsonlArtifact(
+                "analysis-input-bundle",
+                1,
+                hashlib.sha256(
+                    json.dumps(content, separators=(",", ":"), sort_keys=True).encode()
+                ).hexdigest(),
+                hashlib.sha256(payload).hexdigest(),
+                len(payload),
+                1,
+                payload,
+            )
+            provenance = AnalysisProvenance(
+                AnalysisRunId(run_id),
+                None,
+                SnapshotId(str(row[1])),
+                AnalysisDefinitionId(str(row[2])),
+                str(row[3]),
+                str(row[4]),
+                str(row[5]),
+                bool(row[6]),
+                None if row[7] is None else str(row[7]),
+                str(row[8]),
+            )
+            if (
+                artifact.schema_id != "analysis-input-bundle"
+                or artifact.schema_version != 1
+                or len(_analysis_jsonl_rows(artifact)) != 1
+            ):
+                raise StoreError("V0.4-Analyseeingang ist ungültig.")
+            manifest = json.dumps(
+                {
+                    "analysis_definition_id": str(provenance.analysis_definition_id),
+                    "analysis_result_id": None,
+                    "analysis_run_id": run_id,
+                    "artifact_kind": "input",
+                    "content_hash": artifact.content_hash,
+                    "files": [
+                        {
+                            "name": "input.jsonl",
+                            "row_count": 1,
+                            "sha256": artifact.sha256,
+                            "size_bytes": artifact.size_bytes,
+                        }
+                    ],
+                    "manifest_schema_version": 1,
+                    "result_family": None,
+                    "schema_version": 1,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+            manifest_path = destination / "input-manifest.json"
+            if manifest_path.exists():
+                if manifest_path.read_bytes() != manifest:
+                    raise StoreError("V0.4-Analysemanifest widerspricht dem Katalog.")
+            else:
+                self._publish_migration_analysis_file(marker, manifest_path, manifest)
+            relative = destination.relative_to(self._root).as_posix()
+            self._metadata.execute(
+                """
+                INSERT OR IGNORE INTO analysis_artifacts(
+                    analysis_run_id, artifact_kind, result_id, result_family,
+                    schema_id, schema_version, content_hash, manifest_sha256,
+                    manifest_size_bytes, artifact_path, artifact_size_bytes, is_legacy
+                ) VALUES (?, 'input', NULL, NULL, 'analysis-input-bundle', 1, ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    run_id,
+                    artifact.content_hash,
+                    hashlib.sha256(manifest).hexdigest(),
+                    len(manifest),
+                    relative,
+                    len(payload) + len(manifest),
+                ),
+            )
+            self._metadata.execute(
+                "INSERT OR IGNORE INTO analysis_artifact_files VALUES "
+                "(?, 'input', 'input.jsonl', ?, ?, 1)",
+                (run_id, artifact.sha256, artifact.size_bytes),
+            )
+
+        rows = self._metadata.execute(
+            "SELECT analysis_run_id, result_id, analysis_definition_id, status "
+            "FROM analysis_runs "
+            "WHERE result_id IS NOT NULL"
+        ).fetchall()
+        for run_id_value, result_id_value, definition_id_value, status_value in rows:
+            run_id = str(run_id_value)
+            result_id = str(result_id_value)
+            result_directory = self._root / _PARQUET_DIRECTORY / "analyses" / result_id
+            result_path = result_directory / "result.parquet"
+            if not result_path.is_file():
+                if str(status_value) != "completed":
+                    continue
+                raise StoreError("Legacy-Analyseartefakt fehlt.")
+            result_bytes = result_path.read_bytes()
+            file_sha256 = hashlib.sha256(result_bytes).hexdigest()
+            escaped_path = str(result_path).replace("'", "''")
+            relation = self._query.execute(f"SELECT * FROM read_parquet('{escaped_path}')")
+            columns = tuple(item[0] for item in relation.description)
+            result_rows = relation.fetchall()
+            content_hash = hashlib.sha256(
+                json.dumps(
+                    [dict(zip(columns, row, strict=True)) for row in result_rows],
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest()
+            manifest = json.dumps(
+                {
+                    "analysis_definition_id": str(definition_id_value),
+                    "analysis_result_id": result_id,
+                    "analysis_run_id": run_id,
+                    "artifact_kind": "result",
+                    "content_hash": content_hash,
+                    "files": [
+                        {
+                            "name": "result.parquet",
+                            "row_count": len(result_rows),
+                            "sha256": file_sha256,
+                            "size_bytes": len(result_bytes),
+                        }
+                    ],
+                    "manifest_schema_version": 1,
+                    "result_family": "legacy_resting_hr_analysis",
+                    "schema_version": 1,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+            manifest_path = result_directory / "manifest.json"
+            if manifest_path.exists():
+                if manifest_path.read_bytes() != manifest:
+                    raise StoreError("Legacy-Analysemanifest widerspricht dem Katalog.")
+            else:
+                self._publish_migration_analysis_file(marker, manifest_path, manifest)
+            relative = result_directory.relative_to(self._root).as_posix()
+            self._metadata.execute(
+                """
+                INSERT OR IGNORE INTO analysis_artifacts(
+                    analysis_run_id, artifact_kind, result_id, result_family,
+                    schema_id, schema_version, content_hash, manifest_sha256,
+                    manifest_size_bytes, artifact_path, artifact_size_bytes, is_legacy
+                ) VALUES (?, 'result', ?, 'legacy_resting_hr_analysis',
+                          'legacy-resting-hr-result', 1, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    run_id,
+                    result_id,
+                    content_hash,
+                    hashlib.sha256(manifest).hexdigest(),
+                    len(manifest),
+                    relative,
+                    len(result_bytes) + len(manifest),
+                ),
+            )
+            self._metadata.execute(
+                "INSERT OR IGNORE INTO analysis_artifact_files VALUES "
+                "(?, 'result', 'result.parquet', ?, ?, ?)",
+                (run_id, file_sha256, len(result_bytes), len(result_rows)),
+            )
+            if (
+                self._metadata.execute(
+                    "SELECT 1 FROM analysis_artifacts "
+                    "WHERE analysis_run_id = ? AND artifact_kind = 'input'",
+                    (run_id,),
+                ).fetchone()
+                is None
+            ):
+                self._metadata.execute(
+                    "INSERT OR IGNORE INTO analysis_run_facts VALUES "
+                    "(?, 'legacy_input_bundle_not_persisted')",
+                    (run_id,),
+                )
+
+    def prepare_analysis_staging(self, analysis_run_id: AnalysisRunId) -> Path:
+        self._require_open()
+        self._require_writer()
+        staging = self._root / "analysis-staging" / str(analysis_run_id)
+        destination = self._root / _PARQUET_DIRECTORY / "analysis-runs" / str(analysis_run_id)
+        if staging.exists() or destination.exists():
+            raise StoreError("Analyseartefakt existiert bereits.")
+        staging.mkdir(parents=True)
+        return staging
+
+    def persist_analysis_run(self, publication: AnalysisRunPublication) -> None:
         self._require_open()
         self._require_writer()
         provenance = publication.provenance
         configuration = publication.configuration
+        has_result = publication.result_artifact is not None
         if (
-            provenance.result_id is not None
-            or not publication.input_artifact
+            (publication.status == "completed") != has_result
+            or has_result != (provenance.result_id is not None)
+            or has_result != (publication.result_family is not None)
+            or has_result != (publication.model_maturity is not None)
+            or (not has_result and publication.maturity_criteria)
             or configuration.analysis_definition_id != provenance.analysis_definition_id
             or configuration.schema_version != provenance.config_schema_version
             or configuration.content_hash != provenance.config_hash
-            or (
-                publication.data_status is DataQualityStatus.PROVISIONAL
-            ) != bool(publication.data_status_reasons)
+            or (publication.data_status is DataQualityStatus.PROVISIONAL)
+            != bool(publication.data_status_reasons)
         ):
             raise StoreError("Unvollständige Analyseprovenienz.")
+        _analysis_jsonl_rows(publication.input_artifact)
+        publication.input_artifact.validate_schema(publication)
+        if publication.result_artifact is not None:
+            _analysis_jsonl_rows(publication.result_artifact)
+            publication.result_artifact.validate_schema(publication)
+        if (
+            self._metadata.execute(
+                "SELECT 1 FROM dataset_snapshots WHERE snapshot_id = ?",
+                (str(provenance.snapshot_id),),
+            ).fetchone()
+            is None
+        ):
+            raise StoreError("Analyse-Snapshot ist nicht katalogisiert.")
         run_id = str(provenance.analysis_run_id)
         config_json = configuration.canonical_json
         staging = self._root / "analysis-staging" / run_id
-        # ponytail: one canonical JSON input until #116 adds final JSONL schemas/publication.
-        relative = Path(_PARQUET_DIRECTORY) / "analysis-inputs" / f"{run_id}.json"
+        relative = Path(_PARQUET_DIRECTORY) / "analysis-runs" / run_id
         destination = self._root / relative
-        if staging.exists() or destination.exists():
+        if not staging.is_dir() or destination.exists():
             raise StoreError("Analyseartefakt existiert bereits.")
         created_at = datetime.now().astimezone().isoformat()
+        input_manifest = _analysis_artifact_manifest(
+            publication,
+            publication.input_artifact,
+            kind="input",
+            file_name="input.jsonl",
+        )
+        input_manifest_sha256 = hashlib.sha256(input_manifest).hexdigest()
+        result_manifest = (
+            None
+            if publication.result_artifact is None
+            else _analysis_artifact_manifest(
+                publication,
+                publication.result_artifact,
+                kind="result",
+                file_name="result.jsonl",
+            )
+        )
         try:
-            staging.mkdir(parents=True)
-            staged = staging / "input.json"
-            with staged.open("xb") as artifact:
-                artifact.write(publication.input_artifact)
+            input_path = staging / "input.jsonl"
+            if (
+                not input_path.is_file()
+                or input_path.read_bytes() != publication.input_artifact.payload
+            ):
+                raise StoreError("Analyseeingang im Staging widerspricht dem Auftrag.")
+            with (staging / "input-manifest.json").open("xb") as artifact:
+                artifact.write(input_manifest)
                 artifact.flush()
                 os.fsync(artifact.fileno())
             _fsync_directory(staging)
             _publication_fault_point(self._root, "analysis.after_input_write/v1")
+            if publication.result_artifact is not None and result_manifest is not None:
+                result_staging = staging / "result"
+                result_path = result_staging / "result.jsonl"
+                if (
+                    not result_path.is_file()
+                    or result_path.read_bytes() != publication.result_artifact.payload
+                ):
+                    raise StoreError("Analyseergebnis im Staging widerspricht dem Auftrag.")
+                with (result_staging / "result-manifest.json").open("xb") as artifact:
+                    artifact.write(result_manifest)
+                    artifact.flush()
+                    os.fsync(artifact.fileno())
+                _fsync_directory(result_staging)
+                _fsync_directory(staging)
+                _publication_fault_point(self._root, "analysis.after_result_write/v1")
             destination.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(staged, destination)
+            os.replace(staging, destination)
             _fsync_directory(destination.parent)
             _publication_fault_point(self._root, "analysis.after_input_publish/v1")
             with self._metadata:
@@ -11838,21 +12343,20 @@ class LocalStore:
                         reuse_key, model_maturity, data_status, data_status_reasons,
                         maturity_criteria, reproducibility, diagnostics, status, completed_at
                     ) VALUES (
-                        ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL,
-                        ?, ?, '[]', ?, ?, 'insufficient_data', ?
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?
                     )
                     """,
                     (
                         run_id,
                         str(publication.operation_id),
+                        None if provenance.result_id is None else str(provenance.result_id),
                         str(provenance.snapshot_id),
                         str(provenance.analysis_definition_id),
                         None
                         if publication.start_date is None
                         else publication.start_date.isoformat(),
-                        None
-                        if publication.end_date is None
-                        else publication.end_date.isoformat(),
+                        None if publication.end_date is None else publication.end_date.isoformat(),
                         config_json,
                         provenance.config_hash,
                         provenance.config_schema_version,
@@ -11861,6 +12365,11 @@ class LocalStore:
                         provenance.code_diff_hash,
                         provenance.environment_lock_hash,
                         provenance.reuse_key,
+                        (
+                            None
+                            if publication.model_maturity is None
+                            else publication.model_maturity.value
+                        ),
                         publication.data_status.value,
                         json.dumps(
                             [
@@ -11871,12 +12380,25 @@ class LocalStore:
                                 for reason in publication.data_status_reasons
                             ]
                         ),
+                        json.dumps(
+                            [
+                                {
+                                    "code": criterion.code.value,
+                                    "observed_value": criterion.observed_value,
+                                    "passed": criterion.passed,
+                                    "threshold": criterion.threshold,
+                                }
+                                for criterion in publication.maturity_criteria
+                            ],
+                            sort_keys=True,
+                        ),
                         (
                             ReproducibilityStatus.LOCAL_DEVELOPMENT.value
                             if provenance.code_dirty
                             else ReproducibilityStatus.REPRODUCIBLE.value
                         ),
                         json.dumps(publication.diagnostics),
+                        publication.status,
                         created_at,
                     ),
                 )
@@ -11887,11 +12409,13 @@ class LocalStore:
                         analysis_definition_id, config_json, config_hash,
                         config_schema_version, code_commit, code_dirty, code_diff_hash,
                         environment_lock_hash, diagnostics, created_at
-                    ) VALUES (?, ?, 'insufficient_data', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(publication.operation_id),
                         run_id,
+                        publication.status,
+                        None if provenance.result_id is None else str(provenance.result_id),
                         str(provenance.snapshot_id),
                         str(provenance.analysis_definition_id),
                         config_json,
@@ -11905,14 +12429,77 @@ class LocalStore:
                         created_at,
                     ),
                 )
+                self._metadata.execute(
+                    """
+                    INSERT INTO analysis_artifacts(
+                        analysis_run_id, artifact_kind, result_id, result_family,
+                        schema_id, schema_version, content_hash, manifest_sha256,
+                        manifest_size_bytes, artifact_path, artifact_size_bytes, is_legacy
+                    ) VALUES (?, 'input', NULL, NULL, ?, ?, ?, ?, ?, ?, ?, 0)
+                    """,
+                    (
+                        run_id,
+                        publication.input_artifact.schema_id,
+                        publication.input_artifact.schema_version,
+                        publication.input_artifact.content_hash,
+                        input_manifest_sha256,
+                        len(input_manifest),
+                        relative.as_posix(),
+                        publication.input_artifact.size_bytes + len(input_manifest),
+                    ),
+                )
+                self._metadata.execute(
+                    "INSERT INTO analysis_artifact_files VALUES (?, 'input', ?, ?, ?, ?)",
+                    (
+                        run_id,
+                        "input.jsonl",
+                        publication.input_artifact.sha256,
+                        publication.input_artifact.size_bytes,
+                        publication.input_artifact.row_count,
+                    ),
+                )
+                if publication.result_artifact is not None and result_manifest is not None:
+                    result_relative = relative / "result"
+                    self._metadata.execute(
+                        """
+                        INSERT INTO analysis_artifacts(
+                            analysis_run_id, artifact_kind, result_id, result_family,
+                            schema_id, schema_version, content_hash, manifest_sha256,
+                            manifest_size_bytes, artifact_path, artifact_size_bytes, is_legacy
+                        ) VALUES (?, 'result', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                        """,
+                        (
+                            run_id,
+                            str(provenance.result_id),
+                            publication.result_family,
+                            publication.result_artifact.schema_id,
+                            publication.result_artifact.schema_version,
+                            publication.result_artifact.content_hash,
+                            hashlib.sha256(result_manifest).hexdigest(),
+                            len(result_manifest),
+                            result_relative.as_posix(),
+                            publication.result_artifact.size_bytes + len(result_manifest),
+                        ),
+                    )
+                    self._metadata.execute(
+                        "INSERT INTO analysis_artifact_files VALUES "
+                        "(?, 'result', 'result.jsonl', ?, ?, ?)",
+                        (
+                            run_id,
+                            publication.result_artifact.sha256,
+                            publication.result_artifact.size_bytes,
+                            publication.result_artifact.row_count,
+                        ),
+                    )
                 _publication_fault_point(self._root, "analysis.before_catalog_commit/v1")
         except BaseException as error:
-            destination.unlink(missing_ok=True)
-            self._remove_tree(staging)
+            if destination.exists():
+                self._remove_tree(destination)
+            if staging.exists():
+                self._remove_tree(staging)
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 raise
             raise StoreError("Analyselauf konnte nicht persistiert werden.") from error
-        self._remove_tree(staging)
 
     def persist_analysis_receipt(
         self,
@@ -12433,6 +13020,32 @@ class LocalStore:
         except (OSError, sqlite3.Error) as error:
             raise StoreError("Import-Recovery konnte nicht abgeschlossen werden.") from error
 
+    def _recover_analysis_publications(self) -> None:
+        quarantine = self._root / "quarantine" / "analyses"
+        staging = self._root / "analysis-staging"
+        published = self._root / _PARQUET_DIRECTORY / "analysis-runs"
+        known_runs = {
+            str(row[0])
+            for row in self._metadata.execute(
+                "SELECT analysis_run_id FROM analysis_artifacts WHERE artifact_kind = 'input'"
+            )
+        }
+        for root in (staging, published):
+            if not root.exists():
+                continue
+            for path in tuple(item for item in root.iterdir() if item.is_dir()):
+                if root == published and path.name in known_runs:
+                    continue
+                quarantine.mkdir(parents=True, exist_ok=True)
+                target = quarantine / path.name
+                if target.exists():
+                    self._remove_tree(path)
+                else:
+                    os.replace(path, target)
+            _fsync_directory(root)
+        if quarantine.exists():
+            _fsync_directory(quarantine)
+
     def _recover_imports_unchecked(self) -> None:
         running_analyses = self._metadata.execute(
             "SELECT analysis_run_id, result_id FROM analysis_runs WHERE status = 'running'"
@@ -12440,9 +13053,7 @@ class LocalStore:
         for analysis_run_id, result_id in running_analyses:
             analysis_paths = [self._root / "analysis-staging" / str(analysis_run_id)]
             if result_id is not None:
-                analysis_paths.append(
-                    self._root / _PARQUET_DIRECTORY / "analyses" / str(result_id)
-                )
+                analysis_paths.append(self._root / _PARQUET_DIRECTORY / "analyses" / str(result_id))
             for path in analysis_paths:
                 if path.exists():
                     self._remove_tree(path)
@@ -12472,8 +13083,7 @@ class LocalStore:
             published_inputs = {
                 f"{row[0]}.json"
                 for row in self._metadata.execute(
-                    "SELECT analysis_run_id FROM analysis_runs "
-                    "WHERE status = 'insufficient_data'"
+                    "SELECT analysis_run_id FROM analysis_runs WHERE status = 'insufficient_data'"
                 )
             }
             for path in analysis_inputs.iterdir():

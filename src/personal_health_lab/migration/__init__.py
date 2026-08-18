@@ -17,6 +17,7 @@ _REGISTERED_STEPS = (
     (8, 9),
     (9, 10),
     (10, 11),
+    (11, 12),
 )
 _REGISTERED_SNAPSHOT_STEPS = ((1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7))
 _REGISTERED_BACKUP_STEPS = ((1, 2), (2, 3), (3, 4))
