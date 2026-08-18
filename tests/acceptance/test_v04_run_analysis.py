@@ -28,6 +28,7 @@ from personal_health_lab.application import (
     WriteNotStartedStatus,
     WriteRequest,
 )
+from personal_health_lab.synthetic_export import generate_export
 
 
 def _package(path: Path, *, day: int, value: int = 1) -> Path:
@@ -39,7 +40,18 @@ def _package(path: Path, *, day: int, value: int = 1) -> Path:
             sourceName="Apple Watch" sourceVersion="1" device="Apple Watch"
             creationDate="2024-01-{day:02d} 12:00:00 +0100"
             startDate="2024-01-{day:02d} 12:00:00 +0100"
-            endDate="2024-01-{day:02d} 12:01:00 +0100"/></HealthData>''',
+            endDate="2024-01-{day:02d} 12:01:00 +0100"/>
+            <Record type="HKQuantityTypeIdentifierActiveEnergyBurned" unit="kcal" value="-1"
+            sourceName="Apple Watch" sourceVersion="1" device="Apple Watch"
+            creationDate="2024-01-{day:02d} 12:10:00 +0100"
+            startDate="2024-01-{day:02d} 12:10:00 +0100"
+            endDate="2024-01-{day:02d} 12:11:00 +0100"/>
+            <Workout workoutActivityType="HKWorkoutActivityTypeRunning" duration="30"
+            durationUnit="min" totalEnergyBurned="200" totalEnergyBurnedUnit="kcal"
+            sourceName="Apple Watch" sourceVersion="1" device="Apple Watch"
+            creationDate="2024-01-{day:02d} 13:31:00 +0100"
+            startDate="2024-01-{day:02d} 13:00:00 +0100"
+            endDate="2024-01-{day:02d} 13:30:00 +0100"/></HealthData>''',
         )
     return path
 
@@ -149,13 +161,18 @@ def test_started_run_freezes_input_and_persists_insufficient_data_without_result
 
     with sqlite3.connect(runtime.active_store / "metadata.sqlite3") as metadata:
         row = metadata.execute(
-            "SELECT result_id, status, input_artifact_path FROM analysis_runs "
+            "SELECT result_id, status, data_status FROM analysis_runs "
             "WHERE analysis_run_id = ?",
             (str(first.analysis_run_id),),
         ).fetchone()
     assert row is not None
-    assert row[:2] == (None, "insufficient_data")
-    artifact = runtime.active_store / str(row[2])
+    assert row == (None, "insufficient_data", "provisional")
+    artifact = (
+        runtime.active_store
+        / "parquet"
+        / "analysis-inputs"
+        / f"{first.analysis_run_id}.json"
+    )
     frozen_input = artifact.read_bytes()
     payload = json.loads(frozen_input)
     assert payload["analysis_run_id"] == str(first.analysis_run_id)
@@ -170,7 +187,27 @@ def test_started_run_freezes_input_and_persists_insufficient_data_without_result
         value["input_id"] == "steps" and value["value"] == 1.0 and value["measurement_version_ids"]
         for value in payload["values"]
     )
-    assert payload["rule_versions"]
+    assert any(
+        value["input_id"] == "workout_duration_by_type"
+        and value["component"] == "HKWorkoutActivityTypeRunning"
+        and value["value"] == 30.0
+        and value["measurement_version_ids"]
+        for value in payload["values"]
+    )
+    assert "activity-derivation/v1" in payload["rule_versions"]
+    assert any(item.startswith("plausibility/step_count/") for item in payload["rule_versions"])
+    assert any(
+        value["input_id"] == "outcome_day_context"
+        and value["missingness_reason"] == "input_not_available"
+        for value in payload["values"]
+    )
+    assert payload["data_quality_fact_ids"]
+    assert any(
+        value["input_id"] == "active_energy"
+        and value["source_evidence"]
+        and value["data_quality_fact_ids"]
+        for value in payload["values"]
+    )
     assert payload["scalings"]
     with HealthLab.open(runtime) as health_lab:
         _import(health_lab, _package(tmp_path / "later.zip", day=3, value=2))
@@ -180,19 +217,33 @@ def test_started_run_freezes_input_and_persists_insufficient_data_without_result
 def test_analysis_fault_never_exposes_a_partial_run_after_reopen(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    for index, fault_point in enumerate(
-        (
-            "analysis.after_input_write/v1",
-            "analysis.after_input_publish/v1",
-            "analysis.before_catalog_commit/v1",
-        )
+    runtime = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    fixture = generate_export("lag-signal-v1", 42, tmp_path / "legacy-fixture")
+    legacy_request = RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v2"))
+    with HealthLab.open(runtime) as health_lab:
+        _import(health_lab, fixture.export_path)
+        legacy = health_lab.execute_write(
+            legacy_request,
+            expected_plan=health_lab.preview_write(legacy_request).fingerprint,
+        ).result
+    assert isinstance(legacy, AnalysisReceipt)
+    assert legacy.result_ref is not None
+    legacy_artifact = (
+        runtime.active_store
+        / "parquet"
+        / "analyses"
+        / str(legacy.result_ref)
+        / "result.parquet"
+    )
+    legacy_bytes = legacy_artifact.read_bytes()
+
+    for fault_point in (
+        "analysis.after_input_write/v1",
+        "analysis.after_input_publish/v1",
+        "analysis.before_catalog_commit/v1",
     ):
-        runtime = RuntimeConfig(
-            DataMode.SYNTHETIC, tmp_path / f"store-{index}", tmp_path / "real"
-        )
         request = _request()
         with monkeypatch.context() as fault, HealthLab.open(runtime) as health_lab:
-            _import(health_lab, _package(tmp_path / f"snapshot-{index}.zip", day=2))
             plan = health_lab.preview_write(request)
 
             def fail_at_analysis_point(
@@ -208,10 +259,13 @@ def test_analysis_fault_never_exposes_a_partial_run_after_reopen(
             with pytest.raises(HealthLabError):
                 health_lab.execute_write(request, expected_plan=plan.fingerprint)
 
-        with HealthLab.open(runtime):
-            pass
+        with HealthLab.open(runtime) as health_lab:
+            overview = health_lab.load_overview(OverviewSelection())
+        assert overview.resting_hr_analysis is not None
+        assert overview.resting_hr_analysis.provenance is not None
+        assert overview.resting_hr_analysis.provenance.result_id == legacy.result_ref
+        assert legacy_artifact.read_bytes() == legacy_bytes
         with sqlite3.connect(runtime.active_store / "metadata.sqlite3") as metadata:
-            assert metadata.execute("SELECT count(*) FROM analysis_runs").fetchone() == (0,)
-            assert metadata.execute("SELECT count(*) FROM analysis_receipts").fetchone() == (0,)
+            assert metadata.execute("SELECT count(*) FROM analysis_runs").fetchone() == (1,)
         inputs = runtime.active_store / "parquet" / "analysis-inputs"
         assert not inputs.exists() or list(inputs.iterdir()) == []

@@ -13,14 +13,23 @@ from pathlib import Path
 from uuid import uuid4
 
 from personal_health_lab.storage import (
+    ActivityDerivationRecord,
     AnalysisDefinitionId,
     AnalysisProvenance,
     AnalysisResultId,
+    AnalysisRunConfiguration,
     AnalysisRunId,
+    CanonicalUnit,
+    DataQualityStatus,
+    InsufficientAnalysisRunPublication,
     LocalStore,
+    MeasurementVersionId,
     OperationId,
+    PlausibilityRuleRecord,
+    ReviewCaseId,
     SnapshotId,
     StoredMeasurement,
+    StoredWorkout,
 )
 
 _PROJECT_ROOT = Path(__file__).parents[3]
@@ -271,12 +280,21 @@ class AnalysisMissingness(StrEnum):
     AMBIGUOUS = "ambiguous"
 
 
+class AnalysisMissingnessReason(StrEnum):
+    NO_OBSERVATION = "no_observation"
+    EXCLUDED_OR_UNRESOLVED = "excluded_or_unresolved"
+    CONFLICTING_VALUES = "conflicting_values"
+    INPUT_NOT_AVAILABLE = "input_not_available"
+
+
 @dataclass(frozen=True, slots=True)
 class AnalysisSourceEvidence:
-    measurement_version_id: str
+    measurement_version_id: MeasurementVersionId
     source_name: str
     source_version: str
     source_updated_at: datetime
+    is_selected: bool
+    disposition: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,11 +302,12 @@ class AnalysisInputValue:
     day: date
     input_id: AnalysisInput
     component: str | None
-    unit: str | None
+    unit: CanonicalUnit | None
     value: float | None
     missingness: AnalysisMissingness
     source_evidence: tuple[AnalysisSourceEvidence, ...] = ()
-    data_quality_fact_ids: tuple[str, ...] = ()
+    data_quality_fact_ids: tuple[ReviewCaseId, ...] = ()
+    missingness_reason: AnalysisMissingnessReason | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,7 +328,7 @@ class AnalysisInputBundle:
     calendar: tuple[date, ...]
     values: tuple[AnalysisInputValue, ...]
     rule_versions: tuple[str, ...]
-    data_quality_fact_ids: tuple[str, ...]
+    data_quality_fact_ids: tuple[ReviewCaseId, ...]
     scalings: tuple[AnalysisScaling, ...]
     schema_version: int = 1
 
@@ -512,26 +531,30 @@ def plan_analysis(
 
 
 _MEASUREMENT_INPUTS = {
-    "active_energy": AnalysisInput.ACTIVE_ENERGY,
-    "apple_exercise_time": AnalysisInput.TRAINING_TIME,
-    "apple_resting_heart_rate": AnalysisInput.APPLE_RESTING_HEART_RATE,
-    "body_mass": AnalysisInput.PREFERRED_DAILY_WEIGHT,
-    "dietary_energy_consumed": AnalysisInput.NUTRITION_DAY_V1,
-    "step_count": AnalysisInput.STEPS,
-    "walking_running_distance": AnalysisInput.WALKING_RUNNING_DISTANCE,
+    "active_energy": (AnalysisInput.ACTIVE_ENERGY, None),
+    "apple_exercise_time": (AnalysisInput.TRAINING_TIME, None),
+    "apple_resting_heart_rate": (AnalysisInput.APPLE_RESTING_HEART_RATE, None),
+    "body_mass": (AnalysisInput.PREFERRED_DAILY_WEIGHT, None),
+    "dietary_energy_consumed": (AnalysisInput.NUTRITION_DAY_V1, "energy"),
+    "dietary_protein": (AnalysisInput.NUTRITION_DAY_V1, "protein"),
+    "dietary_carbohydrates": (AnalysisInput.NUTRITION_DAY_V1, "carbohydrates"),
+    "dietary_fat_total": (AnalysisInput.NUTRITION_DAY_V1, "total_fat"),
+    "step_count": (AnalysisInput.STEPS, None),
+    "walking_running_distance": (AnalysisInput.WALKING_RUNNING_DISTANCE, None),
 }
+_FIXED_INPUT_COMPONENTS = {
+    AnalysisInput.NUTRITION_DAY_V1: ("energy", "protein", "carbohydrates", "total_fat"),
+}
+_MEASUREMENT_BACKED_INPUTS = {item[0] for item in _MEASUREMENT_INPUTS.values()}
 _POINT_INPUTS = {
     AnalysisInput.APPLE_RESTING_HEART_RATE,
     AnalysisInput.PREFERRED_DAILY_WEIGHT,
 }
-_RULE_VERSIONS = (
-    "healthkit-identity/v3",
-    "healthkit-canonical/v3",
-    "activity-derivation/v1",
-    "preferred-daily-weight/v1",
-    "nutrition-day-v1",
-    "resting-energy-day-allocation/v1",
-)
+_BUILTIN_RULE_VERSIONS = {
+    AnalysisInput.PREFERRED_DAILY_WEIGHT: "preferred-daily-weight/v1",
+    AnalysisInput.NUTRITION_DAY_V1: "nutrition-day-v1",
+    AnalysisInput.RESTING_ENERGY_DAY_V1: "resting-energy-day-allocation/v1",
+}
 
 
 def _calendar_values(day: date, input_id: AnalysisInput) -> tuple[tuple[str, float], ...]:
@@ -555,52 +578,176 @@ def _source_evidence(
 ) -> tuple[AnalysisSourceEvidence, ...]:
     return tuple(
         AnalysisSourceEvidence(
-            str(item.measurement_version_id),
+            item.measurement_version_id,
             item.source_name,
             item.source_version,
             item.source_updated_at,
+            item.is_selected,
+            item.disposition,
         )
         for item in measurements
+    )
+
+
+def _workout_source_evidence(
+    workouts: tuple[StoredWorkout, ...],
+) -> tuple[AnalysisSourceEvidence, ...]:
+    return tuple(
+        AnalysisSourceEvidence(
+            item.workout_version_id,
+            item.source_name,
+            item.source_version,
+            item.source_updated_at,
+            item.is_selected,
+            item.disposition,
+        )
+        for item in workouts
     )
 
 
 def _measurement_value(
     day: date,
     input_id: AnalysisInput,
+    component: str | None,
     measurements: tuple[StoredMeasurement, ...],
 ) -> AnalysisInputValue:
     quality_ids = tuple(
-        sorted({str(case) for item in measurements for case in item.review_case_ids})
+        sorted(
+            {case for item in measurements for case in item.review_case_ids},
+            key=str,
+        )
     )
     if not measurements:
-        return AnalysisInputValue(day, input_id, None, None, None, AnalysisMissingness.MISSING)
+        return AnalysisInputValue(
+            day,
+            input_id,
+            component,
+            None,
+            None,
+            AnalysisMissingness.MISSING,
+            missingness_reason=AnalysisMissingnessReason.NO_OBSERVATION,
+        )
+    eligible = tuple(
+        item
+        for item in measurements
+        if item.is_selected
+        and item.disposition in {"included_source", "included_correction"}
+        and item.effective_value is not None
+    )
+    if not eligible:
+        return AnalysisInputValue(
+            day,
+            input_id,
+            component,
+            measurements[0].unit,
+            None,
+            AnalysisMissingness.MISSING,
+            _source_evidence(measurements),
+            quality_ids,
+            AnalysisMissingnessReason.EXCLUDED_OR_UNRESOLVED,
+        )
     if input_id in _POINT_INPUTS:
-        latest = max(item.source_start for item in measurements)
-        used = tuple(item for item in measurements if item.source_start == latest)
+        latest = max(item.source_start for item in eligible)
+        used = tuple(item for item in eligible if item.source_start == latest)
         distinct = {item.effective_value for item in used}
         if len(distinct) != 1:
             return AnalysisInputValue(
                 day,
                 input_id,
-                None,
-                used[0].unit.value,
+                component,
+                used[0].unit,
                 None,
                 AnalysisMissingness.AMBIGUOUS,
                 _source_evidence(used),
                 quality_ids,
+                AnalysisMissingnessReason.CONFLICTING_VALUES,
             )
         value = next(iter(distinct))
     else:
-        used = measurements
+        used = eligible
         value = sum(item.effective_value or 0.0 for item in used)
     return AnalysisInputValue(
         day,
         input_id,
-        None,
-        used[0].unit.value,
+        component,
+        used[0].unit,
         value,
         AnalysisMissingness.OBSERVED,
         _source_evidence(used),
+        quality_ids,
+    )
+
+
+def _workout_value(
+    day: date,
+    input_id: AnalysisInput,
+    component: str | None,
+    workouts: tuple[StoredWorkout, ...],
+) -> AnalysisInputValue:
+    quality_ids = tuple(
+        sorted({case for item in workouts for case in item.review_case_ids}, key=str)
+    )
+    eligible = tuple(
+        item
+        for item in workouts
+        if item.is_selected
+        and (item.disposition is None or item.disposition.startswith("included"))
+    )
+    if not eligible:
+        return AnalysisInputValue(
+            day,
+            input_id,
+            component,
+            CanonicalUnit.MINUTE
+            if input_id is AnalysisInput.WORKOUT_DURATION_BY_TYPE
+            else CanonicalUnit.KILOCALORIE,
+            None,
+            AnalysisMissingness.MISSING,
+            _workout_source_evidence(workouts),
+            quality_ids,
+            (
+                AnalysisMissingnessReason.EXCLUDED_OR_UNRESOLVED
+                if workouts
+                else AnalysisMissingnessReason.NO_OBSERVATION
+            ),
+        )
+    if input_id is AnalysisInput.WORKOUT_DURATION_BY_TYPE:
+        values = tuple(
+            item.effective_duration_minutes
+            if item.effective_duration_minutes is not None
+            else item.reported_duration_minutes
+            if item.reported_duration_minutes is not None
+            else (item.source_end - item.source_start).total_seconds() / 60
+            for item in eligible
+        )
+        unit = CanonicalUnit.MINUTE
+    else:
+        values = tuple(
+            item.active_energy_kilocalories
+            for item in eligible
+            if item.active_energy_kilocalories is not None
+        )
+        unit = CanonicalUnit.KILOCALORIE
+    if not values:
+        return AnalysisInputValue(
+            day,
+            input_id,
+            component,
+            unit,
+            None,
+            AnalysisMissingness.MISSING,
+            _workout_source_evidence(eligible),
+            quality_ids,
+            AnalysisMissingnessReason.NO_OBSERVATION,
+        )
+    return AnalysisInputValue(
+        day,
+        input_id,
+        component,
+        unit,
+        sum(values),
+        AnalysisMissingness.OBSERVED,
+        _workout_source_evidence(eligible),
         quality_ids,
     )
 
@@ -609,6 +756,9 @@ def build_analysis_input_bundle(
     plan: RunAnalysisPlan,
     analysis_run_id: AnalysisRunId,
     measurements: tuple[StoredMeasurement, ...],
+    workouts: tuple[StoredWorkout, ...] = (),
+    plausibility_rules: tuple[PlausibilityRuleRecord, ...] = (),
+    activity_derivation: ActivityDerivationRecord | None = None,
 ) -> AnalysisInputBundle:
     if (
         plan.base_snapshot_ref is None
@@ -620,18 +770,20 @@ def build_analysis_input_bundle(
         plan.eligible_start_date + timedelta(days=offset)
         for offset in range((plan.eligible_end_date - plan.eligible_start_date).days + 1)
     )
-    grouped: dict[tuple[date, AnalysisInput], list[StoredMeasurement]] = {}
+    grouped: dict[tuple[date, AnalysisInput, str | None], list[StoredMeasurement]] = {}
     for measurement in measurements:
-        input_id = _MEASUREMENT_INPUTS.get(measurement.data_type.value)
-        if (
-            input_id is not None
-            and measurement.is_selected
-            and measurement.disposition in {"included_source", "included_correction"}
-            and measurement.effective_value is not None
-        ):
-            grouped.setdefault((measurement.measurement_local_day, input_id), []).append(
-                measurement
-            )
+        mapped = _MEASUREMENT_INPUTS.get(measurement.data_type.value)
+        if mapped is not None:
+            input_id, component = mapped
+            grouped.setdefault(
+                (measurement.measurement_local_day, input_id, component), []
+            ).append(measurement)
+    workout_components = tuple(sorted({item.original_activity_type for item in workouts}))
+    workouts_by_day_and_type: dict[tuple[date, str], list[StoredWorkout]] = {}
+    for workout in workouts:
+        workouts_by_day_and_type.setdefault(
+            (workout.measurement_local_day, workout.original_activity_type), []
+        ).append(workout)
     required = plan.analysis_definition.method_facts.inputs
     values: list[AnalysisInputValue] = []
     for day in calendar:
@@ -650,8 +802,45 @@ def build_analysis_input_bundle(
                     for component, value in deterministic
                 )
                 continue
-            values.append(
-                _measurement_value(day, input_id, tuple(grouped.get((day, input_id), ())))
+            if input_id in {
+                AnalysisInput.WORKOUT_DURATION_BY_TYPE,
+                AnalysisInput.WORKOUT_ENERGY_BY_TYPE,
+            }:
+                components: tuple[str | None, ...] = workout_components or (None,)
+                values.extend(
+                    _workout_value(
+                        day,
+                        input_id,
+                        component,
+                        tuple(workouts_by_day_and_type.get((day, component), ()))
+                        if component is not None
+                        else (),
+                    )
+                    for component in components
+                )
+                continue
+            if input_id not in _MEASUREMENT_BACKED_INPUTS:
+                values.append(
+                    AnalysisInputValue(
+                        day,
+                        input_id,
+                        None,
+                        None,
+                        None,
+                        AnalysisMissingness.MISSING,
+                        missingness_reason=AnalysisMissingnessReason.INPUT_NOT_AVAILABLE,
+                    )
+                )
+                continue
+            components = _FIXED_INPUT_COMPONENTS.get(input_id, (None,))
+            values.extend(
+                _measurement_value(
+                    day,
+                    input_id,
+                    component,
+                    tuple(grouped.get((day, input_id, component), ())),
+                )
+                for component in components
             )
     scale_keys = sorted(
         {(item.input_id, item.component) for item in values},
@@ -675,7 +864,34 @@ def build_analysis_input_bundle(
             )
         )
     quality_ids = tuple(
-        sorted({fact_id for item in values for fact_id in item.data_quality_fact_ids})
+        sorted(
+            {fact_id for item in measurements for fact_id in item.review_case_ids}
+            | {fact_id for item in workouts for fact_id in item.review_case_ids},
+            key=str,
+        )
+    )
+    rule_versions = ["healthkit-identity/v3", "healthkit-canonical/v3"]
+    rule_versions.extend(
+        f"plausibility/{rule.data_type}/{rule.version_id}" for rule in plausibility_rules
+    )
+    if activity_derivation is not None and any(
+        item
+        in {
+            AnalysisInput.ACTIVE_ENERGY,
+            AnalysisInput.TRAINING_TIME,
+            AnalysisInput.STEPS,
+            AnalysisInput.WALKING_RUNNING_DISTANCE,
+        }
+        for item in required
+    ):
+        rule_versions.extend(
+            (
+                activity_derivation.version_id,
+                activity_derivation.source_classifier_version,
+            )
+        )
+    rule_versions.extend(
+        version for input_id, version in _BUILTIN_RULE_VERSIONS.items() if input_id in required
     )
     return AnalysisInputBundle(
         analysis_run_id,
@@ -685,7 +901,7 @@ def build_analysis_input_bundle(
         plan.eligible_end_date,
         calendar,
         tuple(values),
-        _RULE_VERSIONS,
+        tuple(sorted(set(rule_versions))),
         quality_ids,
         tuple(scalings),
     )
@@ -699,7 +915,7 @@ def _bundle_payload(bundle: AnalysisInputBundle, *, include_run_id: bool) -> dic
             "end_date": bundle.end_date.isoformat(),
         },
         "calendar": [day.isoformat() for day in bundle.calendar],
-        "data_quality_fact_ids": list(bundle.data_quality_fact_ids),
+        "data_quality_fact_ids": [str(item) for item in bundle.data_quality_fact_ids],
         "input_schema_version": bundle.schema_version,
         "rule_versions": list(bundle.rule_versions),
         "scalings": [
@@ -715,23 +931,30 @@ def _bundle_payload(bundle: AnalysisInputBundle, *, include_run_id: bool) -> dic
         "values": [
             {
                 "component": item.component,
-                "data_quality_fact_ids": list(item.data_quality_fact_ids),
+                "data_quality_fact_ids": [str(value) for value in item.data_quality_fact_ids],
                 "day": item.day.isoformat(),
                 "input_id": item.input_id.value,
                 "measurement_version_ids": [
-                    evidence.measurement_version_id for evidence in item.source_evidence
+                    str(evidence.measurement_version_id) for evidence in item.source_evidence
                 ],
                 "missingness": item.missingness.value,
+                "missingness_reason": (
+                    None
+                    if item.missingness_reason is None
+                    else item.missingness_reason.value
+                ),
                 "source_evidence": [
                     {
-                        "measurement_version_id": evidence.measurement_version_id,
+                        "disposition": evidence.disposition,
+                        "is_selected": evidence.is_selected,
+                        "measurement_version_id": str(evidence.measurement_version_id),
                         "source_name": evidence.source_name,
                         "source_updated_at": evidence.source_updated_at.isoformat(),
                         "source_version": evidence.source_version,
                     }
                     for evidence in item.source_evidence
                 ],
-                "unit": item.unit,
+                "unit": None if item.unit is None else item.unit.value,
                 "value": item.value,
             }
             for item in bundle.values
@@ -742,23 +965,7 @@ def _bundle_payload(bundle: AnalysisInputBundle, *, include_run_id: bool) -> dic
     return payload
 
 
-def _reproduction_facts(
-    definition_id: AnalysisDefinitionId,
-    start_date: date | None,
-    end_date: date | None,
-    schema_version: str,
-) -> tuple[str, str, str, bool, str | None, str]:
-    config_json = json.dumps(
-        {
-            "analysis_definition_id": str(definition_id),
-            "end_date": None if end_date is None else end_date.isoformat(),
-            "schema_version": schema_version,
-            "start_date": None if start_date is None else start_date.isoformat(),
-        },
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-
+def _reproduction_facts() -> tuple[str, bool, str | None, str]:
     def git(*arguments: str) -> bytes:
         return subprocess.run(
             ("git", *arguments), cwd=_PROJECT_ROOT, check=True, capture_output=True
@@ -774,8 +981,6 @@ def _reproduction_facts(
         diff_hasher.update(os.readlink(path).encode() if path.is_symlink() else path.read_bytes())
     environment_hash = hashlib.sha256((_PROJECT_ROOT / "uv.lock").read_bytes()).hexdigest()
     return (
-        config_json,
-        hashlib.sha256(config_json.encode()).hexdigest(),
         code_commit,
         bool(tracked_diff or untracked),
         diff_hasher.hexdigest() if tracked_diff or untracked else None,
@@ -793,35 +998,42 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
         plan.eligible_start_date,
         plan.eligible_end_date,
     )
-    if snapshot_id != plan.base_snapshot_ref:
+    workout_snapshot_id, workouts = store.load_workouts(
+        plan.base_snapshot_ref,
+        plan.eligible_start_date,
+        plan.eligible_end_date,
+    )
+    if snapshot_id != plan.base_snapshot_ref or workout_snapshot_id != plan.base_snapshot_ref:
         raise ValueError("Analyseeingang hat sich geändert.")
-    bundle = build_analysis_input_bundle(plan, run_id, measurements)
-    content_json = json.dumps(
-        _bundle_payload(bundle, include_run_id=False), separators=(",", ":"), sort_keys=True
+    bundle = build_analysis_input_bundle(
+        plan,
+        run_id,
+        measurements,
+        workouts,
+        store.load_plausibility_rule_versions(),
+        store.load_activity_derivation_version(plan.base_snapshot_ref),
     )
-    artifact_json = json.dumps(
+    artifact = json.dumps(
         _bundle_payload(bundle, include_run_id=True), separators=(",", ":"), sort_keys=True
+    ).encode()
+    configuration = AnalysisRunConfiguration(
+        plan.analysis_definition.analysis_definition_id,
+        plan.requested_start_date,
+        plan.requested_end_date,
+        plan.schema_version,
     )
-    config_json, config_hash, code_commit, code_dirty, code_diff_hash, environment_hash = (
-        _reproduction_facts(
-            plan.analysis_definition.analysis_definition_id,
-            plan.requested_start_date,
-            plan.requested_end_date,
-            plan.schema_version,
-        )
-    )
+    code_commit, code_dirty, code_diff_hash, environment_hash = _reproduction_facts()
     provenance = AnalysisProvenance(
         run_id,
         None,
         plan.base_snapshot_ref,
         plan.analysis_definition.analysis_definition_id,
-        config_hash,
+        configuration.content_hash,
         plan.schema_version,
         code_commit,
         code_dirty,
         code_diff_hash,
         environment_hash,
-        hashlib.sha256(content_json.encode()).hexdigest(),
     )
     observed = sum(item.value is not None for item in bundle.values)
     diagnostics = (
@@ -830,14 +1042,20 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
         f"observed_values={observed}",
     )
     store.persist_insufficient_analysis_run(
-        operation_id=operation_id,
-        provenance=provenance,
-        start_date=plan.eligible_start_date,
-        end_date=plan.eligible_end_date,
-        config_json=config_json,
-        input_json=artifact_json,
-        diagnostics=diagnostics,
-        data_status="provisional" if bundle.data_quality_fact_ids else "reviewed",
+        InsufficientAnalysisRunPublication(
+            operation_id,
+            provenance,
+            plan.eligible_start_date,
+            plan.eligible_end_date,
+            configuration,
+            artifact,
+            diagnostics,
+            (
+                DataQualityStatus.PROVISIONAL
+                if bundle.data_quality_fact_ids
+                else DataQualityStatus.REVIEWED
+            ),
+        )
     )
     return AnalysisExecution(
         operation_id,
@@ -860,6 +1078,7 @@ __all__ = [
     "AnalysisIntervalMethod",
     "AnalysisMethodFacts",
     "AnalysisMissingness",
+    "AnalysisMissingnessReason",
     "AnalysisResultFamily",
     "AnalysisReuseCandidate",
     "AnalysisScaling",
