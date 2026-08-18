@@ -12,12 +12,17 @@ from enum import StrEnum
 from itertools import pairwise
 from pathlib import Path
 from types import TracebackType
-from typing import Literal, Self, cast, get_args
+from typing import Literal, Self, cast, get_args, overload
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from personal_health_lab import DataMode
-from personal_health_lab.analysis import AnalysisDefinition, analysis_definitions
+from personal_health_lab.analysis import (
+    AnalysisDefinition,
+    RunAnalysisPlan,
+    analysis_definitions,
+    plan_analysis,
+)
 from personal_health_lab.data_quality import (
     DataQualityError,
     HistoricalReviewRequest,
@@ -158,6 +163,7 @@ _READY_WRITES = (
     "revoke_data_review_decision",
     "create_plausibility_rule_version",
     "run_historical_review",
+    "run_analysis",
     "run_resting_heart_rate_analysis",
     "create_metadata_backup",
     "begin_metadata_restore",
@@ -1862,7 +1868,38 @@ class RunHistoricalReview:
 
 
 @dataclass(frozen=True, slots=True)
+class RunAnalysis:
+    analysis_definition_id: AnalysisDefinitionId
+    start_date: date | None = None
+    end_date: date | None = None
+    schema_version: str = "1.0"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.analysis_definition_id, AnalysisDefinitionId):
+            raise ConfigurationError("analysis_definition_id hat einen ungültigen Typ.")
+        if self.analysis_definition_id not in {
+            item.analysis_definition_id for item in analysis_definitions()
+        }:
+            raise ConfigurationError("Unbekannte Analysedefinition.")
+        if any(
+            value is not None and type(value) is not date
+            for value in (self.start_date, self.end_date)
+        ):
+            raise ConfigurationError("Analysegrenzen müssen lokale Kalenderdaten sein.")
+        if self.schema_version != "1.0":
+            raise ConfigurationError("Unbekannte Analyseschemaversion.")
+        if (
+            self.start_date is not None
+            and self.end_date is not None
+            and self.start_date > self.end_date
+        ):
+            raise ConfigurationError("Startdatum darf nicht nach dem Enddatum liegen.")
+
+
+@dataclass(frozen=True, slots=True)
 class RunRestingHeartRateAnalysis:
+    """JSON-3.0 compatibility request; not part of the canonical request union."""
+
     analysis_definition_id: AnalysisDefinitionId
     start_date: date | None = None
     end_date: date | None = None
@@ -2106,7 +2143,7 @@ WriteRequest = (
     | RevokeDataReviewDecision
     | CreatePlausibilityRuleVersion
     | RunHistoricalReview
-    | RunRestingHeartRateAnalysis
+    | RunAnalysis
     | CreateActivityDerivationVersion
     | ReviseContextCoverageStart
     | ReviseIllnessCategory
@@ -2387,6 +2424,7 @@ WritePlanDetails = (
     | DataReviewBatchRevokePlan
     | PlausibilityRuleVersionPlan
     | HistoricalReviewPlan
+    | RunAnalysisPlan
     | RestingHeartRateAnalysisPlan
     | ManualContextRevisionPlan
     | MedicationRevisionPlan
@@ -2802,15 +2840,32 @@ class HealthLab:
             self._store = None
         logger.info("healthlab_closed mode=%s", self._config.mode.value)
 
+    @overload
     def preview_write(
         self,
         request: WriteRequest,
+        selection: SnapshotSelection = _ACTIVE_SNAPSHOT_SELECTION,
+    ) -> WritePlan: ...
+
+    @overload
+    def preview_write(
+        self,
+        request: RunRestingHeartRateAnalysis,
+        selection: SnapshotSelection = _ACTIVE_SNAPSHOT_SELECTION,
+    ) -> WritePlan: ...
+
+    def preview_write(
+        self,
+        request: WriteRequest | RunRestingHeartRateAnalysis,
         selection: SnapshotSelection = _ACTIVE_SNAPSHOT_SELECTION,
     ) -> WritePlan:
         self._require_open()
         if not isinstance(selection, SnapshotSelection):
             raise ConfigurationError("Snapshot-Auswahl ist ungültig.")
-        if not isinstance(request, (*get_args(WriteRequest), CreateActivityDerivationVersion)):
+        if not isinstance(
+            request,
+            (*get_args(WriteRequest), CreateActivityDerivationVersion, RunRestingHeartRateAnalysis),
+        ):
             raise ConfigurationError("Unbekannter Schreibauftrag.")
         if selection.snapshot_ref is not None:
             return WritePlan(
@@ -2874,6 +2929,8 @@ class HealthLab:
             )
         if isinstance(request, RunRestingHeartRateAnalysis):
             return self._build_resting_heart_rate_analysis_plan(request)
+        if isinstance(request, RunAnalysis):
+            return self._build_run_analysis_plan(request)
         if isinstance(request, RunHistoricalReview):
             return self._build_historical_review_plan(request)
         if isinstance(request, CreatePlausibilityRuleVersion):
@@ -3307,6 +3364,81 @@ class HealthLab:
                 filevault,
                 diagnostics,
                 capacity,
+            ),
+        )
+
+    def _build_run_analysis_plan(
+        self, request: RunAnalysis, *, store: LocalStore | None = None
+    ) -> WritePlan:
+        reader = store or self._store
+        if reader is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        try:
+            snapshot = next(
+                (item for item in reader.load_snapshot_catalog() if item.is_active), None
+            )
+        except StoreError as error:
+            raise HealthLabError("Analyseplanung ist nicht verfügbar.") from error
+        details = plan_analysis(
+            request.analysis_definition_id,
+            request.start_date,
+            request.end_date,
+            request.schema_version,
+            None if snapshot is None else snapshot.snapshot_id,
+            None if snapshot is None else snapshot.available_start_date,
+            None if snapshot is None else snapshot.available_end_date,
+        )
+        diagnostics = (
+            (
+                ("migration_required",)
+                if self.load_workspace_status().state is WorkspaceState.MIGRATION_REQUIRED
+                else ()
+            )
+            + (("no_snapshot",) if snapshot is None else ())
+            + (
+                ("no_eligible_analysis_period",)
+                if snapshot is not None and details.eligible_start_date is None
+                else ()
+            )
+        )
+        payload = {
+            "analysis_definition_id": str(details.analysis_definition.analysis_definition_id),
+            "analysis_definition_version": details.analysis_definition.definition_version,
+            "base_snapshot_ref": (
+                None if details.base_snapshot_ref is None else str(details.base_snapshot_ref)
+            ),
+            "diagnostics": diagnostics,
+            "eligible_end_date": (
+                None if details.eligible_end_date is None else details.eligible_end_date.isoformat()
+            ),
+            "eligible_start_date": (
+                None
+                if details.eligible_start_date is None
+                else details.eligible_start_date.isoformat()
+            ),
+            "operation": "run_analysis",
+            "requested_end_date": (
+                None if request.end_date is None else request.end_date.isoformat()
+            ),
+            "requested_start_date": (
+                None if request.start_date is None else request.start_date.isoformat()
+            ),
+            "reuse_candidate": None,
+            "schema_version": request.schema_version,
+            "version": 1,
+        }
+        return WritePlan(
+            PlanFingerprint(
+                hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+            ),
+            details,
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED if diagnostics else WriteApprovalStatus.READY
+                ),
+                diagnostics=diagnostics,
             ),
         )
 
@@ -5002,7 +5134,7 @@ class HealthLab:
 
     def _authorization_plan(
         self,
-        request: WriteRequest,
+        request: WriteRequest | RunRestingHeartRateAnalysis,
         current_plan: WritePlan,
         expected_plan: PlanFingerprint,
     ) -> WritePlan | None:
@@ -5120,9 +5252,27 @@ class HealthLab:
             None,
         )
 
+    @overload
     def execute_write(
         self,
         request: WriteRequest,
+        *,
+        expected_plan: PlanFingerprint,
+        selection: SnapshotSelection = _ACTIVE_SNAPSHOT_SELECTION,
+    ) -> WriteReceipt: ...
+
+    @overload
+    def execute_write(
+        self,
+        request: RunRestingHeartRateAnalysis,
+        *,
+        expected_plan: PlanFingerprint,
+        selection: SnapshotSelection = _ACTIVE_SNAPSHOT_SELECTION,
+    ) -> WriteReceipt: ...
+
+    def execute_write(
+        self,
+        request: WriteRequest | RunRestingHeartRateAnalysis,
         *,
         expected_plan: PlanFingerprint,
         selection: SnapshotSelection = _ACTIVE_SNAPSHOT_SELECTION,
@@ -5201,6 +5351,8 @@ class HealthLab:
             return self._execute_resting_heart_rate_analysis(
                 request, authorization_plan, expected_plan
             )
+        if isinstance(request, RunAnalysis):
+            return self._execute_run_analysis(request, authorization_plan, expected_plan)
         if not isinstance(request, ImportHealthExport):
             return self._execute_data_review_write(request, authorization_plan, expected_plan)
         if not isinstance(authorization_plan.details, ImportHealthExportPlan):
@@ -6819,6 +6971,65 @@ class HealthLab:
         if isinstance(details, MedicationRevisionPlan):
             return details.medication_as_of.date()
         return None
+
+    def _execute_run_analysis(
+        self,
+        request: RunAnalysis,
+        plan: WritePlan,
+        expected_plan: PlanFingerprint,
+    ) -> WriteReceipt:
+        if not isinstance(plan.details, RunAnalysisPlan):
+            return self._not_started(
+                plan,
+                WriteNotStartedStatus.PLAN_CHANGED,
+                ("plan_changed",),
+                expected_plan,
+            )
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        except StoreError:
+            return self._not_started(
+                plan,
+                WriteNotStartedStatus.BLOCKED,
+                ("store_unavailable",),
+                expected_plan,
+            )
+        try:
+            try:
+                locked_plan = self._build_run_analysis_plan(request, store=writer)
+            except HealthLabError:
+                return self._not_started(
+                    plan,
+                    WriteNotStartedStatus.BLOCKED,
+                    ("analysis_plan_unavailable",),
+                    expected_plan,
+                )
+            if locked_plan.fingerprint != plan.fingerprint:
+                return self._not_started(
+                    locked_plan,
+                    WriteNotStartedStatus.PLAN_CHANGED,
+                    ("plan_changed",),
+                    expected_plan,
+                )
+            if locked_plan.approval.status is WriteApprovalStatus.BLOCKED:
+                return self._not_started(
+                    locked_plan,
+                    WriteNotStartedStatus.BLOCKED,
+                    locked_plan.diagnostics,
+                    expected_plan,
+                )
+            return self._not_started(
+                locked_plan,
+                WriteNotStartedStatus.BLOCKED,
+                ("analysis_start_not_available",),
+                expected_plan,
+            )
+        finally:
+            writer.close()
 
     def _execute_resting_heart_rate_analysis(
         self,

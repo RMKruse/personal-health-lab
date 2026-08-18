@@ -720,7 +720,7 @@ def _analysis_json(result: RestingHeartRateAnalysisResult | None) -> dict[str, o
 def _workspace_json(status: WorkspaceStatus) -> dict[str, object]:
     return {
         "allowed_reads": status.allowed_reads,
-        "allowed_writes": status.allowed_writes,
+        "allowed_writes": tuple(item for item in status.allowed_writes if item != "run_analysis"),
         "mode": status.mode.value,
         "person_binding": status.person_binding.value,
         "state": status.state.value,

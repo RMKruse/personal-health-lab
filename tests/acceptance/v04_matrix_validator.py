@@ -17,6 +17,9 @@ _CONTRACT_IDS = {
     "V04-C-ANALYSIS-CATALOG-V1",
     "V04-C-HISTORICAL-WRITE-LOCK-V1",
     "V04-C-MATRIX-VALIDATION-V1",
+    "V04-C-RUN-ANALYSIS-PLAN-V1",
+    "V04-C-RUN-ANALYSIS-RECHECK-V1",
+    "V04-C-RUN-ANALYSIS-LEGACY-V1",
     "V04-C-SNAPSHOT-SELECTION-V1",
     "V04-C-V03-COMPATIBILITY-V1",
 }
@@ -24,6 +27,10 @@ _CASE_IDS = {
     "V04-A-ANALYSIS-CATALOG-V1",
     "V04-A-HISTORICAL-WRITE-LOCK-V1",
     "V04-A-MATRIX-VALIDATION-V1",
+    "V04-A-RUN-ANALYSIS-LEGACY-V1",
+    "V04-A-RUN-ANALYSIS-NONSTART-V1",
+    "V04-A-RUN-ANALYSIS-PLAN-V1",
+    "V04-A-RUN-ANALYSIS-REQUEST-V1",
     "V04-A-SNAPSHOT-SELECTION-V1",
     "V04-A-SNAPSHOT-UNAVAILABLE-V1",
     "V04-A-V03-COMPATIBILITY-V1",
@@ -75,7 +82,11 @@ def validate_matrix(
         "ProjectionUnavailable",
         "SnapshotCatalog",
     }
-    assert _references(matrix, "write_plan_variants") == {"HistoricalModeWritePlan"}
+    assert _references(matrix, "write_request_variants") == {"RunAnalysis"}
+    assert _references(matrix, "write_plan_variants") == {
+        "HistoricalModeWritePlan",
+        "RunAnalysisPlan",
+    }
     assert {str(item.analysis_definition_id) for item in analysis_definitions()} == _DEFINITION_IDS
     assert hasattr(application.HealthLab, "load_analysis_catalog")
     assert hasattr(application.HealthLab, "load_snapshot_catalog")
@@ -83,6 +94,8 @@ def validate_matrix(
     assert hasattr(application, "ProjectionUnavailable")
     assert hasattr(application, "SnapshotCatalog")
     assert hasattr(application, "HistoricalModeWritePlan")
+    assert hasattr(application, "RunAnalysis")
+    assert hasattr(application, "RunAnalysisPlan")
 
     contracts = _rows(matrix, "contract")
     hash_references = _rows(matrix, "hash_reference")

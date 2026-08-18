@@ -1753,7 +1753,6 @@ def test_streamlit_shows_the_pinned_historical_review_plan(
     "ImportHealthExportPlan",
     "ImportReceipt",
     "ImportStatus",
-    "RunRestingHeartRateAnalysis",
     "RestingHeartRateAnalysisPlan",
     "AnalysisReceipt",
     "AnalysisStatus",

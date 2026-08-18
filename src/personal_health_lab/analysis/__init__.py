@@ -1,9 +1,15 @@
 """Fixed V0.4 analysis definitions."""
 
 from dataclasses import dataclass
+from datetime import date
 from enum import StrEnum
 
-from personal_health_lab.storage import AnalysisDefinitionId
+from personal_health_lab.storage import (
+    AnalysisDefinitionId,
+    AnalysisResultId,
+    AnalysisRunId,
+    SnapshotId,
+)
 
 
 class AnalysisResultFamily(StrEnum):
@@ -229,6 +235,24 @@ class AnalysisDefinition:
             raise ValueError("Ergebnisfamilie und Methodenfakten passen nicht zusammen.")
 
 
+@dataclass(frozen=True, slots=True)
+class AnalysisReuseCandidate:
+    analysis_run_id: AnalysisRunId
+    result_ref: AnalysisResultId
+
+
+@dataclass(frozen=True, slots=True)
+class RunAnalysisPlan:
+    analysis_definition: AnalysisDefinition
+    requested_start_date: date | None
+    requested_end_date: date | None
+    eligible_start_date: date | None
+    eligible_end_date: date | None
+    schema_version: str
+    base_snapshot_ref: SnapshotId | None
+    reuse_candidate: AnalysisReuseCandidate | None
+
+
 _LAG_INPUTS = (
     AnalysisInput.ACTIVE_ENERGY,
     AnalysisInput.TRAINING_TIME,
@@ -382,6 +406,40 @@ def analysis_definitions() -> tuple[AnalysisDefinition, ...]:
     return _DEFINITIONS
 
 
+def plan_analysis(
+    analysis_definition_id: AnalysisDefinitionId,
+    start_date: date | None,
+    end_date: date | None,
+    schema_version: str,
+    snapshot_id: SnapshotId | None,
+    available_start_date: date | None,
+    available_end_date: date | None,
+    reuse_candidate: AnalysisReuseCandidate | None = None,
+) -> RunAnalysisPlan:
+    definition = next(
+        item for item in _DEFINITIONS if item.analysis_definition_id == analysis_definition_id
+    )
+    eligible_start_date: date | None = None
+    eligible_end_date: date | None = None
+    if available_start_date is not None and available_end_date is not None:
+        eligible_start = max(
+            value for value in (available_start_date, start_date) if value is not None
+        )
+        eligible_end = min(value for value in (available_end_date, end_date) if value is not None)
+        if eligible_start <= eligible_end:
+            eligible_start_date, eligible_end_date = eligible_start, eligible_end
+    return RunAnalysisPlan(
+        definition,
+        start_date,
+        end_date,
+        eligible_start_date,
+        eligible_end_date,
+        schema_version,
+        snapshot_id,
+        reuse_candidate,
+    )
+
+
 __all__ = [
     "AnalysisBootstrapMethod",
     "AnalysisDefinition",
@@ -390,6 +448,7 @@ __all__ = [
     "AnalysisIntervalMethod",
     "AnalysisMethodFacts",
     "AnalysisResultFamily",
+    "AnalysisReuseCandidate",
     "AssociationMeasure",
     "BootstrapBlockLengthFacts",
     "BootstrapMethodFacts",
@@ -399,10 +458,12 @@ __all__ = [
     "LagProfileMethodFacts",
     "OutcomeAssociationMaturityFacts",
     "OutcomeAssociationMethodFacts",
+    "RunAnalysisPlan",
     "TrendUncertainty",
     "WeightCoreMaturityFacts",
     "WeightCoreMethodFacts",
     "WeightTrendKernel",
     "WeightWindowMethodFacts",
     "analysis_definitions",
+    "plan_analysis",
 ]

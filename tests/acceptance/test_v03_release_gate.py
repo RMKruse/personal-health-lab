@@ -41,7 +41,7 @@ def test_v03_public_application_surface_is_exact_and_closed() -> None:
         "RevokeDataReviewDecision",
         "RollbackMigration",
         "RunHistoricalReview",
-        "RunRestingHeartRateAnalysis",
+        "RunAnalysis",
     }
     assert _names(WritePlanDetails) == {
         "AbortMetadataRestorePlan",
@@ -58,6 +58,7 @@ def test_v03_public_application_surface_is_exact_and_closed() -> None:
         "MetadataRestorePlan",
         "PlausibilityRuleVersionPlan",
         "RestingHeartRateAnalysisPlan",
+        "RunAnalysisPlan",
         "RollbackMigrationPlan",
         "StoreMigrationPlan",
     }

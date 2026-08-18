@@ -8,7 +8,8 @@ analysis_definition_ids = [
 ]
 read_operations = ["load_analysis_catalog", "load_snapshot_catalog"]
 projection_variants = ["AnalysisCatalog", "ProjectionUnavailable", "SnapshotCatalog"]
-write_plan_variants = ["HistoricalModeWritePlan"]
+write_request_variants = ["RunAnalysis"]
+write_plan_variants = ["HistoricalModeWritePlan", "RunAnalysisPlan"]
 
 [[contract]]
 id = "V04-C-ANALYSIS-CATALOG-V1"
@@ -35,10 +36,25 @@ id = "V04-C-V03-COMPATIBILITY-V1"
 source = "https://github.com/RMKruse/personal-health-lab/issues/113"
 statement = "The delivered V0.4 snapshot selection slice preserves the existing V0.3 application behavior."
 
+[[contract]]
+id = "V04-C-RUN-ANALYSIS-PLAN-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/114"
+statement = "RunAnalysis accepts only a fixed definition, optional inclusive date bounds, and input schema 1.0; its preview binds the active snapshot, requested and eligible periods, approval, and an optional reuse candidate."
+
+[[contract]]
+id = "V04-C-RUN-ANALYSIS-RECHECK-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/114"
+statement = "RunAnalysis rechecks request-bound plan facts and the fingerprint under the shared writer lock; plan_changed, store_busy, and blocked never create a model run."
+
+[[contract]]
+id = "V04-C-RUN-ANALYSIS-LEGACY-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/114"
+statement = "The old resting-heart-rate request remains executable only as JSON 3.0 adapter compatibility and is absent from the canonical V0.4 WriteRequest union."
+
 [[hash_reference]]
 id = "V04-H-ANALYSIS-DEFINITIONS-V1"
 artifact = "src/personal_health_lab/analysis/__init__.py"
-sha256 = "05d77947ed0537d620edb7a49b0c7036b8b938cd9651faec7286749bddf89a07"
+sha256 = "525e75404ef968d95fac66e5907cf57fb5b1a63dd0446dcff26c4a859d6c5f72"
 
 [[hash_reference]]
 id = "V04-H-LAG-CALIBRATION-V1"
@@ -144,3 +160,43 @@ level = "application"
 platform = "all"
 expected_result = "unchanged V0.3 immutable context snapshot and baseline projection"
 forbidden_side_effects = "no V0.3 request, receipt, or projection contract change"
+
+[[case]]
+id = "V04-A-RUN-ANALYSIS-REQUEST-V1"
+contracts = ["V04-C-RUN-ANALYSIS-PLAN-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1"]
+runner = "tests/acceptance/test_v04_run_analysis.py::test_run_analysis_is_the_only_canonical_analysis_request_and_validates_inputs"
+level = "application"
+platform = "all"
+expected_result = "one canonical RunAnalysis variant with closed definition IDs, inclusive bounds, and input schema 1.0"
+forbidden_side_effects = "no free formula, runtime parameter, unknown definition, invalid range, or legacy request in the canonical union"
+
+[[case]]
+id = "V04-A-RUN-ANALYSIS-PLAN-V1"
+contracts = ["V04-C-RUN-ANALYSIS-PLAN-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1"]
+runner = "tests/acceptance/test_v04_run_analysis.py::test_run_analysis_preview_binds_definition_snapshot_and_inclusive_eligible_range"
+level = "application"
+platform = "all"
+expected_result = "definition, active snapshot, requested and eligible inclusive ranges, approval, and optional reuse candidate"
+forbidden_side_effects = "no model fit, snapshot mutation, or unrequested analysis parameter"
+
+[[case]]
+id = "V04-A-RUN-ANALYSIS-NONSTART-V1"
+contracts = ["V04-C-RUN-ANALYSIS-RECHECK-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1"]
+runner = "tests/acceptance/test_v04_run_analysis.py::test_run_analysis_nonstart_paths_never_create_a_model_run"
+level = "application"
+platform = "all"
+expected_result = "typed blocked, store_busy, and plan_changed outcomes after writer-lock recheck"
+forbidden_side_effects = "no AnalysisRunId, model fit, result, or partial publication"
+
+[[case]]
+id = "V04-A-RUN-ANALYSIS-LEGACY-V1"
+contracts = ["V04-C-RUN-ANALYSIS-LEGACY-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1"]
+runner = "tests/adapters/test_cli.py::test_cli_runs_and_exposes_the_built_in_lag_analysis"
+level = "application"
+platform = "all"
+expected_result = "the existing JSON 3.0 resting-heart-rate adapter path remains executable"
+forbidden_side_effects = "no legacy request variant in the canonical V0.4 WriteRequest union"

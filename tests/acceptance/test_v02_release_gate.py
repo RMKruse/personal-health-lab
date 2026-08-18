@@ -47,8 +47,8 @@ def test_public_application_surface_is_exact_and_closed(tmp_path: Path) -> None:
         ),
         "RollbackMigration": ({"RollbackMigrationPlan"}, {"RollbackMigrationReceipt"}),
         "RunHistoricalReview": ({"HistoricalReviewPlan"}, {"HistoricalReviewReceipt"}),
-        "RunRestingHeartRateAnalysis": (
-            {"RestingHeartRateAnalysisPlan"},
+        "RunAnalysis": (
+            {"RunAnalysisPlan"},
             {"AnalysisReceipt"},
         ),
     }
@@ -98,9 +98,9 @@ def test_public_application_surface_is_exact_and_closed(tmp_path: Path) -> None:
                 date(2024, 1, 2),
             )
         ],
-        "RunRestingHeartRateAnalysis": [
-            application.RunRestingHeartRateAnalysis(
-                application.AnalysisDefinitionId("lag-signal-v2")
+        "RunAnalysis": [
+            application.RunAnalysis(
+                application.AnalysisDefinitionId("rhr-activity-lag-1-7-v1")
             )
         ],
     }
@@ -194,7 +194,7 @@ def test_adapter_parity_registry_is_exact_and_closed() -> None:
         "RevokeDataReviewDecision",
         "RollbackMigration",
         "RunHistoricalReview",
-        "RunRestingHeartRateAnalysis",
+        "RunAnalysis",
     } <= _names(WriteRequest)
 
 

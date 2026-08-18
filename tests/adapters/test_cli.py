@@ -1836,7 +1836,6 @@ def test_cli_imports_export_and_prints_daily_series(
 
 @pytest.mark.v02_adapter(
     "cli",
-    "RunRestingHeartRateAnalysis",
     "RestingHeartRateAnalysisPlan",
     "AnalysisReceipt",
     "AnalysisStatus",
