@@ -222,6 +222,7 @@ def test_started_run_freezes_input_and_persists_insufficient_data_without_result
     )
     assert payload["scalings"]
     assert all(item["population_standard_deviation"] is None for item in payload["scalings"])
+    assert {item["status"] for item in payload["scalings"]} == {"unavailable"}
     with HealthLab.open(runtime) as health_lab:
         _import(health_lab, _package(tmp_path / "later.zip", day=3, value=2))
     assert artifact.read_bytes() == frozen_input
@@ -295,7 +296,12 @@ def test_analysis_bundle_uses_corrected_workout_energy(tmp_path: Path) -> None:
               sourceName="Apple Watch" sourceVersion="1" device="Apple Watch"
               creationDate="2024-01-02 20:31:00 +0100"
               startDate="2024-01-02 20:00:00 +0100"
-              endDate="2024-01-02 20:30:00 +0100"/></HealthData>""",
+              endDate="2024-01-02 20:30:00 +0100"/>
+            <Workout workoutActivityType="HKWorkoutActivityTypeRunning" duration="30"
+              durationUnit="min" sourceName="Apple Watch" sourceVersion="1"
+              device="Apple Watch" creationDate="2024-01-02 21:31:00 +0100"
+              startDate="2024-01-02 21:00:00 +0100"
+              endDate="2024-01-02 21:30:00 +0100"/></HealthData>""",
         )
     runtime = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
     with HealthLab.open(runtime) as health_lab:
@@ -324,6 +330,41 @@ def test_analysis_bundle_uses_corrected_workout_energy(tmp_path: Path) -> None:
         ).read_bytes()
     )
     assert any(
-        value["input_id"] == "workout_energy_by_type" and value["value"] == 50.0
+        value["input_id"] == "workout_energy_by_type"
+        and value["value"] == 50.0
+        and value["missingness"] == "partial"
+        and len(value["source_evidence"]) == 2
         for value in payload["values"]
     )
+
+
+def test_analysis_bundle_omits_unrelated_input_quality_facts(tmp_path: Path) -> None:
+    runtime = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    request = RunAnalysis(AnalysisDefinitionId("rhr-weight-association-7-14-30-90-v1"))
+    with HealthLab.open(runtime) as health_lab:
+        _import(health_lab, _package(tmp_path / "snapshot.zip", day=2))
+        receipt = health_lab.execute_write(
+            request,
+            expected_plan=health_lab.preview_write(request).fingerprint,
+        ).result
+    assert isinstance(receipt, AnalysisReceipt)
+    with sqlite3.connect(runtime.active_store / "metadata.sqlite3") as metadata:
+        assert metadata.execute(
+            "SELECT data_status FROM analysis_runs WHERE analysis_run_id = ?",
+            (str(receipt.analysis_run_id),),
+        ).fetchone() == ("reviewed",)
+    payload = json.loads(
+        (
+            runtime.active_store
+            / "parquet"
+            / "analysis-inputs"
+            / f"{receipt.analysis_run_id}.json"
+        ).read_bytes()
+    )
+    assert {value["input_id"] for value in payload["values"]} == {
+        "apple_resting_heart_rate",
+        "preferred_daily_weight",
+    }
+    assert payload["data_quality_fact_ids"] == []
+    assert payload["activity_coverage_incomplete"] is False
+    assert "activity-derivation/v1" not in payload["rule_versions"]

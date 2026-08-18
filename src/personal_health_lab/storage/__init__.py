@@ -4,6 +4,7 @@ from personal_health_lab import DataMode
 from personal_health_lab.health_data import (
     AnalysisDataStatusReason,
     AnalysisFreshness,
+    CanonicalHealthType,
     CanonicalUnit,
     DataQualityStatus,
     DataStatusReasonCode,
@@ -128,6 +129,7 @@ __all__ = [
     "BackupImportFact",
     "BackupSnapshotFact",
     "BackupSnapshotOrigin",
+    "CanonicalHealthType",
     "CanonicalUnit",
     "CapacityCheck",
     "CapacityMethodId",

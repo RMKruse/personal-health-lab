@@ -9098,8 +9098,14 @@ class LocalStore:
         snapshot_id: SnapshotId,
         start_date: date | None,
         end_date: date | None,
+        data_types: tuple[CanonicalHealthType, ...],
     ) -> tuple[SnapshotId | None, tuple[StoredMeasurement, ...]]:
-        return self._load_measurements(snapshot_id, start_date, end_date, "TRUE")
+        if not data_types:
+            return snapshot_id, ()
+        type_clause = "versions.canonical_type IN (" + ", ".join(
+            f"'{item.value}'" for item in data_types
+        ) + ")"
+        return self._load_measurements(snapshot_id, start_date, end_date, type_clause)
 
     def load_analysis_activity_inputs(
         self,
@@ -9399,54 +9405,46 @@ class LocalStore:
         def local_time(value: str, offset: int) -> datetime:
             return datetime.fromisoformat(value).astimezone(timezone(timedelta(minutes=offset)))
 
-        return selected_snapshot, tuple(
-            StoredWorkout(
-                LogicalMeasurementId(str(row[1])),
-                MeasurementVersionId(str(row[0])),
+        def stored_workout(row: tuple[object, ...]) -> StoredWorkout:
+            version_id = str(row[0])
+            logical_id = str(row[1])
+            selected = resolved.get(logical_id)
+            if selected is not None and selected.selected_workout_version_id != version_id:
+                selected = None
+            return StoredWorkout(
+                LogicalMeasurementId(logical_id),
+                MeasurementVersionId(version_id),
                 str(row[2]),
-                local_time(str(row[3]), int(row[6])),
-                local_time(str(row[4]), int(row[7])),
-                local_time(str(row[5]), int(row[8])),
-                row[9],
+                local_time(str(row[3]), int(str(row[6]))),
+                local_time(str(row[4]), int(str(row[7]))),
+                local_time(str(row[5]), int(str(row[8]))),
+                cast(date, row[9]),
                 str(row[10]),
                 str(row[11]),
                 str(row[12]),
                 None if row[13] is None else str(row[13]),
-                None if row[14] is None else float(row[14]),
+                None if row[14] is None else float(str(row[14])),
                 (
-                    resolved[str(row[1])].distance_kilometers
-                    if str(row[1]) in resolved
-                    and resolved[str(row[1])].selected_workout_version_id == str(row[0])
-                    else None if row[15] is None else float(row[15])
+                    selected.distance_kilometers
+                    if selected is not None
+                    else None if row[15] is None else float(str(row[15]))
                 ),
                 (
-                    resolved[str(row[1])].active_energy_kilocalories
-                    if str(row[1]) in resolved
-                    and resolved[str(row[1])].selected_workout_version_id == str(row[0])
-                    else None if row[16] is None else float(row[16])
+                    selected.active_energy_kilocalories
+                    if selected is not None
+                    else None if row[16] is None else float(str(row[16]))
                 ),
                 (
-                    resolved[str(row[1])].selected_workout_version_id == str(row[0])
-                    and resolved[str(row[1])].disposition.startswith("included")
-                    if str(row[1]) in resolved
+                    selected.disposition.startswith("included")
+                    if selected is not None
                     else bool(row[17])
                 ),
-                (
-                    resolved[str(row[1])].effective_duration_minutes
-                    if str(row[1]) in resolved
-                    and resolved[str(row[1])].selected_workout_version_id == str(row[0])
-                    else None
-                ),
-                (
-                    resolved[str(row[1])].disposition
-                    if str(row[1]) in resolved
-                    and resolved[str(row[1])].selected_workout_version_id == str(row[0])
-                    else None
-                ),
-                review_cases.get(str(row[0]), ()),
+                None if selected is None else selected.effective_duration_minutes,
+                None if selected is None else selected.disposition,
+                review_cases.get(version_id, ()),
             )
-            for row in rows
-        )
+
+        return selected_snapshot, tuple(stored_workout(row) for row in rows)
 
     def load_workout_review_case_versions(
         self, review_case_id: str

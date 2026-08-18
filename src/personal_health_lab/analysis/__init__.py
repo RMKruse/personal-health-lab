@@ -18,6 +18,7 @@ from personal_health_lab.storage import (
     AnalysisResultId,
     AnalysisRunConfiguration,
     AnalysisRunId,
+    CanonicalHealthType,
     CanonicalUnit,
     DataQualityStatus,
     InsufficientAnalysisRunPublication,
@@ -276,6 +277,7 @@ class RunAnalysisPlan:
 
 class AnalysisMissingness(StrEnum):
     OBSERVED = "observed"
+    PARTIAL = "partial"
     MISSING = "missing"
     AMBIGUOUS = "ambiguous"
 
@@ -285,11 +287,13 @@ class AnalysisMissingnessReason(StrEnum):
     EXCLUDED_OR_UNRESOLVED = "excluded_or_unresolved"
     CONFLICTING_VALUES = "conflicting_values"
     INPUT_NOT_AVAILABLE = "input_not_available"
+    PARTIAL_OBSERVATION = "partial_observation"
 
 
 class AnalysisScalingStatus(StrEnum):
     OBSERVED = "observed"
     INSUFFICIENT_OBSERVATIONS = "insufficient_observations"
+    UNAVAILABLE = "unavailable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -764,15 +768,17 @@ def _workout_value(
             AnalysisMissingnessReason.NO_OBSERVATION,
             quality_status,
         )
+    partial = len(values) != len(eligible)
     return AnalysisInputValue(
         day,
         input_id,
         component,
         unit,
         sum(values),
-        AnalysisMissingness.OBSERVED,
+        AnalysisMissingness.PARTIAL if partial else AnalysisMissingness.OBSERVED,
         _workout_source_evidence(eligible),
         quality_ids,
+        AnalysisMissingnessReason.PARTIAL_OBSERVATION if partial else None,
         quality_status=quality_status,
     )
 
@@ -954,7 +960,7 @@ def build_analysis_input_bundle(
                 input_id,
                 component,
                 None,
-                AnalysisScalingStatus.INSUFFICIENT_OBSERVATIONS,
+                AnalysisScalingStatus.UNAVAILABLE,
             )
         )
     quality_ids = tuple(
@@ -1090,22 +1096,44 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
         raise ValueError("Analyseplan besitzt keinen Snapshot.")
     operation_id = OperationId(uuid4().hex)
     run_id = AnalysisRunId(uuid4().hex)
+    required = plan.analysis_definition.method_facts.inputs
+    required_data_types = tuple(
+        CanonicalHealthType(data_type)
+        for data_type, (input_id, _) in _MEASUREMENT_INPUTS.items()
+        if input_id in required
+    )
     snapshot_id, measurements = store.load_analysis_measurements(
         plan.base_snapshot_ref,
         plan.eligible_start_date,
         plan.eligible_end_date,
+        required_data_types,
     )
-    workout_snapshot_id, workouts = store.load_workouts(
-        plan.base_snapshot_ref,
-        plan.eligible_start_date,
-        plan.eligible_end_date,
+    uses_workouts = any(
+        item
+        in {
+            AnalysisInput.WORKOUT_DURATION_BY_TYPE,
+            AnalysisInput.WORKOUT_ENERGY_BY_TYPE,
+        }
+        for item in required
     )
+    workout_snapshot_id, workouts = (
+        store.load_workouts(
+            plan.base_snapshot_ref,
+            plan.eligible_start_date,
+            plan.eligible_end_date,
+        )
+        if uses_workouts
+        else (plan.base_snapshot_ref, ())
+    )
+    uses_activity = any(item in _ACTIVITY_INPUTS for item in required)
     activity_snapshot_id, activity_values, activity_coverage_incomplete = (
         store.load_analysis_activity_inputs(
             plan.base_snapshot_ref,
             plan.eligible_start_date,
             plan.eligible_end_date,
         )
+        if uses_activity
+        else (plan.base_snapshot_ref, (), False)
     )
     if (
         snapshot_id != plan.base_snapshot_ref
@@ -1120,7 +1148,11 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
         workouts=workouts,
         activity_values=activity_values,
         activity_coverage_incomplete=activity_coverage_incomplete,
-        plausibility_rules=store.load_plausibility_rule_versions(),
+        plausibility_rules=tuple(
+            rule
+            for rule in store.load_plausibility_rule_versions()
+            if rule.data_type in {item.value for item in required_data_types}
+        ),
         activity_derivation=store.load_activity_derivation_version(plan.base_snapshot_ref),
     )
     artifact = json.dumps(
