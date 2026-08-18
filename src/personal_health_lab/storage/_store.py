@@ -1453,6 +1453,14 @@ class BackupSnapshotFact:
 
 
 @dataclass(frozen=True, slots=True)
+class SnapshotCatalogFact:
+    snapshot_id: SnapshotId
+    is_active: bool
+    available_start_date: date | None
+    available_end_date: date | None
+
+
+@dataclass(frozen=True, slots=True)
 class BackupSnapshotOrigin:
     snapshot_id: SnapshotId
     schema_version: int
@@ -3049,6 +3057,48 @@ class LocalStore:
                 "ORDER BY snapshot_id"
             )
         )
+
+    def load_snapshot_catalog(self) -> tuple[SnapshotCatalogFact, ...]:
+        self._require_open()
+        try:
+            facts = []
+            for snapshot_id, is_active in self._metadata.execute(
+                "SELECT snapshot.snapshot_id, active.snapshot_id IS NOT NULL "
+                "FROM dataset_snapshots snapshot "
+                "LEFT JOIN active_snapshot active USING (snapshot_id) "
+                "ORDER BY snapshot.created_at_utc DESC, snapshot.snapshot_id"
+            ):
+                directory = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
+                sources = (
+                    ("measurement_versions.parquet", "measurement_local_date"),
+                    ("workouts.parquet", "measurement_local_date"),
+                    ("weight_nutrition_days.parquet", "day"),
+                    ("sleep_nights.parquet", "day"),
+                    ("activity_days.parquet", "day"),
+                    ("workout_features.parquet", "day"),
+                    ("daily_context.parquet", "day"),
+                    ("medication_context.parquet", "day"),
+                )
+                days = " UNION ALL ".join(
+                    f"SELECT {column} AS day FROM read_parquet("
+                    f"'{str(directory / filename).replace(chr(39), chr(39) * 2)}')"
+                    for filename, column in sources
+                )
+                bounds = self._query.execute(
+                    f"SELECT min(day), max(day) FROM ({days})"
+                ).fetchone()
+                assert bounds is not None
+                facts.append(
+                    SnapshotCatalogFact(
+                        SnapshotId(str(snapshot_id)),
+                        bool(is_active),
+                        None if bounds[0] is None else cast(date, bounds[0]),
+                        None if bounds[1] is None else cast(date, bounds[1]),
+                    )
+                )
+            return tuple(facts)
+        except (duckdb.Error, sqlite3.Error) as error:
+            raise StoreError("Snapshot-Zeitgrenzen sind nicht verfügbar.") from error
 
     def load_backup_snapshot_origin(self) -> BackupSnapshotOrigin | None:
         self._require_open()

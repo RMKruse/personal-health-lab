@@ -6,8 +6,9 @@ analysis_definition_ids = [
   "weight-core-7-14-30-90-v1",
   "rhr-weight-association-7-14-30-90-v1",
 ]
-read_operations = ["load_analysis_catalog"]
-projection_variants = ["AnalysisCatalog"]
+read_operations = ["load_analysis_catalog", "load_snapshot_catalog"]
+projection_variants = ["AnalysisCatalog", "ProjectionUnavailable", "SnapshotCatalog"]
+write_plan_variants = ["HistoricalModeWritePlan"]
 
 [[contract]]
 id = "V04-C-ANALYSIS-CATALOG-V1"
@@ -18,6 +19,21 @@ statement = "HealthLab projects exactly four immutable versioned analysis defini
 id = "V04-C-MATRIX-VALIDATION-V1"
 source = "https://github.com/RMKruse/personal-health-lab/issues/112"
 statement = "The growing V0.4 delta matrix rejects open definition IDs, case IDs, runners, and hash references."
+
+[[contract]]
+id = "V04-C-SNAPSHOT-SELECTION-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/113"
+statement = "Snapshot catalog selection resolves active references dynamically, keeps explicit historical references pinned, and returns closed reasons for unavailable selections."
+
+[[contract]]
+id = "V04-C-HISTORICAL-WRITE-LOCK-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/113"
+statement = "Every write preview is blocked in historical reproduction mode without changing the active snapshot and unlocks when active selection is restored."
+
+[[contract]]
+id = "V04-C-V03-COMPATIBILITY-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/113"
+statement = "The delivered V0.4 snapshot selection slice preserves the existing V0.3 application behavior."
 
 [[hash_reference]]
 id = "V04-H-ANALYSIS-DEFINITIONS-V1"
@@ -68,3 +84,63 @@ level = "meta"
 platform = "all"
 expected_result = "closed IDs, cases, runners, and current SHA-256 references"
 forbidden_side_effects = "no open reference, stale calibration artifact, or unregistered runner"
+
+[[case]]
+id = "V04-A-SNAPSHOT-SELECTION-V1"
+contracts = ["V04-C-SNAPSHOT-SELECTION-V1"]
+hash_references = [
+  "V04-H-ANALYSIS-DEFINITIONS-V1",
+  "V04-H-LAG-CALIBRATION-V1",
+  "V04-H-OUTCOME-ASSOCIATION-CALIBRATION-V1",
+  "V04-H-WEIGHT-CALIBRATION-V1",
+]
+runner = "tests/acceptance/test_v04_snapshot_catalog.py::test_snapshot_catalog_tracks_active_selection_and_keeps_explicit_selection_pinned"
+level = "application"
+platform = "all"
+expected_result = "dynamic active selection and stable explicit historical selection with typed date bounds and actions"
+forbidden_side_effects = "no storage path, SQL shape, Parquet shape, or active snapshot mutation"
+
+[[case]]
+id = "V04-A-SNAPSHOT-UNAVAILABLE-V1"
+contracts = ["V04-C-SNAPSHOT-SELECTION-V1"]
+hash_references = [
+  "V04-H-ANALYSIS-DEFINITIONS-V1",
+  "V04-H-LAG-CALIBRATION-V1",
+  "V04-H-OUTCOME-ASSOCIATION-CALIBRATION-V1",
+  "V04-H-WEIGHT-CALIBRATION-V1",
+]
+runner = "tests/acceptance/test_v04_snapshot_catalog.py::test_snapshot_catalog_returns_closed_reasons_for_missing_selections"
+level = "application"
+platform = "all"
+expected_result = "closed no_snapshot and snapshot_not_found projection reasons"
+forbidden_side_effects = "no technical exception or inferred replacement snapshot"
+
+[[case]]
+id = "V04-A-HISTORICAL-WRITE-LOCK-V1"
+contracts = ["V04-C-HISTORICAL-WRITE-LOCK-V1"]
+hash_references = [
+  "V04-H-ANALYSIS-DEFINITIONS-V1",
+  "V04-H-LAG-CALIBRATION-V1",
+  "V04-H-OUTCOME-ASSOCIATION-CALIBRATION-V1",
+  "V04-H-WEIGHT-CALIBRATION-V1",
+]
+runner = "tests/acceptance/test_v04_snapshot_catalog.py::test_historical_selection_blocks_write_preview_and_active_selection_unlocks"
+level = "application"
+platform = "all"
+expected_result = "historical_snapshot_read_only blocks preview and execution until active selection is restored"
+forbidden_side_effects = "no write, activation, or pinned historical selection drift"
+
+[[case]]
+id = "V04-A-V03-COMPATIBILITY-V1"
+contracts = ["V04-C-V03-COMPATIBILITY-V1"]
+hash_references = [
+  "V04-H-ANALYSIS-DEFINITIONS-V1",
+  "V04-H-LAG-CALIBRATION-V1",
+  "V04-H-OUTCOME-ASSOCIATION-CALIBRATION-V1",
+  "V04-H-WEIGHT-CALIBRATION-V1",
+]
+runner = "tests/acceptance/test_v03_context.py::test_context_coverage_start_publishes_an_immutable_snapshot_and_baseline"
+level = "application"
+platform = "all"
+expected_result = "unchanged V0.3 immutable context snapshot and baseline projection"
+forbidden_side_effects = "no V0.3 request, receipt, or projection contract change"

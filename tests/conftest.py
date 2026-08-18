@@ -64,6 +64,7 @@ _V03_VARIANTS |= {
     "WorkoutCorrection",
     "LocalWorkoutExclusion",
 }
+_V04_APPLICATION_VARIANTS = {"HistoricalModeWritePlan"}
 _V03_VARIANTS |= {
     name
     for name in application.__all__
@@ -99,7 +100,7 @@ _PUBLIC_ADAPTER_VARIANTS |= {
         )
     )
 }
-_V02_ADAPTER_VARIANTS = _PUBLIC_ADAPTER_VARIANTS - _V03_VARIANTS
+_V02_ADAPTER_VARIANTS = _PUBLIC_ADAPTER_VARIANTS - _V03_VARIANTS - _V04_APPLICATION_VARIANTS
 _V02_ADAPTER_VARIANTS |= {
     "AsNeededIntakePlan",
     "AsNeededIntakeReceipt",

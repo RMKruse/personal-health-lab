@@ -50,6 +50,7 @@ def test_v03_public_application_surface_is_exact_and_closed() -> None:
         "DataReviewBatchRevokePlan",
         "DataReviewDecisionPlan",
         "HistoricalReviewPlan",
+        "HistoricalModeWritePlan",
         "ImportHealthExportPlan",
         "ManualContextRevisionPlan",
         "MedicationRevisionPlan",

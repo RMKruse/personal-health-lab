@@ -296,8 +296,73 @@ class SnapshotDateSelection:
 class SnapshotSelection:
     snapshot_ref: SnapshotRef | None = None
 
+    def __post_init__(self) -> None:
+        if self.snapshot_ref is not None and not isinstance(self.snapshot_ref, SnapshotId):
+            raise ConfigurationError("Snapshot-Referenz ist ungültig.")
+
 
 _ACTIVE_SNAPSHOT_SELECTION = SnapshotSelection()
+
+
+class SnapshotSelectionMode(StrEnum):
+    ACTIVE = "active"
+    HISTORICAL = "historical"
+
+
+class SnapshotAction(StrEnum):
+    READ = "read"
+    WRITE = "write"
+
+
+class ProjectionUnavailableCode(StrEnum):
+    NO_SNAPSHOT = "no_snapshot"
+    SNAPSHOT_NOT_FOUND = "snapshot_not_found"
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectionUnavailable:
+    projection_id: Literal["snapshot-catalog"]
+    projection_version: int
+    code: ProjectionUnavailableCode
+    snapshot_ref: SnapshotRef | None
+
+    def __post_init__(self) -> None:
+        if self.projection_id != "snapshot-catalog" or self.projection_version <= 0:
+            raise ValueError("Nicht verfügbare Projektion ist ungültig.")
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotCatalogEntry:
+    snapshot_ref: SnapshotRef
+    is_active: bool
+    available_start_date: date | None
+    available_end_date: date | None
+    allowed_actions: tuple[SnapshotAction, ...]
+
+    def __post_init__(self) -> None:
+        if (self.available_start_date is None) != (self.available_end_date is None):
+            raise ValueError("Snapshot-Zeitgrenzen sind unvollständig.")
+        if (
+            self.available_start_date is not None
+            and self.available_end_date is not None
+            and self.available_start_date > self.available_end_date
+        ):
+            raise ValueError("Snapshot-Zeitgrenzen sind ungültig.")
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotCatalog:
+    snapshots: tuple[SnapshotCatalogEntry, ...]
+    selected_snapshot_ref: SnapshotRef
+    selection_mode: SnapshotSelectionMode
+    projection_id: Literal["snapshot-catalog"] = "snapshot-catalog"
+    projection_version: int = 1
+
+    def __post_init__(self) -> None:
+        if self.projection_id != "snapshot-catalog" or self.projection_version <= 0:
+            raise ValueError("Snapshot-Katalogprojektion ist ungültig.")
+        if self.selected_snapshot_ref not in {item.snapshot_ref for item in self.snapshots}:
+            raise ValueError("Gewählter Snapshot fehlt im Katalog.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2305,6 +2370,11 @@ class RestingHeartRateAnalysisPlan:
     base_snapshot_ref: SnapshotRef | None
 
 
+@dataclass(frozen=True, slots=True)
+class HistoricalModeWritePlan:
+    snapshot_ref: SnapshotRef
+
+
 WritePlanDetails = (
     ImportHealthExportPlan
     | MetadataBackupPlan
@@ -2321,6 +2391,7 @@ WritePlanDetails = (
     | ManualContextRevisionPlan
     | MedicationRevisionPlan
     | ActivityDerivationPlan
+    | HistoricalModeWritePlan
 )
 
 
@@ -2731,10 +2802,29 @@ class HealthLab:
             self._store = None
         logger.info("healthlab_closed mode=%s", self._config.mode.value)
 
-    def preview_write(self, request: WriteRequest) -> WritePlan:
+    def preview_write(
+        self,
+        request: WriteRequest,
+        selection: SnapshotSelection = _ACTIVE_SNAPSHOT_SELECTION,
+    ) -> WritePlan:
         self._require_open()
+        if not isinstance(selection, SnapshotSelection):
+            raise ConfigurationError("Snapshot-Auswahl ist ungültig.")
         if not isinstance(request, (*get_args(WriteRequest), CreateActivityDerivationVersion)):
             raise ConfigurationError("Unbekannter Schreibauftrag.")
+        if selection.snapshot_ref is not None:
+            return WritePlan(
+                PlanFingerprint(
+                    hashlib.sha256(
+                        f"{request!r}:{selection.snapshot_ref}:historical".encode()
+                    ).hexdigest()
+                ),
+                HistoricalModeWritePlan(selection.snapshot_ref),
+                WritePreflight(
+                    WriteApproval(WriteApprovalStatus.BLOCKED),
+                    diagnostics=("historical_snapshot_read_only",),
+                ),
+            )
         if isinstance(request, BeginMetadataRestore):
             return self._build_metadata_restore_plan(request)
         if isinstance(request, AbortMetadataRestore):
@@ -5035,8 +5125,9 @@ class HealthLab:
         request: WriteRequest,
         *,
         expected_plan: PlanFingerprint,
+        selection: SnapshotSelection = _ACTIVE_SNAPSHOT_SELECTION,
     ) -> WriteReceipt:
-        current_plan = self.preview_write(request)
+        current_plan = self.preview_write(request, selection)
         authorization_plan = self._authorization_plan(request, current_plan, expected_plan)
         if authorization_plan is None:
             if current_plan.approval.status is WriteApprovalStatus.BLOCKED:
@@ -6805,6 +6896,58 @@ class HealthLab:
         self._require_ready()
         self._require_open()
         return AnalysisCatalog(analysis_definitions())
+
+    def load_snapshot_catalog(
+        self, selection: SnapshotSelection = _ACTIVE_SNAPSHOT_SELECTION
+    ) -> SnapshotCatalog | ProjectionUnavailable:
+        self._require_ready()
+        self._require_open()
+        if not isinstance(selection, SnapshotSelection):
+            raise ConfigurationError("Snapshot-Auswahl ist ungültig.")
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        try:
+            facts = self._store.load_snapshot_catalog()
+        except StoreError as error:
+            raise HealthLabError("Snapshot-Katalog ist nicht verfügbar.") from error
+        selected = (
+            next((item for item in facts if item.is_active), None)
+            if selection.snapshot_ref is None
+            else next((item for item in facts if item.snapshot_id == selection.snapshot_ref), None)
+        )
+        if selected is None:
+            return ProjectionUnavailable(
+                "snapshot-catalog",
+                1,
+                (
+                    ProjectionUnavailableCode.NO_SNAPSHOT
+                    if selection.snapshot_ref is None
+                    else ProjectionUnavailableCode.SNAPSHOT_NOT_FOUND
+                ),
+                selection.snapshot_ref,
+            )
+        return SnapshotCatalog(
+            tuple(
+                SnapshotCatalogEntry(
+                    item.snapshot_id,
+                    item.is_active,
+                    item.available_start_date,
+                    item.available_end_date,
+                    (
+                        (SnapshotAction.READ, SnapshotAction.WRITE)
+                        if item.is_active
+                        else (SnapshotAction.READ,)
+                    ),
+                )
+                for item in facts
+            ),
+            selected.snapshot_id,
+            (
+                SnapshotSelectionMode.ACTIVE
+                if selection.snapshot_ref is None
+                else SnapshotSelectionMode.HISTORICAL
+            ),
+        )
 
     def load_import_details(self, import_id: ImportId) -> ImportDetails:
         self._require_ready()
