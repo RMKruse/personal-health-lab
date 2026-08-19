@@ -1,3 +1,4 @@
+import sys
 import tomllib
 from collections.abc import Callable
 from enum import Enum
@@ -122,6 +123,27 @@ _V02_ADAPTER_VARIANTS |= {
 }
 _ACTIVE_V02_NODES: set[str] = set()
 _ACTIVE_V03_NODES: set[str] = set()
+
+
+@pytest.fixture(autouse=True)
+def stub_filevault_probe(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    if (
+        sys.platform != "darwin"
+        or request.path.name == "test_v02_store_preflight.py"
+        or request.node.name
+        in {
+            "test_real_json_import_renders_shared_confirmation_plan",
+            "test_streamlit_renders_the_shared_real_import_confirmation_plan",
+        }
+    ):
+        return
+    monkeypatch.setattr(
+        "personal_health_lab.application._application.probe_filevault",
+        lambda _path: application.FileVaultCheck(
+            application.FileVaultStatus.PROTECTED,
+            "test-volume",
+        ),
+    )
 
 
 def pytest_configure(config: pytest.Config) -> None:
