@@ -479,6 +479,14 @@ class StoreError(RuntimeError):
     """A local store cannot be opened safely."""
 
 
+class AnalysisArtifactUnavailableError(StoreError):
+    """A catalogued analysis result cannot currently be read."""
+
+
+class AnalysisArtifactIntegrityError(StoreError):
+    """A catalogued analysis result no longer matches its integrity facts."""
+
+
 class StoreConfigurationError(StoreError, ValueError):
     """A local store conflicts with its requested runtime configuration."""
 
@@ -1085,6 +1093,28 @@ class AnalysisRunPublication:
     maturity_criteria: tuple[ModelMaturityCriterion, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class AnalysisRunFact:
+    analysis_run_id: AnalysisRunId
+    result_id: AnalysisResultId | None
+    snapshot_id: SnapshotId
+    analysis_definition_id: AnalysisDefinitionId
+    start_date: date | None
+    end_date: date | None
+    status: Literal["completed", "insufficient_data", "unstable"]
+    model_maturity: ModelMaturityStatus | None
+    data_status: DataQualityStatus
+    data_status_reasons: tuple[AnalysisDataStatusReason, ...]
+    maturity_criteria: tuple[ModelMaturityCriterion, ...]
+    reproducibility: ReproducibilityStatus
+    diagnostics: tuple[str, ...]
+    completed_at: datetime
+    code_commit: str
+    code_dirty: bool
+    code_diff_hash: str | None
+    environment_lock_hash: str
+
+
 def _analysis_jsonl_rows(artifact: AnalysisJsonlArtifact) -> tuple[dict[str, object], ...]:
     if (
         artifact.schema_version <= 0
@@ -1154,6 +1184,49 @@ def _analysis_provenance(row: tuple[object, ...]) -> AnalysisProvenance:
         code_diff_hash=None if row[8] is None else str(row[8]),
         environment_lock_hash=str(row[9]),
     )
+
+
+def _analysis_run_fact(row: tuple[object, ...]) -> AnalysisRunFact:
+    status = str(row[6])
+    if status not in {"completed", "insufficient_data", "unstable"}:
+        raise StoreError("Analysehistorie enthält einen ungültigen technischen Ausgang.")
+    try:
+        return AnalysisRunFact(
+            AnalysisRunId(str(row[0])),
+            None if row[1] is None else AnalysisResultId(str(row[1])),
+            SnapshotId(str(row[2])),
+            AnalysisDefinitionId(str(row[3])),
+            None if row[4] is None else date.fromisoformat(str(row[4])),
+            None if row[5] is None else date.fromisoformat(str(row[5])),
+            cast(Literal["completed", "insufficient_data", "unstable"], status),
+            None if row[7] is None else ModelMaturityStatus(str(row[7])),
+            DataQualityStatus(str(row[8])),
+            tuple(
+                AnalysisDataStatusReason(
+                    DataStatusReasonCode(str(reason["code"])),
+                    tuple(cast(list[str], reason["evidence_ids"])),
+                )
+                for reason in cast(list[dict[str, object]], json.loads(str(row[9])))
+            ),
+            tuple(
+                ModelMaturityCriterion(
+                    ModelMaturityCriterionCode(str(criterion["code"])),
+                    bool(criterion["passed"]),
+                    cast(float | str, criterion["observed_value"]),
+                    cast(float | str, criterion["threshold"]),
+                )
+                for criterion in cast(list[dict[str, object]], json.loads(str(row[10])))
+            ),
+            ReproducibilityStatus(str(row[11])),
+            tuple(cast(list[str], json.loads(str(row[12])))),
+            datetime.fromisoformat(str(row[13])),
+            str(row[14]),
+            bool(row[15]),
+            None if row[16] is None else str(row[16]),
+            str(row[17]),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise StoreError("Analysehistorie ist beschädigt.") from error
 
 
 class AssociationDirection(StrEnum):
@@ -11944,6 +12017,180 @@ class LocalStore:
         if row is None:
             return None, ()
         return SnapshotId(str(row[0])), self.load_daily_series(start_date, end_date)
+
+    def load_analysis_runs(
+        self, snapshot_id: SnapshotId, analysis_definition_id: AnalysisDefinitionId
+    ) -> tuple[AnalysisRunFact, ...]:
+        self._require_open()
+        try:
+            rows = self._metadata.execute(
+                """
+                SELECT analysis_run_id, result_id, snapshot_id, analysis_definition_id,
+                       analysis_start_date, analysis_end_date, status, model_maturity,
+                       data_status, data_status_reasons, maturity_criteria,
+                       reproducibility, diagnostics, completed_at, code_commit,
+                       code_dirty, code_diff_hash, environment_lock_hash
+                FROM analysis_runs
+                WHERE snapshot_id = ? AND analysis_definition_id = ?
+                ORDER BY rowid DESC
+                """,
+                (str(snapshot_id), str(analysis_definition_id)),
+            ).fetchall()
+            return tuple(_analysis_run_fact(row) for row in rows)
+        except sqlite3.Error as error:
+            raise StoreError("Analysehistorie ist nicht verfügbar.") from error
+
+    def analysis_run_material_is_available(self, fact: AnalysisRunFact) -> bool:
+        self._require_open()
+        snapshot_manifest = (
+            self._root / _PARQUET_DIRECTORY / "snapshots" / str(fact.snapshot_id) / "manifest.json"
+        )
+        if not snapshot_manifest.is_file():
+            return False
+        try:
+            rows = self._metadata.execute(
+                """
+                SELECT artifact.artifact_kind, artifact.artifact_path,
+                       artifact.manifest_sha256, artifact.manifest_size_bytes,
+                       artifact.artifact_size_bytes, artifact.is_legacy,
+                       file.file_name, file.sha256, file.size_bytes
+                FROM analysis_artifacts AS artifact
+                JOIN analysis_artifact_files AS file
+                  USING (analysis_run_id, artifact_kind)
+                WHERE artifact.analysis_run_id = ?
+                ORDER BY artifact.artifact_kind, file.file_name
+                """,
+                (str(fact.analysis_run_id),),
+            ).fetchall()
+        except sqlite3.Error as error:
+            raise StoreError("Analyseartefakt-Katalog ist nicht verfügbar.") from error
+        required = {"input", *(("result",) if fact.status == "completed" else ())}
+        if {str(row[0]) for row in rows} != required:
+            return False
+        try:
+            for kind in required:
+                artifact_rows = tuple(row for row in rows if str(row[0]) == kind)
+                directory = self._root / str(artifact_rows[0][1])
+                manifest_name = (
+                    "manifest.json"
+                    if kind == "result" and bool(artifact_rows[0][5])
+                    else f"{kind}-manifest.json"
+                )
+                manifest = (directory / manifest_name).read_bytes()
+                files = tuple((directory / str(row[6])).read_bytes() for row in artifact_rows)
+                if (
+                    hashlib.sha256(manifest).hexdigest() != str(artifact_rows[0][2])
+                    or len(manifest) != int(artifact_rows[0][3])
+                    or sum(map(len, files), len(manifest)) != int(artifact_rows[0][4])
+                    or any(
+                        hashlib.sha256(payload).hexdigest() != str(row[7])
+                        or len(payload) != int(row[8])
+                        for row, payload in zip(artifact_rows, files, strict=True)
+                    )
+                ):
+                    return False
+        except (IndexError, OSError):
+            return False
+        return True
+
+    def load_analysis_result_artifact(
+        self,
+        analysis_run_id: AnalysisRunId,
+        result_id: AnalysisResultId,
+        analysis_definition_id: AnalysisDefinitionId,
+    ) -> AnalysisJsonlArtifact:
+        self._require_open()
+        try:
+            rows = self._metadata.execute(
+                """
+                SELECT artifact.result_id, artifact.result_family, artifact.schema_id,
+                       artifact.schema_version, artifact.content_hash,
+                       artifact.manifest_sha256, artifact.manifest_size_bytes,
+                       artifact.artifact_path, artifact.artifact_size_bytes,
+                       artifact.is_legacy, file.file_name, file.sha256,
+                       file.size_bytes, file.row_count
+                FROM analysis_artifacts AS artifact
+                JOIN analysis_artifact_files AS file
+                  USING (analysis_run_id, artifact_kind)
+                WHERE artifact.analysis_run_id = ? AND artifact.artifact_kind = 'result'
+                """,
+                (str(analysis_run_id),),
+            ).fetchall()
+        except sqlite3.Error as error:
+            raise StoreError("Analyseergebnis-Katalog ist nicht verfügbar.") from error
+        if not rows:
+            raise AnalysisArtifactUnavailableError("Analyseergebnisartefakt fehlt.")
+        if len(rows) != 1:
+            raise AnalysisArtifactIntegrityError("Analyseergebnisartefakt ist mehrdeutig.")
+        row = rows[0]
+        result_family = str(row[1])
+        if (
+            str(row[0]) != str(result_id)
+            or str(row[2]) != f"analysis-result-{result_family}"
+            or int(row[3]) != 1
+            or bool(row[9])
+            or str(row[10]) != "result.jsonl"
+        ):
+            raise AnalysisArtifactIntegrityError("Analyseergebnis-Katalog ist widersprüchlich.")
+        directory = self._root / str(row[7])
+        manifest_path = directory / "result-manifest.json"
+        result_path = directory / "result.jsonl"
+        if not manifest_path.is_file() or not result_path.is_file():
+            raise AnalysisArtifactUnavailableError("Analyseergebnisdatei fehlt.")
+        try:
+            manifest = manifest_path.read_bytes()
+            payload = result_path.read_bytes()
+        except OSError as error:
+            raise AnalysisArtifactUnavailableError(
+                "Analyseergebnisdatei ist nicht lesbar."
+            ) from error
+        expected_manifest = {
+            "analysis_definition_id": str(analysis_definition_id),
+            "analysis_result_id": str(result_id),
+            "analysis_run_id": str(analysis_run_id),
+            "artifact_kind": "result",
+            "content_hash": str(row[4]),
+            "files": [
+                {
+                    "name": "result.jsonl",
+                    "row_count": int(row[13]),
+                    "sha256": str(row[11]),
+                    "size_bytes": int(row[12]),
+                }
+            ],
+            "manifest_schema_version": 1,
+            "result_family": result_family,
+            "schema_version": 1,
+        }
+        try:
+            manifest_record = json.loads(manifest)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise AnalysisArtifactIntegrityError(
+                "Analyseergebnismanifest ist beschädigt."
+            ) from error
+        if (
+            manifest_record != expected_manifest
+            or hashlib.sha256(manifest).hexdigest() != str(row[5])
+            or len(manifest) != int(row[6])
+            or hashlib.sha256(payload).hexdigest() != str(row[11])
+            or len(payload) != int(row[12])
+            or len(manifest) + len(payload) != int(row[8])
+        ):
+            raise AnalysisArtifactIntegrityError("Analyseergebnis verletzt den Integritätsvertrag.")
+        artifact = AnalysisJsonlArtifact(
+            str(row[2]),
+            int(row[3]),
+            str(row[4]),
+            str(row[11]),
+            int(row[12]),
+            int(row[13]),
+            payload,
+        )
+        try:
+            _analysis_jsonl_rows(artifact)
+        except StoreError as error:
+            raise AnalysisArtifactIntegrityError("Analyseergebnis ist beschädigt.") from error
+        return artifact
 
     def find_reusable_resting_hr_analysis(
         self, candidate: AnalysisProvenance

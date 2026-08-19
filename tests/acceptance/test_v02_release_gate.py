@@ -99,9 +99,7 @@ def test_public_application_surface_is_exact_and_closed(tmp_path: Path) -> None:
             )
         ],
         "RunAnalysis": [
-            application.RunAnalysis(
-                application.AnalysisDefinitionId("rhr-activity-lag-1-7-v1")
-            )
+            application.RunAnalysis(application.AnalysisDefinitionId("rhr-activity-lag-1-7-v1"))
         ],
     }
     config = RuntimeConfig(
@@ -144,6 +142,8 @@ def test_public_application_surface_is_exact_and_closed(tmp_path: Path) -> None:
         "load_activity_days",
         "load_activity_settings",
         "load_analysis_catalog",
+        "load_analysis_result",
+        "load_analysis_runs",
         "load_snapshot_catalog",
         "load_context_audit",
         "load_context_records",

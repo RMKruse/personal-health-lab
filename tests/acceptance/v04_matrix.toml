@@ -6,8 +6,22 @@ analysis_definition_ids = [
   "weight-core-7-14-30-90-v1",
   "rhr-weight-association-7-14-30-90-v1",
 ]
-read_operations = ["load_analysis_catalog", "load_snapshot_catalog"]
-projection_variants = ["AnalysisCatalog", "ProjectionUnavailable", "SnapshotCatalog"]
+read_operations = [
+  "load_analysis_catalog",
+  "load_analysis_result",
+  "load_analysis_runs",
+  "load_snapshot_catalog",
+]
+projection_variants = [
+  "AnalysisCatalog",
+  "AnalysisRuns",
+  "ProjectionUnavailable",
+  "RhrActivityLag1To30Result",
+  "RhrActivityLag1To7Result",
+  "RhrWeightAssociationResult",
+  "SnapshotCatalog",
+  "WeightCoreResult",
+]
 write_request_variants = ["RunAnalysis"]
 write_plan_variants = ["HistoricalModeWritePlan", "RunAnalysisPlan"]
 
@@ -81,15 +95,40 @@ id = "V04-C-ANALYSIS-LEGACY-MIGRATION-V1"
 source = "https://github.com/RMKruse/personal-health-lab/issues/116"
 statement = "The store upgrade idempotently registers untouched V0.1-V0.3 result artifacts as legacy and never reinterprets their definitions as V0.4 definitions."
 
+[[contract]]
+id = "V04-C-ANALYSIS-RUN-HISTORY-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/117"
+statement = "Analysis run history resolves one snapshot and definition, includes every started attempt with its technical outcome, and exposes the resolved snapshot, definition, period, and run references."
+
+[[contract]]
+id = "V04-C-ANALYSIS-RESULT-SELECTION-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/117"
+statement = "Analysis result selection resolves an explicit matching run or the latest started run for the snapshot and definition, including insufficient_data and unstable attempts without falling back."
+
+[[contract]]
+id = "V04-C-ANALYSIS-RESULT-UNAVAILABLE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/117"
+statement = "Missing snapshots, runs, results, artifacts, selection mismatches, and integrity failures return the closed ProjectionUnavailable code instead of a technical exception or older result."
+
+[[contract]]
+id = "V04-C-ANALYSIS-PROJECTION-COMPATIBILITY-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/117"
+statement = "The two focused V0.4 analysis projections extend the exact public HealthLab surface while preserving every delivered V0.3 operation."
+
 [[hash_reference]]
 id = "V04-H-ANALYSIS-DEFINITIONS-V1"
 artifact = "src/personal_health_lab/analysis/__init__.py"
-sha256 = "2427f129b1140fbef51d3a3284bddb205c6560a2e126776b7b5873799c5de42e"
+sha256 = "e3e2dcc0578e11d59ecdcdfbd91974eff1c027ade3a2e0002dbed23f6f74009d"
 
 [[hash_reference]]
 id = "V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1"
 artifact = "src/personal_health_lab/storage/_store.py"
-sha256 = "be4fbde57129a8d81cf0757284a0161f8ff6027c2819a1784eefe0593911e1e3"
+sha256 = "2ee68190f8db74efdec9220ca52e73aef71e5e2442eba750f7e3e74a770a063a"
+
+[[hash_reference]]
+id = "V04-H-ANALYSIS-PROJECTIONS-V1"
+artifact = "src/personal_health_lab/application/_application.py"
+sha256 = "572e87b06be0f048abafa600c261756de5f9185ff8df5c2d347b3c3b17bf4941"
 
 [[hash_reference]]
 id = "V04-H-LAG-CALIBRATION-V1"
@@ -285,3 +324,63 @@ level = "application"
 platform = "all"
 expected_result = "idempotent catalog registration keeps legacy Parquet readable and records the absent historical input bundle"
 forbidden_side_effects = "no legacy Parquet rewrite, invented input bundle, V0.4 definition reinterpretation, or duplicate catalog fact"
+
+[[case]]
+id = "V04-A-ANALYSIS-RUN-HISTORY-V1"
+contracts = ["V04-C-ANALYSIS-RUN-HISTORY-V1", "V04-C-ANALYSIS-RESULT-SELECTION-V1"]
+hash_references = ["V04-H-ANALYSIS-PROJECTIONS-V1", "V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1"]
+runner = "tests/acceptance/test_v04_analysis_projections.py::test_analysis_history_is_snapshot_coherent_and_latest_unavailable_run_wins"
+level = "application"
+platform = "all"
+expected_result = "snapshot-coherent newest-first history with every attempt and resolved definition, period, and run references"
+forbidden_side_effects = "no mixed snapshot, omitted failed attempt, adapter selection, or inferred replacement result"
+
+[[case]]
+id = "V04-A-ANALYSIS-SELECTION-FAILURES-V1"
+contracts = ["V04-C-ANALYSIS-RESULT-UNAVAILABLE-V1"]
+hash_references = ["V04-H-ANALYSIS-PROJECTIONS-V1"]
+runner = "tests/acceptance/test_v04_analysis_projections.py::test_analysis_result_returns_closed_selection_failures"
+level = "application"
+platform = "all"
+expected_result = "closed no_snapshot, snapshot_not_found, no_run_for_snapshot, and run_selection_mismatch projections"
+forbidden_side_effects = "no technical exception, mixed selection, or replacement snapshot"
+
+[[case]]
+id = "V04-A-ANALYSIS-RESULT-FAMILIES-V1"
+contracts = ["V04-C-ANALYSIS-RESULT-SELECTION-V1"]
+hash_references = ["V04-H-ANALYSIS-PROJECTIONS-V1", "V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1"]
+runner = "tests/acceptance/test_v04_analysis_projections.py::test_analysis_result_projects_each_typed_result_family"
+level = "application"
+platform = "all"
+expected_result = "four immutable typed result-family projections with resolved references and status axes"
+forbidden_side_effects = "no raw JSON, SQL row, storage path, DataFrame, or untyped result dictionary"
+
+[[case]]
+id = "V04-A-ANALYSIS-LATEST-RUN-V1"
+contracts = ["V04-C-ANALYSIS-RESULT-SELECTION-V1", "V04-C-ANALYSIS-RESULT-UNAVAILABLE-V1"]
+hash_references = ["V04-H-ANALYSIS-PROJECTIONS-V1"]
+runner = "tests/acceptance/test_v04_analysis_projections.py::test_latest_started_run_does_not_fall_back_to_an_older_result"
+level = "application"
+platform = "all"
+expected_result = "latest insufficient_data attempt returns result_not_available while the explicit older completed run remains readable"
+forbidden_side_effects = "no silent fallback to the older result"
+
+[[case]]
+id = "V04-A-ANALYSIS-ARTIFACT-READ-V1"
+contracts = ["V04-C-ANALYSIS-RESULT-UNAVAILABLE-V1"]
+hash_references = ["V04-H-ANALYSIS-PROJECTIONS-V1", "V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1"]
+runner = "tests/acceptance/test_v04_analysis_projections.py::test_analysis_result_distinguishes_missing_and_corrupt_artifacts"
+level = "application"
+platform = "all"
+expected_result = "missing files return artifact_unavailable and hash violations return integrity_failed"
+forbidden_side_effects = "no raw storage exception or partially trusted artifact"
+
+[[case]]
+id = "V04-A-ANALYSIS-PROJECTION-COMPATIBILITY-V1"
+contracts = ["V04-C-ANALYSIS-PROJECTION-COMPATIBILITY-V1"]
+hash_references = ["V04-H-ANALYSIS-PROJECTIONS-V1"]
+runner = "tests/acceptance/test_v02_release_gate.py::test_public_application_surface_is_exact_and_closed"
+level = "application"
+platform = "all"
+expected_result = "the exact HealthLab surface includes both focused analysis reads and every delivered V0.3 operation"
+forbidden_side_effects = "no removed or renamed V0.3 operation"

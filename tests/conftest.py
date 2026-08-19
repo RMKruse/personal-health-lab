@@ -64,7 +64,13 @@ _V03_VARIANTS |= {
     "WorkoutCorrection",
     "LocalWorkoutExclusion",
 }
-_V04_APPLICATION_VARIANTS = {"HistoricalModeWritePlan", "RunAnalysis", "RunAnalysisPlan"}
+_V04_APPLICATION_VARIANTS = {
+    "HistoricalModeWritePlan",
+    "RunAnalysis",
+    "RunAnalysisPlan",
+    "WeightTrendFailureReason",
+    "WeightTrendSupportStatus",
+}
 _V03_VARIANTS |= {
     name
     for name in application.__all__

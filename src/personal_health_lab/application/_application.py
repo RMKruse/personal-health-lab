@@ -5,7 +5,7 @@ import json
 import logging
 import math
 import shutil
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from enum import StrEnum
@@ -18,10 +18,25 @@ from zoneinfo import ZoneInfo
 
 from personal_health_lab import DataMode
 from personal_health_lab.analysis import (
+    AnalysisBootstrapFacts,
     AnalysisDefinition,
+    AnalysisLagContrastEstimate,
+    AnalysisLagEstimate,
+    AnalysisLagResultValues,
+    AnalysisResultDiagnostic,
+    AnalysisResultFamily,
+    AnalysisResultMaturityCriterion,
+    RhrWeightAssociationEstimate,
+    RhrWeightAssociationResultValues,
     RunAnalysisPlan,
+    WeightCoreResultValues,
+    WeightModelEstimate,
+    WeightPrediction,
+    WeightTrendEstimate,
     analysis_definitions,
+    derive_current_analysis_reproducibility,
     execute_analysis_run,
+    load_analysis_result_values,
     plan_analysis,
 )
 from personal_health_lab.data_quality import (
@@ -40,9 +55,13 @@ from personal_health_lab.data_quality import (
 )
 from personal_health_lab.health_data import (
     ActivitySourceClass,
+    AnalysisDataStatusReason,
+    AnalysisFreshness,
     CanonicalSleepCategory,
     DataQualityStatus,
+    ModelMaturityCriterion,
     ModelMaturityStatus,
+    ReproducibilityStatus,
     canonical_unit_for,
     classify_activity_source,
 )
@@ -94,6 +113,8 @@ from personal_health_lab.resting_hr_analysis import (
     run_resting_hr_analysis as execute_analysis,
 )
 from personal_health_lab.storage import (
+    AnalysisArtifactIntegrityError,
+    AnalysisArtifactUnavailableError,
     AsNeededIntakePublication,
     CapacityCheck,
     CapacityMethodId,
@@ -324,17 +345,34 @@ class SnapshotAction(StrEnum):
 class ProjectionUnavailableCode(StrEnum):
     NO_SNAPSHOT = "no_snapshot"
     SNAPSHOT_NOT_FOUND = "snapshot_not_found"
+    NO_RUN_FOR_SNAPSHOT = "no_run_for_snapshot"
+    RUN_SELECTION_MISMATCH = "run_selection_mismatch"
+    RESULT_NOT_AVAILABLE = "result_not_available"
+    ARTIFACT_UNAVAILABLE = "artifact_unavailable"
+    INTEGRITY_FAILED = "integrity_failed"
 
 
 @dataclass(frozen=True, slots=True)
 class ProjectionUnavailable:
-    projection_id: Literal["snapshot-catalog"]
+    projection_id: Literal["snapshot-catalog", "analysis-runs", "analysis-result"]
     projection_version: int
     code: ProjectionUnavailableCode
     snapshot_ref: SnapshotRef | None
+    analysis_definition_id: AnalysisDefinitionId | None = None
+    analysis_run_id: AnalysisRunId | None = None
+    start_date: date | None = None
+    end_date: date | None = None
 
     def __post_init__(self) -> None:
-        if self.projection_id != "snapshot-catalog" or self.projection_version <= 0:
+        if (
+            self.projection_id
+            not in {
+                "snapshot-catalog",
+                "analysis-runs",
+                "analysis-result",
+            }
+            or self.projection_version <= 0
+        ):
             raise ValueError("Nicht verfügbare Projektion ist ungültig.")
 
 
@@ -381,6 +419,193 @@ class AnalysisCatalog:
     def __post_init__(self) -> None:
         if self.projection_id != "analysis-catalog" or self.projection_version <= 0:
             raise ValueError("Analysekatalogprojektion ist ungültig.")
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisRunSelection:
+    analysis_definition_id: AnalysisDefinitionId
+    snapshot_ref: SnapshotRef | None = None
+
+    def __post_init__(self) -> None:
+        if self.analysis_definition_id not in {
+            definition.analysis_definition_id for definition in analysis_definitions()
+        }:
+            raise ConfigurationError("Analysedefinition ist unbekannt.")
+        if self.snapshot_ref is not None and not isinstance(self.snapshot_ref, SnapshotId):
+            raise ConfigurationError("Snapshot-Referenz ist ungültig.")
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisResultSelection:
+    analysis_definition_id: AnalysisDefinitionId
+    snapshot_ref: SnapshotRef | None = None
+    analysis_run_id: AnalysisRunId | None = None
+
+    def __post_init__(self) -> None:
+        AnalysisRunSelection(self.analysis_definition_id, self.snapshot_ref)
+        if self.analysis_run_id is not None and not isinstance(self.analysis_run_id, AnalysisRunId):
+            raise ConfigurationError("Modelllauf-Referenz ist ungültig.")
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisRun:
+    analysis_run_id: AnalysisRunId
+    result_ref: AnalysisResultRef | None
+    snapshot_ref: SnapshotRef
+    analysis_definition_id: AnalysisDefinitionId
+    start_date: date | None
+    end_date: date | None
+    status: AnalysisStatus
+    model_maturity: ModelMaturityStatus | None
+    data_status: DataQualityStatus
+    data_status_reasons: tuple[AnalysisDataStatusReason, ...]
+    maturity_criteria: tuple[ModelMaturityCriterion, ...]
+    freshness: AnalysisFreshness
+    reproducibility: ReproducibilityStatus
+    diagnostics: tuple[str, ...]
+    completed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisRuns:
+    runs: tuple[AnalysisRun, ...]
+    snapshot_ref: SnapshotRef
+    analysis_definition_id: AnalysisDefinitionId
+    projection_id: Literal["analysis-runs"] = "analysis-runs"
+    projection_version: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class _AnalysisResultBase:
+    snapshot_ref: SnapshotRef
+    analysis_definition_id: AnalysisDefinitionId
+    start_date: date | None
+    end_date: date | None
+    analysis_run_id: AnalysisRunId
+    result_ref: AnalysisResultRef
+    result_schema_version: int
+    status: AnalysisStatus
+    model_maturity: ModelMaturityStatus
+    data_status: DataQualityStatus
+    data_status_reasons: tuple[AnalysisDataStatusReason, ...]
+    freshness: AnalysisFreshness
+    reproducibility: ReproducibilityStatus
+    run_diagnostics: tuple[str, ...]
+    completed_at: datetime
+    projection_id: Literal["analysis-result"] = field(init=False, default="analysis-result")
+    projection_version: int = field(init=False, default=1)
+
+
+@dataclass(frozen=True, slots=True)
+class RhrActivityLag1To7Result(_AnalysisResultBase):
+    lag_estimates: tuple[AnalysisLagEstimate, ...]
+    contrasts: tuple[AnalysisLagContrastEstimate, ...]
+    bootstrap_facts: tuple[AnalysisBootstrapFacts, ...]
+    diagnostics: tuple[AnalysisResultDiagnostic, ...]
+    maturity_criteria: tuple[AnalysisResultMaturityCriterion, ...]
+    result_family: Literal["rhr_activity_lag_1_7"] = field(
+        init=False, default="rhr_activity_lag_1_7"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RhrActivityLag1To30Result(_AnalysisResultBase):
+    lag_estimates: tuple[AnalysisLagEstimate, ...]
+    contrasts: tuple[AnalysisLagContrastEstimate, ...]
+    bootstrap_facts: tuple[AnalysisBootstrapFacts, ...]
+    diagnostics: tuple[AnalysisResultDiagnostic, ...]
+    maturity_criteria: tuple[AnalysisResultMaturityCriterion, ...]
+    result_family: Literal["rhr_activity_lag_1_30"] = field(
+        init=False, default="rhr_activity_lag_1_30"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class WeightCoreResult(_AnalysisResultBase):
+    trends: tuple[WeightTrendEstimate, ...]
+    models: tuple[WeightModelEstimate, ...]
+    predictions: tuple[WeightPrediction, ...]
+    bootstrap_facts: tuple[AnalysisBootstrapFacts, ...]
+    diagnostics: tuple[AnalysisResultDiagnostic, ...]
+    maturity_criteria: tuple[AnalysisResultMaturityCriterion, ...]
+    result_family: Literal["weight_core"] = field(init=False, default="weight_core")
+
+
+@dataclass(frozen=True, slots=True)
+class RhrWeightAssociationResult(_AnalysisResultBase):
+    associations: tuple[RhrWeightAssociationEstimate, ...]
+    bootstrap_facts: tuple[AnalysisBootstrapFacts, ...]
+    diagnostics: tuple[AnalysisResultDiagnostic, ...]
+    maturity_criteria: tuple[AnalysisResultMaturityCriterion, ...]
+    result_family: Literal["rhr_weight_association"] = field(
+        init=False, default="rhr_weight_association"
+    )
+
+
+type AnalysisResult = (
+    RhrActivityLag1To7Result
+    | RhrActivityLag1To30Result
+    | WeightCoreResult
+    | RhrWeightAssociationResult
+)
+
+
+def _analysis_result_projection(
+    run: AnalysisRun,
+    family: AnalysisResultFamily,
+    schema_version: int,
+    values: AnalysisLagResultValues | WeightCoreResultValues | RhrWeightAssociationResultValues,
+) -> AnalysisResult:
+    if run.model_maturity is None or run.result_ref is None:
+        raise ValueError("Analyseergebnis besitzt keine vollständige Laufreferenz.")
+    common = (
+        run.snapshot_ref,
+        run.analysis_definition_id,
+        run.start_date,
+        run.end_date,
+        run.analysis_run_id,
+        run.result_ref,
+        schema_version,
+        run.status,
+        run.model_maturity,
+        run.data_status,
+        run.data_status_reasons,
+        run.freshness,
+        run.reproducibility,
+        run.diagnostics,
+        run.completed_at,
+    )
+    if isinstance(values, AnalysisLagResultValues):
+        result_type = (
+            RhrActivityLag1To7Result
+            if family is AnalysisResultFamily.RHR_ACTIVITY_LAG_1_7
+            else RhrActivityLag1To30Result
+        )
+        return result_type(
+            *common,
+            values.lag_estimates,
+            values.contrasts,
+            values.bootstrap_facts,
+            values.diagnostics,
+            values.maturity_criteria,
+        )
+    if isinstance(values, WeightCoreResultValues):
+        return WeightCoreResult(
+            *common,
+            values.trends,
+            values.models,
+            values.predictions,
+            values.bootstrap_facts,
+            values.diagnostics,
+            values.maturity_criteria,
+        )
+    return RhrWeightAssociationResult(
+        *common,
+        values.associations,
+        values.bootstrap_facts,
+        values.diagnostics,
+        values.maturity_criteria,
+    )
 
 
 def _resolve_medication_local_datetime(day: date, local_time: time, timezone: str) -> datetime:
@@ -3695,9 +3920,7 @@ class HealthLab:
             "context_as_of_date": snapshot_as_of.date().isoformat(),
             "collisions": (),
             "references": (),
-            "affected_start_date": None
-            if start_date is None
-            else start_date.isoformat(),
+            "affected_start_date": None if start_date is None else start_date.isoformat(),
             "affected_end_date": snapshot_as_of.date().isoformat(),
             "preflight": {
                 "approval": "blocked" if blocked else ("no_change" if no_change else "ready"),
@@ -4416,8 +4639,7 @@ class HealthLab:
             "withdrawal_reason": withdrawal_reason,
             "base_snapshot_ref": None if snapshot is None else str(snapshot),
             "medication_as_of": as_of.isoformat(),
-            "references": (str(regime_id),)
-            + (() if category_id is None else (str(category_id),)),
+            "references": (str(regime_id),) + (() if category_id is None else (str(category_id),)),
             "diagnostics": diagnostics,
             "approval": "no_change" if no_change else ("blocked" if blocked else "ready"),
         }
@@ -4647,9 +4869,7 @@ class HealthLab:
             "snapshot_as_of": snapshot_as_of.isoformat(),
             "timezone": timezone,
             "collisions": tuple(map(str, colliding_logical_ids)),
-            "references": ()
-            if category_logical_id is None
-            else (str(category_logical_id),),
+            "references": () if category_logical_id is None else (str(category_logical_id),),
             "affected_from": None if start_date is None else start_date.isoformat(),
             "affected_to": (
                 end_date.isoformat() if end_date is not None else snapshot_as_of.date().isoformat()
@@ -7125,6 +7345,148 @@ class HealthLab:
         self._require_ready()
         self._require_open()
         return AnalysisCatalog(analysis_definitions())
+
+    def load_analysis_runs(
+        self, selection: AnalysisRunSelection
+    ) -> AnalysisRuns | ProjectionUnavailable:
+        self._require_ready()
+        self._require_open()
+        if not isinstance(selection, AnalysisRunSelection):
+            raise ConfigurationError("Modelllauf-Auswahl ist ungültig.")
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        try:
+            snapshots = self._store.load_snapshot_catalog()
+            selected = (
+                next((item for item in snapshots if item.is_active), None)
+                if selection.snapshot_ref is None
+                else next(
+                    (item for item in snapshots if item.snapshot_id == selection.snapshot_ref), None
+                )
+            )
+            if selected is None:
+                return ProjectionUnavailable(
+                    "analysis-runs",
+                    1,
+                    (
+                        ProjectionUnavailableCode.NO_SNAPSHOT
+                        if selection.snapshot_ref is None
+                        else ProjectionUnavailableCode.SNAPSHOT_NOT_FOUND
+                    ),
+                    selection.snapshot_ref,
+                    selection.analysis_definition_id,
+                )
+            active = next((item for item in snapshots if item.is_active), None)
+            facts = self._store.load_analysis_runs(
+                selected.snapshot_id, selection.analysis_definition_id
+            )
+            reproducibility = derive_current_analysis_reproducibility(self._store, facts)
+        except StoreError as error:
+            raise HealthLabError("Analysehistorie ist nicht verfügbar.") from error
+        return AnalysisRuns(
+            tuple(
+                AnalysisRun(
+                    fact.analysis_run_id,
+                    fact.result_id,
+                    fact.snapshot_id,
+                    fact.analysis_definition_id,
+                    fact.start_date,
+                    fact.end_date,
+                    AnalysisStatus(fact.status),
+                    fact.model_maturity,
+                    fact.data_status,
+                    fact.data_status_reasons,
+                    fact.maturity_criteria,
+                    (
+                        AnalysisFreshness.CURRENT
+                        if active is not None and fact.snapshot_id == active.snapshot_id
+                        else AnalysisFreshness.STALE
+                    ),
+                    current_reproducibility,
+                    fact.diagnostics,
+                    fact.completed_at,
+                )
+                for fact, current_reproducibility in zip(facts, reproducibility, strict=True)
+            ),
+            selected.snapshot_id,
+            selection.analysis_definition_id,
+        )
+
+    def load_analysis_result(
+        self, selection: AnalysisResultSelection
+    ) -> AnalysisResult | ProjectionUnavailable:
+        if not isinstance(selection, AnalysisResultSelection):
+            raise ConfigurationError("Analyseergebnis-Auswahl ist ungültig.")
+        history = self.load_analysis_runs(
+            AnalysisRunSelection(selection.analysis_definition_id, selection.snapshot_ref)
+        )
+        if isinstance(history, ProjectionUnavailable):
+            return replace(history, projection_id="analysis-result")
+        selected = (
+            next(
+                (run for run in history.runs if run.analysis_run_id == selection.analysis_run_id),
+                None,
+            )
+            if selection.analysis_run_id is not None
+            else next(iter(history.runs), None)
+        )
+        if selected is None:
+            return ProjectionUnavailable(
+                "analysis-result",
+                1,
+                (
+                    ProjectionUnavailableCode.RUN_SELECTION_MISMATCH
+                    if selection.analysis_run_id is not None
+                    else ProjectionUnavailableCode.NO_RUN_FOR_SNAPSHOT
+                ),
+                history.snapshot_ref,
+                history.analysis_definition_id,
+                selection.analysis_run_id,
+            )
+        if selected.status is not AnalysisStatus.COMPLETED or selected.result_ref is None:
+            return ProjectionUnavailable(
+                "analysis-result",
+                1,
+                ProjectionUnavailableCode.RESULT_NOT_AVAILABLE,
+                selected.snapshot_ref,
+                selected.analysis_definition_id,
+                selected.analysis_run_id,
+                selected.start_date,
+                selected.end_date,
+            )
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        definition = next(
+            item
+            for item in analysis_definitions()
+            if item.analysis_definition_id == selected.analysis_definition_id
+        )
+        try:
+            schema_version, values = load_analysis_result_values(
+                self._store,
+                selected.analysis_run_id,
+                selected.result_ref,
+                definition,
+            )
+            return _analysis_result_projection(
+                selected, definition.result_family, schema_version, values
+            )
+        except AnalysisArtifactUnavailableError:
+            code = ProjectionUnavailableCode.ARTIFACT_UNAVAILABLE
+        except (AnalysisArtifactIntegrityError, ValueError, json.JSONDecodeError):
+            code = ProjectionUnavailableCode.INTEGRITY_FAILED
+        except StoreError as error:
+            raise HealthLabError("Analyseergebnis ist nicht verfügbar.") from error
+        return ProjectionUnavailable(
+            "analysis-result",
+            1,
+            code,
+            selected.snapshot_ref,
+            selected.analysis_definition_id,
+            selected.analysis_run_id,
+            selected.start_date,
+            selected.end_date,
+        )
 
     def load_snapshot_catalog(
         self, selection: SnapshotSelection = _ACTIVE_SNAPSHOT_SELECTION

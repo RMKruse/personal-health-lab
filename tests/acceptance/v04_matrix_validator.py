@@ -19,6 +19,10 @@ _CONTRACT_IDS = {
     "V04-C-ANALYSIS-INPUT-BUNDLE-V1",
     "V04-C-ANALYSIS-LEGACY-MIGRATION-V1",
     "V04-C-ANALYSIS-PUBLICATION-V1",
+    "V04-C-ANALYSIS-PROJECTION-COMPATIBILITY-V1",
+    "V04-C-ANALYSIS-RESULT-SELECTION-V1",
+    "V04-C-ANALYSIS-RESULT-UNAVAILABLE-V1",
+    "V04-C-ANALYSIS-RUN-HISTORY-V1",
     "V04-C-ANALYSIS-RUN-ATOMICITY-V1",
     "V04-C-HISTORICAL-WRITE-LOCK-V1",
     "V04-C-MATRIX-VALIDATION-V1",
@@ -30,12 +34,18 @@ _CONTRACT_IDS = {
     "V04-C-V03-COMPATIBILITY-V1",
 }
 _CASE_IDS = {
+    "V04-A-ANALYSIS-ARTIFACT-READ-V1",
     "V04-A-ANALYSIS-CATALOG-V1",
     "V04-A-ANALYSIS-INPUT-BUNDLE-V1",
     "V04-A-ANALYSIS-LEGACY-MIGRATION-V1",
     "V04-A-ANALYSIS-PUBLICATION-V1",
     "V04-A-ANALYSIS-PUBLICATION-VALIDATION-V1",
+    "V04-A-ANALYSIS-PROJECTION-COMPATIBILITY-V1",
+    "V04-A-ANALYSIS-RESULT-FAMILIES-V1",
     "V04-A-ANALYSIS-RUN-ATOMICITY-V1",
+    "V04-A-ANALYSIS-RUN-HISTORY-V1",
+    "V04-A-ANALYSIS-SELECTION-FAILURES-V1",
+    "V04-A-ANALYSIS-LATEST-RUN-V1",
     "V04-A-HISTORICAL-WRITE-LOCK-V1",
     "V04-A-MATRIX-VALIDATION-V1",
     "V04-A-RUN-ANALYSIS-LEGACY-V1",
@@ -49,6 +59,7 @@ _CASE_IDS = {
 _HASH_IDS = {
     "V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1",
     "V04-H-ANALYSIS-DEFINITIONS-V1",
+    "V04-H-ANALYSIS-PROJECTIONS-V1",
     "V04-H-LAG-CALIBRATION-V1",
     "V04-H-OUTCOME-ASSOCIATION-CALIBRATION-V1",
     "V04-H-WEIGHT-CALIBRATION-V1",
@@ -87,12 +98,19 @@ def validate_matrix(
     assert _references(matrix, "analysis_definition_ids") == _DEFINITION_IDS
     assert _references(matrix, "read_operations") == {
         "load_analysis_catalog",
+        "load_analysis_result",
+        "load_analysis_runs",
         "load_snapshot_catalog",
     }
     assert _references(matrix, "projection_variants") == {
         "AnalysisCatalog",
+        "AnalysisRuns",
         "ProjectionUnavailable",
+        "RhrActivityLag1To30Result",
+        "RhrActivityLag1To7Result",
+        "RhrWeightAssociationResult",
         "SnapshotCatalog",
+        "WeightCoreResult",
     }
     assert _references(matrix, "write_request_variants") == {"RunAnalysis"}
     assert _references(matrix, "write_plan_variants") == {
@@ -101,10 +119,17 @@ def validate_matrix(
     }
     assert {str(item.analysis_definition_id) for item in analysis_definitions()} == _DEFINITION_IDS
     assert hasattr(application.HealthLab, "load_analysis_catalog")
+    assert hasattr(application.HealthLab, "load_analysis_result")
+    assert hasattr(application.HealthLab, "load_analysis_runs")
     assert hasattr(application.HealthLab, "load_snapshot_catalog")
     assert hasattr(application, "AnalysisCatalog")
+    assert hasattr(application, "AnalysisRuns")
     assert hasattr(application, "ProjectionUnavailable")
     assert hasattr(application, "SnapshotCatalog")
+    assert hasattr(application, "RhrActivityLag1To30Result")
+    assert hasattr(application, "RhrActivityLag1To7Result")
+    assert hasattr(application, "RhrWeightAssociationResult")
+    assert hasattr(application, "WeightCoreResult")
     assert hasattr(application, "HistoricalModeWritePlan")
     assert hasattr(application, "RunAnalysis")
     assert hasattr(application, "RunAnalysisPlan")

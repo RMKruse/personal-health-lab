@@ -20,6 +20,7 @@ from personal_health_lab.storage import (
     AnalysisProvenance,
     AnalysisResultId,
     AnalysisRunConfiguration,
+    AnalysisRunFact,
     AnalysisRunId,
     AnalysisRunPublication,
     CanonicalHealthType,
@@ -30,6 +31,7 @@ from personal_health_lab.storage import (
     MeasurementVersionId,
     OperationId,
     PlausibilityRuleRecord,
+    ReproducibilityStatus,
     ReviewCaseId,
     SnapshotId,
     StoredActivityDayValue,
@@ -126,6 +128,11 @@ class BootstrapSampleCountBasis(StrEnum):
     PAIRED_DAYS = "paired_days"
 
 
+class AnalysisBootstrapVariant(StrEnum):
+    PRIMARY = "primary"
+    SENSITIVITY = "sensitivity"
+
+
 class AssociationMeasure(StrEnum):
     PEARSON_LOCAL_SLOPES = "pearson_local_slopes"
     PEARSON_PAIRED_DEVIATIONS = "pearson_paired_deviations"
@@ -137,6 +144,22 @@ class WeightTrendKernel(StrEnum):
 
 class TrendUncertainty(StrEnum):
     NO_CALIBRATED_INTERVAL = "no_calibrated_interval"
+
+
+class WeightTrendSupportStatus(StrEnum):
+    ESTIMATED = "estimated"
+    UNAVAILABLE = "unavailable"
+
+
+class WeightTrendFailureReason(StrEnum):
+    INSUFFICIENT_LOCAL_SUPPORT = "insufficient_local_support"
+    SINGULAR_LOCAL_FIT = "singular_local_fit"
+    OUTSIDE_OBSERVED_SUPPORT = "outside_observed_support"
+
+
+class WeightModelFamily(StrEnum):
+    ENERGY_COMPONENTS = "energy_components"
+    ENERGY_MACROS = "energy_macros"
 
 
 @dataclass(frozen=True, slots=True)
@@ -530,6 +553,386 @@ class AnalysisExecution:
     analysis_definition_id: AnalysisDefinitionId
     diagnostics: tuple[str, ...]
     provenance: AnalysisProvenance
+
+
+type AnalysisFactValue = (
+    str
+    | int
+    | float
+    | bool
+    | None
+    | tuple[AnalysisFactValue, ...]
+    | tuple[tuple[str, AnalysisFactValue], ...]
+)
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisResultInterval:
+    lower: float
+    upper: float
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisLagEstimate:
+    feature_id: str
+    lag_day: int
+    natural_scale: float
+    natural_unit: CanonicalUnit
+    estimate_bpm_per_natural_scale: float
+    estimate_bpm_per_personal_sd: float
+    pointwise_interval: AnalysisResultInterval
+    simultaneous_band: AnalysisResultInterval
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisLagContrastEstimate:
+    feature_id: str
+    start_day: int
+    end_day: int
+    natural_scale: float
+    natural_unit: CanonicalUnit
+    estimate_bpm_per_natural_scale: float
+    estimate_bpm_per_personal_sd: float
+    pointwise_interval: AnalysisResultInterval
+    simultaneous_band: AnalysisResultInterval
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisBootstrapFacts:
+    variant: AnalysisBootstrapVariant
+    seed: int
+    block_length: int
+    attempts: int
+    successful_refits: int
+    failure_counts: tuple[tuple[str, int], ...]
+    quantile_stability: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisResultDiagnostic:
+    code: AnalysisDiagnostic
+    facts: tuple[tuple[str, AnalysisFactValue], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisResultMaturityCriterion:
+    code: AnalysisMaturityCriterionCode
+    passed: bool
+    observed_value: float | str
+    threshold: float | str
+
+
+@dataclass(frozen=True, slots=True)
+class WeightTrendEstimate:
+    day: date
+    window_days: int
+    level_kg: float | None
+    rate_kg_per_week: float | None
+    local_support: int
+    numerical_pivot: float | None
+    support_status: WeightTrendSupportStatus
+    failure_reason: WeightTrendFailureReason | None
+
+
+@dataclass(frozen=True, slots=True)
+class WeightModelEstimate:
+    window_days: int
+    model_family: WeightModelFamily
+    feature_id: str
+    coefficient: float | None
+    natural_scale: float
+    natural_unit: CanonicalUnit
+    estimate_kg_per_week_per_natural_scale: float | None
+    estimate_kg_per_week_per_personal_sd: float | None
+    pointwise_interval: AnalysisResultInterval
+    simultaneous_band: AnalysisResultInterval
+    blocked_prediction_gain: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class WeightPrediction:
+    day: date
+    window_days: int
+    model_family: WeightModelFamily
+    observed_kg_per_week: float | None
+    predicted_kg_per_week: float | None
+    residual_kg_per_week: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class RhrWeightAssociationEstimate:
+    window_days: int
+    measure: AssociationMeasure
+    estimate: float | None
+    paired_days: int
+    pointwise_interval: AnalysisResultInterval
+    simultaneous_band: AnalysisResultInterval
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisLagResultValues:
+    lag_estimates: tuple[AnalysisLagEstimate, ...]
+    contrasts: tuple[AnalysisLagContrastEstimate, ...]
+    bootstrap_facts: tuple[AnalysisBootstrapFacts, ...]
+    diagnostics: tuple[AnalysisResultDiagnostic, ...]
+    maturity_criteria: tuple[AnalysisResultMaturityCriterion, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WeightCoreResultValues:
+    trends: tuple[WeightTrendEstimate, ...]
+    models: tuple[WeightModelEstimate, ...]
+    predictions: tuple[WeightPrediction, ...]
+    bootstrap_facts: tuple[AnalysisBootstrapFacts, ...]
+    diagnostics: tuple[AnalysisResultDiagnostic, ...]
+    maturity_criteria: tuple[AnalysisResultMaturityCriterion, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RhrWeightAssociationResultValues:
+    associations: tuple[RhrWeightAssociationEstimate, ...]
+    bootstrap_facts: tuple[AnalysisBootstrapFacts, ...]
+    diagnostics: tuple[AnalysisResultDiagnostic, ...]
+    maturity_criteria: tuple[AnalysisResultMaturityCriterion, ...]
+
+
+type AnalysisResultValues = (
+    AnalysisLagResultValues | WeightCoreResultValues | RhrWeightAssociationResultValues
+)
+
+
+def _result_items(record: dict[str, object], name: str) -> tuple[dict[str, object], ...]:
+    values = record.get(name)
+    if not isinstance(values, list) or any(not isinstance(value, dict) for value in values):
+        raise ValueError("Analyseergebnisliste ist ungültig.")
+    return tuple(cast(dict[str, object], value) for value in values)
+
+
+def _result_string(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("Analyseergebnistext ist ungültig.")
+    return value
+
+
+def _result_int(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError("Analyseergebniszahl ist ungültig.")
+    return value
+
+
+def _result_float(value: object, *, optional: bool = False) -> float | None:
+    if value is None and optional:
+        return None
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        raise ValueError("Analyseergebniswert ist ungültig.")
+    return float(value)
+
+
+def _result_interval(value: object) -> AnalysisResultInterval:
+    if not isinstance(value, dict) or set(value) != {"lower", "upper"}:
+        raise ValueError("Analyseergebnisintervall ist ungültig.")
+    lower = _result_float(value["lower"])
+    upper = _result_float(value["upper"])
+    assert lower is not None and upper is not None
+    if lower > upper:
+        raise ValueError("Analyseergebnisintervall ist umgekehrt.")
+    return AnalysisResultInterval(lower, upper)
+
+
+def _freeze_analysis_fact(value: object) -> AnalysisFactValue:
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return value
+    if isinstance(value, list):
+        return tuple(_freeze_analysis_fact(item) for item in value)
+    if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+        return tuple(
+            (key, _freeze_analysis_fact(item))
+            for key, item in sorted(cast(dict[str, object], value).items())
+        )
+    raise ValueError("Analyseergebnisfakt ist ungültig.")
+
+
+def _result_support_lists(
+    record: dict[str, object],
+) -> tuple[
+    tuple[AnalysisBootstrapFacts, ...],
+    tuple[AnalysisResultDiagnostic, ...],
+    tuple[AnalysisResultMaturityCriterion, ...],
+]:
+    bootstrap = tuple(
+        AnalysisBootstrapFacts(
+            AnalysisBootstrapVariant(_result_string(item["variant"])),
+            _result_int(item["seed"]),
+            _result_int(item["block_length"]),
+            _result_int(item["attempts"]),
+            _result_int(item["successful_refits"]),
+            tuple(
+                sorted(
+                    (_result_string(code), _result_int(count))
+                    for code, count in cast(dict[str, object], item["failure_counts"]).items()
+                )
+            ),
+            _result_float(item["quantile_stability"], optional=True),
+        )
+        for item in _result_items(record, "bootstrap_facts")
+    )
+    diagnostics = tuple(
+        AnalysisResultDiagnostic(
+            AnalysisDiagnostic(_result_string(item["code"])),
+            cast(
+                tuple[tuple[str, AnalysisFactValue], ...],
+                _freeze_analysis_fact(item["facts"]),
+            ),
+        )
+        for item in _result_items(record, "diagnostics")
+    )
+    maturity = tuple(
+        AnalysisResultMaturityCriterion(
+            AnalysisMaturityCriterionCode(_result_string(item["code"])),
+            cast(bool, item["passed"]),
+            cast(float | str, item["observed_value"]),
+            cast(float | str, item["threshold"]),
+        )
+        for item in _result_items(record, "maturity_criteria")
+    )
+    return bootstrap, diagnostics, maturity
+
+
+def load_analysis_result_values(
+    store: LocalStore,
+    analysis_run_id: AnalysisRunId,
+    result_id: AnalysisResultId,
+    definition: AnalysisDefinition,
+) -> tuple[int, AnalysisResultValues]:
+    artifact = store.load_analysis_result_artifact(
+        analysis_run_id, result_id, definition.analysis_definition_id
+    )
+    record = json.loads(artifact.payload)
+    if (
+        not isinstance(record, dict)
+        or record.get("analysis_run_id") != str(analysis_run_id)
+        or record.get("analysis_result_id") != str(result_id)
+        or record.get("analysis_definition_id") != str(definition.analysis_definition_id)
+        or record.get("result_family") != definition.result_family.value
+        or record.get("result_schema_version") != artifact.schema_version
+    ):
+        raise ValueError("Analyseergebnisreferenzen sind inkohärent.")
+    typed = cast(dict[str, object], record)
+    content = dict(typed)
+    del content["analysis_run_id"]
+    del content["analysis_result_id"]
+    if (
+        hashlib.sha256(
+            json.dumps(content, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+        != artifact.content_hash
+    ):
+        raise ValueError("Analyseergebnis verletzt den Inhaltshash.")
+    bootstrap, diagnostics, maturity = _result_support_lists(typed)
+    if definition.result_family in {
+        AnalysisResultFamily.RHR_ACTIVITY_LAG_1_7,
+        AnalysisResultFamily.RHR_ACTIVITY_LAG_1_30,
+    }:
+        values: AnalysisResultValues = AnalysisLagResultValues(
+            tuple(
+                AnalysisLagEstimate(
+                    _result_string(item["feature_id"]),
+                    _result_int(item["lag_day"]),
+                    cast(float, _result_float(item["natural_scale"])),
+                    CanonicalUnit(_result_string(item["natural_unit"])),
+                    cast(float, _result_float(item["estimate_bpm_per_natural_scale"])),
+                    cast(float, _result_float(item["estimate_bpm_per_personal_sd"])),
+                    _result_interval(item["pointwise_interval"]),
+                    _result_interval(item["simultaneous_band"]),
+                )
+                for item in _result_items(typed, "lag_estimates")
+            ),
+            tuple(
+                AnalysisLagContrastEstimate(
+                    _result_string(item["feature_id"]),
+                    _result_int(item["start_day"]),
+                    _result_int(item["end_day"]),
+                    cast(float, _result_float(item["natural_scale"])),
+                    CanonicalUnit(_result_string(item["natural_unit"])),
+                    cast(float, _result_float(item["estimate_bpm_per_natural_scale"])),
+                    cast(float, _result_float(item["estimate_bpm_per_personal_sd"])),
+                    _result_interval(item["pointwise_interval"]),
+                    _result_interval(item["simultaneous_band"]),
+                )
+                for item in _result_items(typed, "contrasts")
+            ),
+            bootstrap,
+            diagnostics,
+            maturity,
+        )
+    elif definition.result_family is AnalysisResultFamily.WEIGHT_CORE:
+        values = WeightCoreResultValues(
+            tuple(
+                WeightTrendEstimate(
+                    date.fromisoformat(_result_string(item["day"])),
+                    _result_int(item["window_days"]),
+                    _result_float(item["level_kg"], optional=True),
+                    _result_float(item["rate_kg_per_week"], optional=True),
+                    _result_int(item["local_support"]),
+                    _result_float(item["numerical_pivot"], optional=True),
+                    WeightTrendSupportStatus(_result_string(item["support_status"])),
+                    None
+                    if item["failure_reason"] is None
+                    else WeightTrendFailureReason(_result_string(item["failure_reason"])),
+                )
+                for item in _result_items(typed, "trends")
+            ),
+            tuple(
+                WeightModelEstimate(
+                    _result_int(item["window_days"]),
+                    WeightModelFamily(_result_string(item["model_family"])),
+                    _result_string(item["feature_id"]),
+                    _result_float(item["coefficient"], optional=True),
+                    cast(float, _result_float(item["natural_scale"])),
+                    CanonicalUnit(_result_string(item["natural_unit"])),
+                    _result_float(item["estimate_kg_per_week_per_natural_scale"], optional=True),
+                    _result_float(item["estimate_kg_per_week_per_personal_sd"], optional=True),
+                    _result_interval(item["pointwise_interval"]),
+                    _result_interval(item["simultaneous_band"]),
+                    _result_float(item["blocked_prediction_gain"], optional=True),
+                )
+                for item in _result_items(typed, "models")
+            ),
+            tuple(
+                WeightPrediction(
+                    date.fromisoformat(_result_string(item["day"])),
+                    _result_int(item["window_days"]),
+                    WeightModelFamily(_result_string(item["model_family"])),
+                    _result_float(item["observed_kg_per_week"], optional=True),
+                    _result_float(item["predicted_kg_per_week"], optional=True),
+                    _result_float(item["residual_kg_per_week"], optional=True),
+                )
+                for item in _result_items(typed, "predictions")
+            ),
+            bootstrap,
+            diagnostics,
+            maturity,
+        )
+    else:
+        values = RhrWeightAssociationResultValues(
+            tuple(
+                RhrWeightAssociationEstimate(
+                    _result_int(item["window_days"]),
+                    AssociationMeasure(_result_string(item["measure"])),
+                    _result_float(item["estimate"], optional=True),
+                    _result_int(item["paired_days"]),
+                    _result_interval(item["pointwise_interval"]),
+                    _result_interval(item["simultaneous_band"]),
+                )
+                for item in _result_items(typed, "associations")
+            ),
+            bootstrap,
+            diagnostics,
+            maturity,
+        )
+    return artifact.schema_version, values
 
 
 _LAG_INPUTS = (
@@ -1407,6 +1810,20 @@ def _validate_result_item(field: str, item: object) -> None:
         value.value for value in AnalysisMaturityCriterionCode
     }:
         raise StoreError("Analyseergebnis enthält einen unbekannten Reifekriteriumscode.")
+    if field == "bootstrap_facts" and item.get("variant") not in {
+        value.value for value in AnalysisBootstrapVariant
+    }:
+        raise StoreError("Analyseergebnis enthält eine unbekannte Bootstrap-Variante.")
+    if field in {"models", "predictions"} and item.get("model_family") not in {
+        value.value for value in WeightModelFamily
+    }:
+        raise StoreError("Analyseergebnis enthält eine unbekannte Modellfamilie.")
+    if field == "trends" and (
+        item.get("support_status") not in {value.value for value in WeightTrendSupportStatus}
+        or item.get("failure_reason")
+        not in {None, *(value.value for value in WeightTrendFailureReason)}
+    ):
+        raise StoreError("Analyseergebnis enthält einen unbekannten Trendstatus.")
     for key, value in item.items():
         if key in {
             "code",
@@ -1618,6 +2035,47 @@ def _reproduction_facts() -> tuple[str, bool, str | None, str]:
         diff_hasher.hexdigest() if tracked_diff or untracked else None,
         environment_hash,
     )
+
+
+def derive_current_analysis_reproducibility(
+    store: LocalStore, facts: tuple[AnalysisRunFact, ...]
+) -> tuple[ReproducibilityStatus, ...]:
+    current_development: tuple[str, bool, str | None, str] | None = None
+    statuses: list[ReproducibilityStatus] = []
+    for fact in facts:
+        available = store.analysis_run_material_is_available(fact)
+        try:
+            if fact.code_dirty:
+                if current_development is None:
+                    current_development = _reproduction_facts()
+                available = available and current_development == (
+                    fact.code_commit,
+                    True,
+                    fact.code_diff_hash,
+                    fact.environment_lock_hash,
+                )
+            else:
+                lock = subprocess.run(
+                    ("git", "show", f"{fact.code_commit}:uv.lock"),
+                    cwd=_PROJECT_ROOT,
+                    check=True,
+                    capture_output=True,
+                ).stdout
+                available = (
+                    available
+                    and fact.code_diff_hash is None
+                    and hashlib.sha256(lock).hexdigest() == fact.environment_lock_hash
+                )
+        except (OSError, subprocess.CalledProcessError):
+            available = False
+        statuses.append(
+            ReproducibilityStatus.LOCAL_DEVELOPMENT
+            if available and fact.code_dirty
+            else ReproducibilityStatus.REPRODUCIBLE
+            if available
+            else ReproducibilityStatus.NOT_RECORDED
+        )
+    return tuple(statuses)
 
 
 def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisExecution:

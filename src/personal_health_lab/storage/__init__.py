@@ -17,6 +17,8 @@ from personal_health_lab.health_data import (
 
 from ._store import (
     ActivityDerivationRecord,
+    AnalysisArtifactIntegrityError,
+    AnalysisArtifactUnavailableError,
     AnalysisDefinitionId,
     AnalysisDiagnostics,
     AnalysisJsonlArtifact,
@@ -24,6 +26,7 @@ from ._store import (
     AnalysisProvenance,
     AnalysisResultId,
     AnalysisRunConfiguration,
+    AnalysisRunFact,
     AnalysisRunId,
     AnalysisRunPublication,
     AnalysisRunRecord,
@@ -113,6 +116,8 @@ from ._store import (
 
 __all__ = [
     "ActivityDerivationRecord",
+    "AnalysisArtifactIntegrityError",
+    "AnalysisArtifactUnavailableError",
     "AnalysisDataStatusReason",
     "AnalysisDefinitionId",
     "AnalysisDiagnostics",
@@ -122,6 +127,7 @@ __all__ = [
     "AnalysisProvenance",
     "AnalysisResultId",
     "AnalysisRunConfiguration",
+    "AnalysisRunFact",
     "AnalysisRunId",
     "AnalysisRunPublication",
     "AnalysisRunRecord",
