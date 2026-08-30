@@ -118,6 +118,7 @@ class DataQualityStatus(StrEnum):
 class DataStatusReasonCode(StrEnum):
     OPEN_REVIEW_CASE = "open_review_case"
     PASSIVE_COVERAGE_GAP = "passive_coverage_gap"
+    PROVISIONAL_INPUT_QUALITY = "provisional_input_quality"
 
 
 @dataclass(frozen=True, slots=True)

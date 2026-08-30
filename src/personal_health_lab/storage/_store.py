@@ -1398,6 +1398,43 @@ class StoredActivityDayValue:
 
 
 @dataclass(frozen=True, slots=True)
+class StoredAnalysisSourceEvidence:
+    source_record_id: MeasurementVersionId | ContextRevisionId | MedicationRevisionId
+    source_name: str
+    source_version: str
+    source_updated_at: datetime
+    disposition: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class StoredOutcomeSleepInterval:
+    category: CanonicalSleepCategory
+    start: datetime
+    end: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class StoredOutcomeContextDay:
+    day: date
+    sleep_minutes: float | None
+    sleep_status: Literal["unobserved", "partial", "observed"]
+    sleep_quality_status: DataQualityStatus
+    context_quality_status: DataQualityStatus
+    medication_quality_status: DataQualityStatus
+    illness_severity: str | None
+    illness_origin: Literal["unknown", "assumed_none", "observed"]
+    stress_level: str | None
+    stress_origin: Literal["unknown", "assumed_average", "observed"]
+    medication_regime_revision_id: MedicationRevisionId | None
+    medication_deviation: bool
+    medication_as_needed_intake: bool
+    sleep_intervals: tuple[StoredOutcomeSleepInterval, ...] = ()
+    sleep_source_evidence: tuple[StoredAnalysisSourceEvidence, ...] = ()
+    context_source_evidence: tuple[StoredAnalysisSourceEvidence, ...] = ()
+    medication_source_evidence: tuple[StoredAnalysisSourceEvidence, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class StoredWorkout:
     logical_workout_id: LogicalMeasurementId
     workout_version_id: MeasurementVersionId
@@ -9460,6 +9497,310 @@ class LocalStore:
             coverage_incomplete,
         )
 
+    def load_analysis_outcome_context_inputs(
+        self,
+        snapshot_id: SnapshotId,
+        start_date: date | None,
+        end_date: date | None,
+    ) -> tuple[SnapshotId, tuple[StoredOutcomeContextDay, ...]]:
+        self._require_open()
+        if start_date is None or end_date is None:
+            return snapshot_id, ()
+        directory = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
+        lineage = directory / "derivation_lineage.parquet"
+        sleep_intervals = directory / "sleep_intervals.parquet"
+        sleep_nights = directory / "sleep_nights.parquet"
+        sleep_episodes = directory / "sleep_episodes.parquet"
+        daily_context = directory / "daily_context.parquet"
+        medication_context = directory / "medication_context.parquet"
+        if not all(
+            path.exists()
+            for path in (
+                lineage,
+                sleep_intervals,
+                sleep_nights,
+                sleep_episodes,
+                daily_context,
+                medication_context,
+            )
+        ):
+            return snapshot_id, ()
+
+        def path(value: Path) -> str:
+            return str(value).replace("'", "''")
+
+        sleep = {
+            row[0]: row[1:]
+            for row in self._query.execute(
+                f"""
+                SELECT night.day, night.observation_status, episode.observed_sleep_minutes,
+                       night.quality_status
+                FROM read_parquet('{path(sleep_nights)}') night
+                LEFT JOIN read_parquet('{path(sleep_episodes)}') episode
+                  ON episode.derived_record_id = night.primary_episode_id
+                WHERE night.day BETWEEN ? AND ?
+                ORDER BY night.day
+                """,
+                (start_date, end_date),
+            ).fetchall()
+        }
+        sleep_intervals_by_day: dict[date, list[StoredOutcomeSleepInterval]] = {}
+        for row in self._query.execute(
+            f"""
+            SELECT night.day, source.canonical_category, source.source_start_utc,
+                   source.source_end_utc
+            FROM read_parquet('{path(sleep_nights)}') night
+            JOIN read_parquet('{path(lineage)}') lineage
+              ON lineage.derived_record_id = night.primary_episode_id
+             AND lineage.derived_family = 'sleep_episode'
+            JOIN read_parquet('{path(sleep_intervals)}') source
+              ON source.measurement_version_id = lineage.source_version_id
+            WHERE night.day BETWEEN ? AND ? AND source.canonical_category != 'in_bed'
+            ORDER BY night.day, source.source_start_utc, source.source_end_utc
+            """,
+            (start_date, end_date),
+        ).fetchall():
+            sleep_intervals_by_day.setdefault(cast(date, row[0]), []).append(
+                StoredOutcomeSleepInterval(
+                    CanonicalSleepCategory(str(row[1])),
+                    datetime.fromisoformat(str(row[2])),
+                    datetime.fromisoformat(str(row[3])),
+                )
+            )
+        sleep_sources: dict[date, list[StoredAnalysisSourceEvidence]] = {}
+        for row in self._query.execute(
+            f"""
+            SELECT night.day, source.measurement_version_id, source.source_name,
+                   source.source_version, source.source_updated_at_utc
+            FROM read_parquet('{path(sleep_nights)}') night
+            JOIN read_parquet('{path(lineage)}') lineage
+              ON lineage.derived_record_id = night.derived_record_id
+             AND lineage.derived_family = 'sleep_night'
+            JOIN read_parquet('{path(sleep_intervals)}') source
+              ON source.measurement_version_id = lineage.source_version_id
+            WHERE night.day BETWEEN ? AND ?
+            ORDER BY night.day, source.measurement_version_id
+            """,
+            (start_date, end_date),
+        ).fetchall():
+            sleep_sources.setdefault(cast(date, row[0]), []).append(
+                StoredAnalysisSourceEvidence(
+                    MeasurementVersionId(str(row[1])),
+                    str(row[2]),
+                    str(row[3]),
+                    datetime.fromisoformat(str(row[4])),
+                    "included_source",
+                )
+            )
+        context = {
+            row[0]: row[1:]
+            for row in self._query.execute(
+                f"""
+                SELECT context.day, context.illness_severity, context.stress_level,
+                       context.quality_status
+                FROM read_parquet('{path(daily_context)}') context
+                WHERE context.day BETWEEN ? AND ?
+                ORDER BY context.day
+                """,
+                (start_date, end_date),
+            ).fetchall()
+        }
+        medication = {
+            row[0]: row[1:]
+            for row in self._query.execute(
+                f"""
+                SELECT medication.day, medication.deviation_count,
+                       medication.as_needed_intake_count, medication.quality_status
+                FROM read_parquet('{path(medication_context)}') medication
+                WHERE medication.day BETWEEN ? AND ?
+                ORDER BY medication.day
+                """,
+                (start_date, end_date),
+            ).fetchall()
+        }
+        context_source_ids = {
+            row[0]: tuple(str(item) for item in row[1])
+            for row in self._query.execute(
+                f"""
+                SELECT context.day,
+                       list(lineage.source_version_id ORDER BY lineage.source_version_id)
+                FROM read_parquet('{path(daily_context)}') context
+                JOIN read_parquet('{path(lineage)}') lineage
+                  ON lineage.derived_record_id = context.derived_record_id
+                 AND lineage.derived_family = 'daily_context'
+                WHERE context.day BETWEEN ? AND ?
+                GROUP BY context.day ORDER BY context.day
+                """,
+                (start_date, end_date),
+            ).fetchall()
+        }
+        medication_source_ids = {
+            row[0]: tuple(str(item) for item in row[1])
+            for row in self._query.execute(
+                f"""
+                SELECT medication.day,
+                       list(lineage.source_version_id ORDER BY lineage.source_version_id)
+                FROM read_parquet('{path(medication_context)}') medication
+                JOIN read_parquet('{path(lineage)}') lineage
+                  ON lineage.derived_record_id = medication.derived_record_id
+                 AND lineage.derived_family = 'medication_context'
+                WHERE medication.day BETWEEN ? AND ?
+                GROUP BY medication.day ORDER BY medication.day
+                """,
+                (start_date, end_date),
+            ).fetchall()
+        }
+        manual_source_times = {
+            str(row[0]): datetime.fromisoformat(str(row[1]))
+            for row in self._metadata.execute(
+                "SELECT revision_id, created_at_utc FROM manual_context_revisions "
+                "UNION ALL SELECT revision_id, created_at_utc FROM medication_regime_revisions "
+                "UNION ALL SELECT revision_id, created_at_utc "
+                "FROM medication_deviation_revisions "
+                "UNION ALL SELECT revision_id, created_at_utc FROM as_needed_intake_revisions "
+                "UNION ALL SELECT revision_id, created_at_utc "
+                "FROM intake_reason_category_revisions"
+            ).fetchall()
+        }
+
+        def manual_evidence(
+            source_ids: tuple[str, ...], source_name: str, source_version: str
+        ) -> tuple[StoredAnalysisSourceEvidence, ...]:
+            return tuple(
+                StoredAnalysisSourceEvidence(
+                    (
+                        ContextRevisionId(source_id)
+                        if source_name == "manual-context"
+                        else MedicationRevisionId(source_id)
+                    ),
+                    source_name,
+                    source_version,
+                    manual_source_times[source_id],
+                    "active_revision",
+                )
+                for source_id in source_ids
+                if source_id in manual_source_times
+            )
+        coverage = self.load_context_coverage_start(snapshot_id)
+        context_revisions = tuple(
+            item for item in self.load_active_illness(snapshot_id) if item.state == "active"
+        )
+        illness_periods = tuple(
+            item for item in context_revisions if item.object_kind == "illness_period"
+        )
+        stress_days = {
+            item.start_date
+            for item in context_revisions
+            if item.object_kind == "daily_stress" and item.start_date is not None
+        }
+        regimes = tuple(
+            sorted(
+                (
+                    item
+                    for item in self.load_active_medication_regimes(snapshot_id)
+                    if item.state == "active"
+                ),
+                key=lambda item: item.starts_at,
+            )
+        )
+        days = tuple(
+            start_date + timedelta(days=offset)
+            for offset in range((end_date - start_date).days + 1)
+        )
+        result = []
+        for day in days:
+            sleep_row = sleep.get(day)
+            context_row = context.get(day)
+            medication_row = medication.get(day)
+            illness_observed = any(
+                item.start_date is not None
+                and item.start_date <= day
+                and (item.end_date is None or day <= item.end_date)
+                for item in illness_periods
+            )
+            covered = (
+                coverage is not None
+                and coverage.start_date is not None
+                and day >= coverage.start_date
+            )
+            regime = next(
+                (item for item in reversed(regimes) if item.starts_at.date() <= day),
+                None,
+            )
+            result.append(
+                StoredOutcomeContextDay(
+                    day=day,
+                    sleep_minutes=(
+                        None
+                        if sleep_row is None or sleep_row[1] is None
+                        else float(sleep_row[1])
+                    ),
+                    sleep_status=cast(
+                        Literal["unobserved", "partial", "observed"],
+                        "unobserved" if sleep_row is None else str(sleep_row[0]),
+                    ),
+                    sleep_quality_status=(
+                        DataQualityStatus.REVIEWED
+                        if sleep_row is None
+                        else DataQualityStatus(str(sleep_row[2]))
+                    ),
+                    context_quality_status=(
+                        DataQualityStatus.REVIEWED
+                        if context_row is None
+                        else DataQualityStatus(str(context_row[2]))
+                    ),
+                    medication_quality_status=(
+                        DataQualityStatus.REVIEWED
+                        if medication_row is None
+                        else DataQualityStatus(str(medication_row[2]))
+                    ),
+                    illness_severity=(
+                        None
+                        if context_row is None or context_row[0] is None
+                        else str(context_row[0])
+                    ),
+                    illness_origin=(
+                        "observed" if illness_observed else "assumed_none" if covered else "unknown"
+                    ),
+                    stress_level=(
+                        None
+                        if context_row is None or context_row[1] is None
+                        else str(context_row[1])
+                    ),
+                    stress_origin=(
+                        "observed"
+                        if day in stress_days
+                        else "assumed_average"
+                        if covered
+                        else "unknown"
+                    ),
+                    medication_regime_revision_id=(
+                        None
+                        if regime is None
+                        else MedicationRevisionId(str(regime.revision_id))
+                    ),
+                    medication_deviation=(
+                        False if medication_row is None else int(medication_row[0]) > 0
+                    ),
+                    medication_as_needed_intake=(
+                        False if medication_row is None else int(medication_row[1]) > 0
+                    ),
+                    sleep_intervals=tuple(sleep_intervals_by_day.get(day, ())),
+                    sleep_source_evidence=tuple(sleep_sources.get(day, ())),
+                    context_source_evidence=manual_evidence(
+                        context_source_ids.get(day, ()),
+                        "manual-context",
+                        "daily-context/v1",
+                    ),
+                    medication_source_evidence=manual_evidence(
+                        medication_source_ids.get(day, ()),
+                        "manual-medication",
+                        "medication-context/v1",
+                    ),
+                )
+            )
+        return snapshot_id, tuple(result)
+
     def load_activity_measurements(
         self,
         snapshot_id: SnapshotId | None,
@@ -12313,11 +12654,14 @@ class LocalStore:
                 raise StoreError("V0.4-Analyseeingang ist ungültig.") from error
             if not isinstance(record, dict):
                 raise StoreError("V0.4-Analyseeingang ist ungültig.")
+            input_schema_version = record.get("input_schema_version")
+            if input_schema_version not in {1, 2}:
+                raise StoreError("V0.4-Analyseeingang ist ungültig.")
             content = dict(record)
             content.pop("analysis_run_id", None)
             artifact = AnalysisJsonlArtifact(
                 "analysis-input-bundle",
-                1,
+                input_schema_version,
                 hashlib.sha256(
                     json.dumps(content, separators=(",", ":"), sort_keys=True).encode()
                 ).hexdigest(),
@@ -12340,7 +12684,7 @@ class LocalStore:
             )
             if (
                 artifact.schema_id != "analysis-input-bundle"
-                or artifact.schema_version != 1
+                or artifact.schema_version != input_schema_version
                 or len(_analysis_jsonl_rows(artifact)) != 1
             ):
                 raise StoreError("V0.4-Analyseeingang ist ungültig.")
@@ -12361,7 +12705,7 @@ class LocalStore:
                     ],
                     "manifest_schema_version": 1,
                     "result_family": None,
-                    "schema_version": 1,
+                    "schema_version": input_schema_version,
                 },
                 separators=(",", ":"),
                 sort_keys=True,
@@ -12379,10 +12723,11 @@ class LocalStore:
                     analysis_run_id, artifact_kind, result_id, result_family,
                     schema_id, schema_version, content_hash, manifest_sha256,
                     manifest_size_bytes, artifact_path, artifact_size_bytes, is_legacy
-                ) VALUES (?, 'input', NULL, NULL, 'analysis-input-bundle', 1, ?, ?, ?, ?, ?, 0)
+                ) VALUES (?, 'input', NULL, NULL, 'analysis-input-bundle', ?, ?, ?, ?, ?, ?, 0)
                 """,
                 (
                     run_id,
+                    input_schema_version,
                     artifact.content_hash,
                     hashlib.sha256(manifest).hexdigest(),
                     len(manifest),

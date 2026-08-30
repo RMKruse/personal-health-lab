@@ -147,7 +147,9 @@ def _artifact(
     content = {key: value for key, value in record.items() if key not in identity_fields}
     return AnalysisJsonlArtifact(
         schema_id,
-        1,
+        int(record.get("input_schema_version", 1))
+        if schema_id == "analysis-input-bundle"
+        else 1,
         hashlib.sha256(
             json.dumps(content, separators=(",", ":"), sort_keys=True).encode()
         ).hexdigest(),

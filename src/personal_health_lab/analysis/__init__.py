@@ -8,6 +8,7 @@ import subprocess
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from enum import StrEnum
+from itertools import pairwise
 from pathlib import Path
 from typing import Literal, cast
 from uuid import uuid4
@@ -26,11 +27,14 @@ from personal_health_lab.storage import (
     AnalysisRunId,
     AnalysisRunPublication,
     CanonicalHealthType,
+    CanonicalSleepCategory,
     CanonicalUnit,
+    ContextRevisionId,
     DataQualityStatus,
     DataStatusReasonCode,
     LocalStore,
     MeasurementVersionId,
+    MedicationRevisionId,
     ModelMaturityStatus,
     OperationId,
     PlausibilityRuleRecord,
@@ -38,7 +42,9 @@ from personal_health_lab.storage import (
     ReviewCaseId,
     SnapshotId,
     StoredActivityDayValue,
+    StoredAnalysisSourceEvidence,
     StoredMeasurement,
+    StoredOutcomeContextDay,
     StoredWorkout,
     StoreError,
 )
@@ -364,6 +370,32 @@ class AnalysisSourceEvidence:
     disposition: str | None
 
 
+class AnalysisSourceRecordKind(StrEnum):
+    MEASUREMENT_VERSION = "measurement_version"
+    CONTEXT_REVISION = "context_revision"
+    MEDICATION_REVISION = "medication_revision"
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisSourceRecordEvidence:
+    source_record_kind: AnalysisSourceRecordKind
+    source_record_id: MeasurementVersionId | ContextRevisionId | MedicationRevisionId
+    source_name: str
+    source_version: str
+    source_updated_at: datetime
+    is_selected: bool
+    disposition: str | None
+
+    def __post_init__(self) -> None:
+        expected_type = {
+            AnalysisSourceRecordKind.MEASUREMENT_VERSION: MeasurementVersionId,
+            AnalysisSourceRecordKind.CONTEXT_REVISION: ContextRevisionId,
+            AnalysisSourceRecordKind.MEDICATION_REVISION: MedicationRevisionId,
+        }[self.source_record_kind]
+        if not isinstance(self.source_record_id, expected_type):
+            raise ValueError("Quellenart und opake Quellen-ID widersprechen sich.")
+
+
 @dataclass(frozen=True, slots=True)
 class AnalysisInputValue:
     day: date
@@ -376,6 +408,7 @@ class AnalysisInputValue:
     data_quality_fact_ids: tuple[ReviewCaseId, ...] = ()
     missingness_reason: AnalysisMissingnessReason | None = None
     quality_status: DataQualityStatus = DataQualityStatus.REVIEWED
+    source_records: tuple[AnalysisSourceRecordEvidence, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,7 +432,7 @@ class AnalysisInputBundle:
     data_quality_fact_ids: tuple[ReviewCaseId, ...]
     scalings: tuple[AnalysisScaling, ...]
     activity_coverage_incomplete: bool = False
-    schema_version: int = 1
+    schema_version: int = 2
 
 
 _INPUT_KEYS = {
@@ -425,6 +458,7 @@ _INPUT_VALUE_KEYS = {
     "missingness_reason",
     "quality_status",
     "source_evidence",
+    "source_records",
     "unit",
     "value",
 }
@@ -433,6 +467,15 @@ _SOURCE_EVIDENCE_KEYS = {
     "is_selected",
     "measurement_version_id",
     "source_name",
+    "source_updated_at",
+    "source_version",
+}
+_SOURCE_RECORD_KEYS = {
+    "disposition",
+    "is_selected",
+    "source_name",
+    "source_record_id",
+    "source_record_kind",
     "source_updated_at",
     "source_version",
 }
@@ -1437,12 +1480,245 @@ def _activity_value(
     )
 
 
+_ILLNESS_SEVERITY = {None: 0.0, "mild": 1.0, "moderate": 2.0, "severe": 3.0}
+_STRESS_DEVIATION = {
+    "very_low": -2.0,
+    "low": -1.0,
+    "average": 0.0,
+    "high": 1.0,
+    "very_high": 2.0,
+}
+_CONTEXT_RULE_VERSIONS = (
+    "sleep-episode/v1",
+    "sleep-night/v1",
+    "daily-context/v1",
+    "medication-context/v1",
+    "outcome-context-encoding/v1",
+    "analysis-complete-case/v1",
+)
+
+
+def _context_measurement_source_evidence(
+    sources: tuple[StoredAnalysisSourceEvidence, ...],
+) -> tuple[AnalysisSourceEvidence, ...]:
+    return tuple(
+        AnalysisSourceEvidence(
+            source.source_record_id,
+            source.source_name,
+            source.source_version,
+            source.source_updated_at,
+            True,
+            source.disposition,
+        )
+        for source in sources
+        if isinstance(source.source_record_id, MeasurementVersionId)
+    )
+
+
+def _context_source_records(
+    sources: tuple[StoredAnalysisSourceEvidence, ...],
+) -> tuple[AnalysisSourceRecordEvidence, ...]:
+    return tuple(
+        AnalysisSourceRecordEvidence(
+            (
+                AnalysisSourceRecordKind.MEASUREMENT_VERSION
+                if isinstance(source.source_record_id, MeasurementVersionId)
+                else AnalysisSourceRecordKind.CONTEXT_REVISION
+                if isinstance(source.source_record_id, ContextRevisionId)
+                else AnalysisSourceRecordKind.MEDICATION_REVISION
+            ),
+            source.source_record_id,
+            source.source_name,
+            source.source_version,
+            source.source_updated_at,
+            True,
+            source.disposition,
+        )
+        for source in sources
+    )
+
+
+def _outcome_context_values(
+    day: date,
+    context: StoredOutcomeContextDay | None,
+    medication_segments: dict[MedicationRevisionId, float],
+) -> tuple[AnalysisInputValue, ...]:
+    if context is None:
+        return tuple(
+            AnalysisInputValue(
+                day,
+                AnalysisInput.OUTCOME_DAY_CONTEXT,
+                component,
+                unit,
+                None,
+                AnalysisMissingness.MISSING,
+                missingness_reason=AnalysisMissingnessReason.INPUT_NOT_AVAILABLE,
+            )
+            for component, unit in (
+                ("sleep_duration_minutes", CanonicalUnit.MINUTE),
+                ("sleep_observation_status", None),
+                ("illness_severity", None),
+                ("stress_deviation", None),
+                ("stress_origin_observed", None),
+                ("medication_regime_segment", None),
+                ("medication_deviation", None),
+                ("medication_as_needed_intake", None),
+            )
+        )
+
+    sleep_status = context.sleep_status
+    if sleep_status == "observed":
+        boundaries = sorted(
+            {
+                value
+                for interval in context.sleep_intervals
+                for value in (interval.start, interval.end)
+            }
+        )
+        asleep_categories = {
+            CanonicalSleepCategory.ASLEEP_UNSPECIFIED,
+            CanonicalSleepCategory.ASLEEP_CORE,
+            CanonicalSleepCategory.ASLEEP_DEEP,
+            CanonicalSleepCategory.ASLEEP_REM,
+        }
+        for left, right in pairwise(boundaries):
+            active = {
+                interval.category
+                for interval in context.sleep_intervals
+                if interval.start <= left and interval.end >= right
+            }
+            asleep = active & asleep_categories
+            if (
+                not active
+                or len(asleep) > 1
+                or (asleep and CanonicalSleepCategory.AWAKE in active)
+            ):
+                sleep_status = "partial"
+                break
+    sleep_quality_status = (
+        DataQualityStatus.PROVISIONAL
+        if sleep_status == "partial"
+        else context.sleep_quality_status
+    )
+    sleep_missingness = (
+        AnalysisMissingness.PARTIAL
+        if sleep_status == "partial"
+        else AnalysisMissingness.MISSING
+        if context.sleep_minutes is None
+        else AnalysisMissingness.OBSERVED
+    )
+    sleep_reason = (
+        AnalysisMissingnessReason.PARTIAL_OBSERVATION
+        if sleep_status == "partial"
+        else AnalysisMissingnessReason.NO_OBSERVATION
+        if context.sleep_minutes is None
+        else None
+    )
+    illness_known = context.illness_origin != "unknown"
+    stress_known = context.stress_origin != "unknown"
+    medication_known = context.medication_regime_revision_id is not None
+    values = (
+        (
+            "sleep_duration_minutes",
+            CanonicalUnit.MINUTE,
+            context.sleep_minutes,
+            sleep_missingness,
+            sleep_reason,
+            sleep_quality_status,
+            context.sleep_source_evidence,
+        ),
+        (
+            "sleep_observation_status",
+            None,
+            {"unobserved": 0.0, "partial": 1.0, "observed": 2.0}[sleep_status],
+            AnalysisMissingness.OBSERVED,
+            None,
+            sleep_quality_status,
+            context.sleep_source_evidence,
+        ),
+        (
+            "illness_severity",
+            None,
+            _ILLNESS_SEVERITY.get(context.illness_severity) if illness_known else None,
+            AnalysisMissingness.OBSERVED if illness_known else AnalysisMissingness.MISSING,
+            None if illness_known else AnalysisMissingnessReason.NO_OBSERVATION,
+            context.context_quality_status,
+            context.context_source_evidence,
+        ),
+        (
+            "stress_deviation",
+            None,
+            _STRESS_DEVIATION.get(context.stress_level)
+            if stress_known and context.stress_level is not None
+            else None,
+            AnalysisMissingness.OBSERVED if stress_known else AnalysisMissingness.MISSING,
+            None if stress_known else AnalysisMissingnessReason.NO_OBSERVATION,
+            context.context_quality_status,
+            context.context_source_evidence,
+        ),
+        (
+            "stress_origin_observed",
+            None,
+            float(context.stress_origin == "observed") if stress_known else None,
+            AnalysisMissingness.OBSERVED if stress_known else AnalysisMissingness.MISSING,
+            None if stress_known else AnalysisMissingnessReason.NO_OBSERVATION,
+            context.context_quality_status,
+            context.context_source_evidence,
+        ),
+        (
+            "medication_regime_segment",
+            None,
+            medication_segments.get(context.medication_regime_revision_id)
+            if medication_known and context.medication_regime_revision_id is not None
+            else None,
+            AnalysisMissingness.OBSERVED if medication_known else AnalysisMissingness.MISSING,
+            None if medication_known else AnalysisMissingnessReason.NO_OBSERVATION,
+            context.medication_quality_status,
+            context.medication_source_evidence,
+        ),
+        (
+            "medication_deviation",
+            None,
+            float(context.medication_deviation) if medication_known else None,
+            AnalysisMissingness.OBSERVED if medication_known else AnalysisMissingness.MISSING,
+            None if medication_known else AnalysisMissingnessReason.NO_OBSERVATION,
+            context.medication_quality_status,
+            context.medication_source_evidence,
+        ),
+        (
+            "medication_as_needed_intake",
+            None,
+            float(context.medication_as_needed_intake) if medication_known else None,
+            AnalysisMissingness.OBSERVED if medication_known else AnalysisMissingness.MISSING,
+            None if medication_known else AnalysisMissingnessReason.NO_OBSERVATION,
+            context.medication_quality_status,
+            context.medication_source_evidence,
+        ),
+    )
+    return tuple(
+        AnalysisInputValue(
+            day,
+            AnalysisInput.OUTCOME_DAY_CONTEXT,
+            component,
+            unit,
+            value,
+            missingness,
+            _context_measurement_source_evidence(sources),
+            missingness_reason=reason,
+            quality_status=quality_status,
+            source_records=_context_source_records(sources),
+        )
+        for component, unit, value, missingness, reason, quality_status, sources in values
+    )
+
+
 def build_analysis_input_bundle(
     plan: RunAnalysisPlan,
     analysis_run_id: AnalysisRunId,
     measurements: tuple[StoredMeasurement, ...],
     workouts: tuple[StoredWorkout, ...] = (),
     activity_values: tuple[StoredActivityDayValue, ...] = (),
+    outcome_context_days: tuple[StoredOutcomeContextDay, ...] = (),
     activity_coverage_incomplete: bool = False,
     plausibility_rules: tuple[PlausibilityRuleRecord, ...] = (),
     activity_derivation: ActivityDerivationRecord | None = None,
@@ -1498,6 +1774,17 @@ def build_analysis_input_bundle(
     activity_by_day_and_input = {
         (item.day, _MEASUREMENT_INPUTS[item.data_type.value][0]): item for item in activity_values
     }
+    context_by_day = {item.day: item for item in outcome_context_days}
+    medication_segments = {
+        revision_id: float(index)
+        for index, revision_id in enumerate(
+            dict.fromkeys(
+                item.medication_regime_revision_id
+                for item in outcome_context_days
+                if item.medication_regime_revision_id is not None
+            )
+        )
+    }
     required = plan.analysis_definition.method_facts.inputs
     values: list[AnalysisInputValue] = []
     for day in calendar:
@@ -1537,6 +1824,15 @@ def build_analysis_input_bundle(
                         input_id,
                         activity_by_day_and_input.get((day, input_id)),
                         tuple(grouped.get((day, input_id, None), ())),
+                    )
+                )
+                continue
+            if input_id is AnalysisInput.OUTCOME_DAY_CONTEXT:
+                values.extend(
+                    _outcome_context_values(
+                        day,
+                        context_by_day.get(day),
+                        medication_segments,
                     )
                 )
                 continue
@@ -1597,6 +1893,8 @@ def build_analysis_input_bundle(
         )
     if any(item in _WORKOUT_INPUTS for item in required):
         rule_versions.append("analytical-workout-type/v1")
+    if AnalysisInput.OUTCOME_DAY_CONTEXT in required:
+        rule_versions.extend(_CONTEXT_RULE_VERSIONS)
     rule_versions.extend(
         version for input_id, version in _BUILTIN_RULE_VERSIONS.items() if input_id in required
     )
@@ -1662,6 +1960,18 @@ def _bundle_payload(bundle: AnalysisInputBundle, *, include_run_id: bool) -> dic
                     }
                     for evidence in item.source_evidence
                 ],
+                "source_records": [
+                    {
+                        "disposition": source.disposition,
+                        "is_selected": source.is_selected,
+                        "source_name": source.source_name,
+                        "source_record_id": str(source.source_record_id),
+                        "source_record_kind": source.source_record_kind.value,
+                        "source_updated_at": source.source_updated_at.isoformat(),
+                        "source_version": source.source_version,
+                    }
+                    for source in item.source_records
+                ],
                 "unit": None if item.unit is None else item.unit.value,
                 "value": item.value,
             }
@@ -1702,7 +2012,7 @@ def _validate_input_artifact(
     rows = _artifact_rows(artifact)
     if (
         artifact.schema_id != "analysis-input-bundle"
-        or artifact.schema_version != 1
+        or artifact.schema_version != 2
         or len(rows) != 1
     ):
         raise StoreError("Unbekanntes Analyseeingangsschema.")
@@ -1715,7 +2025,7 @@ def _validate_input_artifact(
     quality_ids = record.get("data_quality_fact_ids")
     if (
         set(record) != _INPUT_KEYS
-        or record.get("input_schema_version") != 1
+        or record.get("input_schema_version") != 2
         or record.get("analysis_run_id") != str(provenance.analysis_run_id)
         or record.get("snapshot_id") != str(provenance.snapshot_id)
         or record.get("analysis_definition_id") != str(provenance.analysis_definition_id)
@@ -1743,6 +2053,7 @@ def _validate_input_artifact(
         if not isinstance(value, dict) or set(value) != _INPUT_VALUE_KEYS:
             raise StoreError("Analysewert verletzt das Schema.")
         evidence = value["source_evidence"]
+        source_records = value["source_records"]
         numeric = value["value"]
         if (
             not isinstance(value["day"], str)
@@ -1769,6 +2080,7 @@ def _validate_input_artifact(
             )
             or value["quality_status"] not in {item.value for item in DataQualityStatus}
             or not isinstance(evidence, list)
+            or not isinstance(source_records, list)
             or not isinstance(value["measurement_version_ids"], list)
             or not all(isinstance(item, str) for item in value["measurement_version_ids"])
             or not isinstance(value["data_quality_fact_ids"], list)
@@ -1798,6 +2110,49 @@ def _validate_input_artifact(
                     raise ValueError
             except ValueError as error:
                 raise StoreError("Analysequellenbeleg verletzt das Zeitschema.") from error
+        for source in source_records:
+            source_kind = source.get("source_record_kind") if isinstance(source, dict) else None
+            source_id = source.get("source_record_id") if isinstance(source, dict) else None
+            if (
+                not isinstance(source, dict)
+                or set(source) != _SOURCE_RECORD_KEYS
+                or source["source_record_kind"]
+                not in {item.value for item in AnalysisSourceRecordKind}
+                or not isinstance(source["source_record_id"], str)
+                or not source["source_record_id"]
+                or (
+                    source_kind == AnalysisSourceRecordKind.MEASUREMENT_VERSION.value
+                    and (
+                        len(cast(str, source_id)) != 64
+                        or not set(cast(str, source_id)) <= set("0123456789abcdef")
+                    )
+                )
+                or (
+                    source_kind
+                    in {
+                        AnalysisSourceRecordKind.CONTEXT_REVISION.value,
+                        AnalysisSourceRecordKind.MEDICATION_REVISION.value,
+                    }
+                    and (
+                        len(cast(str, source_id)) != 32
+                        or not set(cast(str, source_id)) <= set("0123456789abcdef")
+                    )
+                )
+                or not isinstance(source["source_name"], str)
+                or not isinstance(source["source_version"], str)
+                or not isinstance(source["source_updated_at"], str)
+                or not isinstance(source["is_selected"], bool)
+                or (
+                    source["disposition"] is not None
+                    and not isinstance(source["disposition"], str)
+                )
+            ):
+                raise StoreError("Analysequellenreferenz verletzt das Schema.")
+            try:
+                if datetime.fromisoformat(source["source_updated_at"]).tzinfo is None:
+                    raise ValueError
+            except ValueError as error:
+                raise StoreError("Analysequellenreferenz verletzt das Zeitschema.") from error
     for scaling in scalings:
         if not isinstance(scaling, dict) or set(scaling) != _SCALING_KEYS:
             raise StoreError("Analyseskalierung verletzt das Schema.")
@@ -2193,11 +2548,44 @@ def _with_scalings(
     return replace(bundle, scalings=scalings)
 
 
-def _short_lag_point_fit(
-    bundle: AnalysisInputBundle, method: LagProfileMethodFacts
-) -> _LagPointOutcome:
-    if bundle.analysis_definition_id != AnalysisDefinitionId("rhr-activity-lag-1-7-v1"):
-        raise ValueError("Kurzfristiger Fit verlangt die 1-7-Definition.")
+def _with_context_scalings(
+    bundle: AnalysisInputBundle,
+    context_columns: tuple[str, ...],
+    context_deviations: tuple[float, ...],
+) -> AnalysisInputBundle:
+    scalings = bundle.scalings + tuple(
+        AnalysisScaling(
+            AnalysisInput.OUTCOME_DAY_CONTEXT,
+            component,
+            deviation,
+            AnalysisScalingStatus.OBSERVED,
+        )
+        for component, deviation in zip(
+            context_columns, context_deviations, strict=True
+        )
+    )
+    return replace(bundle, scalings=scalings)
+
+
+@dataclass(frozen=True, slots=True)
+class _LagVariantFit:
+    status: Literal["completed", "insufficient_data", "unstable"]
+    diagnostics: tuple[str, ...]
+    feature_keys: tuple[tuple[AnalysisInput, str | None], ...]
+    rows: tuple[int, ...] = ()
+    deviations: np.ndarray | None = None
+    estimates: np.ndarray | None = None
+    context_columns: tuple[str, ...] = ()
+    context_deviations: tuple[float, ...] = ()
+    matrix_columns: int = 0
+    rank: int = 0
+
+
+def _short_lag_variant_fit(
+    bundle: AnalysisInputBundle,
+    method: LagProfileMethodFacts,
+    context_lags: tuple[int, ...],
+) -> _LagVariantFit:
     horizon = 7
     values = {(item.day, item.input_id, item.component): item for item in bundle.values}
     feature_keys = tuple(
@@ -2211,8 +2599,39 @@ def _short_lag_point_fit(
             key=lambda item: (item[0].value, item[1] or ""),
         )
     )
+    context_keys = tuple(
+        sorted(
+            {
+                item.component
+                for item in bundle.values
+                if item.input_id is AnalysisInput.OUTCOME_DAY_CONTEXT and item.component is not None
+            }
+        )
+    )
+    medication_segments = tuple(
+        sorted(
+            {
+                int(item.value)
+                for item in bundle.values
+                if item.input_id is AnalysisInput.OUTCOME_DAY_CONTEXT
+                and item.component == "medication_regime_segment"
+                and item.value is not None
+            }
+        )
+    )
+    context_specs = tuple(
+        (lag, component, segment)
+        for lag in context_lags
+        for component in context_keys
+        for segment in (
+            medication_segments[1:]
+            if component == "medication_regime_segment"
+            else (None,)
+        )
+    )
     rows: list[int] = []
     lagged_rows: list[list[list[float]]] = []
+    context_rows: list[list[float]] = []
     outcomes: list[float] = []
     for outcome_index in range(horizon, len(bundle.calendar)):
         outcome = values.get(
@@ -2229,7 +2648,18 @@ def _short_lag_point_fit(
             ]
             for lag in range(1, horizon + 1)
         ]
-        if (
+        context_by_key = {
+            (lag, component): values.get(
+                (
+                    bundle.calendar[outcome_index - lag],
+                    AnalysisInput.OUTCOME_DAY_CONTEXT,
+                    component,
+                )
+            )
+            for lag in context_lags
+            for component in context_keys
+        }
+        complete = (
             outcome is not None
             and outcome.value is not None
             and math.isfinite(outcome.value)
@@ -2238,29 +2668,52 @@ def _short_lag_point_fit(
                 for lag in lagged_values
                 for item in lag
             )
-        ):
+            and all(
+                item is not None and item.value is not None and math.isfinite(item.value)
+                for item in context_by_key.values()
+            )
+        )
+        if complete:
             rows.append(outcome_index)
-            outcomes.append(outcome.value)
+            outcomes.append(cast(float, cast(AnalysisInputValue, outcome).value))
             lagged_rows.append(
                 [
                     [cast(float, cast(AnalysisInputValue, item).value) for item in lag]
                     for lag in lagged_values
                 ]
             )
+            context_rows.append(
+                [
+                    float(
+                        cast(
+                            AnalysisInputValue,
+                            context_by_key[(lag, component)],
+                        ).value
+                        == segment
+                    )
+                    if segment is not None
+                    else cast(
+                        float,
+                        cast(AnalysisInputValue, context_by_key[(lag, component)]).value,
+                    )
+                    for lag, component, segment in context_specs
+                ]
+            )
     if not rows or not feature_keys:
-        return _LagPointOutcome(
-            _with_scalings(bundle, feature_keys, None),
+        return _LagVariantFit(
             "insufficient_data",
             ("insufficient_complete_rows",),
+            feature_keys,
         )
     lagged = np.asarray(lagged_rows, dtype=float)
     deviations = np.std(lagged, axis=(0, 1))
-    scaled_bundle = _with_scalings(bundle, feature_keys, deviations)
     if np.any(~np.isfinite(deviations)) or np.any(deviations <= 0):
-        return _LagPointOutcome(
-            scaled_bundle,
+        return _LagVariantFit(
             "insufficient_data",
             ("insufficient_activity_scaling",),
+            feature_keys,
+            tuple(rows),
+            deviations,
         )
     means = np.mean(lagged, axis=(0, 1))
     standardized = (lagged - means) / deviations
@@ -2269,11 +2722,41 @@ def _short_lag_point_fit(
         [standardized[:, :, feature] @ basis for feature in range(len(feature_keys))],
         axis=1,
     )
+    context_names = tuple(
+        (
+            f"{component}={segment}@day-{lag}"
+            if segment is not None
+            else f"{component}@day-{lag}"
+        )
+        for lag, component, segment in context_specs
+    )
+    context_design = np.empty((len(rows), 0))
+    context_columns: tuple[str, ...] = ()
+    context_deviations: tuple[float, ...] = ()
+    if context_names:
+        raw_context = np.asarray(context_rows, dtype=float)
+        raw_deviations = np.std(raw_context, axis=0)
+        selected = np.isfinite(raw_deviations) & (raw_deviations > 0)
+        context_design = (
+            raw_context[:, selected] - np.mean(raw_context[:, selected], axis=0)
+        ) / raw_deviations[selected]
+        context_columns = tuple(
+            name for name, included in zip(context_names, selected, strict=True) if included
+        )
+        context_deviations = tuple(float(value) for value in raw_deviations[selected])
     ordinals = np.asarray([bundle.calendar[index].toordinal() for index in rows], dtype=float)
     weekdays = np.asarray([bundle.calendar[index].weekday() for index in rows])
     day_deviation = float(np.std(ordinals))
     if not math.isfinite(day_deviation) or day_deviation <= 0:
-        return _LagPointOutcome(scaled_bundle, "unstable", ("rank_deficient",))
+        return _LagVariantFit(
+            "unstable",
+            ("rank_deficient",),
+            feature_keys,
+            tuple(rows),
+            deviations,
+            context_columns=context_columns,
+            context_deviations=context_deviations,
+        )
     scaled_day = (ordinals - np.mean(ordinals)) / day_deviation
     nuisance = (
         np.ones(len(rows)),
@@ -2282,10 +2765,20 @@ def _short_lag_point_fit(
         np.cos(2.0 * np.pi * ordinals / 365.2425),
         *((weekdays == weekday).astype(float) for weekday in range(6)),
     )
-    matrix = np.column_stack((exposure_design, *nuisance))
+    matrix = np.column_stack((exposure_design, *nuisance, context_design))
     rank = int(np.linalg.matrix_rank(matrix))
     if rank < matrix.shape[1]:
-        return _LagPointOutcome(scaled_bundle, "unstable", ("rank_deficient",))
+        return _LagVariantFit(
+            "unstable",
+            ("rank_deficient",),
+            feature_keys,
+            tuple(rows),
+            deviations,
+            context_columns=context_columns,
+            context_deviations=context_deviations,
+            matrix_columns=matrix.shape[1],
+            rank=rank,
+        )
     second_difference = np.diff(np.eye(horizon), n=2, axis=0) @ basis
     per_feature_penalty = np.vstack(
         (
@@ -2312,18 +2805,107 @@ def _short_lag_point_fit(
         ] = basis
     estimates = (transform @ coefficients).reshape(len(feature_keys), horizon)
     if np.any(~np.isfinite(estimates)):
-        return _LagPointOutcome(
-            scaled_bundle,
+        return _LagVariantFit(
             "unstable",
             ("non_finite_point_estimate",),
+            feature_keys,
+            tuple(rows),
+            deviations,
+            context_columns=context_columns,
+            context_deviations=context_deviations,
+            matrix_columns=matrix.shape[1],
+            rank=rank,
         )
+    return _LagVariantFit(
+        "completed",
+        ("completed_point_estimate",),
+        feature_keys,
+        tuple(rows),
+        deviations,
+        estimates,
+        context_columns,
+        context_deviations,
+        matrix.shape[1],
+        rank,
+    )
+
+
+def _short_lag_point_fit(
+    bundle: AnalysisInputBundle, method: LagProfileMethodFacts
+) -> _LagPointOutcome:
+    if bundle.analysis_definition_id != AnalysisDefinitionId("rhr-activity-lag-1-7-v1"):
+        raise ValueError("Kurzfristiger Fit verlangt die 1-7-Definition.")
+    variants = {
+        "primary": (0,),
+        "context_days_0_2": (0, 1, 2),
+        "without_context": (),
+    }
+    fits = {
+        name: _short_lag_variant_fit(bundle, method, context_lags)
+        for name, context_lags in variants.items()
+    }
+    primary = fits["primary"]
+    scaled_bundle = _with_context_scalings(
+        _with_scalings(bundle, primary.feature_keys, primary.deviations),
+        primary.context_columns,
+        primary.context_deviations,
+    )
+    scaled_bundle = replace(
+        scaled_bundle,
+        scalings=scaled_bundle.scalings
+        + tuple(
+            AnalysisScaling(
+                input_id,
+                f"variant:{name}:{component or 'value'}",
+                (
+                    None
+                    if fit.deviations is None
+                    or not math.isfinite(float(fit.deviations[index]))
+                    or fit.deviations[index] <= 0
+                    else float(fit.deviations[index])
+                ),
+                (
+                    AnalysisScalingStatus.INSUFFICIENT_OBSERVATIONS
+                    if fit.deviations is None
+                    or not math.isfinite(float(fit.deviations[index]))
+                    or fit.deviations[index] <= 0
+                    else AnalysisScalingStatus.OBSERVED
+                ),
+            )
+            for name, fit in fits.items()
+            if name != "primary"
+            for index, (input_id, component) in enumerate(fit.feature_keys)
+        )
+        + tuple(
+            AnalysisScaling(
+                AnalysisInput.OUTCOME_DAY_CONTEXT,
+                f"variant:{name}:{component}",
+                deviation,
+                AnalysisScalingStatus.OBSERVED,
+            )
+            for name, fit in fits.items()
+            if name != "primary"
+            for component, deviation in zip(
+                fit.context_columns, fit.context_deviations, strict=True
+            )
+        ),
+    )
+    for name, fit in fits.items():
+        if fit.status != "completed":
+            diagnostics = (
+                fit.diagnostics
+                if name == "primary"
+                else tuple(f"{name}:{item}" for item in fit.diagnostics)
+            )
+            return _LagPointOutcome(scaled_bundle, fit.status, diagnostics)
+    assert primary.deviations is not None and primary.estimates is not None
     lag_estimates: list[dict[str, object]] = []
     contrasts: list[dict[str, object]] = []
-    for feature, (input_id, component) in enumerate(feature_keys):
+    for feature, (input_id, component) in enumerate(primary.feature_keys):
         feature_id = _feature_id(input_id, component)
         natural_scale, natural_unit = _LAG_NATURAL_SCALES[input_id]
-        personal_sd = float(deviations[feature])
-        for lag, estimate in enumerate(estimates[feature], start=1):
+        personal_sd = float(primary.deviations[feature])
+        for lag, estimate in enumerate(primary.estimates[feature], start=1):
             natural_estimate = float(estimate) * natural_scale / personal_sd
             if not math.isfinite(natural_estimate):
                 return _LagPointOutcome(
@@ -2346,7 +2928,7 @@ def _short_lag_point_fit(
         for contrast in method.contrasts:
             estimate = sum(
                 float(value)
-                for value in estimates[feature, contrast.start_day - 1 : contrast.end_day]
+                for value in primary.estimates[feature, contrast.start_day - 1 : contrast.end_day]
             )
             natural_estimate = estimate * natural_scale / personal_sd
             if not math.isfinite(estimate) or not math.isfinite(natural_estimate):
@@ -2368,26 +2950,117 @@ def _short_lag_point_fit(
                     "start_day": contrast.start_day,
                 }
             )
+    context_components = tuple(
+        sorted(
+            {
+                item.component
+                for item in bundle.values
+                if item.input_id is AnalysisInput.OUTCOME_DAY_CONTEXT and item.component is not None
+            }
+        )
+    )
+    activity_scalings = {
+        name: {
+            _feature_id(*key): float(cast(np.ndarray, fit.deviations)[index])
+            for index, key in enumerate(fit.feature_keys)
+        }
+        for name, fit in fits.items()
+    }
+    cumulative = {
+        name: {
+            _feature_id(*key): float(np.sum(cast(np.ndarray, fit.estimates)[index]))
+            for index, key in enumerate(fit.feature_keys)
+        }
+        for name, fit in fits.items()
+        if name != "primary"
+    }
+    result_diagnostics: tuple[dict[str, object], ...] = (
+        {
+            "code": AnalysisDiagnostic.FIT.value,
+            "facts": {
+                "basis_nodes": method.lag_basis_nodes,
+                "context_columns": primary.context_columns,
+                "feature_count": len(primary.feature_keys),
+                "fit_rows": len(primary.rows),
+                "matrix_columns": primary.matrix_columns,
+                "rank": primary.rank,
+                "ridge_penalty": method.ridge_penalty,
+                "smoothing_penalty": method.smoothing_penalty,
+                "variant": "primary",
+            },
+        },
+        {
+            "code": AnalysisDiagnostic.INPUT.value,
+            "facts": {
+                "activity_coverage_incomplete": bundle.activity_coverage_incomplete,
+                "activity_scalings": activity_scalings,
+                "context_components": context_components,
+                "context_rule_versions": _CONTEXT_RULE_VERSIONS,
+                "context_scalings": {
+                    name: dict(zip(fit.context_columns, fit.context_deviations, strict=True))
+                    for name, fit in fits.items()
+                },
+                "context_variants": tuple(variants),
+            },
+        },
+        {
+            "code": AnalysisDiagnostic.MISSINGNESS.value,
+            "facts": {
+                "context_missing_values": {
+                    component: sum(
+                        item.input_id is AnalysisInput.OUTCOME_DAY_CONTEXT
+                        and item.component == component
+                        and item.value is None
+                        for item in bundle.values
+                    )
+                    for component in context_components
+                },
+                "input_missing_values": {
+                    _feature_id(input_id, component): sum(
+                        item.input_id is input_id
+                        and item.component == component
+                        and item.value is None
+                        for item in bundle.values
+                    )
+                    for input_id, component in {
+                        (item.input_id, item.component) for item in bundle.values
+                    }
+                },
+                "input_missingness": {
+                    _feature_id(input_id, component): {
+                        state.value: sum(
+                            item.input_id is input_id
+                            and item.component == component
+                            and item.missingness is state
+                            for item in bundle.values
+                        )
+                        for state in AnalysisMissingness
+                    }
+                    for input_id, component in {
+                        (item.input_id, item.component) for item in bundle.values
+                    }
+                },
+                "fit_days": {
+                    name: tuple(bundle.calendar[index].isoformat() for index in fit.rows)
+                    for name, fit in fits.items()
+                },
+            },
+        },
+        {
+            "code": AnalysisDiagnostic.SENSITIVITY.value,
+            "facts": {
+                "cumulative_bpm_per_personal_sd": cumulative,
+                "fit_rows": {name: len(fit.rows) for name, fit in fits.items()},
+            },
+        },
+    )
     return _LagPointOutcome(
         scaled_bundle,
         "completed",
         ("completed_point_estimate",),
         tuple(lag_estimates),
         tuple(contrasts),
-        (
-            {
-                "code": AnalysisDiagnostic.FIT.value,
-                "facts": {
-                    "basis_nodes": method.lag_basis_nodes,
-                    "feature_count": len(feature_keys),
-                    "fit_rows": len(rows),
-                    "matrix_columns": matrix.shape[1],
-                    "rank": rank,
-                    "ridge_penalty": method.ridge_penalty,
-                    "smoothing_penalty": method.smoothing_penalty,
-                },
-            },
-        ),
+        result_diagnostics,
     )
 
 
@@ -2428,10 +3101,21 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
         if uses_activity
         else (plan.base_snapshot_ref, (), False)
     )
+    uses_context = AnalysisInput.OUTCOME_DAY_CONTEXT in required
+    context_snapshot_id, outcome_context_days = (
+        store.load_analysis_outcome_context_inputs(
+            plan.base_snapshot_ref,
+            plan.eligible_start_date,
+            plan.eligible_end_date,
+        )
+        if uses_context
+        else (plan.base_snapshot_ref, ())
+    )
     if (
         snapshot_id != plan.base_snapshot_ref
         or workout_snapshot_id != plan.base_snapshot_ref
         or activity_snapshot_id != plan.base_snapshot_ref
+        or context_snapshot_id != plan.base_snapshot_ref
     ):
         raise ValueError("Analyseeingang hat sich geändert.")
     bundle = build_analysis_input_bundle(
@@ -2440,6 +3124,7 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
         measurements,
         workouts=workouts,
         activity_values=activity_values,
+        outcome_context_days=outcome_context_days,
         activity_coverage_incomplete=activity_coverage_incomplete,
         plausibility_rules=tuple(
             rule
@@ -2538,6 +3223,22 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
             result_payload,
             _validate_result_artifact,
         )
+    provisional_evidence = tuple(
+        sorted(
+            {
+                str(evidence.measurement_version_id)
+                for item in bundle.values
+                if item.quality_status is DataQualityStatus.PROVISIONAL
+                for evidence in item.source_evidence
+            }
+            | {
+                str(source.source_record_id)
+                for item in bundle.values
+                if item.quality_status is DataQualityStatus.PROVISIONAL
+                for source in item.source_records
+            }
+        )
+    )
     data_status_reasons = (
         (
             AnalysisDataStatusReason(
@@ -2556,6 +3257,15 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
         )
         if bundle.activity_coverage_incomplete
         else ()
+    ) + (
+        (
+            AnalysisDataStatusReason(
+                DataStatusReasonCode.PROVISIONAL_INPUT_QUALITY,
+                provisional_evidence,
+            ),
+        )
+        if provisional_evidence
+        else ()
     )
     _publish_analysis_run(
         store,
@@ -2568,9 +3278,7 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
             input_artifact=artifact,
             diagnostics=diagnostics,
             data_status=(
-                DataQualityStatus.PROVISIONAL
-                if data_status_reasons
-                else DataQualityStatus.REVIEWED
+                DataQualityStatus.PROVISIONAL if data_status_reasons else DataQualityStatus.REVIEWED
             ),
             data_status_reasons=data_status_reasons,
             status=status,

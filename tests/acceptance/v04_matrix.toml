@@ -130,15 +130,25 @@ id = "V04-C-SHORT-LAG-TECHNICAL-OUTCOMES-V1"
 source = "https://github.com/RMKruse/personal-health-lab/issues/118"
 statement = "Zero or non-finite activity scaling, rank loss, and non-finite point estimates produce a closed insufficient_data or unstable run without a result identity or partial artifact."
 
+[[contract]]
+id = "V04-C-SHORT-LAG-CONTEXT-SENSITIVITY-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/119"
+statement = "The short lag primary fit uses explicit outcome-day sleep, illness, stress-origin, and medication context; mandatory context-days-0-2 and no-context fits use fixed complete-case rules and expose rows, missingness, variants, and scalings."
+
+[[contract]]
+id = "V04-C-ANALYSIS-INPUT-SCHEMA2-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/119"
+statement = "New analysis input bundles use closed schema version 2 so typed measurement, manual-context, and medication revision source records can be frozen without conflating opaque identifier kinds; legacy version 1 artifacts remain cataloged."
+
 [[hash_reference]]
 id = "V04-H-ANALYSIS-DEFINITIONS-V1"
 artifact = "src/personal_health_lab/analysis/__init__.py"
-sha256 = "c4eba7f5a091ca332524a6c94cc1eec5bbc188b19af17842bbc6c8c257523f0c"
+sha256 = "f933db11c931723d24e5f3b927aaf5c64f24d02d0452f0eb1fd3bcba45697b2f"
 
 [[hash_reference]]
 id = "V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1"
 artifact = "src/personal_health_lab/storage/_store.py"
-sha256 = "a3db43ba2cfdfcd0d718365f060543c8fbc3b34212f480c116e7933d6301f2bb"
+sha256 = "d9efc285588be52bdf0f17bf0c6fb63499ad937cee418341c0a8a99405046d05"
 
 [[hash_reference]]
 id = "V04-H-ANALYSIS-PROJECTIONS-V1"
@@ -419,3 +429,13 @@ level = "application"
 platform = "all"
 expected_result = "zero scaling is insufficient_data and unpenalized rank loss is unstable"
 forbidden_side_effects = "no result identity, result artifact, maturity verdict, or fallback result"
+
+[[case]]
+id = "V04-A-SHORT-LAG-CONTEXT-SENSITIVITY-V1"
+contracts = ["V04-C-SHORT-LAG-CONTEXT-SENSITIVITY-V1", "V04-C-ANALYSIS-INPUT-SCHEMA2-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1", "V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1", "V04-H-LAG-CALIBRATION-V1"]
+runner = "tests/acceptance/test_v04_short_lag_point_fit.py::test_short_lag_run_freezes_context_and_runs_all_fixed_variants"
+level = "application"
+platform = "all"
+expected_result = "the primary, context-days-0-2, and no-context fits complete with frozen context values and reproducible variant diagnostics"
+forbidden_side_effects = "no context imputation, data-dependent variant selection, or silent row substitution"

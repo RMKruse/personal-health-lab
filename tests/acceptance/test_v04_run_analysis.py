@@ -198,6 +198,7 @@ def test_started_run_freezes_input_and_persists_insufficient_data_without_result
     assert {reason["code"] for reason in json.loads(row[3])} == {
         "open_review_case",
         "passive_coverage_gap",
+        "provisional_input_quality",
     }
     artifact_directory = (
         runtime.active_store / "parquet" / "analysis-runs" / str(first.analysis_run_id)
@@ -224,7 +225,7 @@ def test_started_run_freezes_input_and_persists_insufficient_data_without_result
         ],
         "manifest_schema_version": 1,
         "result_family": None,
-        "schema_version": 1,
+        "schema_version": 2,
     }
     assert len(manifest["content_hash"]) == 64
     assert len(manifest["files"][0]["sha256"]) == 64
@@ -239,7 +240,7 @@ def test_started_run_freezes_input_and_persists_insufficient_data_without_result
     assert catalog[:4] == (
         "input",
         "analysis-input-bundle",
-        1,
+        2,
         manifest["content_hash"],
     )
     assert len(catalog[4]) == 64
@@ -273,8 +274,7 @@ def test_started_run_freezes_input_and_persists_insufficient_data_without_result
     assert "activity-derivation/v1" in payload["rule_versions"]
     assert any(item.startswith("plausibility/step_count/") for item in payload["rule_versions"])
     assert any(
-        value["input_id"] == "outcome_day_context"
-        and value["missingness_reason"] == "input_not_available"
+        value["input_id"] == "outcome_day_context" and value["missingness"] == "missing"
         for value in payload["values"]
     )
     assert payload["data_quality_fact_ids"]
@@ -576,7 +576,7 @@ def test_store_upgrade_registers_legacy_analysis_artifacts_idempotently(
     )
     assert facts == [("legacy_input_bundle_not_persisted",)]
     assert definition == ("lag-signal-v2",)
-    assert current_artifact == ("input", "analysis-input-bundle", 1, 0)
+    assert current_artifact == ("input", "analysis-input-bundle", 2, 0)
     assert current_facts == []
     assert interrupted_artifacts == []
 
@@ -618,7 +618,9 @@ def test_analysis_run_publication_commits_input_and_result_family_together(
             del content[field]
         return AnalysisJsonlArtifact(
             schema_id,
-            1,
+            int(record.get("input_schema_version", 1))
+            if schema_id == "analysis-input-bundle"
+            else 1,
             hashlib.sha256(
                 json.dumps(content, separators=(",", ":"), sort_keys=True).encode()
             ).hexdigest(),
