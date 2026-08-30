@@ -115,10 +115,25 @@ id = "V04-C-ANALYSIS-PROJECTION-COMPATIBILITY-V1"
 source = "https://github.com/RMKruse/personal-health-lab/issues/117"
 statement = "The two focused V0.4 analysis projections extend the exact public HealthLab surface while preserving every delivered V0.3 operation."
 
+[[contract]]
+id = "V04-C-SHORT-LAG-ACTIVITY-DESIGN-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/118"
+statement = "The short lag model jointly uses the four general activity inputs and duration and energy for every analytical workout type, pooling types with fewer than ten positive days into Other without adding redundant totals, interactions, scores, or data-dependent feature selection."
+
+[[contract]]
+id = "V04-C-SHORT-LAG-POINT-FIT-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/118"
+statement = "The short lag model uses the calibrated seven-node lag basis, smoothing penalty 3, and ridge penalty 1 and publishes daily and cumulative day 1-7 point estimates in personal-SD and fixed natural units."
+
+[[contract]]
+id = "V04-C-SHORT-LAG-TECHNICAL-OUTCOMES-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/118"
+statement = "Zero or non-finite activity scaling, rank loss, and non-finite point estimates produce a closed insufficient_data or unstable run without a result identity or partial artifact."
+
 [[hash_reference]]
 id = "V04-H-ANALYSIS-DEFINITIONS-V1"
 artifact = "src/personal_health_lab/analysis/__init__.py"
-sha256 = "e3e2dcc0578e11d59ecdcdfbd91974eff1c027ade3a2e0002dbed23f6f74009d"
+sha256 = "c4eba7f5a091ca332524a6c94cc1eec5bbc188b19af17842bbc6c8c257523f0c"
 
 [[hash_reference]]
 id = "V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1"
@@ -128,7 +143,7 @@ sha256 = "a3db43ba2cfdfcd0d718365f060543c8fbc3b34212f480c116e7933d6301f2bb"
 [[hash_reference]]
 id = "V04-H-ANALYSIS-PROJECTIONS-V1"
 artifact = "src/personal_health_lab/application/_application.py"
-sha256 = "337a7ee527e4df0ca058e97f36c98227059ca42bbcb7d407e7663bb70036f80b"
+sha256 = "945122d342eadbdc127f11b4f459e3df80a3f260d27a07d3c54a287c3f001d57"
 
 [[hash_reference]]
 id = "V04-H-LAG-CALIBRATION-V1"
@@ -384,3 +399,23 @@ level = "application"
 platform = "all"
 expected_result = "the exact HealthLab surface includes both focused analysis reads and every delivered V0.3 operation"
 forbidden_side_effects = "no removed or renamed V0.3 operation"
+
+[[case]]
+id = "V04-A-SHORT-LAG-POINT-FIT-V1"
+contracts = ["V04-C-SHORT-LAG-ACTIVITY-DESIGN-V1", "V04-C-SHORT-LAG-POINT-FIT-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1", "V04-H-ANALYSIS-PROJECTIONS-V1", "V04-H-LAG-CALIBRATION-V1"]
+runner = "tests/acceptance/test_v04_short_lag_point_fit.py::test_short_lag_run_projects_full_activity_point_estimates"
+level = "application"
+platform = "all"
+expected_result = "one typed exploratory result with eight fixed general and pooled workout features, seven daily estimates, one cumulative contrast per feature, and both reporting scales"
+forbidden_side_effects = "no redundant totals, interactions, activity scores, feature selection, uncertainty interval, bootstrap, or maturity verdict"
+
+[[case]]
+id = "V04-A-SHORT-LAG-SCALING-RANK-V1"
+contracts = ["V04-C-SHORT-LAG-TECHNICAL-OUTCOMES-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1", "V04-H-ANALYSIS-PROJECTIONS-V1"]
+runner = "tests/acceptance/test_v04_short_lag_point_fit.py::test_short_lag_run_closes_scaling_and_rank_failures_without_a_result"
+level = "application"
+platform = "all"
+expected_result = "zero scaling is insufficient_data and unpenalized rank loss is unstable"
+forbidden_side_effects = "no result identity, result artifact, maturity verdict, or fallback result"

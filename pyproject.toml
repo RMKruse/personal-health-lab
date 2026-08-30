@@ -12,6 +12,7 @@ license = { file = "LICENSE" }
 dependencies = [
     "duckdb>=1.4",
     "jsonschema>=4.26",
+    "numpy>=2.3",
     "streamlit>=1.47",
 ]
 

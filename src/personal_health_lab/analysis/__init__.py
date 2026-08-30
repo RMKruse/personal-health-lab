@@ -5,12 +5,14 @@ import json
 import math
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from uuid import uuid4
+
+import numpy as np
 
 from personal_health_lab.storage import (
     ActivityDerivationRecord,
@@ -29,6 +31,7 @@ from personal_health_lab.storage import (
     DataStatusReasonCode,
     LocalStore,
     MeasurementVersionId,
+    ModelMaturityStatus,
     OperationId,
     PlausibilityRuleRecord,
     ReproducibilityStatus,
@@ -553,6 +556,9 @@ class AnalysisExecution:
     analysis_definition_id: AnalysisDefinitionId
     diagnostics: tuple[str, ...]
     provenance: AnalysisProvenance
+    status: Literal["completed", "insufficient_data", "unstable"]
+    result_id: AnalysisResultId | None = None
+    model_maturity: ModelMaturityStatus | None = None
 
 
 type AnalysisFactValue = (
@@ -580,8 +586,8 @@ class AnalysisLagEstimate:
     natural_unit: CanonicalUnit
     estimate_bpm_per_natural_scale: float
     estimate_bpm_per_personal_sd: float
-    pointwise_interval: AnalysisResultInterval
-    simultaneous_band: AnalysisResultInterval
+    pointwise_interval: AnalysisResultInterval | None
+    simultaneous_band: AnalysisResultInterval | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -593,8 +599,8 @@ class AnalysisLagContrastEstimate:
     natural_unit: CanonicalUnit
     estimate_bpm_per_natural_scale: float
     estimate_bpm_per_personal_sd: float
-    pointwise_interval: AnalysisResultInterval
-    simultaneous_band: AnalysisResultInterval
+    pointwise_interval: AnalysisResultInterval | None
+    simultaneous_band: AnalysisResultInterval | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -739,6 +745,10 @@ def _result_interval(value: object) -> AnalysisResultInterval:
     return AnalysisResultInterval(lower, upper)
 
 
+def _result_optional_interval(value: object) -> AnalysisResultInterval | None:
+    return None if value is None else _result_interval(value)
+
+
 def _freeze_analysis_fact(value: object) -> AnalysisFactValue:
     if value is None or isinstance(value, (str, bool)):
         return value
@@ -844,8 +854,8 @@ def load_analysis_result_values(
                     CanonicalUnit(_result_string(item["natural_unit"])),
                     cast(float, _result_float(item["estimate_bpm_per_natural_scale"])),
                     cast(float, _result_float(item["estimate_bpm_per_personal_sd"])),
-                    _result_interval(item["pointwise_interval"]),
-                    _result_interval(item["simultaneous_band"]),
+                    _result_optional_interval(item["pointwise_interval"]),
+                    _result_optional_interval(item["simultaneous_band"]),
                 )
                 for item in _result_items(typed, "lag_estimates")
             ),
@@ -858,8 +868,8 @@ def load_analysis_result_values(
                     CanonicalUnit(_result_string(item["natural_unit"])),
                     cast(float, _result_float(item["estimate_bpm_per_natural_scale"])),
                     cast(float, _result_float(item["estimate_bpm_per_personal_sd"])),
-                    _result_interval(item["pointwise_interval"]),
-                    _result_interval(item["simultaneous_band"]),
+                    _result_optional_interval(item["pointwise_interval"]),
+                    _result_optional_interval(item["simultaneous_band"]),
                 )
                 for item in _result_items(typed, "contrasts")
             ),
@@ -936,6 +946,7 @@ def load_analysis_result_values(
 
 
 _LAG_INPUTS = (
+    AnalysisInput.APPLE_RESTING_HEART_RATE,
     AnalysisInput.ACTIVE_ENERGY,
     AnalysisInput.TRAINING_TIME,
     AnalysisInput.STEPS,
@@ -1290,6 +1301,20 @@ def _workout_value(
     component: str | None,
     workouts: tuple[StoredWorkout, ...],
 ) -> AnalysisInputValue:
+    unit = (
+        CanonicalUnit.MINUTE
+        if input_id is AnalysisInput.WORKOUT_DURATION_BY_TYPE
+        else CanonicalUnit.KILOCALORIE
+    )
+    if not workouts and component is not None:
+        return AnalysisInputValue(
+            day,
+            input_id,
+            component,
+            unit,
+            0.0,
+            AnalysisMissingness.OBSERVED,
+        )
     quality_ids = tuple(
         sorted({case for item in workouts for case in item.review_case_ids}, key=str)
     )
@@ -1305,9 +1330,7 @@ def _workout_value(
             day,
             input_id,
             component,
-            CanonicalUnit.MINUTE
-            if input_id is AnalysisInput.WORKOUT_DURATION_BY_TYPE
-            else CanonicalUnit.KILOCALORIE,
+            unit,
             None,
             AnalysisMissingness.MISSING,
             _workout_source_evidence(workouts),
@@ -1328,14 +1351,12 @@ def _workout_value(
             else (item.source_end - item.source_start).total_seconds() / 60
             for item in eligible
         )
-        unit = CanonicalUnit.MINUTE
     else:
         values = tuple(
             item.active_energy_kilocalories
             for item in eligible
             if item.active_energy_kilocalories is not None
         )
-        unit = CanonicalUnit.KILOCALORIE
     if not values:
         return AnalysisInputValue(
             day,
@@ -1444,11 +1465,35 @@ def build_analysis_input_bundle(
             grouped.setdefault((measurement.measurement_local_day, input_id, component), []).append(
                 measurement
             )
-    workout_components = tuple(sorted({item.original_activity_type for item in workouts}))
+    included_workouts = tuple(
+        item
+        for item in workouts
+        if item.is_selected
+        and (item.disposition is None or item.disposition.startswith("included"))
+    )
+    positive_days_by_type: dict[str, set[date]] = {}
+    for workout in included_workouts:
+        duration = (
+            workout.effective_duration_minutes
+            if workout.effective_duration_minutes is not None
+            else workout.reported_duration_minutes
+            if workout.reported_duration_minutes is not None
+            else (workout.source_end - workout.source_start).total_seconds() / 60
+        )
+        if duration > 0:
+            positive_days_by_type.setdefault(workout.original_activity_type, set()).add(
+                workout.measurement_local_day
+            )
+    analytical_type = {
+        workout_type: workout_type if len(days) >= 10 else "other"
+        for workout_type, days in positive_days_by_type.items()
+    }
+    workout_components = tuple(sorted(set(analytical_type.values())))
     workouts_by_day_and_type: dict[tuple[date, str], list[StoredWorkout]] = {}
     for workout in workouts:
+        component = analytical_type.get(workout.original_activity_type, "other")
         workouts_by_day_and_type.setdefault(
-            (workout.measurement_local_day, workout.original_activity_type), []
+            (workout.measurement_local_day, component), []
         ).append(workout)
     activity_by_day_and_input = {
         (item.day, _MEASUREMENT_INPUTS[item.data_type.value][0]): item for item in activity_values
@@ -1550,6 +1595,8 @@ def build_analysis_input_bundle(
                 activity_derivation.source_classifier_version,
             )
         )
+    if any(item in _WORKOUT_INPUTS for item in required):
+        rule_versions.append("analytical-workout-type/v1")
     rule_versions.extend(
         version for input_id, version in _BUILTIN_RULE_VERSIONS.items() if input_id in required
     )
@@ -1912,6 +1959,8 @@ def _validate_result_item(field: str, item: object) -> None:
             ):
                 raise StoreError("Analyseergebnis verletzt das geschlossene Familienschema.")
         elif key in {"pointwise_interval", "simultaneous_band"}:
+            if value is None and field in {"lag_estimates", "contrasts"}:
+                continue
             if not isinstance(value, dict) or set(value) != {"lower", "upper"}:
                 raise StoreError("Analyseergebnis verletzt das geschlossene Familienschema.")
             bounds = tuple(value.values())
@@ -2078,6 +2127,270 @@ def derive_current_analysis_reproducibility(
     return tuple(statuses)
 
 
+_LAG_FEATURE_INPUTS = _ACTIVITY_INPUTS | _WORKOUT_INPUTS
+_LAG_NATURAL_SCALES = {
+    AnalysisInput.ACTIVE_ENERGY: (100.0, CanonicalUnit.KILOCALORIE),
+    AnalysisInput.TRAINING_TIME: (10.0, CanonicalUnit.MINUTE),
+    AnalysisInput.STEPS: (1_000.0, CanonicalUnit.COUNT),
+    AnalysisInput.WALKING_RUNNING_DISTANCE: (1.0, CanonicalUnit.KILOMETER),
+    AnalysisInput.WORKOUT_DURATION_BY_TYPE: (10.0, CanonicalUnit.MINUTE),
+    AnalysisInput.WORKOUT_ENERGY_BY_TYPE: (100.0, CanonicalUnit.KILOCALORIE),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _LagPointOutcome:
+    bundle: AnalysisInputBundle
+    status: Literal["completed", "insufficient_data", "unstable"]
+    diagnostics: tuple[str, ...]
+    lag_estimates: tuple[dict[str, object], ...] = ()
+    contrasts: tuple[dict[str, object], ...] = ()
+    result_diagnostics: tuple[dict[str, object], ...] = ()
+
+
+def _feature_id(input_id: AnalysisInput, component: str | None) -> str:
+    return input_id.value if component is None else f"{input_id.value}:{component}"
+
+
+def _lag_basis(horizon: int, nodes: int) -> np.ndarray:
+    lags = np.arange(horizon, dtype=float)
+    knots = np.linspace(0.0, horizon - 1.0, nodes)
+    identity = np.eye(nodes)
+    return np.column_stack(
+        [np.interp(lags, knots, identity[:, index]) for index in range(nodes)]
+    )
+
+
+def _with_scalings(
+    bundle: AnalysisInputBundle,
+    feature_keys: tuple[tuple[AnalysisInput, str | None], ...],
+    deviations: np.ndarray | None,
+) -> AnalysisInputBundle:
+    positions = {key: index for index, key in enumerate(feature_keys)}
+    scalings = tuple(
+        AnalysisScaling(
+            scaling.input_id,
+            scaling.component,
+            (
+                None
+                if deviations is None
+                or not math.isfinite(float(deviations[positions[key]]))
+                or deviations[positions[key]] <= 0
+                else float(deviations[positions[key]])
+            ),
+            (
+                AnalysisScalingStatus.INSUFFICIENT_OBSERVATIONS
+                if deviations is None
+                or not math.isfinite(float(deviations[positions[key]]))
+                or deviations[positions[key]] <= 0
+                else AnalysisScalingStatus.OBSERVED
+            ),
+        )
+        if (key := (scaling.input_id, scaling.component)) in positions
+        else scaling
+        for scaling in bundle.scalings
+    )
+    return replace(bundle, scalings=scalings)
+
+
+def _short_lag_point_fit(
+    bundle: AnalysisInputBundle, method: LagProfileMethodFacts
+) -> _LagPointOutcome:
+    if bundle.analysis_definition_id != AnalysisDefinitionId("rhr-activity-lag-1-7-v1"):
+        raise ValueError("Kurzfristiger Fit verlangt die 1-7-Definition.")
+    horizon = 7
+    values = {(item.day, item.input_id, item.component): item for item in bundle.values}
+    feature_keys = tuple(
+        sorted(
+            {
+                (item.input_id, item.component)
+                for item in bundle.values
+                if item.input_id in _LAG_FEATURE_INPUTS
+                and (item.input_id not in _WORKOUT_INPUTS or item.component is not None)
+            },
+            key=lambda item: (item[0].value, item[1] or ""),
+        )
+    )
+    rows: list[int] = []
+    lagged_rows: list[list[list[float]]] = []
+    outcomes: list[float] = []
+    for outcome_index in range(horizon, len(bundle.calendar)):
+        outcome = values.get(
+            (
+                bundle.calendar[outcome_index],
+                AnalysisInput.APPLE_RESTING_HEART_RATE,
+                None,
+            )
+        )
+        lagged_values = [
+            [
+                values.get((bundle.calendar[outcome_index - lag], input_id, component))
+                for input_id, component in feature_keys
+            ]
+            for lag in range(1, horizon + 1)
+        ]
+        if (
+            outcome is not None
+            and outcome.value is not None
+            and math.isfinite(outcome.value)
+            and all(
+                item is not None and item.value is not None and math.isfinite(item.value)
+                for lag in lagged_values
+                for item in lag
+            )
+        ):
+            rows.append(outcome_index)
+            outcomes.append(outcome.value)
+            lagged_rows.append(
+                [
+                    [cast(float, cast(AnalysisInputValue, item).value) for item in lag]
+                    for lag in lagged_values
+                ]
+            )
+    if not rows or not feature_keys:
+        return _LagPointOutcome(
+            _with_scalings(bundle, feature_keys, None),
+            "insufficient_data",
+            ("insufficient_complete_rows",),
+        )
+    lagged = np.asarray(lagged_rows, dtype=float)
+    deviations = np.std(lagged, axis=(0, 1))
+    scaled_bundle = _with_scalings(bundle, feature_keys, deviations)
+    if np.any(~np.isfinite(deviations)) or np.any(deviations <= 0):
+        return _LagPointOutcome(
+            scaled_bundle,
+            "insufficient_data",
+            ("insufficient_activity_scaling",),
+        )
+    means = np.mean(lagged, axis=(0, 1))
+    standardized = (lagged - means) / deviations
+    basis = _lag_basis(horizon, method.lag_basis_nodes)
+    exposure_design = np.concatenate(
+        [standardized[:, :, feature] @ basis for feature in range(len(feature_keys))],
+        axis=1,
+    )
+    ordinals = np.asarray([bundle.calendar[index].toordinal() for index in rows], dtype=float)
+    weekdays = np.asarray([bundle.calendar[index].weekday() for index in rows])
+    day_deviation = float(np.std(ordinals))
+    if not math.isfinite(day_deviation) or day_deviation <= 0:
+        return _LagPointOutcome(scaled_bundle, "unstable", ("rank_deficient",))
+    scaled_day = (ordinals - np.mean(ordinals)) / day_deviation
+    nuisance = (
+        np.ones(len(rows)),
+        scaled_day,
+        np.sin(2.0 * np.pi * ordinals / 365.2425),
+        np.cos(2.0 * np.pi * ordinals / 365.2425),
+        *((weekdays == weekday).astype(float) for weekday in range(6)),
+    )
+    matrix = np.column_stack((exposure_design, *nuisance))
+    rank = int(np.linalg.matrix_rank(matrix))
+    if rank < matrix.shape[1]:
+        return _LagPointOutcome(scaled_bundle, "unstable", ("rank_deficient",))
+    second_difference = np.diff(np.eye(horizon), n=2, axis=0) @ basis
+    per_feature_penalty = np.vstack(
+        (
+            math.sqrt(method.smoothing_penalty) * second_difference,
+            math.sqrt(method.ridge_penalty) * basis,
+        )
+    )
+    penalty = np.zeros((len(feature_keys) * len(per_feature_penalty), matrix.shape[1]))
+    for feature in range(len(feature_keys)):
+        column = feature * method.lag_basis_nodes
+        row = feature * len(per_feature_penalty)
+        penalty[
+            row : row + len(per_feature_penalty),
+            column : column + method.lag_basis_nodes,
+        ] = per_feature_penalty
+    augmented = np.vstack((matrix, penalty))
+    target = np.concatenate((np.asarray(outcomes), np.zeros(len(penalty))))
+    coefficients, _, _, _ = np.linalg.lstsq(augmented, target, rcond=None)
+    transform = np.zeros((len(feature_keys) * horizon, matrix.shape[1]))
+    for feature in range(len(feature_keys)):
+        transform[
+            feature * horizon : (feature + 1) * horizon,
+            feature * method.lag_basis_nodes : (feature + 1) * method.lag_basis_nodes,
+        ] = basis
+    estimates = (transform @ coefficients).reshape(len(feature_keys), horizon)
+    if np.any(~np.isfinite(estimates)):
+        return _LagPointOutcome(
+            scaled_bundle,
+            "unstable",
+            ("non_finite_point_estimate",),
+        )
+    lag_estimates: list[dict[str, object]] = []
+    contrasts: list[dict[str, object]] = []
+    for feature, (input_id, component) in enumerate(feature_keys):
+        feature_id = _feature_id(input_id, component)
+        natural_scale, natural_unit = _LAG_NATURAL_SCALES[input_id]
+        personal_sd = float(deviations[feature])
+        for lag, estimate in enumerate(estimates[feature], start=1):
+            natural_estimate = float(estimate) * natural_scale / personal_sd
+            if not math.isfinite(natural_estimate):
+                return _LagPointOutcome(
+                    scaled_bundle,
+                    "unstable",
+                    ("non_finite_point_estimate",),
+                )
+            lag_estimates.append(
+                {
+                    "estimate_bpm_per_natural_scale": natural_estimate,
+                    "estimate_bpm_per_personal_sd": float(estimate),
+                    "feature_id": feature_id,
+                    "lag_day": lag,
+                    "natural_scale": natural_scale,
+                    "natural_unit": natural_unit.value,
+                    "pointwise_interval": None,
+                    "simultaneous_band": None,
+                }
+            )
+        for contrast in method.contrasts:
+            estimate = sum(
+                float(value)
+                for value in estimates[feature, contrast.start_day - 1 : contrast.end_day]
+            )
+            natural_estimate = estimate * natural_scale / personal_sd
+            if not math.isfinite(estimate) or not math.isfinite(natural_estimate):
+                return _LagPointOutcome(
+                    scaled_bundle,
+                    "unstable",
+                    ("non_finite_point_estimate",),
+                )
+            contrasts.append(
+                {
+                    "end_day": contrast.end_day,
+                    "estimate_bpm_per_natural_scale": natural_estimate,
+                    "estimate_bpm_per_personal_sd": estimate,
+                    "feature_id": feature_id,
+                    "natural_scale": natural_scale,
+                    "natural_unit": natural_unit.value,
+                    "pointwise_interval": None,
+                    "simultaneous_band": None,
+                    "start_day": contrast.start_day,
+                }
+            )
+    return _LagPointOutcome(
+        scaled_bundle,
+        "completed",
+        ("completed_point_estimate",),
+        tuple(lag_estimates),
+        tuple(contrasts),
+        (
+            {
+                "code": AnalysisDiagnostic.FIT.value,
+                "facts": {
+                    "basis_nodes": method.lag_basis_nodes,
+                    "feature_count": len(feature_keys),
+                    "fit_rows": len(rows),
+                    "matrix_columns": matrix.shape[1],
+                    "rank": rank,
+                    "ridge_penalty": method.ridge_penalty,
+                    "smoothing_penalty": method.smoothing_penalty,
+                },
+            },
+        ),
+    )
+
+
 def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisExecution:
     if plan.base_snapshot_ref is None:
         raise ValueError("Analyseplan besitzt keinen Snapshot.")
@@ -2135,6 +2448,21 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
         ),
         activity_derivation=store.load_activity_derivation_version(plan.base_snapshot_ref),
     )
+    if plan.analysis_definition.result_family is AnalysisResultFamily.RHR_ACTIVITY_LAG_1_7:
+        method = plan.analysis_definition.method_facts
+        assert isinstance(method, LagProfileMethodFacts)
+        point = _short_lag_point_fit(bundle, method)
+        bundle = point.bundle
+        status = point.status
+        diagnostics = point.diagnostics
+    else:
+        point = None
+        status = "insufficient_data"
+        diagnostics = (
+            "insufficient_data",
+            f"calendar_days={len(bundle.calendar)}",
+            f"observed_values={sum(item.value is not None for item in bundle.values)}",
+        )
     artifact_payload = (
         json.dumps(
             _bundle_payload(bundle, include_run_id=True), separators=(",", ":"), sort_keys=True
@@ -2165,9 +2493,10 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
         plan.schema_version,
     )
     code_commit, code_dirty, code_diff_hash, environment_hash = _reproduction_facts()
+    result_id = AnalysisResultId(uuid4().hex) if status == "completed" else None
     provenance = AnalysisProvenance(
         run_id,
-        None,
+        result_id,
         plan.base_snapshot_ref,
         plan.analysis_definition.analysis_definition_id,
         configuration.content_hash,
@@ -2177,12 +2506,38 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
         code_diff_hash,
         environment_hash,
     )
-    observed = sum(item.value is not None for item in bundle.values)
-    diagnostics = (
-        "insufficient_data",
-        f"calendar_days={len(bundle.calendar)}",
-        f"observed_values={observed}",
-    )
+    result_artifact: AnalysisJsonlArtifact | None = None
+    if result_id is not None and point is not None:
+        result_record: dict[str, object] = {
+            "analysis_definition_id": str(plan.analysis_definition.analysis_definition_id),
+            "analysis_result_id": str(result_id),
+            "analysis_run_id": str(run_id),
+            "bootstrap_facts": [],
+            "contrasts": list(point.contrasts),
+            "diagnostics": list(point.result_diagnostics),
+            "lag_estimates": list(point.lag_estimates),
+            "maturity_criteria": [],
+            "result_family": plan.analysis_definition.result_family.value,
+            "result_schema_version": 1,
+        }
+        result_payload = (
+            json.dumps(result_record, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+        )
+        result_content = dict(result_record)
+        del result_content["analysis_run_id"]
+        del result_content["analysis_result_id"]
+        result_artifact = AnalysisJsonlArtifact(
+            f"analysis-result-{plan.analysis_definition.result_family.value}",
+            1,
+            hashlib.sha256(
+                json.dumps(result_content, separators=(",", ":"), sort_keys=True).encode()
+            ).hexdigest(),
+            hashlib.sha256(result_payload).hexdigest(),
+            len(result_payload),
+            1,
+            result_payload,
+            _validate_result_artifact,
+        )
     data_status_reasons = (
         (
             AnalysisDataStatusReason(
@@ -2205,15 +2560,29 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
     _publish_analysis_run(
         store,
         AnalysisRunPublication(
-            operation_id,
-            provenance,
-            plan.eligible_start_date,
-            plan.eligible_end_date,
-            configuration,
-            artifact,
-            diagnostics,
-            (DataQualityStatus.PROVISIONAL if data_status_reasons else DataQualityStatus.REVIEWED),
-            data_status_reasons,
+            operation_id=operation_id,
+            provenance=provenance,
+            start_date=plan.eligible_start_date,
+            end_date=plan.eligible_end_date,
+            configuration=configuration,
+            input_artifact=artifact,
+            diagnostics=diagnostics,
+            data_status=(
+                DataQualityStatus.PROVISIONAL
+                if data_status_reasons
+                else DataQualityStatus.REVIEWED
+            ),
+            data_status_reasons=data_status_reasons,
+            status=status,
+            result_family=(
+                plan.analysis_definition.result_family.value
+                if result_artifact is not None
+                else None
+            ),
+            result_artifact=result_artifact,
+            model_maturity=(
+                ModelMaturityStatus.EXPLORATORY if result_artifact is not None else None
+            ),
         ),
     )
     return AnalysisExecution(
@@ -2223,6 +2592,9 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
         plan.analysis_definition.analysis_definition_id,
         diagnostics,
         provenance,
+        status,
+        result_id,
+        ModelMaturityStatus.EXPLORATORY if result_artifact is not None else None,
     )
 
 

@@ -265,7 +265,7 @@ def test_started_run_freezes_input_and_persists_insufficient_data_without_result
     )
     assert any(
         value["input_id"] == "workout_duration_by_type"
-        and value["component"] == "HKWorkoutActivityTypeRunning"
+        and value["component"] == "other"
         and value["value"] == 30.0
         and value["measurement_version_ids"]
         for value in payload["values"]
@@ -286,7 +286,10 @@ def test_started_run_freezes_input_and_persists_insufficient_data_without_result
     )
     assert payload["scalings"]
     assert all(item["population_standard_deviation"] is None for item in payload["scalings"])
-    assert {item["status"] for item in payload["scalings"]} == {"unavailable"}
+    assert {item["status"] for item in payload["scalings"]} == {
+        "insufficient_observations",
+        "unavailable",
+    }
     with HealthLab.open(runtime) as health_lab:
         _import(health_lab, _package(tmp_path / "later.zip", day=3, value=2))
     assert artifact.read_bytes() == frozen_input

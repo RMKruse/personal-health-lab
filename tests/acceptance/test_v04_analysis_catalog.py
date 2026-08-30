@@ -76,6 +76,7 @@ def test_analysis_catalog_projects_four_fixed_definitions_without_a_snapshot(tmp
     }
     assert asdict(short.bootstrap) == asdict(long.bootstrap) == expected_bootstrap
     assert tuple(value.value for value in short.inputs) == (
+        "apple_resting_heart_rate",
         "active_energy",
         "training_time",
         "steps",

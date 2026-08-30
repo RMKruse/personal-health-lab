@@ -7248,11 +7248,11 @@ class HealthLab:
             receipt = AnalysisReceipt(
                 operation_id=result.operation_id,
                 analysis_run_id=result.analysis_run_id,
-                status=AnalysisStatus.INSUFFICIENT_DATA,
+                status=AnalysisStatus(result.status),
                 snapshot_ref=result.snapshot_id,
                 analysis_definition_id=result.analysis_definition_id,
-                model_maturity=None,
-                result_ref=None,
+                model_maturity=result.model_maturity,
+                result_ref=result.result_id,
                 diagnostics=result.diagnostics,
                 provenance=result.provenance,
             )

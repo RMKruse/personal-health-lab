@@ -681,6 +681,7 @@ source = { editable = "." }
 dependencies = [
     { name = "duckdb" },
     { name = "jsonschema" },
+    { name = "numpy" },
     { name = "streamlit" },
 ]
 
@@ -695,6 +696,7 @@ dev = [
 requires-dist = [
     { name = "duckdb", specifier = ">=1.4" },
     { name = "jsonschema", specifier = ">=4.26" },
+    { name = "numpy", specifier = ">=2.3" },
     { name = "streamlit", specifier = ">=1.47" },
 ]
 
