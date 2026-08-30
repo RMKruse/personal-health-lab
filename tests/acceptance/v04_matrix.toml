@@ -123,12 +123,12 @@ sha256 = "e3e2dcc0578e11d59ecdcdfbd91974eff1c027ade3a2e0002dbed23f6f74009d"
 [[hash_reference]]
 id = "V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1"
 artifact = "src/personal_health_lab/storage/_store.py"
-sha256 = "2ee68190f8db74efdec9220ca52e73aef71e5e2442eba750f7e3e74a770a063a"
+sha256 = "a3db43ba2cfdfcd0d718365f060543c8fbc3b34212f480c116e7933d6301f2bb"
 
 [[hash_reference]]
 id = "V04-H-ANALYSIS-PROJECTIONS-V1"
 artifact = "src/personal_health_lab/application/_application.py"
-sha256 = "572e87b06be0f048abafa600c261756de5f9185ff8df5c2d347b3c3b17bf4941"
+sha256 = "337a7ee527e4df0ca058e97f36c98227059ca42bbcb7d407e7663bb70036f80b"
 
 [[hash_reference]]
 id = "V04-H-LAG-CALIBRATION-V1"

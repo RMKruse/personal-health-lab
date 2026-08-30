@@ -462,7 +462,6 @@ class AnalysisRun:
     maturity_criteria: tuple[ModelMaturityCriterion, ...]
     freshness: AnalysisFreshness
     reproducibility: ReproducibilityStatus
-    diagnostics: tuple[str, ...]
     completed_at: datetime
 
 
@@ -490,7 +489,6 @@ class _AnalysisResultBase:
     data_status_reasons: tuple[AnalysisDataStatusReason, ...]
     freshness: AnalysisFreshness
     reproducibility: ReproducibilityStatus
-    run_diagnostics: tuple[str, ...]
     completed_at: datetime
     projection_id: Literal["analysis-result"] = field(init=False, default="analysis-result")
     projection_version: int = field(init=False, default=1)
@@ -572,7 +570,6 @@ def _analysis_result_projection(
         run.data_status_reasons,
         run.freshness,
         run.reproducibility,
-        run.diagnostics,
         run.completed_at,
     )
     if isinstance(values, AnalysisLagResultValues):
@@ -7403,7 +7400,6 @@ class HealthLab:
                         else AnalysisFreshness.STALE
                     ),
                     current_reproducibility,
-                    fact.diagnostics,
                     fact.completed_at,
                 )
                 for fact, current_reproducibility in zip(facts, reproducibility, strict=True)

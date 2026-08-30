@@ -12042,12 +12042,22 @@ class LocalStore:
 
     def analysis_run_material_is_available(self, fact: AnalysisRunFact) -> bool:
         self._require_open()
-        snapshot_manifest = (
-            self._root / _PARQUET_DIRECTORY / "snapshots" / str(fact.snapshot_id) / "manifest.json"
+        snapshot_directory = (
+            self._root / _PARQUET_DIRECTORY / "snapshots" / str(fact.snapshot_id)
         )
-        if not snapshot_manifest.is_file():
-            return False
         try:
+            snapshot = self._metadata.execute(
+                "SELECT manifest_sha256 FROM dataset_snapshots WHERE snapshot_id = ?",
+                (str(fact.snapshot_id),),
+            ).fetchone()
+            if snapshot is None:
+                return False
+            try:
+                self._validate_snapshot(
+                    snapshot_directory, str(fact.snapshot_id), str(snapshot[0])
+                )
+            except StoreError:
+                return False
             rows = self._metadata.execute(
                 """
                 SELECT artifact.artifact_kind, artifact.artifact_path,

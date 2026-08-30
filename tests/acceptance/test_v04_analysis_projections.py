@@ -1,6 +1,5 @@
 import hashlib
 import json
-import sqlite3
 from datetime import date
 from pathlib import Path
 from uuid import uuid4
@@ -342,18 +341,6 @@ def test_latest_started_run_does_not_fall_back_to_an_older_result(tmp_path: Path
     with HealthLab.open(runtime) as health_lab:
         latest_run_id = _run(health_lab)
 
-    with sqlite3.connect(runtime.active_store / "metadata.sqlite3") as metadata:
-        metadata.execute(
-            "UPDATE analysis_runs SET completed_at = '2099-01-01T00:00:00+00:00' "
-            "WHERE analysis_run_id = ?",
-            (str(completed_run_id),),
-        )
-        metadata.execute(
-            "UPDATE analysis_runs SET completed_at = '2000-01-01T00:00:00+00:00' "
-            "WHERE analysis_run_id = ?",
-            (str(latest_run_id),),
-        )
-
     with HealthLab.open(runtime) as health_lab:
         implicit = health_lab.load_analysis_result(AnalysisResultSelection(DEFINITION))
         explicit = health_lab.load_analysis_result(
@@ -371,14 +358,23 @@ def test_analysis_reproducibility_is_derived_from_current_material(tmp_path: Pat
         _import(health_lab, _package(tmp_path / "snapshot.zip", 2))
         run_id = _run(health_lab)
         before = health_lab.load_analysis_runs(AnalysisRunSelection(DEFINITION))
+        assert before.runs[0].reproducibility is not ReproducibilityStatus.NOT_RECORDED
 
-    assert before.runs[0].reproducibility is not ReproducibilityStatus.NOT_RECORDED
-    (runtime.active_store / "parquet" / "analysis-runs" / str(run_id) / "input.jsonl").unlink()
+        input_path = (
+            runtime.active_store / "parquet" / "analysis-runs" / str(run_id) / "input.jsonl"
+        )
+        input_payload = input_path.read_bytes()
+        input_path.unlink()
+        missing_input = health_lab.load_analysis_runs(AnalysisRunSelection(DEFINITION))
+        assert missing_input.runs[0].reproducibility is ReproducibilityStatus.NOT_RECORDED
 
-    with HealthLab.open(runtime) as health_lab:
-        after = health_lab.load_analysis_runs(AnalysisRunSelection(DEFINITION))
-
-    assert after.runs[0].reproducibility is ReproducibilityStatus.NOT_RECORDED
+        input_path.write_bytes(input_payload)
+        snapshot_file = next(
+            (runtime.active_store / "parquet" / "snapshots").glob("*/source_occurrences.parquet")
+        )
+        snapshot_file.unlink()
+        missing_snapshot = health_lab.load_analysis_runs(AnalysisRunSelection(DEFINITION))
+        assert missing_snapshot.runs[0].reproducibility is ReproducibilityStatus.NOT_RECORDED
 
 
 def test_analysis_result_distinguishes_missing_and_corrupt_artifacts(tmp_path: Path) -> None:
