@@ -8,6 +8,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 
+import personal_health_lab.analysis as analysis_module
 from personal_health_lab.application import (
     AnalysisDefinitionId,
     AnalysisReceipt,
@@ -75,14 +76,16 @@ def _package(
     calendar_days: int = 140,
     constant_steps: bool = False,
     duplicate_general: bool = False,
+    include_workouts: bool = True,
+    lag_signal: bool = True,
     missing_sleep_day: int | None = None,
     partial_sleep_day: int | None = None,
 ) -> tuple[Path, float]:
     rng = random.Random(118)
     start = date(2024, 1, 1)
     days = tuple(start + timedelta(days=offset) for offset in range(calendar_days))
-    common_days = set(rng.sample(days, min(35, calendar_days)))
-    rare_days = rng.sample(days, min(9, calendar_days))
+    common_days = set(rng.sample(days, min(35, calendar_days))) if include_workouts else set()
+    rare_days = rng.sample(days, min(9, calendar_days)) if include_workouts else []
     active_energy = [rng.uniform(200, 800) for _ in days]
     records: list[str] = []
     for index, day in enumerate(days):
@@ -95,8 +98,10 @@ def _package(
                 if index == partial_sleep_day
                 else (
                     (
-                        (sleep_end := datetime.combine(day, time(6), UTC)
-                        + timedelta(minutes=rng.randrange(0, 120)))
+                        (
+                            sleep_end := datetime.combine(day, time(6), UTC)
+                            + timedelta(minutes=rng.randrange(0, 120))
+                        )
                         - timedelta(minutes=rng.randrange(360, 541)),
                         sleep_end,
                     ),
@@ -146,7 +151,7 @@ def _package(
                     "HKQuantityTypeIdentifierRestingHeartRate",
                     "count/min",
                     62
-                    + (-0.006 * (active_energy[index - 1] - 500) if index else 0)
+                    + (-0.006 * (active_energy[index - 1] - 500) if lag_signal and index else 0)
                     + rng.gauss(0, 0.3),
                     day,
                     12,
@@ -323,10 +328,33 @@ def test_short_lag_run_projects_full_activity_point_estimates(tmp_path: Path) ->
     assert len(result.lag_estimates) == len(features) * 7
     assert len(result.contrasts) == len(features)
     assert {(item.start_day, item.end_day) for item in result.contrasts} == {(1, 7)}
-    assert all(item.pointwise_interval is None for item in result.lag_estimates)
-    assert all(item.simultaneous_band is None for item in result.lag_estimates)
-    assert result.bootstrap_facts == ()
-    assert result.maturity_criteria == ()
+    assert all(item.pointwise_interval is not None for item in result.lag_estimates)
+    assert all(item.simultaneous_band is not None for item in result.lag_estimates)
+    assert all(item.pointwise_interval is not None for item in result.contrasts)
+    assert all(item.simultaneous_band is not None for item in result.contrasts)
+    assert tuple(item.variant.value for item in result.bootstrap_facts) == (
+        "primary",
+        "sensitivity",
+    )
+    assert all(item.successful_refits == 2_000 for item in result.bootstrap_facts)
+    assert all(item.attempts <= 2_020 for item in result.bootstrap_facts)
+    assert result.bootstrap_facts[0].block_length == 6
+    assert result.bootstrap_facts[1].block_length == 11
+    assert all(item.quantile_stability is not None for item in result.bootstrap_facts)
+    assert {item.code.value for item in result.maturity_criteria} == {
+        "augmented_condition_number",
+        "context_sensitivity",
+        "effective_blocks",
+        "full_rank",
+        "input_completeness",
+        "ljung_box",
+        "maximum_gap_days",
+        "minimum_fit_rows",
+        "positive_training_days",
+        "residual_acf",
+        "unpenalized_condition_number",
+    }
+    assert all(item.threshold != "" for item in result.maturity_criteria)
     fit_facts = dict(result.diagnostics[0].facts)
     assert fit_facts["basis_nodes"] == 7
     assert fit_facts["smoothing_penalty"] == 3.0
@@ -339,6 +367,11 @@ def test_short_lag_run_projects_full_activity_point_estimates(tmp_path: Path) ->
     assert active.estimate_bpm_per_natural_scale < 0
     assert active.estimate_bpm_per_personal_sd == pytest.approx(
         active.estimate_bpm_per_natural_scale * active_energy_sd / active.natural_scale
+    )
+    assert active.simultaneous_band is not None
+    true_bpm_per_personal_sd = -0.006 * active_energy_sd
+    assert (
+        active.simultaneous_band.lower <= true_bpm_per_personal_sd <= active.simultaneous_band.upper
     )
 
 
@@ -404,7 +437,7 @@ def test_short_lag_run_closes_scaling_and_rank_failures_without_a_result(
                 ).read_bytes()
             )
             assert any(
-                    (item["component"] or "").startswith("variant:context_days_0_2:")
+                (item["component"] or "").startswith("variant:context_days_0_2:")
                 and item["status"] == "observed"
                 for item in payload["scalings"]
             )
@@ -466,9 +499,7 @@ def test_short_lag_run_freezes_context_and_runs_all_fixed_variants(tmp_path: Pat
         "without_context",
     }
     input_missingness = dict(missingness_facts["input_missingness"])
-    sleep_missingness = dict(
-        input_missingness["outcome_day_context:sleep_duration_minutes"]
-    )
+    sleep_missingness = dict(input_missingness["outcome_day_context:sleep_duration_minutes"])
     assert sleep_missingness["partial"] == 1
 
     payload = json.loads(
@@ -535,9 +566,7 @@ def test_short_lag_run_freezes_context_and_runs_all_fixed_variants(tmp_path: Pat
     assert context_scalings["sleep_duration_minutes@day-0"] == "observed"
     assert context_scalings["sleep_observation_status@day-0"] == "observed"
     assert context_scalings["medication_regime_segment=1@day-0"] == "observed"
-    assert context_scalings[
-        "variant:context_days_0_2:sleep_duration_minutes@day-2"
-    ] == "observed"
+    assert context_scalings["variant:context_days_0_2:sleep_duration_minutes@day-2"] == "observed"
     assert any(
         item["input_id"] == "active_energy"
         and item["component"] == "variant:without_context:value"
@@ -550,3 +579,78 @@ def test_short_lag_run_freezes_context_and_runs_all_fixed_variants(tmp_path: Pat
         "daily-context/v1",
         "medication-context/v1",
     } <= set(payload["rule_versions"])
+
+
+def test_short_lag_null_case_closes_the_fit_row_maturity_boundary(tmp_path: Path) -> None:
+    runtime = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    package, _ = _package(
+        tmp_path / "null-analysis.zip",
+        calendar_days=107,
+        include_workouts=False,
+        lag_signal=False,
+    )
+    with HealthLab.open(runtime) as health_lab:
+        _write(health_lab, ImportHealthExport(package))
+        _add_baseline_context(health_lab, date(2024, 1, 1))
+        receipt = _write(health_lab, RunAnalysis(DEFINITION))
+        assert isinstance(receipt, AnalysisReceipt)
+        result = health_lab.load_analysis_result(AnalysisResultSelection(DEFINITION))
+
+    assert isinstance(result, RhrActivityLag1To7Result)
+    fit_rows = next(
+        item for item in result.maturity_criteria if item.code.value == "minimum_fit_rows"
+    )
+    assert (fit_rows.observed_value, fit_rows.threshold, fit_rows.passed) == (100.0, 100.0, True)
+    assert all(
+        item.simultaneous_band is not None
+        and item.simultaneous_band.lower <= 0.0 <= item.simultaneous_band.upper
+        for item in (*result.lag_estimates, *result.contrasts)
+    )
+    expected_maturity = (
+        ModelMaturityStatus.ROBUST
+        if all(item.passed for item in result.maturity_criteria)
+        else ModelMaturityStatus.EXPLORATORY
+    )
+    assert receipt.model_maturity is result.model_maturity is expected_maturity
+
+
+def test_short_lag_bootstrap_underfulfillment_is_unstable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = analysis_module._lag_coefficients
+    calls = 0
+
+    def fail_bootstrap(*args):
+        nonlocal calls
+        calls += 1
+        if calls > 3:
+            raise analysis_module.np.linalg.LinAlgError("synthetic bootstrap failure")
+        return original(*args)
+
+    monkeypatch.setattr(analysis_module, "_lag_coefficients", fail_bootstrap)
+    runtime = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    package, _ = _package(
+        tmp_path / "bootstrap-failure.zip",
+        calendar_days=107,
+        include_workouts=False,
+    )
+    with HealthLab.open(runtime) as health_lab:
+        _write(health_lab, ImportHealthExport(package))
+        _add_baseline_context(health_lab, date(2024, 1, 1))
+        receipt = _write(health_lab, RunAnalysis(DEFINITION))
+        assert isinstance(receipt, AnalysisReceipt)
+        result = health_lab.load_analysis_result(AnalysisResultSelection(DEFINITION))
+
+    assert receipt.status is AnalysisStatus.UNSTABLE
+    assert receipt.result_ref is None
+    assert receipt.model_maturity is None
+    assert receipt.diagnostics[0] == "bootstrap_underfulfilled"
+    assert "bootstrap_attempts=2020" in receipt.diagnostics
+    assert "bootstrap_successful_refits=0" in receipt.diagnostics
+    assert "bootstrap_failure:linear_algebra=2020" in receipt.diagnostics
+    assert any(item.startswith("sensitivity:bootstrap_seed=") for item in receipt.diagnostics)
+    assert "sensitivity:bootstrap_attempts=2020" in receipt.diagnostics
+    assert "sensitivity:bootstrap_successful_refits=0" in receipt.diagnostics
+    assert "sensitivity:bootstrap_failure:linear_algebra=2020" in receipt.diagnostics
+    assert isinstance(result, ProjectionUnavailable)
+    assert result.code is ProjectionUnavailableCode.RESULT_NOT_AVAILABLE

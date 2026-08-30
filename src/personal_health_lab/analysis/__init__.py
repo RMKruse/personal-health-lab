@@ -30,6 +30,7 @@ from personal_health_lab.storage import (
     CanonicalSleepCategory,
     CanonicalUnit,
     ContextRevisionId,
+    DataMode,
     DataQualityStatus,
     DataStatusReasonCode,
     LocalStore,
@@ -92,7 +93,6 @@ class AnalysisDiagnostic(StrEnum):
 class AnalysisMaturityCriterionCode(StrEnum):
     AUGMENTED_CONDITION_NUMBER = "augmented_condition_number"
     BLOCKED_PREDICTION_GAIN = "blocked_prediction_gain"
-    BOOTSTRAP_SUCCESS = "bootstrap_success"
     CALENDAR_DAYS = "calendar_days"
     COMMON_COMPLETE_FRACTION = "common_complete_fraction"
     CONTEXT_SENSITIVITY = "context_sensitivity"
@@ -108,6 +108,7 @@ class AnalysisMaturityCriterionCode(StrEnum):
     MODEL_ANCHORS = "model_anchors"
     PAIR_DENSITY = "pair_density"
     POSITIVE_TRAINING_DAYS = "positive_training_days"
+    REAL_DATA_REVALIDATION_PENDING = "real_data_revalidation_pending"
     RESIDUAL_ACF = "residual_acf"
     RHR_MEASUREMENT_ERROR = "rhr_measurement_error"
     RIDGE_SENSITIVITY = "ridge_sensitivity"
@@ -1588,17 +1589,11 @@ def _outcome_context_values(
                 if interval.start <= left and interval.end >= right
             }
             asleep = active & asleep_categories
-            if (
-                not active
-                or len(asleep) > 1
-                or (asleep and CanonicalSleepCategory.AWAKE in active)
-            ):
+            if not active or len(asleep) > 1 or (asleep and CanonicalSleepCategory.AWAKE in active):
                 sleep_status = "partial"
                 break
     sleep_quality_status = (
-        DataQualityStatus.PROVISIONAL
-        if sleep_status == "partial"
-        else context.sleep_quality_status
+        DataQualityStatus.PROVISIONAL if sleep_status == "partial" else context.sleep_quality_status
     )
     sleep_missingness = (
         AnalysisMissingness.PARTIAL
@@ -1768,9 +1763,9 @@ def build_analysis_input_bundle(
     workouts_by_day_and_type: dict[tuple[date, str], list[StoredWorkout]] = {}
     for workout in workouts:
         component = analytical_type.get(workout.original_activity_type, "other")
-        workouts_by_day_and_type.setdefault(
-            (workout.measurement_local_day, component), []
-        ).append(workout)
+        workouts_by_day_and_type.setdefault((workout.measurement_local_day, component), []).append(
+            workout
+        )
     activity_by_day_and_input = {
         (item.day, _MEASUREMENT_INPUTS[item.data_type.value][0]): item for item in activity_values
     }
@@ -2143,8 +2138,7 @@ def _validate_input_artifact(
                 or not isinstance(source["source_updated_at"], str)
                 or not isinstance(source["is_selected"], bool)
                 or (
-                    source["disposition"] is not None
-                    and not isinstance(source["disposition"], str)
+                    source["disposition"] is not None and not isinstance(source["disposition"], str)
                 )
             ):
                 raise StoreError("Analysequellenreferenz verletzt das Schema.")
@@ -2501,6 +2495,8 @@ class _LagPointOutcome:
     lag_estimates: tuple[dict[str, object], ...] = ()
     contrasts: tuple[dict[str, object], ...] = ()
     result_diagnostics: tuple[dict[str, object], ...] = ()
+    bootstrap_facts: tuple[AnalysisBootstrapFacts, ...] = ()
+    maturity_criteria: tuple[AnalysisResultMaturityCriterion, ...] = ()
 
 
 def _feature_id(input_id: AnalysisInput, component: str | None) -> str:
@@ -2511,9 +2507,7 @@ def _lag_basis(horizon: int, nodes: int) -> np.ndarray:
     lags = np.arange(horizon, dtype=float)
     knots = np.linspace(0.0, horizon - 1.0, nodes)
     identity = np.eye(nodes)
-    return np.column_stack(
-        [np.interp(lags, knots, identity[:, index]) for index in range(nodes)]
-    )
+    return np.column_stack([np.interp(lags, knots, identity[:, index]) for index in range(nodes)])
 
 
 def _with_scalings(
@@ -2560,9 +2554,7 @@ def _with_context_scalings(
             deviation,
             AnalysisScalingStatus.OBSERVED,
         )
-        for component, deviation in zip(
-            context_columns, context_deviations, strict=True
-        )
+        for component, deviation in zip(context_columns, context_deviations, strict=True)
     )
     return replace(bundle, scalings=scalings)
 
@@ -2579,6 +2571,141 @@ class _LagVariantFit:
     context_deviations: tuple[float, ...] = ()
     matrix_columns: int = 0
     rank: int = 0
+    matrix: np.ndarray | None = None
+    outcomes: np.ndarray | None = None
+    penalty: np.ndarray | None = None
+    transform: np.ndarray | None = None
+    standard_errors: np.ndarray | None = None
+    estimate_covariance: np.ndarray | None = None
+    residuals: np.ndarray | None = None
+    unpenalized_condition: float | None = None
+    augmented_condition: float | None = None
+    maximum_residual_acf: float | None = None
+    ljung_box_per_lag: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _LagBootstrapOutcome:
+    fact: AnalysisBootstrapFacts
+    estimates: np.ndarray | None = None
+    critical_value: float | None = None
+
+
+def _lag_coefficients(matrix: np.ndarray, outcome: np.ndarray, penalty: np.ndarray) -> np.ndarray:
+    augmented = np.vstack((matrix, penalty))
+    target = np.concatenate((outcome, np.zeros(len(penalty))))
+    return cast(np.ndarray, np.linalg.lstsq(augmented, target, rcond=None)[0])
+
+
+def _lag_residual_diagnostics(residuals: np.ndarray) -> tuple[float, float]:
+    maximum_lag = min(14, max(1, len(residuals) // 10))
+    centered = residuals - np.mean(residuals)
+    denominator = float(centered @ centered)
+    if denominator <= 0.0:
+        return 1.0, math.inf
+    correlations = np.asarray(
+        [float(centered[lag:] @ centered[:-lag] / denominator) for lag in range(1, maximum_lag + 1)]
+    )
+    count = len(centered)
+    statistic = (
+        count * (count + 2.0) * np.sum(correlations**2 / (count - np.arange(1, maximum_lag + 1)))
+    )
+    return float(np.max(np.abs(correlations))), float(statistic / maximum_lag)
+
+
+def _lag_block_length(rows: int, factor: int) -> int:
+    return int(max(math.ceil(7 / 3), math.ceil(factor * rows ** (1.0 / 3.0))))
+
+
+def _short_lag_bootstrap(
+    fit: _LagVariantFit,
+    method: LagProfileMethodFacts,
+    analysis_definition_id: AnalysisDefinitionId,
+    variant: AnalysisBootstrapVariant,
+) -> _LagBootstrapOutcome:
+    assert (
+        fit.matrix is not None
+        and fit.outcomes is not None
+        and fit.penalty is not None
+        and fit.transform is not None
+        and fit.estimates is not None
+        and fit.standard_errors is not None
+    )
+    factor = 1 if variant is AnalysisBootstrapVariant.PRIMARY else 2
+    block_length = _lag_block_length(len(fit.rows), factor)
+    seed = int.from_bytes(
+        hashlib.sha256(f"{analysis_definition_id}:{variant.value}".encode()).digest()[:8],
+        "big",
+    )
+    rng = np.random.default_rng(seed)
+    blocks: list[np.ndarray] = []
+    for start in range(len(fit.rows)):
+        end = start + 1
+        while (
+            end < len(fit.rows)
+            and end - start < block_length
+            and fit.rows[end] == fit.rows[end - 1] + 1
+        ):
+            end += 1
+        blocks.append(np.arange(start, end))
+    estimates: list[np.ndarray] = []
+    failures: dict[str, int] = {}
+    attempts = 0
+    while (
+        len(estimates) < method.bootstrap.successful_refits
+        and attempts < method.bootstrap.maximum_attempts
+    ):
+        attempts += 1
+        pieces: list[np.ndarray] = []
+        size = 0
+        while size < len(fit.rows):
+            block = blocks[int(rng.integers(len(blocks)))]
+            pieces.append(block)
+            size += len(block)
+        indices = np.concatenate(pieces)[: len(fit.rows)]
+        try:
+            coefficients = _lag_coefficients(
+                fit.matrix[indices], fit.outcomes[indices], fit.penalty
+            )
+            estimate = (fit.transform @ coefficients).reshape(fit.estimates.shape)
+        except np.linalg.LinAlgError:
+            failures["linear_algebra"] = failures.get("linear_algebra", 0) + 1
+            continue
+        if np.any(~np.isfinite(estimate)):
+            failures["non_finite_refit"] = failures.get("non_finite_refit", 0) + 1
+            continue
+        estimates.append(estimate)
+    samples = np.asarray(estimates)
+    critical_value: float | None = None
+    quantile_stability: float | None = None
+    if len(samples) == method.bootstrap.successful_refits:
+        standardized = np.max(
+            np.abs((samples - fit.estimates) / np.maximum(fit.standard_errors, 1e-9)),
+            axis=(1, 2),
+        )
+        critical_value = max(
+            float(np.quantile(standardized, method.bootstrap.confidence_level)),
+            method.simultaneous_critical_floor,
+        )
+        midpoint = method.bootstrap.successful_refits // 2
+        midpoint_critical = max(
+            float(np.quantile(standardized[:midpoint], method.bootstrap.confidence_level)),
+            method.simultaneous_critical_floor,
+        )
+        quantile_stability = abs(midpoint_critical - critical_value)
+    return _LagBootstrapOutcome(
+        AnalysisBootstrapFacts(
+            variant,
+            seed,
+            block_length,
+            attempts,
+            len(samples),
+            tuple(sorted(failures.items())),
+            quantile_stability,
+        ),
+        samples if critical_value is not None else None,
+        critical_value,
+    )
 
 
 def _short_lag_variant_fit(
@@ -2624,9 +2751,7 @@ def _short_lag_variant_fit(
         for lag in context_lags
         for component in context_keys
         for segment in (
-            medication_segments[1:]
-            if component == "medication_regime_segment"
-            else (None,)
+            medication_segments[1:] if component == "medication_regime_segment" else (None,)
         )
     )
     rows: list[int] = []
@@ -2723,11 +2848,7 @@ def _short_lag_variant_fit(
         axis=1,
     )
     context_names = tuple(
-        (
-            f"{component}={segment}@day-{lag}"
-            if segment is not None
-            else f"{component}@day-{lag}"
-        )
+        (f"{component}={segment}@day-{lag}" if segment is not None else f"{component}@day-{lag}")
         for lag, component, segment in context_specs
     )
     context_design = np.empty((len(rows), 0))
@@ -2794,17 +2915,31 @@ def _short_lag_variant_fit(
             row : row + len(per_feature_penalty),
             column : column + method.lag_basis_nodes,
         ] = per_feature_penalty
-    augmented = np.vstack((matrix, penalty))
-    target = np.concatenate((np.asarray(outcomes), np.zeros(len(penalty))))
-    coefficients, _, _, _ = np.linalg.lstsq(augmented, target, rcond=None)
     transform = np.zeros((len(feature_keys) * horizon, matrix.shape[1]))
     for feature in range(len(feature_keys)):
         transform[
             feature * horizon : (feature + 1) * horizon,
             feature * method.lag_basis_nodes : (feature + 1) * method.lag_basis_nodes,
         ] = basis
+    outcome_values = np.asarray(outcomes)
+    try:
+        coefficients = _lag_coefficients(matrix, outcome_values, penalty)
+    except np.linalg.LinAlgError:
+        return _LagVariantFit(
+            "unstable",
+            ("linear_algebra_failure",),
+            feature_keys,
+            tuple(rows),
+            deviations,
+            context_columns=context_columns,
+            context_deviations=context_deviations,
+            matrix_columns=matrix.shape[1],
+            rank=rank,
+        )
     estimates = (transform @ coefficients).reshape(len(feature_keys), horizon)
-    if np.any(~np.isfinite(estimates)):
+    with np.errstate(over="ignore"):
+        cumulative_estimates = np.sum(estimates, axis=1)
+    if np.any(~np.isfinite(estimates)) or np.any(~np.isfinite(cumulative_estimates)):
         return _LagVariantFit(
             "unstable",
             ("non_finite_point_estimate",),
@@ -2816,17 +2951,77 @@ def _short_lag_variant_fit(
             matrix_columns=matrix.shape[1],
             rank=rank,
         )
+    augmented = np.vstack((matrix, penalty))
+    residuals = outcome_values - matrix @ coefficients
+    try:
+        crossproduct = matrix.T @ matrix
+        inverse = np.linalg.pinv(crossproduct + penalty.T @ penalty)
+        effective_degrees = float(np.trace(inverse @ crossproduct))
+        residual_variance = float(
+            residuals @ residuals / max(1.0, len(outcome_values) - effective_degrees)
+        )
+        covariance = residual_variance * inverse @ crossproduct @ inverse
+        estimate_covariance = transform @ covariance @ transform.T
+        standard_errors = np.sqrt(np.maximum(np.diag(estimate_covariance), 1e-12)).reshape(
+            estimates.shape
+        )
+        unpenalized_condition = float(np.linalg.cond(matrix))
+        augmented_condition = float(np.linalg.cond(augmented))
+        maximum_residual_acf, ljung_box_per_lag = _lag_residual_diagnostics(residuals)
+    except np.linalg.LinAlgError:
+        return _LagVariantFit(
+            "unstable",
+            ("linear_algebra_failure",),
+            feature_keys,
+            tuple(rows),
+            deviations,
+            context_columns=context_columns,
+            context_deviations=context_deviations,
+            matrix_columns=matrix.shape[1],
+            rank=rank,
+        )
+    if not all(
+        math.isfinite(value)
+        for value in (
+            unpenalized_condition,
+            augmented_condition,
+            maximum_residual_acf,
+            ljung_box_per_lag,
+        )
+    ) or np.any(~np.isfinite(standard_errors)):
+        return _LagVariantFit(
+            "unstable",
+            ("non_finite_fit_diagnostic",),
+            feature_keys,
+            tuple(rows),
+            deviations,
+            context_columns=context_columns,
+            context_deviations=context_deviations,
+            matrix_columns=matrix.shape[1],
+            rank=rank,
+        )
     return _LagVariantFit(
-        "completed",
-        ("completed_point_estimate",),
-        feature_keys,
-        tuple(rows),
-        deviations,
-        estimates,
-        context_columns,
-        context_deviations,
-        matrix.shape[1],
-        rank,
+        status="completed",
+        diagnostics=("completed_point_estimate",),
+        feature_keys=feature_keys,
+        rows=tuple(rows),
+        deviations=deviations,
+        estimates=estimates,
+        context_columns=context_columns,
+        context_deviations=context_deviations,
+        matrix_columns=matrix.shape[1],
+        rank=rank,
+        matrix=matrix,
+        outcomes=outcome_values,
+        penalty=penalty,
+        transform=transform,
+        standard_errors=standard_errors,
+        estimate_covariance=estimate_covariance,
+        residuals=residuals,
+        unpenalized_condition=unpenalized_condition,
+        augmented_condition=augmented_condition,
+        maximum_residual_acf=maximum_residual_acf,
+        ljung_box_per_lag=ljung_box_per_lag,
     )
 
 
@@ -2898,7 +3093,60 @@ def _short_lag_point_fit(
                 else tuple(f"{name}:{item}" for item in fit.diagnostics)
             )
             return _LagPointOutcome(scaled_bundle, fit.status, diagnostics)
-    assert primary.deviations is not None and primary.estimates is not None
+    bootstrap_outcomes = tuple(
+        _short_lag_bootstrap(primary, method, bundle.analysis_definition_id, variant)
+        for variant in (
+            AnalysisBootstrapVariant.PRIMARY,
+            AnalysisBootstrapVariant.SENSITIVITY,
+        )
+    )
+    if any(outcome.estimates is None for outcome in bootstrap_outcomes):
+        failure_diagnostics = [
+            (
+                "bootstrap_underfulfilled"
+                if outcome.fact.variant is AnalysisBootstrapVariant.PRIMARY
+                else f"{outcome.fact.variant.value}:bootstrap_underfulfilled"
+            )
+            for outcome in bootstrap_outcomes
+            if outcome.estimates is None
+        ]
+        for outcome in bootstrap_outcomes:
+            prefix = (
+                ""
+                if outcome.fact.variant is AnalysisBootstrapVariant.PRIMARY
+                else f"{outcome.fact.variant.value}:"
+            )
+            failure_diagnostics.extend(
+                (
+                    f"{prefix}bootstrap_seed={outcome.fact.seed}",
+                    f"{prefix}bootstrap_attempts={outcome.fact.attempts}",
+                    f"{prefix}bootstrap_successful_refits={outcome.fact.successful_refits}",
+                    *(
+                        f"{prefix}bootstrap_failure:{code}={count}"
+                        for code, count in outcome.fact.failure_counts
+                    ),
+                )
+            )
+        return _LagPointOutcome(
+            scaled_bundle,
+            "unstable",
+            tuple(failure_diagnostics),
+            bootstrap_facts=tuple(outcome.fact for outcome in bootstrap_outcomes),
+        )
+    assert (
+        primary.deviations is not None
+        and primary.estimates is not None
+        and primary.standard_errors is not None
+        and primary.estimate_covariance is not None
+        and bootstrap_outcomes[0].estimates is not None
+        and bootstrap_outcomes[0].critical_value is not None
+    )
+    primary_samples = bootstrap_outcomes[0].estimates
+    critical_value = bootstrap_outcomes[0].critical_value
+    alpha = (1.0 - method.bootstrap.confidence_level) / 2.0
+    pointwise_lower, pointwise_upper = np.quantile(primary_samples, (alpha, 1.0 - alpha), axis=0)
+    simultaneous_lower = primary.estimates - critical_value * primary.standard_errors
+    simultaneous_upper = primary.estimates + critical_value * primary.standard_errors
     lag_estimates: list[dict[str, object]] = []
     contrasts: list[dict[str, object]] = []
     for feature, (input_id, component) in enumerate(primary.feature_keys):
@@ -2921,8 +3169,14 @@ def _short_lag_point_fit(
                     "lag_day": lag,
                     "natural_scale": natural_scale,
                     "natural_unit": natural_unit.value,
-                    "pointwise_interval": None,
-                    "simultaneous_band": None,
+                    "pointwise_interval": {
+                        "lower": float(pointwise_lower[feature, lag - 1]),
+                        "upper": float(pointwise_upper[feature, lag - 1]),
+                    },
+                    "simultaneous_band": {
+                        "lower": float(simultaneous_lower[feature, lag - 1]),
+                        "upper": float(simultaneous_upper[feature, lag - 1]),
+                    },
                 }
             )
         for contrast in method.contrasts:
@@ -2931,6 +3185,22 @@ def _short_lag_point_fit(
                 for value in primary.estimates[feature, contrast.start_day - 1 : contrast.end_day]
             )
             natural_estimate = estimate * natural_scale / personal_sd
+            bootstrap_contrast = np.sum(
+                primary_samples[:, feature, contrast.start_day - 1 : contrast.end_day],
+                axis=1,
+            )
+            contrast_lower, contrast_upper = np.quantile(bootstrap_contrast, (alpha, 1.0 - alpha))
+            covariance_start = feature * 7 + contrast.start_day - 1
+            covariance_end = feature * 7 + contrast.end_day
+            contrast_variance = float(
+                np.sum(
+                    primary.estimate_covariance[
+                        covariance_start:covariance_end,
+                        covariance_start:covariance_end,
+                    ]
+                )
+            )
+            contrast_error = math.sqrt(max(contrast_variance, 1e-12))
             if not math.isfinite(estimate) or not math.isfinite(natural_estimate):
                 return _LagPointOutcome(
                     scaled_bundle,
@@ -2945,8 +3215,14 @@ def _short_lag_point_fit(
                     "feature_id": feature_id,
                     "natural_scale": natural_scale,
                     "natural_unit": natural_unit.value,
-                    "pointwise_interval": None,
-                    "simultaneous_band": None,
+                    "pointwise_interval": {
+                        "lower": float(contrast_lower),
+                        "upper": float(contrast_upper),
+                    },
+                    "simultaneous_band": {
+                        "lower": estimate - critical_value * contrast_error,
+                        "upper": estimate + critical_value * contrast_error,
+                    },
                     "start_day": contrast.start_day,
                 }
             )
@@ -2974,6 +3250,114 @@ def _short_lag_point_fit(
         for name, fit in fits.items()
         if name != "primary"
     }
+    expanded_context = fits["context_days_0_2"]
+    assert (
+        expanded_context.estimates is not None
+        and primary.unpenalized_condition is not None
+        and primary.augmented_condition is not None
+        and primary.maximum_residual_acf is not None
+        and primary.ljung_box_per_lag is not None
+    )
+    context_sensitivity = float(
+        np.max(
+            np.abs(np.sum(primary.estimates, axis=1) - np.sum(expanded_context.estimates, axis=1))
+        )
+    )
+    positive_training_days = {
+        _feature_id(input_id, component): len(
+            {
+                item.day
+                for item in bundle.values
+                if item.input_id is input_id
+                and item.component == component
+                and item.value is not None
+                and item.value > 0
+            }
+        )
+        for input_id, component in primary.feature_keys
+        if input_id in _WORKOUT_INPUTS
+    }
+    minimum_positive_training_days = min(
+        positive_training_days.values(),
+        default=method.maturity.minimum_positive_training_days,
+    )
+    maximum_gap_days = max(
+        (current - previous - 1 for previous, current in pairwise(primary.rows)),
+        default=0,
+    )
+    primary_block_length = bootstrap_outcomes[0].fact.block_length
+    maturity_values: tuple[tuple[AnalysisMaturityCriterionCode, float, float, bool], ...] = (
+        (
+            AnalysisMaturityCriterionCode.MINIMUM_FIT_ROWS,
+            float(len(primary.rows)),
+            float(method.maturity.minimum_fit_rows),
+            len(primary.rows) >= method.maturity.minimum_fit_rows,
+        ),
+        (
+            AnalysisMaturityCriterionCode.INPUT_COMPLETENESS,
+            len(primary.rows) / len(bundle.calendar),
+            method.maturity.minimum_input_completeness,
+            len(primary.rows) / len(bundle.calendar) >= method.maturity.minimum_input_completeness,
+        ),
+        (
+            AnalysisMaturityCriterionCode.EFFECTIVE_BLOCKS,
+            float(len(primary.rows) // primary_block_length),
+            float(method.maturity.minimum_effective_blocks),
+            len(primary.rows) // primary_block_length >= method.maturity.minimum_effective_blocks,
+        ),
+        (
+            AnalysisMaturityCriterionCode.POSITIVE_TRAINING_DAYS,
+            float(minimum_positive_training_days),
+            float(method.maturity.minimum_positive_training_days),
+            minimum_positive_training_days >= method.maturity.minimum_positive_training_days,
+        ),
+        (
+            AnalysisMaturityCriterionCode.FULL_RANK,
+            float(primary.rank),
+            float(primary.matrix_columns),
+            primary.rank == primary.matrix_columns,
+        ),
+        (
+            AnalysisMaturityCriterionCode.UNPENALIZED_CONDITION_NUMBER,
+            primary.unpenalized_condition,
+            method.maturity.maximum_unpenalized_condition_number,
+            primary.unpenalized_condition <= method.maturity.maximum_unpenalized_condition_number,
+        ),
+        (
+            AnalysisMaturityCriterionCode.AUGMENTED_CONDITION_NUMBER,
+            primary.augmented_condition,
+            method.maturity.maximum_augmented_condition_number,
+            primary.augmented_condition <= method.maturity.maximum_augmented_condition_number,
+        ),
+        (
+            AnalysisMaturityCriterionCode.RESIDUAL_ACF,
+            primary.maximum_residual_acf,
+            method.maturity.maximum_residual_acf,
+            primary.maximum_residual_acf <= method.maturity.maximum_residual_acf,
+        ),
+        (
+            AnalysisMaturityCriterionCode.LJUNG_BOX,
+            primary.ljung_box_per_lag,
+            method.maturity.maximum_ljung_box,
+            primary.ljung_box_per_lag <= method.maturity.maximum_ljung_box,
+        ),
+        (
+            AnalysisMaturityCriterionCode.CONTEXT_SENSITIVITY,
+            context_sensitivity,
+            method.maturity.maximum_context_sensitivity_bpm_per_sd,
+            context_sensitivity <= method.maturity.maximum_context_sensitivity_bpm_per_sd,
+        ),
+        (
+            AnalysisMaturityCriterionCode.MAXIMUM_GAP_DAYS,
+            float(maximum_gap_days),
+            float(method.maturity.maximum_gap_days),
+            maximum_gap_days <= method.maturity.maximum_gap_days,
+        ),
+    )
+    maturity_criteria = tuple(
+        AnalysisResultMaturityCriterion(code, passed, observed, threshold)
+        for code, observed, threshold, passed in maturity_values
+    )
     result_diagnostics: tuple[dict[str, object], ...] = (
         {
             "code": AnalysisDiagnostic.FIT.value,
@@ -3047,10 +3431,38 @@ def _short_lag_point_fit(
             },
         },
         {
+            "code": AnalysisDiagnostic.RESIDUAL.value,
+            "facts": {
+                "ljung_box_per_lag": primary.ljung_box_per_lag,
+                "maximum_residual_acf": primary.maximum_residual_acf,
+            },
+        },
+        {
             "code": AnalysisDiagnostic.SENSITIVITY.value,
             "facts": {
                 "cumulative_bpm_per_personal_sd": cumulative,
+                "maximum_context_change_bpm_per_personal_sd": context_sensitivity,
                 "fit_rows": {name: len(fit.rows) for name, fit in fits.items()},
+            },
+        },
+        {
+            "code": AnalysisDiagnostic.BOOTSTRAP.value,
+            "facts": {
+                "confidence_level": method.bootstrap.confidence_level,
+                "primary_critical_value": critical_value,
+                "simultaneous_critical_floor": method.simultaneous_critical_floor,
+                "variants": tuple(
+                    {
+                        "attempts": outcome.fact.attempts,
+                        "block_length": outcome.fact.block_length,
+                        "failure_counts": dict(outcome.fact.failure_counts),
+                        "quantile_stability": outcome.fact.quantile_stability,
+                        "seed": outcome.fact.seed,
+                        "successful_refits": outcome.fact.successful_refits,
+                        "variant": outcome.fact.variant.value,
+                    }
+                    for outcome in bootstrap_outcomes
+                ),
             },
         },
     )
@@ -3061,6 +3473,8 @@ def _short_lag_point_fit(
         tuple(lag_estimates),
         tuple(contrasts),
         result_diagnostics,
+        tuple(outcome.fact for outcome in bootstrap_outcomes),
+        maturity_criteria,
     )
 
 
@@ -3192,16 +3606,54 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
         environment_hash,
     )
     result_artifact: AnalysisJsonlArtifact | None = None
+    maturity_criteria = point.maturity_criteria if point is not None else ()
+    if result_id is not None and store.load_identity().mode is DataMode.REAL:
+        maturity_criteria += (
+            AnalysisResultMaturityCriterion(
+                AnalysisMaturityCriterionCode.REAL_DATA_REVALIDATION_PENDING,
+                False,
+                "pending",
+                "revalidated",
+            ),
+        )
+    model_maturity = (
+        ModelMaturityStatus.ROBUST
+        if result_id is not None
+        and maturity_criteria
+        and all(item.passed for item in maturity_criteria)
+        else ModelMaturityStatus.EXPLORATORY
+        if result_id is not None
+        else None
+    )
     if result_id is not None and point is not None:
         result_record: dict[str, object] = {
             "analysis_definition_id": str(plan.analysis_definition.analysis_definition_id),
             "analysis_result_id": str(result_id),
             "analysis_run_id": str(run_id),
-            "bootstrap_facts": [],
+            "bootstrap_facts": [
+                {
+                    "attempts": item.attempts,
+                    "block_length": item.block_length,
+                    "failure_counts": dict(item.failure_counts),
+                    "quantile_stability": item.quantile_stability,
+                    "seed": item.seed,
+                    "successful_refits": item.successful_refits,
+                    "variant": item.variant.value,
+                }
+                for item in point.bootstrap_facts
+            ],
             "contrasts": list(point.contrasts),
             "diagnostics": list(point.result_diagnostics),
             "lag_estimates": list(point.lag_estimates),
-            "maturity_criteria": [],
+            "maturity_criteria": [
+                {
+                    "code": item.code.value,
+                    "observed_value": item.observed_value,
+                    "passed": item.passed,
+                    "threshold": item.threshold,
+                }
+                for item in maturity_criteria
+            ],
             "result_family": plan.analysis_definition.result_family.value,
             "result_schema_version": 1,
         }
@@ -3241,31 +3693,35 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
     )
     data_status_reasons = (
         (
-            AnalysisDataStatusReason(
-                DataStatusReasonCode.OPEN_REVIEW_CASE,
-                tuple(str(item) for item in bundle.data_quality_fact_ids),
-            ),
+            (
+                AnalysisDataStatusReason(
+                    DataStatusReasonCode.OPEN_REVIEW_CASE,
+                    tuple(str(item) for item in bundle.data_quality_fact_ids),
+                ),
+            )
+            if bundle.data_quality_fact_ids
+            else ()
         )
-        if bundle.data_quality_fact_ids
-        else ()
-    ) + (
-        (
-            AnalysisDataStatusReason(
-                DataStatusReasonCode.PASSIVE_COVERAGE_GAP,
-                ("activity-coverage/v1",),
-            ),
+        + (
+            (
+                AnalysisDataStatusReason(
+                    DataStatusReasonCode.PASSIVE_COVERAGE_GAP,
+                    ("activity-coverage/v1",),
+                ),
+            )
+            if bundle.activity_coverage_incomplete
+            else ()
         )
-        if bundle.activity_coverage_incomplete
-        else ()
-    ) + (
-        (
-            AnalysisDataStatusReason(
-                DataStatusReasonCode.PROVISIONAL_INPUT_QUALITY,
-                provisional_evidence,
-            ),
+        + (
+            (
+                AnalysisDataStatusReason(
+                    DataStatusReasonCode.PROVISIONAL_INPUT_QUALITY,
+                    provisional_evidence,
+                ),
+            )
+            if provisional_evidence
+            else ()
         )
-        if provisional_evidence
-        else ()
     )
     _publish_analysis_run(
         store,
@@ -3288,9 +3744,7 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
                 else None
             ),
             result_artifact=result_artifact,
-            model_maturity=(
-                ModelMaturityStatus.EXPLORATORY if result_artifact is not None else None
-            ),
+            model_maturity=model_maturity,
         ),
     )
     return AnalysisExecution(
@@ -3302,7 +3756,7 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
         provenance,
         status,
         result_id,
-        ModelMaturityStatus.EXPLORATORY if result_artifact is not None else None,
+        model_maturity,
     )
 
 

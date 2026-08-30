@@ -140,10 +140,25 @@ id = "V04-C-ANALYSIS-INPUT-SCHEMA2-V1"
 source = "https://github.com/RMKruse/personal-health-lab/issues/119"
 statement = "New analysis input bundles use closed schema version 2 so typed measurement, manual-context, and medication revision source records can be frozen without conflating opaque identifier kinds; legacy version 1 artifacts remain cataloged."
 
+[[contract]]
+id = "V04-C-SHORT-LAG-BOOTSTRAP-UNCERTAINTY-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/120"
+statement = "The short lag result uses primary and factor-2 moving-block full-refit runs with 2,000 successes in at most 2,020 attempts, pointwise intervals, the calibrated studentized simultaneous band, and recomputed cumulative contrasts; underfulfillment is unstable."
+
+[[contract]]
+id = "V04-C-SHORT-LAG-MATURITY-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/120"
+statement = "Every calibrated short lag maturity criterion exposes its code, observed value, threshold, and verdict, and the complete criterion family determines exploratory or robust maturity."
+
+[[contract]]
+id = "V04-C-SHORT-LAG-SYNTHETIC-CASES-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/120"
+statement = "The V0.4 delta registers short lag signal, null, missingness, maturity-boundary, and bootstrap-failure cases without personal health values."
+
 [[hash_reference]]
 id = "V04-H-ANALYSIS-DEFINITIONS-V1"
 artifact = "src/personal_health_lab/analysis/__init__.py"
-sha256 = "f933db11c931723d24e5f3b927aaf5c64f24d02d0452f0eb1fd3bcba45697b2f"
+sha256 = "f88edcc8c41be58ed8bfc42a94c6554963ee16fe416672a457fb2d9a4f606b8d"
 
 [[hash_reference]]
 id = "V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1"
@@ -418,7 +433,7 @@ runner = "tests/acceptance/test_v04_short_lag_point_fit.py::test_short_lag_run_p
 level = "application"
 platform = "all"
 expected_result = "one typed exploratory result with eight fixed general and pooled workout features, seven daily estimates, one cumulative contrast per feature, and both reporting scales"
-forbidden_side_effects = "no redundant totals, interactions, activity scores, feature selection, uncertainty interval, bootstrap, or maturity verdict"
+forbidden_side_effects = "no redundant totals, interactions, activity scores, feature selection, or data-dependent method choice"
 
 [[case]]
 id = "V04-A-SHORT-LAG-SCALING-RANK-V1"
@@ -439,3 +454,53 @@ level = "application"
 platform = "all"
 expected_result = "the primary, context-days-0-2, and no-context fits complete with frozen context values and reproducible variant diagnostics"
 forbidden_side_effects = "no context imputation, data-dependent variant selection, or silent row substitution"
+
+[[case]]
+id = "V04-A-SHORT-LAG-UNCERTAINTY-SIGNAL-V1"
+contracts = ["V04-C-SHORT-LAG-BOOTSTRAP-UNCERTAINTY-V1", "V04-C-SHORT-LAG-SYNTHETIC-CASES-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1", "V04-H-LAG-CALIBRATION-V1"]
+runner = "tests/acceptance/test_v04_short_lag_point_fit.py::test_short_lag_run_projects_full_activity_point_estimates"
+level = "application"
+platform = "all"
+expected_result = "the calibrated signal is covered by typed pointwise and simultaneous uncertainty with two complete bootstrap variants"
+forbidden_side_effects = "no partial bootstrap result, uncalibrated critical value, or separately fitted cumulative contrast"
+
+[[case]]
+id = "V04-A-SHORT-LAG-NULL-V1"
+contracts = ["V04-C-SHORT-LAG-SYNTHETIC-CASES-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1", "V04-H-LAG-CALIBRATION-V1"]
+runner = "tests/acceptance/test_v04_short_lag_point_fit.py::test_short_lag_null_case_closes_the_fit_row_maturity_boundary"
+level = "application"
+platform = "all"
+expected_result = "the null signal remains inside every simultaneous lag and cumulative band"
+forbidden_side_effects = "no family-wide null false alarm"
+
+[[case]]
+id = "V04-A-SHORT-LAG-MISSINGNESS-V1"
+contracts = ["V04-C-SHORT-LAG-SYNTHETIC-CASES-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1", "V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1"]
+runner = "tests/acceptance/test_v04_short_lag_point_fit.py::test_short_lag_run_freezes_context_and_runs_all_fixed_variants"
+level = "application"
+platform = "all"
+expected_result = "missing and partial context remain typed while all fixed complete-case variants and uncertainty complete"
+forbidden_side_effects = "no zero fill, imputation, carry-forward, or hidden row substitution"
+
+[[case]]
+id = "V04-A-SHORT-LAG-MATURITY-BOUNDARY-V1"
+contracts = ["V04-C-SHORT-LAG-MATURITY-V1", "V04-C-SHORT-LAG-SYNTHETIC-CASES-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1", "V04-H-LAG-CALIBRATION-V1"]
+runner = "tests/acceptance/test_v04_short_lag_point_fit.py::test_short_lag_null_case_closes_the_fit_row_maturity_boundary"
+level = "application"
+platform = "all"
+expected_result = "exactly 100 complete fit rows pass the inclusive short-lag row threshold and the complete criterion family determines maturity"
+forbidden_side_effects = "no hidden maturity criterion or window-level maturity override"
+
+[[case]]
+id = "V04-A-SHORT-LAG-BOOTSTRAP-FAILURE-V1"
+contracts = ["V04-C-SHORT-LAG-BOOTSTRAP-UNCERTAINTY-V1", "V04-C-SHORT-LAG-SYNTHETIC-CASES-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1"]
+runner = "tests/acceptance/test_v04_short_lag_point_fit.py::test_short_lag_bootstrap_underfulfillment_is_unstable"
+level = "application"
+platform = "all"
+expected_result = "2,020 classified failed attempts produce unstable without a result identity or maturity verdict"
+forbidden_side_effects = "no underfilled interval, band, result artifact, or fallback result"
