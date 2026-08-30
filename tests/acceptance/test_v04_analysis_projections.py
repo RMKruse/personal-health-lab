@@ -1,5 +1,6 @@
 import hashlib
 import json
+import sqlite3
 from datetime import date
 from pathlib import Path
 from uuid import uuid4
@@ -8,6 +9,8 @@ from zipfile import ZipFile
 import personal_health_lab.analysis as analysis_module
 from personal_health_lab.application import (
     AnalysisDefinitionId,
+    AnalysisFreshness,
+    AnalysisReceipt,
     AnalysisResultRef,
     AnalysisResultSelection,
     AnalysisRunId,
@@ -147,9 +150,7 @@ def _artifact(
     content = {key: value for key, value in record.items() if key not in identity_fields}
     return AnalysisJsonlArtifact(
         schema_id,
-        int(record.get("input_schema_version", 1))
-        if schema_id == "analysis-input-bundle"
-        else 1,
+        int(record.get("input_schema_version", 1)) if schema_id == "analysis-input-bundle" else 1,
         hashlib.sha256(
             json.dumps(content, separators=(",", ":"), sort_keys=True).encode()
         ).hexdigest(),
@@ -325,6 +326,12 @@ def test_analysis_result_projects_each_typed_result_family(tmp_path: Path) -> No
         assert result.analysis_definition_id == definition
         assert result.analysis_run_id == run_id
         assert result.result_ref == result_ref
+        assert result.status is AnalysisStatus.COMPLETED
+        assert result.model_maturity is ModelMaturityStatus.EXPLORATORY
+        assert result.data_status is DataQualityStatus.REVIEWED
+        assert result.data_status_reasons == ()
+        assert result.freshness is AnalysisFreshness.CURRENT
+        assert result.reproducibility is ReproducibilityStatus.NOT_RECORDED
         assert result.start_date == date(2024, 1, 2)
         assert result.end_date == date(2024, 1, 2)
         if isinstance(result, WeightCoreResult):
@@ -341,7 +348,13 @@ def test_latest_started_run_does_not_fall_back_to_an_older_result(tmp_path: Path
         runtime, source_run_id, snapshot_ref, DEFINITION, "rhr_activity_lag_1_7"
     )
     with HealthLab.open(runtime) as health_lab:
-        latest_run_id = _run(health_lab)
+        request = RunAnalysis(DEFINITION, start_date=date(2024, 1, 2))
+        latest = health_lab.execute_write(
+            request, expected_plan=health_lab.preview_write(request).fingerprint
+        ).result
+        assert isinstance(latest, AnalysisReceipt)
+        assert latest.status is AnalysisStatus.INSUFFICIENT_DATA
+        latest_run_id = latest.analysis_run_id
 
     with HealthLab.open(runtime) as health_lab:
         implicit = health_lab.load_analysis_result(AnalysisResultSelection(DEFINITION))
@@ -361,6 +374,15 @@ def test_analysis_reproducibility_is_derived_from_current_material(tmp_path: Pat
         run_id = _run(health_lab)
         before = health_lab.load_analysis_runs(AnalysisRunSelection(DEFINITION))
         assert before.runs[0].reproducibility is not ReproducibilityStatus.NOT_RECORDED
+        frozen_axes = (
+            before.runs[0].status,
+            before.runs[0].data_status,
+            before.runs[0].data_status_reasons,
+            before.runs[0].model_maturity,
+            before.runs[0].maturity_criteria,
+            before.runs[0].freshness,
+            before.runs[0].completed_at,
+        )
 
         input_path = (
             runtime.active_store / "parquet" / "analysis-runs" / str(run_id) / "input.jsonl"
@@ -371,6 +393,29 @@ def test_analysis_reproducibility_is_derived_from_current_material(tmp_path: Pat
         assert missing_input.runs[0].reproducibility is ReproducibilityStatus.NOT_RECORDED
 
         input_path.write_bytes(input_payload)
+        with sqlite3.connect(runtime.active_store / "metadata.sqlite3") as metadata:
+            metadata.execute(
+                "UPDATE analysis_artifacts SET schema_version = 99 "
+                "WHERE analysis_run_id = ? AND artifact_kind = 'input'",
+                (str(run_id),),
+            )
+        unknown_schema = health_lab.load_analysis_runs(AnalysisRunSelection(DEFINITION))
+        assert unknown_schema.runs[0].reproducibility is ReproducibilityStatus.NOT_RECORDED
+        assert (
+            unknown_schema.runs[0].status,
+            unknown_schema.runs[0].data_status,
+            unknown_schema.runs[0].data_status_reasons,
+            unknown_schema.runs[0].model_maturity,
+            unknown_schema.runs[0].maturity_criteria,
+            unknown_schema.runs[0].freshness,
+            unknown_schema.runs[0].completed_at,
+        ) == frozen_axes
+        with sqlite3.connect(runtime.active_store / "metadata.sqlite3") as metadata:
+            metadata.execute(
+                "UPDATE analysis_artifacts SET schema_version = 2 "
+                "WHERE analysis_run_id = ? AND artifact_kind = 'input'",
+                (str(run_id),),
+            )
         snapshot_file = next(
             (runtime.active_store / "parquet" / "snapshots").glob("*/source_occurrences.parquet")
         )
@@ -398,6 +443,16 @@ def test_analysis_result_distinguishes_missing_and_corrupt_artifacts(tmp_path: P
     path.write_bytes(payload + b"corrupt")
     with HealthLab.open(runtime) as health_lab:
         corrupt = health_lab.load_analysis_result(AnalysisResultSelection(DEFINITION))
+    path.write_bytes(payload)
+    with sqlite3.connect(runtime.active_store / "metadata.sqlite3") as metadata:
+        metadata.execute(
+            "UPDATE analysis_artifacts SET schema_version = 99 "
+            "WHERE analysis_run_id = ? AND artifact_kind = 'result'",
+            (str(run_id),),
+        )
+    with HealthLab.open(runtime) as health_lab:
+        unknown_schema = health_lab.load_analysis_result(AnalysisResultSelection(DEFINITION))
 
     assert unavailable.code is ProjectionUnavailableCode.ARTIFACT_UNAVAILABLE
     assert corrupt.code is ProjectionUnavailableCode.INTEGRITY_FAILED
+    assert unknown_schema.code is ProjectionUnavailableCode.INTEGRITY_FAILED

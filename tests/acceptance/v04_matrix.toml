@@ -116,6 +116,21 @@ source = "https://github.com/RMKruse/personal-health-lab/issues/117"
 statement = "The two focused V0.4 analysis projections extend the exact public HealthLab surface while preserving every delivered V0.3 operation."
 
 [[contract]]
+id = "V04-C-ANALYSIS-REUSE-IDENTITY-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/121"
+statement = "Only a completed run with identical definition, canonical configuration and period, snapshot, frozen input content, code state, and environment lock is reusable; reuse creates only a new receipt for the existing run and result identities."
+
+[[contract]]
+id = "V04-C-ANALYSIS-INTEGRITY-REPRODUCIBILITY-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/121"
+statement = "Reuse and current reproducibility require available artifacts with known schemas and valid catalog, manifest, file-size, and SHA-256 facts; missing material and every integrity failure expose closed unavailability without partial values."
+
+[[contract]]
+id = "V04-C-ANALYSIS-STATUS-AXES-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/121"
+statement = "Technical run status, frozen data status, frozen model maturity, dynamically derived freshness, and dynamically derived reproducibility remain separate traceable axes."
+
+[[contract]]
 id = "V04-C-SHORT-LAG-ACTIVITY-DESIGN-V1"
 source = "https://github.com/RMKruse/personal-health-lab/issues/118"
 statement = "The short lag model jointly uses the four general activity inputs and duration and energy for every analytical workout type, pooling types with fewer than ten positive days into Other without adding redundant totals, interactions, scores, or data-dependent feature selection."
@@ -158,17 +173,17 @@ statement = "The V0.4 delta registers short lag signal, null, missingness, matur
 [[hash_reference]]
 id = "V04-H-ANALYSIS-DEFINITIONS-V1"
 artifact = "src/personal_health_lab/analysis/__init__.py"
-sha256 = "f88edcc8c41be58ed8bfc42a94c6554963ee16fe416672a457fb2d9a4f606b8d"
+sha256 = "3291dac453f95fb4a62b92c1ae3455d48cfb164e3ccb35484d232366536e5fd5"
 
 [[hash_reference]]
 id = "V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1"
 artifact = "src/personal_health_lab/storage/_store.py"
-sha256 = "d9efc285588be52bdf0f17bf0c6fb63499ad937cee418341c0a8a99405046d05"
+sha256 = "b7d0e33c3a2f1656ce1991b13af2c0606e8460497217f9dd3e66566a58c8453e"
 
 [[hash_reference]]
 id = "V04-H-ANALYSIS-PROJECTIONS-V1"
 artifact = "src/personal_health_lab/application/_application.py"
-sha256 = "945122d342eadbdc127f11b4f459e3df80a3f260d27a07d3c54a287c3f001d57"
+sha256 = "73933aa80e0b0f5705fb32ccc8f1f18df057591704f22c0955de522d45e507db"
 
 [[hash_reference]]
 id = "V04-H-LAG-CALIBRATION-V1"
@@ -387,7 +402,7 @@ forbidden_side_effects = "no technical exception, mixed selection, or replacemen
 
 [[case]]
 id = "V04-A-ANALYSIS-RESULT-FAMILIES-V1"
-contracts = ["V04-C-ANALYSIS-RESULT-SELECTION-V1"]
+contracts = ["V04-C-ANALYSIS-RESULT-SELECTION-V1", "V04-C-ANALYSIS-STATUS-AXES-V1"]
 hash_references = ["V04-H-ANALYSIS-PROJECTIONS-V1", "V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1"]
 runner = "tests/acceptance/test_v04_analysis_projections.py::test_analysis_result_projects_each_typed_result_family"
 level = "application"
@@ -407,13 +422,43 @@ forbidden_side_effects = "no silent fallback to the older result"
 
 [[case]]
 id = "V04-A-ANALYSIS-ARTIFACT-READ-V1"
-contracts = ["V04-C-ANALYSIS-RESULT-UNAVAILABLE-V1"]
+contracts = ["V04-C-ANALYSIS-RESULT-UNAVAILABLE-V1", "V04-C-ANALYSIS-INTEGRITY-REPRODUCIBILITY-V1"]
 hash_references = ["V04-H-ANALYSIS-PROJECTIONS-V1", "V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1"]
 runner = "tests/acceptance/test_v04_analysis_projections.py::test_analysis_result_distinguishes_missing_and_corrupt_artifacts"
 level = "application"
 platform = "all"
-expected_result = "missing files return artifact_unavailable and hash violations return integrity_failed"
+expected_result = "missing files return artifact_unavailable while hash violations and unknown schemas return integrity_failed"
 forbidden_side_effects = "no raw storage exception or partially trusted artifact"
+
+[[case]]
+id = "V04-A-ANALYSIS-REUSE-V1"
+contracts = ["V04-C-ANALYSIS-REUSE-IDENTITY-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1", "V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1", "V04-H-ANALYSIS-PROJECTIONS-V1"]
+runner = "tests/acceptance/test_v04_short_lag_point_fit.py::test_short_lag_run_freezes_context_and_runs_all_fixed_variants"
+level = "application"
+platform = "all"
+expected_result = "preview identifies the valid completed run and execution creates one reused receipt with its existing run and result identities"
+forbidden_side_effects = "no duplicate model run, result identity, or artifact"
+
+[[case]]
+id = "V04-A-ANALYSIS-REUSE-INTEGRITY-V1"
+contracts = ["V04-C-ANALYSIS-REUSE-IDENTITY-V1", "V04-C-ANALYSIS-INTEGRITY-REPRODUCIBILITY-V1"]
+hash_references = ["V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1", "V04-H-ANALYSIS-PROJECTIONS-V1"]
+runner = "tests/acceptance/test_v04_short_lag_point_fit.py::test_short_lag_run_freezes_context_and_runs_all_fixed_variants"
+level = "application"
+platform = "all"
+expected_result = "a completed run with invalid material is neither advertised nor reused and a new attempt receives a fresh run identity"
+forbidden_side_effects = "no reuse of missing, corrupt, unknown-schema, incomplete, or unstable material"
+
+[[case]]
+id = "V04-A-ANALYSIS-REPRODUCIBILITY-V1"
+contracts = ["V04-C-ANALYSIS-INTEGRITY-REPRODUCIBILITY-V1", "V04-C-ANALYSIS-STATUS-AXES-V1"]
+hash_references = ["V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1", "V04-H-ANALYSIS-PROJECTIONS-V1"]
+runner = "tests/acceptance/test_v04_analysis_projections.py::test_analysis_reproducibility_is_derived_from_current_material"
+level = "application"
+platform = "all"
+expected_result = "current code, lock, snapshot, known schemas, and valid artifacts derive reproducibility without mutating the frozen run facts"
+forbidden_side_effects = "no frozen mutable reproducibility value or reproducible status for unavailable or unknown-schema material"
 
 [[case]]
 id = "V04-A-ANALYSIS-PROJECTION-COMPATIBILITY-V1"

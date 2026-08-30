@@ -1024,6 +1024,60 @@ class AnalysisProvenance:
             json.dumps(values, separators=(",", ":"), sort_keys=True).encode()
         ).hexdigest()
 
+    def reuse_key_for_input(self, input_content_hash: str) -> str:
+        return AnalysisReuseIdentity.from_provenance(self).reuse_key(input_content_hash)
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisReuseIdentity:
+    snapshot_id: SnapshotId
+    analysis_definition_id: AnalysisDefinitionId
+    config_hash: str
+    code_commit: str
+    code_dirty: bool
+    code_diff_hash: str | None
+    environment_lock_hash: str
+
+    @classmethod
+    def from_provenance(cls, provenance: AnalysisProvenance) -> AnalysisReuseIdentity:
+        return cls(
+            provenance.snapshot_id,
+            provenance.analysis_definition_id,
+            provenance.config_hash,
+            provenance.code_commit,
+            provenance.code_dirty,
+            provenance.code_diff_hash,
+            provenance.environment_lock_hash,
+        )
+
+    def reuse_key(self, input_content_hash: str) -> str:
+        values = {
+            "analysis_definition_id": str(self.analysis_definition_id),
+            "code_commit": self.code_commit,
+            "code_diff_hash": self.code_diff_hash,
+            "code_dirty": self.code_dirty,
+            "config_hash": self.config_hash,
+            "environment_lock_hash": self.environment_lock_hash,
+            "input_content_hash": input_content_hash,
+            "snapshot_id": str(self.snapshot_id),
+        }
+        return hashlib.sha256(
+            json.dumps(values, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisReuseRequest:
+    identity: AnalysisReuseIdentity
+    input_content_hash: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.input_content_hash is not None and (
+            len(self.input_content_hash) != 64
+            or not set(self.input_content_hash) <= set("0123456789abcdef")
+        ):
+            raise ValueError("Analyseeingangs-Hash muss SHA-256 sein.")
+
 
 @dataclass(frozen=True, slots=True)
 class AnalysisRunConfiguration:
@@ -9681,6 +9735,7 @@ class LocalStore:
                 for source_id in source_ids
                 if source_id in manual_source_times
             )
+
         coverage = self.load_context_coverage_start(snapshot_id)
         context_revisions = tuple(
             item for item in self.load_active_illness(snapshot_id) if item.state == "active"
@@ -9731,9 +9786,7 @@ class LocalStore:
                 StoredOutcomeContextDay(
                     day=day,
                     sleep_minutes=(
-                        None
-                        if sleep_row is None or sleep_row[1] is None
-                        else float(sleep_row[1])
+                        None if sleep_row is None or sleep_row[1] is None else float(sleep_row[1])
                     ),
                     sleep_status=cast(
                         Literal["unobserved", "partial", "observed"],
@@ -9775,9 +9828,7 @@ class LocalStore:
                         else "unknown"
                     ),
                     medication_regime_revision_id=(
-                        None
-                        if regime is None
-                        else MedicationRevisionId(str(regime.revision_id))
+                        None if regime is None else MedicationRevisionId(str(regime.revision_id))
                     ),
                     medication_deviation=(
                         False if medication_row is None else int(medication_row[0]) > 0
@@ -12383,9 +12434,7 @@ class LocalStore:
 
     def analysis_run_material_is_available(self, fact: AnalysisRunFact) -> bool:
         self._require_open()
-        snapshot_directory = (
-            self._root / _PARQUET_DIRECTORY / "snapshots" / str(fact.snapshot_id)
-        )
+        snapshot_directory = self._root / _PARQUET_DIRECTORY / "snapshots" / str(fact.snapshot_id)
         try:
             snapshot = self._metadata.execute(
                 "SELECT manifest_sha256 FROM dataset_snapshots WHERE snapshot_id = ?",
@@ -12394,9 +12443,7 @@ class LocalStore:
             if snapshot is None:
                 return False
             try:
-                self._validate_snapshot(
-                    snapshot_directory, str(fact.snapshot_id), str(snapshot[0])
-                )
+                self._validate_snapshot(snapshot_directory, str(fact.snapshot_id), str(snapshot[0]))
             except StoreError:
                 return False
             rows = self._metadata.execute(
@@ -12404,7 +12451,8 @@ class LocalStore:
                 SELECT artifact.artifact_kind, artifact.artifact_path,
                        artifact.manifest_sha256, artifact.manifest_size_bytes,
                        artifact.artifact_size_bytes, artifact.is_legacy,
-                       file.file_name, file.sha256, file.size_bytes
+                       file.file_name, file.sha256, file.size_bytes,
+                       artifact.schema_id, artifact.schema_version, artifact.result_family
                 FROM analysis_artifacts AS artifact
                 JOIN analysis_artifact_files AS file
                   USING (analysis_run_id, artifact_kind)
@@ -12421,6 +12469,28 @@ class LocalStore:
         try:
             for kind in required:
                 artifact_rows = tuple(row for row in rows if str(row[0]) == kind)
+                legacy = bool(artifact_rows[0][5])
+                expected_schema = (
+                    (
+                        (
+                            "legacy-resting-hr-input"
+                            if kind == "input"
+                            else "legacy-resting-hr-result"
+                        ),
+                        1,
+                    )
+                    if legacy
+                    else (
+                        (
+                            "analysis-input-bundle"
+                            if kind == "input"
+                            else f"analysis-result-{artifact_rows[0][11]}"
+                        ),
+                        2 if kind == "input" else 1,
+                    )
+                )
+                if (str(artifact_rows[0][9]), int(artifact_rows[0][10])) != expected_schema:
+                    return False
                 directory = self._root / str(artifact_rows[0][1])
                 manifest_name = (
                     "manifest.json"
@@ -12543,10 +12613,13 @@ class LocalStore:
             raise AnalysisArtifactIntegrityError("Analyseergebnis ist beschädigt.") from error
         return artifact
 
-    def find_reusable_resting_hr_analysis(
-        self, candidate: AnalysisProvenance
+    def find_reusable_analysis_run(
+        self,
+        request: AnalysisReuseRequest,
     ) -> AnalysisRunRecord | None:
         self._require_open()
+        candidate = request.identity
+        input_content_hash = request.input_content_hash
         row = self._metadata.execute(
             """
             SELECT analysis_run_id, result_id, snapshot_id, analysis_definition_id,
@@ -12554,11 +12627,24 @@ class LocalStore:
                    code_diff_hash, environment_lock_hash, model_maturity, diagnostics
             FROM analysis_runs
             WHERE status = 'completed'
-              AND reuse_key = ?
+              AND analysis_definition_id = ? AND snapshot_id = ? AND config_hash = ?
+              AND code_commit = ? AND code_dirty = ?
+              AND code_diff_hash IS ? AND environment_lock_hash = ?
+              AND (? IS NULL OR reuse_key = ?)
             ORDER BY completed_at DESC, rowid DESC
             LIMIT 1
             """,
-            (candidate.reuse_key,),
+            (
+                str(candidate.analysis_definition_id),
+                str(candidate.snapshot_id),
+                candidate.config_hash,
+                candidate.code_commit,
+                candidate.code_dirty,
+                candidate.code_diff_hash,
+                candidate.environment_lock_hash,
+                input_content_hash,
+                (None if input_content_hash is None else candidate.reuse_key(input_content_hash)),
+            ),
         ).fetchone()
         if row is None:
             return None
@@ -12576,7 +12662,7 @@ class LocalStore:
             model_maturity,
             diagnostics,
         ) = row
-        return AnalysisRunRecord(
+        record = AnalysisRunRecord(
             provenance=AnalysisProvenance(
                 analysis_run_id=AnalysisRunId(str(analysis_run_id)),
                 result_id=AnalysisResultId(str(result_id)),
@@ -12592,6 +12678,58 @@ class LocalStore:
             model_maturity=ModelMaturityStatus(str(model_maturity)),
             diagnostics=tuple(cast(list[str], json.loads(str(diagnostics)))),
         )
+        facts = self.load_analysis_runs(candidate.snapshot_id, candidate.analysis_definition_id)
+        fact = next(
+            (item for item in facts if item.analysis_run_id == record.provenance.analysis_run_id),
+            None,
+        )
+        artifacts = self._metadata.execute(
+            """
+            SELECT artifact_kind, schema_id, schema_version, content_hash, is_legacy,
+                   result_family
+            FROM analysis_artifacts
+            WHERE analysis_run_id = ?
+            ORDER BY artifact_kind
+            """,
+            (str(record.provenance.analysis_run_id),),
+        ).fetchall()
+        if fact is None or not self.analysis_run_material_is_available(fact) or len(artifacts) != 2:
+            return None
+        input_artifact, result_artifact = artifacts
+        modern = (
+            str(input_artifact[1]) == "analysis-input-bundle"
+            and int(input_artifact[2]) == 2
+            and not bool(input_artifact[4])
+            and str(result_artifact[1]) == f"analysis-result-{result_artifact[5]}"
+            and int(result_artifact[2]) == 1
+            and not bool(result_artifact[4])
+        )
+        legacy = (
+            str(input_artifact[1]) == "legacy-resting-hr-input"
+            and int(input_artifact[2]) == 1
+            and bool(input_artifact[4])
+            and str(result_artifact[1]) == "legacy-resting-hr-result"
+            and int(result_artifact[2]) == 1
+            and bool(result_artifact[4])
+        )
+        if (
+            tuple(str(row[0]) for row in artifacts) != ("input", "result")
+            or not (modern or legacy)
+            or (input_content_hash is not None and str(input_artifact[3]) != input_content_hash)
+            or record.provenance.result_id is None
+        ):
+            return None
+        if legacy:
+            return record
+        try:
+            self.load_analysis_result_artifact(
+                record.provenance.analysis_run_id,
+                record.provenance.result_id,
+                record.provenance.analysis_definition_id,
+            )
+        except (AnalysisArtifactUnavailableError, AnalysisArtifactIntegrityError):
+            return None
+        return record
 
     def _record_migration_analysis_path(self, marker: Path, path: Path) -> None:
         values = json.loads(marker.read_bytes())
@@ -12749,6 +12887,15 @@ class LocalStore:
         for run_id_value, result_id_value, definition_id_value, status_value in rows:
             run_id = str(run_id_value)
             result_id = str(result_id_value)
+            if (
+                self._metadata.execute(
+                    "SELECT 1 FROM analysis_artifacts "
+                    "WHERE analysis_run_id = ? AND artifact_kind = 'result'",
+                    (run_id,),
+                ).fetchone()
+                is not None
+            ):
+                continue
             result_directory = self._root / _PARQUET_DIRECTORY / "analyses" / result_id
             result_path = result_directory / "result.parquet"
             if not result_path.is_file():
@@ -12966,7 +13113,7 @@ class LocalStore:
                         provenance.code_dirty,
                         provenance.code_diff_hash,
                         provenance.environment_lock_hash,
-                        provenance.reuse_key,
+                        provenance.reuse_key_for_input(publication.input_artifact.content_hash),
                         (
                             None
                             if publication.model_maturity is None
@@ -13037,7 +13184,7 @@ class LocalStore:
                         analysis_run_id, artifact_kind, result_id, result_family,
                         schema_id, schema_version, content_hash, manifest_sha256,
                         manifest_size_bytes, artifact_path, artifact_size_bytes, is_legacy
-                    ) VALUES (?, 'input', NULL, NULL, ?, ?, ?, ?, ?, ?, ?, 0)
+                    ) VALUES (?, 'input', NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         run_id,
@@ -13048,6 +13195,7 @@ class LocalStore:
                         len(input_manifest),
                         relative.as_posix(),
                         publication.input_artifact.size_bytes + len(input_manifest),
+                        int(publication.input_artifact.schema_id == "legacy-resting-hr-input"),
                     ),
                 )
                 self._metadata.execute(
@@ -13157,77 +13305,28 @@ class LocalStore:
         end_date: date | None,
         config_json: str,
         receipt_diagnostics: tuple[str, ...],
+        input_artifact: AnalysisJsonlArtifact,
     ) -> None:
         self._require_open()
         self._require_writer()
         provenance = result.provenance
         if provenance is None or provenance.result_id is None:
             raise StoreError("Analyseprovenienz fehlt.")
+        if (
+            input_artifact.schema_id != "legacy-resting-hr-input"
+            or input_artifact.schema_version != 1
+            or hashlib.sha256(input_artifact.payload).hexdigest() != input_artifact.sha256
+            or len(input_artifact.payload) != input_artifact.size_bytes
+            or len(_analysis_jsonl_rows(input_artifact)) != 1
+        ):
+            raise StoreError("Legacy-Analyseeingang ist ungültig.")
         result_id = provenance.result_id
         staging = self._root / "analysis-staging" / str(provenance.analysis_run_id)
         destination = self._root / _PARQUET_DIRECTORY / "analyses" / str(result_id)
-        with self._metadata:
-            self._metadata.execute(
-                """
-                INSERT INTO analysis_runs(
-                    analysis_run_id, operation_id, result_id, snapshot_id,
-                    analysis_definition_id, analysis_start_date, analysis_end_date,
-                    config_json, config_hash, config_schema_version,
-                    code_commit, code_dirty, code_diff_hash, environment_lock_hash, reuse_key,
-                    model_maturity, data_status, data_status_reasons, maturity_criteria,
-                    reproducibility, diagnostics,
-                    status, completed_at
-                ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    'running', ?
-                )
-                """,
-                (
-                    str(provenance.analysis_run_id),
-                    str(operation_id),
-                    str(result_id),
-                    str(result.snapshot_id),
-                    str(result.analysis_definition_id),
-                    start_date.isoformat() if start_date else None,
-                    end_date.isoformat() if end_date else None,
-                    config_json,
-                    provenance.config_hash,
-                    provenance.config_schema_version,
-                    provenance.code_commit,
-                    provenance.code_dirty,
-                    provenance.code_diff_hash,
-                    provenance.environment_lock_hash,
-                    provenance.reuse_key,
-                    result.model_maturity.value,
-                    result.data_status.value,
-                    json.dumps(
-                        [
-                            {
-                                "code": reason.code.value,
-                                "evidence_ids": reason.evidence_ids,
-                            }
-                            for reason in result.data_status_reasons
-                        ],
-                        sort_keys=True,
-                    ),
-                    json.dumps(
-                        [
-                            {
-                                "code": criterion.code.value,
-                                "passed": criterion.passed,
-                                "observed_value": criterion.observed_value,
-                                "threshold": criterion.threshold,
-                            }
-                            for criterion in result.maturity_criteria
-                        ],
-                        sort_keys=True,
-                    ),
-                    result.reproducibility.value,
-                    json.dumps(receipt_diagnostics),
-                    datetime.now().astimezone().isoformat(),
-                ),
-            )
         staging.mkdir(parents=True)
+        input_staging = staging / "input"
+        input_staging.mkdir()
+        (input_staging / "input.jsonl").write_bytes(input_artifact.payload)
         path = staging / "result.parquet"
         escaped_path = str(path).replace("'", "''")
         self._query.execute(
@@ -13330,13 +13429,203 @@ class LocalStore:
             ],
         )
         self._query.execute(f"COPY resting_hr_analysis_result TO '{escaped_path}' (FORMAT PARQUET)")
+        result_payload = path.read_bytes()
+        result_sha256 = hashlib.sha256(result_payload).hexdigest()
+        manifest_facts = {
+            "analysis_definition_id": str(provenance.analysis_definition_id),
+            "analysis_run_id": str(provenance.analysis_run_id),
+            "manifest_schema_version": 1,
+        }
+        input_manifest = json.dumps(
+            {
+                **manifest_facts,
+                "analysis_result_id": None,
+                "artifact_kind": "input",
+                "content_hash": input_artifact.content_hash,
+                "files": [
+                    {
+                        "name": "input.jsonl",
+                        "row_count": 1,
+                        "sha256": input_artifact.sha256,
+                        "size_bytes": input_artifact.size_bytes,
+                    }
+                ],
+                "result_family": None,
+                "schema_version": 1,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        result_manifest = json.dumps(
+            {
+                **manifest_facts,
+                "analysis_result_id": str(result_id),
+                "artifact_kind": "result",
+                "content_hash": result_sha256,
+                "files": [
+                    {
+                        "name": "result.parquet",
+                        "row_count": len(estimates),
+                        "sha256": result_sha256,
+                        "size_bytes": len(result_payload),
+                    }
+                ],
+                "result_family": "legacy_resting_hr_analysis",
+                "schema_version": 1,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        (input_staging / "input-manifest.json").write_bytes(input_manifest)
+        (staging / "manifest.json").write_bytes(result_manifest)
+        _fsync_snapshot(input_staging)
+        _fsync_snapshot(staging)
         destination.parent.mkdir(parents=True, exist_ok=True)
         staging.replace(destination)
+        _fsync_directory(destination.parent)
+        relative = destination.relative_to(self._root).as_posix()
+        input_relative = (destination / "input").relative_to(self._root).as_posix()
+        created_at = datetime.now().astimezone().isoformat()
+        data_status_reasons = json.dumps(
+            [
+                {"code": reason.code.value, "evidence_ids": reason.evidence_ids}
+                for reason in result.data_status_reasons
+            ],
+            sort_keys=True,
+        )
+        maturity_criteria = json.dumps(
+            [
+                {
+                    "code": criterion.code.value,
+                    "passed": criterion.passed,
+                    "observed_value": criterion.observed_value,
+                    "threshold": criterion.threshold,
+                }
+                for criterion in result.maturity_criteria
+            ],
+            sort_keys=True,
+        )
         with self._metadata:
             self._metadata.execute(
-                "UPDATE analysis_runs SET status = 'completed', completed_at = ? "
-                "WHERE analysis_run_id = ?",
-                (datetime.now().astimezone().isoformat(), str(provenance.analysis_run_id)),
+                """
+                INSERT INTO analysis_runs(
+                    analysis_run_id, operation_id, result_id, snapshot_id,
+                    analysis_definition_id, analysis_start_date, analysis_end_date,
+                    config_json, config_hash, config_schema_version,
+                    code_commit, code_dirty, code_diff_hash, environment_lock_hash, reuse_key,
+                    model_maturity, data_status, data_status_reasons, maturity_criteria,
+                    reproducibility, diagnostics, status, completed_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    'completed', ?
+                )
+                """,
+                (
+                    str(provenance.analysis_run_id),
+                    str(operation_id),
+                    str(result_id),
+                    str(result.snapshot_id),
+                    str(result.analysis_definition_id),
+                    start_date.isoformat() if start_date else None,
+                    end_date.isoformat() if end_date else None,
+                    config_json,
+                    provenance.config_hash,
+                    provenance.config_schema_version,
+                    provenance.code_commit,
+                    provenance.code_dirty,
+                    provenance.code_diff_hash,
+                    provenance.environment_lock_hash,
+                    provenance.reuse_key_for_input(input_artifact.content_hash),
+                    result.model_maturity.value,
+                    result.data_status.value,
+                    data_status_reasons,
+                    maturity_criteria,
+                    result.reproducibility.value,
+                    json.dumps(receipt_diagnostics),
+                    created_at,
+                ),
+            )
+            self._metadata.execute(
+                """
+                INSERT INTO analysis_receipts(
+                    operation_id, analysis_run_id, status, result_id, snapshot_id,
+                    analysis_definition_id, config_json, config_hash,
+                    config_schema_version, code_commit, code_dirty, code_diff_hash,
+                    environment_lock_hash, diagnostics, created_at
+                ) VALUES (?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(operation_id),
+                    str(provenance.analysis_run_id),
+                    str(result_id),
+                    str(result.snapshot_id),
+                    str(result.analysis_definition_id),
+                    config_json,
+                    provenance.config_hash,
+                    provenance.config_schema_version,
+                    provenance.code_commit,
+                    provenance.code_dirty,
+                    provenance.code_diff_hash,
+                    provenance.environment_lock_hash,
+                    json.dumps(receipt_diagnostics),
+                    created_at,
+                ),
+            )
+            self._metadata.executemany(
+                """
+                INSERT INTO analysis_artifacts(
+                    analysis_run_id, artifact_kind, result_id, result_family,
+                    schema_id, schema_version, content_hash, manifest_sha256,
+                    manifest_size_bytes, artifact_path, artifact_size_bytes, is_legacy
+                ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    (
+                        str(provenance.analysis_run_id),
+                        "input",
+                        None,
+                        None,
+                        "legacy-resting-hr-input",
+                        input_artifact.content_hash,
+                        hashlib.sha256(input_manifest).hexdigest(),
+                        len(input_manifest),
+                        input_relative,
+                        input_artifact.size_bytes + len(input_manifest),
+                    ),
+                    (
+                        str(provenance.analysis_run_id),
+                        "result",
+                        str(result_id),
+                        "legacy_resting_hr_analysis",
+                        "legacy-resting-hr-result",
+                        result_sha256,
+                        hashlib.sha256(result_manifest).hexdigest(),
+                        len(result_manifest),
+                        relative,
+                        len(result_payload) + len(result_manifest),
+                    ),
+                ),
+            )
+            self._metadata.executemany(
+                "INSERT INTO analysis_artifact_files VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    (
+                        str(provenance.analysis_run_id),
+                        "input",
+                        "input.jsonl",
+                        input_artifact.sha256,
+                        input_artifact.size_bytes,
+                        1,
+                    ),
+                    (
+                        str(provenance.analysis_run_id),
+                        "result",
+                        "result.parquet",
+                        result_sha256,
+                        len(result_payload),
+                        len(estimates),
+                    ),
+                ),
             )
 
     def load_latest_resting_hr_analysis(
@@ -13403,21 +13692,128 @@ class LocalStore:
     def _load_resting_hr_analysis_row(
         self, row: tuple[object, ...], freshness: AnalysisFreshness
     ) -> RestingHeartRateAnalysisResult:
+        run_id = AnalysisRunId(str(row[0]))
         result_id = str(row[1])
         snapshot_id = str(row[2])
         definition_id = str(row[3])
-        path = self._root / _PARQUET_DIRECTORY / "analyses" / result_id / "result.parquet"
-        escaped_path = str(path).replace("'", "''")
-        rows = self._query.execute(
-            f"""
-            SELECT lag_days, direction, estimate_per_100_kcal,
-                   estimate_per_personal_standard_deviation, exposure_unit, outcome_unit,
-                   personal_standard_deviation_kcal, pointwise_interval, simultaneous_band,
-                   model_maturity, diagnostics, methodology
-            FROM read_parquet('{escaped_path}')
-            ORDER BY lag_days NULLS LAST
+        fact_row = self._metadata.execute(
             """
+            SELECT analysis_run_id, result_id, snapshot_id, analysis_definition_id,
+                   analysis_start_date, analysis_end_date, status, model_maturity,
+                   data_status, data_status_reasons, maturity_criteria,
+                   reproducibility, diagnostics, completed_at, code_commit,
+                   code_dirty, code_diff_hash, environment_lock_hash
+            FROM analysis_runs
+            WHERE analysis_run_id = ?
+            """,
+            (str(run_id),),
+        ).fetchone()
+        if fact_row is None:
+            raise AnalysisArtifactUnavailableError("Legacy-Analyselauf fehlt.")
+        fact = _analysis_run_fact(fact_row)
+        migrated_without_input = (
+            self._metadata.execute(
+                "SELECT 1 FROM analysis_run_facts "
+                "WHERE analysis_run_id = ? AND fact_code = 'legacy_input_bundle_not_persisted'",
+                (str(run_id),),
+            ).fetchone()
+            is not None
+        )
+        if not migrated_without_input and not self.analysis_run_material_is_available(fact):
+            raise AnalysisArtifactIntegrityError(
+                "Legacy-Analyseartefakt verletzt den Integritätsvertrag."
+            )
+        catalog = self._metadata.execute(
+            """
+            SELECT artifact.result_id, artifact.result_family, artifact.schema_id,
+                   artifact.schema_version, artifact.content_hash,
+                   artifact.manifest_sha256, artifact.manifest_size_bytes,
+                   artifact.artifact_path, artifact.artifact_size_bytes,
+                   artifact.is_legacy, file.file_name, file.sha256,
+                   file.size_bytes, file.row_count
+            FROM analysis_artifacts AS artifact
+            JOIN analysis_artifact_files AS file USING (analysis_run_id, artifact_kind)
+            WHERE artifact.analysis_run_id = ? AND artifact.artifact_kind = 'result'
+            """,
+            (str(run_id),),
         ).fetchall()
+        if not catalog:
+            raise AnalysisArtifactUnavailableError("Legacy-Analyseergebnis fehlt.")
+        if len(catalog) != 1:
+            raise AnalysisArtifactIntegrityError("Legacy-Analyseergebnis ist mehrdeutig.")
+        artifact = catalog[0]
+        if (
+            str(artifact[0]) != result_id
+            or str(artifact[1]) != "legacy_resting_hr_analysis"
+            or (str(artifact[2]), int(artifact[3])) != ("legacy-resting-hr-result", 1)
+            or not bool(artifact[9])
+            or str(artifact[10]) != "result.parquet"
+        ):
+            raise AnalysisArtifactIntegrityError(
+                "Legacy-Analyseergebnis verwendet ein unbekanntes Schema."
+            )
+        directory = self._root / str(artifact[7])
+        manifest_path = directory / "manifest.json"
+        path = directory / "result.parquet"
+        try:
+            manifest = manifest_path.read_bytes()
+            payload = path.read_bytes()
+            manifest_record = json.loads(manifest)
+        except OSError as error:
+            raise AnalysisArtifactUnavailableError("Legacy-Analyseergebnisdatei fehlt.") from error
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise AnalysisArtifactIntegrityError(
+                "Legacy-Analysemanifest ist beschädigt."
+            ) from error
+        expected_manifest = {
+            "analysis_definition_id": definition_id,
+            "analysis_result_id": result_id,
+            "analysis_run_id": str(run_id),
+            "artifact_kind": "result",
+            "content_hash": str(artifact[4]),
+            "files": [
+                {
+                    "name": "result.parquet",
+                    "row_count": int(artifact[13]),
+                    "sha256": str(artifact[11]),
+                    "size_bytes": int(artifact[12]),
+                }
+            ],
+            "manifest_schema_version": 1,
+            "result_family": "legacy_resting_hr_analysis",
+            "schema_version": 1,
+        }
+        if (
+            manifest_record != expected_manifest
+            or hashlib.sha256(manifest).hexdigest() != str(artifact[5])
+            or len(manifest) != int(artifact[6])
+            or hashlib.sha256(payload).hexdigest() != str(artifact[11])
+            or len(payload) != int(artifact[12])
+            or len(manifest) + len(payload) != int(artifact[8])
+        ):
+            raise AnalysisArtifactIntegrityError(
+                "Legacy-Analyseergebnis verletzt den Integritätsvertrag."
+            )
+        escaped_path = str(path).replace("'", "''")
+        try:
+            rows = self._query.execute(
+                f"""
+                SELECT lag_days, direction, estimate_per_100_kcal,
+                       estimate_per_personal_standard_deviation, exposure_unit, outcome_unit,
+                       personal_standard_deviation_kcal, pointwise_interval, simultaneous_band,
+                       model_maturity, diagnostics, methodology
+                FROM read_parquet('{escaped_path}')
+                ORDER BY lag_days NULLS LAST
+                """
+            ).fetchall()
+        except duckdb.Error as error:
+            raise AnalysisArtifactIntegrityError(
+                "Legacy-Analyseergebnis ist beschädigt."
+            ) from error
+        if len(rows) != int(artifact[13]):
+            raise AnalysisArtifactIntegrityError(
+                "Legacy-Analyseergebnis hat eine ungültige Zeilenzahl."
+            )
 
         def interval(value: str) -> AssociationInterval:
             values = cast(list[float], json.loads(value))

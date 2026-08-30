@@ -22,7 +22,7 @@ MODULES = {
 }
 ALLOWED_DEPENDENCIES = {
     "adapters": {"application", "package_root", "synthetic_export"},
-    "analysis": {"storage"},
+    "analysis": {"resting_hr_analysis", "storage"},
     "application": {
         "analysis",
         "health_import",
@@ -185,9 +185,7 @@ def test_production_adapters_only_import_the_application_interface() -> None:
                 else:
                     continue
                 imports.update(
-                    name.split(".")[1]
-                    for name in names
-                    if name.startswith("personal_health_lab.")
+                    name.split(".")[1] for name in names if name.startswith("personal_health_lab.")
                 )
 
     assert imports - {"adapters"} == {"application"}

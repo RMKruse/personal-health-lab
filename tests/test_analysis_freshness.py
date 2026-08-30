@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -102,10 +103,40 @@ def test_legacy_analysis_artifacts_remain_readable(tmp_path: Path) -> None:
         )
         query.execute("COPY legacy TO ? (FORMAT PARQUET)", [str(replacement)])
     replacement.replace(artifact)
+    payload = artifact.read_bytes()
+    payload_hash = hashlib.sha256(payload).hexdigest()
+    manifest_path = artifact.with_name("manifest.json")
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["content_hash"] = payload_hash
+    manifest["files"][0]["sha256"] = payload_hash
+    manifest["files"][0]["size_bytes"] = len(payload)
+    manifest_payload = json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode()
+    manifest_path.write_bytes(manifest_payload)
     with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
         metadata.execute(
             "UPDATE analysis_runs SET code_dirty = 1, reproducibility = 'not_recorded', "
             "data_status = 'reviewed', maturity_criteria = '[]'"
+        )
+        metadata.execute(
+            "UPDATE analysis_artifacts SET content_hash = ?, manifest_sha256 = ?, "
+            "manifest_size_bytes = ?, artifact_size_bytes = ? "
+            "WHERE analysis_run_id = ? AND artifact_kind = 'result'",
+            (
+                payload_hash,
+                hashlib.sha256(manifest_payload).hexdigest(),
+                len(manifest_payload),
+                len(payload) + len(manifest_payload),
+                str(original.provenance.analysis_run_id),
+            ),
+        )
+        metadata.execute(
+            "UPDATE analysis_artifact_files SET sha256 = ?, size_bytes = ? "
+            "WHERE analysis_run_id = ? AND artifact_kind = 'result'",
+            (
+                payload_hash,
+                len(payload),
+                str(original.provenance.analysis_run_id),
+            ),
         )
 
     with HealthLab.open(config) as health_lab:

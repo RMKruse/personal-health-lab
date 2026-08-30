@@ -55,3 +55,17 @@ def test_reuse_requires_every_reproduction_identity_to_match(tmp_path: Path) -> 
 
     assert all(candidate.reuse_key != provenance.reuse_key for candidate in changed_candidates)
     assert len({candidate.reuse_key for candidate in changed_candidates}) == len(changed_candidates)
+    input_content_hash = "a" * 64
+    strict_candidates = tuple(
+        candidate
+        for candidate in changed_candidates
+        if candidate.config_schema_version == provenance.config_schema_version
+    )
+    assert all(
+        candidate.reuse_key_for_input(input_content_hash)
+        != provenance.reuse_key_for_input(input_content_hash)
+        for candidate in strict_candidates
+    )
+    assert provenance.reuse_key_for_input("b" * 64) != provenance.reuse_key_for_input(
+        input_content_hash
+    )

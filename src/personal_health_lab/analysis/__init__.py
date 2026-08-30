@@ -15,6 +15,7 @@ from uuid import uuid4
 
 import numpy as np
 
+from personal_health_lab.resting_hr_analysis import _fit_resting_hr_analysis
 from personal_health_lab.storage import (
     ActivityDerivationRecord,
     AnalysisDataStatusReason,
@@ -22,10 +23,13 @@ from personal_health_lab.storage import (
     AnalysisJsonlArtifact,
     AnalysisProvenance,
     AnalysisResultId,
+    AnalysisReuseIdentity,
+    AnalysisReuseRequest,
     AnalysisRunConfiguration,
     AnalysisRunFact,
     AnalysisRunId,
     AnalysisRunPublication,
+    AnalysisRunRecord,
     CanonicalHealthType,
     CanonicalSleepCategory,
     CanonicalUnit,
@@ -40,8 +44,10 @@ from personal_health_lab.storage import (
     OperationId,
     PlausibilityRuleRecord,
     ReproducibilityStatus,
+    RestingHeartRateAnalysisResult,
     ReviewCaseId,
     SnapshotId,
+    StoreBusyError,
     StoredActivityDayValue,
     StoredAnalysisSourceEvidence,
     StoredMeasurement,
@@ -600,9 +606,36 @@ class AnalysisExecution:
     analysis_definition_id: AnalysisDefinitionId
     diagnostics: tuple[str, ...]
     provenance: AnalysisProvenance
-    status: Literal["completed", "insufficient_data", "unstable"]
+    status: Literal["completed", "reused", "insufficient_data", "unstable"]
     result_id: AnalysisResultId | None = None
     model_maturity: ModelMaturityStatus | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyAnalysisRunPreparation:
+    provenance: AnalysisProvenance
+    input_artifact: AnalysisJsonlArtifact
+    reusable: AnalysisRunRecord | None
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyAnalysisExecution:
+    operation_id: OperationId
+    analysis_run_id: AnalysisRunId
+    status: Literal[
+        "completed",
+        "reused",
+        "insufficient_data",
+        "unstable",
+        "plan_changed",
+        "store_busy",
+    ]
+    snapshot_id: SnapshotId | None
+    analysis_definition_id: AnalysisDefinitionId
+    model_maturity: ModelMaturityStatus | None = None
+    result_id: AnalysisResultId | None = None
+    diagnostics: tuple[str, ...] = ()
+    provenance: AnalysisProvenance | None = None
 
 
 type AnalysisFactValue = (
@@ -2394,8 +2427,35 @@ def _validate_result_artifact(publication: AnalysisRunPublication) -> None:
         raise StoreError("Analyseergebnis verletzt den Inhaltshash.")
 
 
+def _validate_legacy_input_publication(publication: AnalysisRunPublication) -> None:
+    artifact = publication.input_artifact
+    record = json.loads(artifact.payload)
+    if (
+        not isinstance(record, dict)
+        or record.get("analysis_run_id") != str(publication.provenance.analysis_run_id)
+        or record.get("snapshot_id") != str(publication.provenance.snapshot_id)
+        or record.get("input_schema_version") != 1
+        or not isinstance(record.get("series"), list)
+    ):
+        raise StoreError("Legacy-Analyseeingang verletzt das Schema.")
+    content = dict(record)
+    del content["analysis_run_id"]
+    if (
+        hashlib.sha256(
+            json.dumps(content, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+        != artifact.content_hash
+    ):
+        raise StoreError("Legacy-Analyseeingang verletzt den Inhaltshash.")
+
+
 def _publish_analysis_run(store: LocalStore, publication: AnalysisRunPublication) -> None:
-    _validate_input_artifact(publication.input_artifact, publication.provenance)
+    if publication.input_artifact.schema_id == "analysis-input-bundle":
+        _validate_input_artifact(publication.input_artifact, publication.provenance)
+    elif publication.input_artifact.schema_id == "legacy-resting-hr-input":
+        _validate_legacy_input_publication(publication)
+    else:
+        raise StoreError("Unbekanntes Analyseeingangsschema.")
     if publication.result_artifact is not None:
         _validate_result_artifact(publication)
     staging = store.prepare_analysis_staging(publication.provenance.analysis_run_id)
@@ -2432,6 +2492,330 @@ def _reproduction_facts() -> tuple[str, bool, str | None, str]:
         bool(tracked_diff or untracked),
         diff_hasher.hexdigest() if tracked_diff or untracked else None,
         environment_hash,
+    )
+
+
+def _analysis_reuse_request(
+    plan: RunAnalysisPlan, input_content_hash: str | None = None
+) -> AnalysisReuseRequest:
+    if plan.base_snapshot_ref is None:
+        raise ValueError("Analyseplan besitzt keinen Snapshot.")
+    configuration = AnalysisRunConfiguration(
+        plan.analysis_definition.analysis_definition_id,
+        plan.requested_start_date,
+        plan.requested_end_date,
+        plan.schema_version,
+    )
+    code_commit, code_dirty, code_diff_hash, environment_hash = _reproduction_facts()
+    return AnalysisReuseRequest(
+        AnalysisReuseIdentity(
+            plan.base_snapshot_ref,
+            plan.analysis_definition.analysis_definition_id,
+            configuration.content_hash,
+            code_commit,
+            code_dirty,
+            code_diff_hash,
+            environment_hash,
+        ),
+        input_content_hash,
+    )
+
+
+def prepare_legacy_analysis_run(
+    store: LocalStore,
+    operation_id: OperationId,
+    run_id: AnalysisRunId,
+    snapshot_id: SnapshotId,
+    analysis_definition_id: AnalysisDefinitionId,
+    configuration: AnalysisRunConfiguration,
+) -> LegacyAnalysisRunPreparation:
+    code_commit, code_dirty, code_diff_hash, environment_hash = _reproduction_facts()
+    provenance = AnalysisProvenance(
+        run_id,
+        None,
+        snapshot_id,
+        analysis_definition_id,
+        configuration.content_hash,
+        configuration.schema_version,
+        code_commit,
+        code_dirty,
+        code_diff_hash,
+        environment_hash,
+    )
+    input_start = (
+        None
+        if configuration.requested_start_date is None
+        else configuration.requested_start_date - timedelta(days=7)
+    )
+    loaded_snapshot_id, series = store.load_analysis_input(
+        input_start, configuration.requested_end_date
+    )
+    if loaded_snapshot_id != provenance.snapshot_id:
+        raise ValueError("Analyseeingang hat sich geändert.")
+    record = {
+        "analysis_run_id": str(provenance.analysis_run_id),
+        "input_schema_version": 1,
+        "snapshot_id": str(provenance.snapshot_id),
+        "series": [
+            {
+                "data_type": item.data_type.value,
+                "unit": item.unit.value,
+                "values": [
+                    {
+                        "day": value.day.isoformat(),
+                        "measurement_version_ids": [
+                            str(version_id) for version_id in value.measurement_version_ids
+                        ],
+                        "source_names": list(value.source_names),
+                        "source_starts": [stamp.isoformat() for stamp in value.source_starts],
+                        "source_updated_ats": [
+                            stamp.isoformat() for stamp in value.source_updated_ats
+                        ],
+                        "source_versions": list(value.source_versions),
+                        "value": value.value,
+                    }
+                    for value in item.values
+                ],
+            }
+            for item in series
+        ],
+    }
+    content = dict(record)
+    del content["analysis_run_id"]
+    payload = json.dumps(record, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+    artifact = AnalysisJsonlArtifact(
+        "legacy-resting-hr-input",
+        1,
+        hashlib.sha256(
+            json.dumps(content, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest(),
+        hashlib.sha256(payload).hexdigest(),
+        len(payload),
+        1,
+        payload,
+        _validate_legacy_input_publication,
+    )
+    reusable = store.find_reusable_analysis_run(
+        AnalysisReuseRequest(
+            AnalysisReuseIdentity.from_provenance(provenance),
+            artifact.content_hash,
+        )
+    )
+    if reusable is not None:
+        store.persist_analysis_receipt(
+            operation_id=operation_id,
+            analysis_run_id=reusable.provenance.analysis_run_id,
+            status="reused",
+            provenance=reusable.provenance,
+            config_json=configuration.canonical_json,
+            diagnostics=reusable.diagnostics,
+        )
+    return LegacyAnalysisRunPreparation(provenance, artifact, reusable)
+
+
+def publish_legacy_analysis_failure(
+    store: LocalStore,
+    operation_id: OperationId,
+    provenance: AnalysisProvenance,
+    configuration: AnalysisRunConfiguration,
+    input_artifact: AnalysisJsonlArtifact,
+    start_date: date | None,
+    end_date: date | None,
+    status: Literal["insufficient_data", "unstable"],
+    diagnostics: tuple[str, ...],
+    data_status: DataQualityStatus,
+    data_status_reasons: tuple[AnalysisDataStatusReason, ...],
+) -> None:
+    _publish_analysis_run(
+        store,
+        AnalysisRunPublication(
+            operation_id=operation_id,
+            provenance=provenance,
+            start_date=start_date,
+            end_date=end_date,
+            configuration=configuration,
+            input_artifact=input_artifact,
+            diagnostics=diagnostics,
+            data_status=data_status,
+            data_status_reasons=data_status_reasons,
+            status=status,
+            result_family=None,
+            result_artifact=None,
+            model_maturity=None,
+        ),
+    )
+
+
+def publish_legacy_analysis_success(
+    store: LocalStore,
+    operation_id: OperationId,
+    result: RestingHeartRateAnalysisResult,
+    configuration: AnalysisRunConfiguration,
+    input_artifact: AnalysisJsonlArtifact,
+    start_date: date | None,
+    end_date: date | None,
+    diagnostics: tuple[str, ...],
+) -> None:
+    store.persist_resting_hr_analysis(
+        operation_id=operation_id,
+        result=result,
+        start_date=start_date,
+        end_date=end_date,
+        config_json=configuration.canonical_json,
+        receipt_diagnostics=diagnostics,
+        input_artifact=input_artifact,
+    )
+
+
+def execute_legacy_analysis_run(
+    *,
+    store_path: Path,
+    mode: DataMode,
+    operation_id: OperationId,
+    run_id: AnalysisRunId,
+    expected_snapshot_id: SnapshotId | None,
+    analysis_definition_id: AnalysisDefinitionId,
+    configuration: AnalysisRunConfiguration,
+    open_review_case_ids: tuple[str, ...],
+) -> LegacyAnalysisExecution:
+    try:
+        store = LocalStore.open_writer(store_path, mode)
+    except StoreBusyError:
+        return LegacyAnalysisExecution(
+            operation_id,
+            run_id,
+            "store_busy",
+            expected_snapshot_id,
+            analysis_definition_id,
+        )
+    try:
+        input_start = (
+            None
+            if configuration.requested_start_date is None
+            else configuration.requested_start_date - timedelta(days=7)
+        )
+        snapshot_id, series = store.load_analysis_input(
+            input_start, configuration.requested_end_date
+        )
+        if snapshot_id != expected_snapshot_id:
+            return LegacyAnalysisExecution(
+                operation_id,
+                run_id,
+                "plan_changed",
+                snapshot_id,
+                analysis_definition_id,
+                diagnostics=("plan_changed",),
+            )
+        if snapshot_id is None:
+            diagnostics = ("no_snapshot",)
+            store.persist_analysis_receipt(
+                operation_id=operation_id,
+                analysis_run_id=run_id,
+                status="insufficient_data",
+                provenance=None,
+                config_json=configuration.canonical_json,
+                diagnostics=diagnostics,
+            )
+            return LegacyAnalysisExecution(
+                operation_id,
+                run_id,
+                "insufficient_data",
+                None,
+                analysis_definition_id,
+                diagnostics=diagnostics,
+            )
+        preparation = prepare_legacy_analysis_run(
+            store,
+            operation_id,
+            run_id,
+            snapshot_id,
+            analysis_definition_id,
+            configuration,
+        )
+        if preparation.reusable is not None:
+            reusable = preparation.reusable
+            return LegacyAnalysisExecution(
+                operation_id,
+                reusable.provenance.analysis_run_id,
+                "reused",
+                snapshot_id,
+                analysis_definition_id,
+                reusable.model_maturity,
+                reusable.provenance.result_id,
+                reusable.diagnostics,
+                reusable.provenance,
+            )
+        result_id = AnalysisResultId(uuid4().hex)
+        provenance = replace(preparation.provenance, result_id=result_id)
+        fit = _fit_resting_hr_analysis(
+            series=series,
+            snapshot_id=snapshot_id,
+            analysis_definition_id=analysis_definition_id,
+            start_date=configuration.requested_start_date,
+            end_date=configuration.requested_end_date,
+            open_review_case_ids=open_review_case_ids,
+            provenance=provenance,
+        )
+        if fit.result is None:
+            failure_status = cast(Literal["insufficient_data", "unstable"], fit.status)
+            publish_legacy_analysis_failure(
+                store,
+                operation_id,
+                preparation.provenance,
+                configuration,
+                preparation.input_artifact,
+                configuration.requested_start_date,
+                configuration.requested_end_date,
+                failure_status,
+                fit.diagnostics,
+                fit.data_status,
+                fit.data_status_reasons,
+            )
+            return LegacyAnalysisExecution(
+                operation_id,
+                run_id,
+                failure_status,
+                snapshot_id,
+                analysis_definition_id,
+                diagnostics=fit.diagnostics,
+                provenance=preparation.provenance,
+            )
+        publish_legacy_analysis_success(
+            store,
+            operation_id,
+            fit.result,
+            configuration,
+            preparation.input_artifact,
+            configuration.requested_start_date,
+            configuration.requested_end_date,
+            fit.diagnostics,
+        )
+        return LegacyAnalysisExecution(
+            operation_id,
+            run_id,
+            "completed",
+            snapshot_id,
+            analysis_definition_id,
+            fit.result.model_maturity,
+            result_id,
+            fit.diagnostics,
+            provenance,
+        )
+    finally:
+        store.close()
+
+
+def analysis_reuse_candidate(
+    store: LocalStore, plan: RunAnalysisPlan
+) -> AnalysisReuseCandidate | None:
+    if plan.base_snapshot_ref is None or plan.eligible_start_date is None:
+        return None
+    reusable = store.find_reusable_analysis_run(_analysis_reuse_request(plan))
+    if reusable is None or reusable.provenance.result_id is None:
+        return None
+    return AnalysisReuseCandidate(
+        reusable.provenance.analysis_run_id,
+        reusable.provenance.result_id,
     )
 
 
@@ -2712,6 +3096,8 @@ def _short_lag_variant_fit(
     bundle: AnalysisInputBundle,
     method: LagProfileMethodFacts,
     context_lags: tuple[int, ...],
+    *,
+    prepare_only: bool = False,
 ) -> _LagVariantFit:
     horizon = 7
     values = {(item.day, item.input_id, item.component): item for item in bundle.values}
@@ -2865,6 +3251,16 @@ def _short_lag_variant_fit(
             name for name, included in zip(context_names, selected, strict=True) if included
         )
         context_deviations = tuple(float(value) for value in raw_deviations[selected])
+    if prepare_only:
+        return _LagVariantFit(
+            "completed",
+            (),
+            feature_keys,
+            tuple(rows),
+            deviations,
+            context_columns=context_columns,
+            context_deviations=context_deviations,
+        )
     ordinals = np.asarray([bundle.calendar[index].toordinal() for index in rows], dtype=float)
     weekdays = np.asarray([bundle.calendar[index].weekday() for index in rows])
     day_deviation = float(np.std(ordinals))
@@ -3025,23 +3421,36 @@ def _short_lag_variant_fit(
     )
 
 
-def _short_lag_point_fit(
-    bundle: AnalysisInputBundle, method: LagProfileMethodFacts
-) -> _LagPointOutcome:
-    if bundle.analysis_definition_id != AnalysisDefinitionId("rhr-activity-lag-1-7-v1"):
-        raise ValueError("Kurzfristiger Fit verlangt die 1-7-Definition.")
-    variants = {
-        "primary": (0,),
-        "context_days_0_2": (0, 1, 2),
-        "without_context": (),
-    }
-    fits = {
-        name: _short_lag_variant_fit(bundle, method, context_lags)
-        for name, context_lags in variants.items()
-    }
+_SHORT_LAG_VARIANTS = {
+    "primary": (0,),
+    "context_days_0_2": (0, 1, 2),
+    "without_context": (),
+}
+
+
+def _with_short_lag_scalings(
+    bundle: AnalysisInputBundle, fits: dict[str, _LagVariantFit]
+) -> AnalysisInputBundle:
     primary = fits["primary"]
     scaled_bundle = _with_context_scalings(
-        _with_scalings(bundle, primary.feature_keys, primary.deviations),
+        _with_scalings(
+            replace(
+                bundle,
+                scalings=tuple(
+                    item
+                    for item in bundle.scalings
+                    if not (
+                        (item.component or "").startswith("variant:")
+                        or (
+                            item.input_id is AnalysisInput.OUTCOME_DAY_CONTEXT
+                            and "@day-" in (item.component or "")
+                        )
+                    )
+                ),
+            ),
+            primary.feature_keys,
+            primary.deviations,
+        ),
         primary.context_columns,
         primary.context_deviations,
     )
@@ -3085,6 +3494,30 @@ def _short_lag_point_fit(
             )
         ),
     )
+    return scaled_bundle
+
+
+def _prepare_short_lag_input(
+    bundle: AnalysisInputBundle, method: LagProfileMethodFacts
+) -> AnalysisInputBundle:
+    fits = {
+        name: _short_lag_variant_fit(bundle, method, context_lags, prepare_only=True)
+        for name, context_lags in _SHORT_LAG_VARIANTS.items()
+    }
+    return _with_short_lag_scalings(bundle, fits)
+
+
+def _short_lag_point_fit(
+    bundle: AnalysisInputBundle, method: LagProfileMethodFacts
+) -> _LagPointOutcome:
+    if bundle.analysis_definition_id != AnalysisDefinitionId("rhr-activity-lag-1-7-v1"):
+        raise ValueError("Kurzfristiger Fit verlangt die 1-7-Definition.")
+    fits = {
+        name: _short_lag_variant_fit(bundle, method, context_lags)
+        for name, context_lags in _SHORT_LAG_VARIANTS.items()
+    }
+    primary = fits["primary"]
+    scaled_bundle = _with_short_lag_scalings(bundle, fits)
     for name, fit in fits.items():
         if fit.status != "completed":
             diagnostics = (
@@ -3384,7 +3817,7 @@ def _short_lag_point_fit(
                     name: dict(zip(fit.context_columns, fit.context_deviations, strict=True))
                     for name, fit in fits.items()
                 },
-                "context_variants": tuple(variants),
+                "context_variants": tuple(_SHORT_LAG_VARIANTS),
             },
         },
         {
@@ -3547,21 +3980,10 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
         ),
         activity_derivation=store.load_activity_derivation_version(plan.base_snapshot_ref),
     )
+    method = plan.analysis_definition.method_facts
     if plan.analysis_definition.result_family is AnalysisResultFamily.RHR_ACTIVITY_LAG_1_7:
-        method = plan.analysis_definition.method_facts
         assert isinstance(method, LagProfileMethodFacts)
-        point = _short_lag_point_fit(bundle, method)
-        bundle = point.bundle
-        status = point.status
-        diagnostics = point.diagnostics
-    else:
-        point = None
-        status = "insufficient_data"
-        diagnostics = (
-            "insufficient_data",
-            f"calendar_days={len(bundle.calendar)}",
-            f"observed_values={sum(item.value is not None for item in bundle.values)}",
-        )
+        bundle = _prepare_short_lag_input(bundle, method)
     artifact_payload = (
         json.dumps(
             _bundle_payload(bundle, include_run_id=True), separators=(",", ":"), sort_keys=True
@@ -3591,19 +4013,58 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
         plan.requested_end_date,
         plan.schema_version,
     )
-    code_commit, code_dirty, code_diff_hash, environment_hash = _reproduction_facts()
+    reuse_request = _analysis_reuse_request(plan, input_content_hash)
+    reusable = store.find_reusable_analysis_run(reuse_request)
+    if reusable is not None:
+        reused_provenance = reusable.provenance
+        store.persist_analysis_receipt(
+            operation_id=operation_id,
+            analysis_run_id=reused_provenance.analysis_run_id,
+            status="reused",
+            provenance=reused_provenance,
+            config_json=configuration.canonical_json,
+            diagnostics=reusable.diagnostics,
+        )
+        return AnalysisExecution(
+            operation_id,
+            reused_provenance.analysis_run_id,
+            reused_provenance.snapshot_id,
+            reused_provenance.analysis_definition_id,
+            reusable.diagnostics,
+            reused_provenance,
+            "reused",
+            reused_provenance.result_id,
+            reusable.model_maturity,
+        )
+    if plan.analysis_definition.result_family is AnalysisResultFamily.RHR_ACTIVITY_LAG_1_7:
+        assert isinstance(method, LagProfileMethodFacts)
+        point = _short_lag_point_fit(bundle, method)
+        if point.bundle != bundle:
+            raise ValueError("Analyseeingang hat sich während des Modelllaufs geändert.")
+        bundle = point.bundle
+        status = point.status
+        diagnostics = point.diagnostics
+    else:
+        point = None
+        status = "insufficient_data"
+        diagnostics = (
+            "insufficient_data",
+            f"calendar_days={len(bundle.calendar)}",
+            f"observed_values={sum(item.value is not None for item in bundle.values)}",
+        )
     result_id = AnalysisResultId(uuid4().hex) if status == "completed" else None
+    identity = reuse_request.identity
     provenance = AnalysisProvenance(
         run_id,
         result_id,
-        plan.base_snapshot_ref,
-        plan.analysis_definition.analysis_definition_id,
-        configuration.content_hash,
+        identity.snapshot_id,
+        identity.analysis_definition_id,
+        identity.config_hash,
         plan.schema_version,
-        code_commit,
-        code_dirty,
-        code_diff_hash,
-        environment_hash,
+        identity.code_commit,
+        identity.code_dirty,
+        identity.code_diff_hash,
+        identity.environment_lock_hash,
     )
     result_artifact: AnalysisJsonlArtifact | None = None
     maturity_criteria = point.maturity_criteria if point is not None else ()

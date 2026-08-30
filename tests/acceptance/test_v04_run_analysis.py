@@ -1,6 +1,7 @@
 import fcntl
 import hashlib
 import json
+import shutil
 import sqlite3
 from copy import deepcopy
 from dataclasses import replace
@@ -467,6 +468,8 @@ def test_store_upgrade_registers_legacy_analysis_artifacts_idempotently(
         runtime.active_store / "parquet" / "analyses" / str(legacy.result_ref) / "result.parquet"
     )
     result_bytes = result_path.read_bytes()
+    result_path.with_name("manifest.json").unlink()
+    shutil.rmtree(result_path.parent / "input")
     interrupted_run_id = uuid4().hex
 
     with sqlite3.connect(runtime.active_store / "metadata.sqlite3") as metadata:

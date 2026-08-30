@@ -13,6 +13,7 @@ from personal_health_lab.application import (
     AnalysisDefinitionId,
     AnalysisReceipt,
     AnalysisResultSelection,
+    AnalysisRunSelection,
     AnalysisStatus,
     AsNeededIntakeCreate,
     AsNeededMedication,
@@ -458,8 +459,18 @@ def test_short_lag_run_freezes_context_and_runs_all_fixed_variants(tmp_path: Pat
         receipt = _write(health_lab, request)
         assert isinstance(receipt, AnalysisReceipt)
         result = health_lab.load_analysis_result(AnalysisResultSelection(DEFINITION))
+        reuse_plan = health_lab.preview_write(request)
+        reused = health_lab.execute_write(request, expected_plan=reuse_plan.fingerprint).result
+        runs = health_lab.load_analysis_runs(AnalysisRunSelection(DEFINITION))
 
     assert receipt.status is AnalysisStatus.COMPLETED
+    assert reuse_plan.details.reuse_candidate is not None
+    assert reuse_plan.details.reuse_candidate.analysis_run_id == receipt.analysis_run_id
+    assert isinstance(reused, AnalysisReceipt)
+    assert reused.status is AnalysisStatus.REUSED
+    assert reused.analysis_run_id == receipt.analysis_run_id
+    assert reused.result_ref == receipt.result_ref
+    assert len(runs.runs) == 1
     assert isinstance(result, RhrActivityLag1To7Result)
     assert result.data_status is DataQualityStatus.PROVISIONAL
     reasons = {item.code: item.evidence_ids for item in result.data_status_reasons}
@@ -579,6 +590,23 @@ def test_short_lag_run_freezes_context_and_runs_all_fixed_variants(tmp_path: Pat
         "daily-context/v1",
         "medication-context/v1",
     } <= set(payload["rule_versions"])
+    input_path = (
+        runtime.active_store
+        / "parquet"
+        / "analysis-runs"
+        / str(receipt.analysis_run_id)
+        / "input.jsonl"
+    )
+    input_path.write_bytes(input_path.read_bytes() + b"corrupt")
+    with HealthLab.open(runtime) as health_lab:
+        invalid_plan = health_lab.preview_write(RunAnalysis(DEFINITION))
+        replacement = _write(health_lab, RunAnalysis(DEFINITION))
+        replacement_runs = health_lab.load_analysis_runs(AnalysisRunSelection(DEFINITION))
+    assert invalid_plan.details.reuse_candidate is None
+    assert isinstance(replacement, AnalysisReceipt)
+    assert replacement.status is AnalysisStatus.COMPLETED
+    assert replacement.analysis_run_id != receipt.analysis_run_id
+    assert len(replacement_runs.runs) == 2
 
 
 def test_short_lag_null_case_closes_the_fit_row_maturity_boundary(tmp_path: Path) -> None:

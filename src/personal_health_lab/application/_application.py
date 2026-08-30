@@ -34,10 +34,14 @@ from personal_health_lab.analysis import (
     WeightPrediction,
     WeightTrendEstimate,
     analysis_definitions,
+    analysis_reuse_candidate,
     derive_current_analysis_reproducibility,
     execute_analysis_run,
     load_analysis_result_values,
     plan_analysis,
+)
+from personal_health_lab.analysis import (
+    execute_legacy_analysis_run as execute_analysis,
 )
 from personal_health_lab.data_quality import (
     DataQualityError,
@@ -103,18 +107,14 @@ from personal_health_lab.recovery import (
 )
 from personal_health_lab.resting_hr_analysis import (
     AnalysisDefinitionId,
-    AnalysisError,
-    AnalysisInputChanged,
     AnalysisProvenance,
     AnalysisResultId,
     AnalysisRunId,
 )
-from personal_health_lab.resting_hr_analysis import (
-    run_resting_hr_analysis as execute_analysis,
-)
 from personal_health_lab.storage import (
     AnalysisArtifactIntegrityError,
     AnalysisArtifactUnavailableError,
+    AnalysisRunConfiguration,
     AsNeededIntakePublication,
     CapacityCheck,
     CapacityMethodId,
@@ -3611,6 +3611,7 @@ class HealthLab:
             None if snapshot is None else snapshot.available_start_date,
             None if snapshot is None else snapshot.available_end_date,
         )
+        details = replace(details, reuse_candidate=analysis_reuse_candidate(reader, details))
         diagnostics = (
             (
                 ("migration_required",)
@@ -3646,7 +3647,14 @@ class HealthLab:
             "requested_start_date": (
                 None if request.start_date is None else request.start_date.isoformat()
             ),
-            "reuse_candidate": None,
+            "reuse_candidate": (
+                None
+                if details.reuse_candidate is None
+                else {
+                    "analysis_run_id": str(details.reuse_candidate.analysis_run_id),
+                    "result_ref": str(details.reuse_candidate.result_ref),
+                }
+            ),
             "schema_version": request.schema_version,
             "version": 1,
         }
@@ -7279,58 +7287,60 @@ class HealthLab:
                 ("plan_changed",),
                 expected_plan,
             )
+        operation_id = OperationId(uuid4().hex)
+        run_id = AnalysisRunId(uuid4().hex)
+        configuration = AnalysisRunConfiguration(
+            request.analysis_definition_id,
+            request.start_date,
+            request.end_date,
+            request.schema_version,
+        )
         try:
-            result = execute_analysis(
-                root=self._config.active_store,
+            execution = execute_analysis(
+                store_path=self._config.active_store,
                 mode=self._config.mode,
-                analysis_definition_id=request.analysis_definition_id,
-                start_date=request.start_date,
-                end_date=request.end_date,
-                config_schema_version=request.schema_version,
+                operation_id=operation_id,
+                run_id=run_id,
                 expected_snapshot_id=plan.details.base_snapshot_ref,
+                analysis_definition_id=request.analysis_definition_id,
+                configuration=configuration,
                 open_review_case_ids=tuple(
                     str(case.case_id) for case in self.load_data_review(DataReviewSelection()).cases
                 ),
             )
-        except AnalysisInputChanged:
-            return self._not_started(
-                plan,
-                WriteNotStartedStatus.PLAN_CHANGED,
-                ("plan_changed",),
-                expected_plan,
-            )
         except ValueError as error:
             raise ConfigurationError(str(error)) from error
-        except AnalysisError as error:
-            raise HealthLabError(str(error)) from error
-        if result.status == "store_busy":
+        except StoreError as error:
+            raise HealthLabError("Ruhepulsanalyse konnte nicht abgeschlossen werden.") from error
+        if execution.status in {"plan_changed", "store_busy"}:
+            not_started_status = (
+                WriteNotStartedStatus.PLAN_CHANGED
+                if execution.status == "plan_changed"
+                else WriteNotStartedStatus.STORE_BUSY
+            )
             return self._not_started(
                 plan,
-                WriteNotStartedStatus.STORE_BUSY,
-                ("store_busy",),
+                not_started_status,
+                execution.diagnostics or (execution.status,),
                 expected_plan,
             )
         receipt = AnalysisReceipt(
-            operation_id=result.operation_id,
-            analysis_run_id=result.analysis_run_id,
-            status=AnalysisStatus(result.status),
-            snapshot_ref=result.snapshot_id,
-            analysis_definition_id=result.analysis_definition_id,
-            model_maturity=(
-                None
-                if result.model_maturity is None
-                else ModelMaturityStatus(result.model_maturity)
-            ),
-            result_ref=result.result_id,
-            diagnostics=result.diagnostics,
-            provenance=result.provenance,
+            operation_id=execution.operation_id,
+            analysis_run_id=execution.analysis_run_id,
+            status=AnalysisStatus(execution.status),
+            snapshot_ref=execution.snapshot_id,
+            analysis_definition_id=request.analysis_definition_id,
+            model_maturity=execution.model_maturity,
+            result_ref=execution.result_id,
+            diagnostics=execution.diagnostics,
+            provenance=execution.provenance,
         )
         return WriteReceipt(
-            result.operation_id,
+            execution.operation_id,
             expected_plan,
             receipt,
             plan.preflight,
-            result.diagnostics,
+            execution.diagnostics,
         )
 
     def load_overview(self, selection: OverviewSelection) -> Overview:

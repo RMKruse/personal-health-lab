@@ -14,7 +14,6 @@ from random import Random
 from statistics import correlation, fmean, pstdev
 from types import MappingProxyType
 from typing import Literal
-from uuid import uuid4
 
 from personal_health_lab.health_data import (
     AnalysisDataStatusReason,
@@ -37,12 +36,9 @@ from personal_health_lab.storage import (
     AssociationDirection,
     AssociationEstimate,
     AssociationInterval,
-    DataMode,
-    LocalStore,
     OperationId,
     RestingHeartRateAnalysisResult,
     SnapshotId,
-    StoreBusyError,
 )
 from personal_health_lab.storage import (
     AnalysisResultId as AnalysisResultId,
@@ -444,37 +440,7 @@ def _freeze_status_facts(
     end_date: date | None,
     open_review_case_ids: tuple[str, ...],
 ) -> RestingHeartRateAnalysisResult:
-    reasons: list[AnalysisDataStatusReason] = []
-    if open_review_case_ids:
-        reasons.append(
-            AnalysisDataStatusReason(
-                DataStatusReasonCode.OPEN_REVIEW_CASE,
-                open_review_case_ids,
-            )
-        )
-    daily = {item.data_type: {value.day for value in item.values} for item in series}
-    active_days = daily.get(CanonicalHealthType.ACTIVE_ENERGY, set())
-    resting_days = daily.get(CanonicalHealthType.APPLE_RESTING_HEART_RATE, set())
-    if active_days:
-        first_complete_candidate = min(active_days) + timedelta(days=7)
-        gaps = sorted(
-            {
-                day - timedelta(days=lag)
-                for day in resting_days
-                if day >= first_complete_candidate
-                and (start_date is None or day >= start_date)
-                and (end_date is None or day <= end_date)
-                for lag in range(1, 8)
-                if day - timedelta(days=lag) not in active_days
-            }
-        )
-        if gaps:
-            reasons.append(
-                AnalysisDataStatusReason(
-                    DataStatusReasonCode.PASSIVE_COVERAGE_GAP,
-                    tuple(f"active_energy:{day.isoformat()}" for day in gaps),
-                )
-            )
+    data_status, reasons = _data_status_facts(series, start_date, end_date, open_review_case_ids)
     diagnostics = result.diagnostics
     methodology = result.methodology
     assert diagnostics.input_completeness is not None
@@ -532,8 +498,8 @@ def _freeze_status_facts(
     )
     return replace(
         result,
-        data_status=(DataQualityStatus.PROVISIONAL if reasons else DataQualityStatus.REVIEWED),
-        data_status_reasons=tuple(reasons),
+        data_status=data_status,
+        data_status_reasons=reasons,
         maturity_criteria=criteria,
         reproducibility=(
             ReproducibilityStatus.LOCAL_DEVELOPMENT
@@ -543,95 +509,76 @@ def _freeze_status_facts(
     )
 
 
-def run_resting_hr_analysis(
+def _data_status_facts(
+    series: tuple[DailyHealthSeries, ...],
+    start_date: date | None,
+    end_date: date | None,
+    open_review_case_ids: tuple[str, ...],
+) -> tuple[DataQualityStatus, tuple[AnalysisDataStatusReason, ...]]:
+    reasons: list[AnalysisDataStatusReason] = []
+    if open_review_case_ids:
+        reasons.append(
+            AnalysisDataStatusReason(
+                DataStatusReasonCode.OPEN_REVIEW_CASE,
+                open_review_case_ids,
+            )
+        )
+    daily = {item.data_type: {value.day for value in item.values} for item in series}
+    active_days = daily.get(CanonicalHealthType.ACTIVE_ENERGY, set())
+    resting_days = daily.get(CanonicalHealthType.APPLE_RESTING_HEART_RATE, set())
+    if active_days:
+        first_complete_candidate = min(active_days) + timedelta(days=7)
+        gaps = sorted(
+            {
+                day - timedelta(days=lag)
+                for day in resting_days
+                if day >= first_complete_candidate
+                and (start_date is None or day >= start_date)
+                and (end_date is None or day <= end_date)
+                for lag in range(1, 8)
+                if day - timedelta(days=lag) not in active_days
+            }
+        )
+        if gaps:
+            reasons.append(
+                AnalysisDataStatusReason(
+                    DataStatusReasonCode.PASSIVE_COVERAGE_GAP,
+                    tuple(f"active_energy:{day.isoformat()}" for day in gaps),
+                )
+            )
+    frozen_reasons = tuple(reasons)
+    return (
+        DataQualityStatus.PROVISIONAL if frozen_reasons else DataQualityStatus.REVIEWED,
+        frozen_reasons,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _RestingHeartRateFitOutcome:
+    status: Literal["completed", "insufficient_data", "unstable"]
+    result: RestingHeartRateAnalysisResult | None
+    diagnostics: tuple[str, ...]
+    data_status: DataQualityStatus
+    data_status_reasons: tuple[AnalysisDataStatusReason, ...]
+
+
+def _fit_resting_hr_analysis(
     *,
-    root: Path,
-    mode: DataMode,
+    series: tuple[DailyHealthSeries, ...],
+    snapshot_id: SnapshotId,
     analysis_definition_id: AnalysisDefinitionId,
     start_date: date | None,
     end_date: date | None,
-    config_schema_version: str,
-    expected_snapshot_id: SnapshotId | None,
     open_review_case_ids: tuple[str, ...],
-) -> AnalysisExecution:
+    provenance: AnalysisProvenance,
+) -> _RestingHeartRateFitOutcome:
     definition = _DEFINITIONS.get(analysis_definition_id)
     if definition is None:
         raise ValueError("Unbekannte eingebaute Analysedefinition.")
-    context = _reproduction_context(
-        analysis_definition_id,
-        start_date,
-        end_date,
-        config_schema_version,
+    data_status, data_status_reasons = _data_status_facts(
+        series, start_date, end_date, open_review_case_ids
     )
-    operation_id = OperationId(str(uuid4()))
-    run_id = AnalysisRunId(str(uuid4()))
-    result_id = AnalysisResultId(str(uuid4()))
     try:
-        store = LocalStore.open_writer(root, mode)
-    except StoreBusyError:
-        return AnalysisExecution(
-            operation_id, run_id, "store_busy", None, analysis_definition_id, None, None
-        )
-    except Exception as error:
-        raise AnalysisError("Ruhepulsanalyse konnte nicht gestartet werden.") from error
-    try:
-        input_start = None if start_date is None else start_date - timedelta(days=7)
-        snapshot_id, series = store.load_analysis_input(input_start, end_date)
-        if snapshot_id != expected_snapshot_id:
-            raise AnalysisInputChanged
-        if snapshot_id is None:
-            store.persist_analysis_receipt(
-                operation_id=operation_id,
-                analysis_run_id=run_id,
-                status="insufficient_data",
-                provenance=None,
-                config_json=context.config_json,
-                diagnostics=("no_snapshot",),
-            )
-            return AnalysisExecution(
-                operation_id,
-                run_id,
-                "insufficient_data",
-                None,
-                analysis_definition_id,
-                None,
-                None,
-                ("no_snapshot",),
-            )
-        candidate = AnalysisProvenance(
-            analysis_run_id=run_id,
-            result_id=result_id,
-            snapshot_id=snapshot_id,
-            analysis_definition_id=analysis_definition_id,
-            config_hash=context.config_hash,
-            config_schema_version=context.config_schema_version,
-            code_commit=context.code_commit,
-            code_dirty=context.code_dirty,
-            code_diff_hash=context.code_diff_hash,
-            environment_lock_hash=context.environment_lock_hash,
-        )
-        reusable = store.find_reusable_resting_hr_analysis(candidate)
-        if reusable is not None:
-            provenance = reusable.provenance
-            store.persist_analysis_receipt(
-                operation_id=operation_id,
-                analysis_run_id=provenance.analysis_run_id,
-                status="reused",
-                provenance=provenance,
-                config_json=context.config_json,
-                diagnostics=reusable.diagnostics,
-            )
-            return AnalysisExecution(
-                operation_id,
-                provenance.analysis_run_id,
-                "reused",
-                provenance.snapshot_id,
-                provenance.analysis_definition_id,
-                reusable.model_maturity,
-                provenance.result_id,
-                reusable.diagnostics,
-                provenance,
-            )
         result = _fit(
             series,
             snapshot_id,
@@ -640,94 +587,31 @@ def run_resting_hr_analysis(
             start_date,
             end_date,
         )
-        result = _freeze_status_facts(
-            replace(result, provenance=candidate),
-            series,
-            start_date,
-            end_date,
-            open_review_case_ids,
-        )
-        receipt_diagnostics = (
-            f"model_readiness_{result.model_maturity}",
-            result.diagnostics.association_guardrail,
-        )
-        store.persist_resting_hr_analysis(
-            operation_id=operation_id,
-            result=result,
-            start_date=start_date,
-            end_date=end_date,
-            config_json=context.config_json,
-            receipt_diagnostics=receipt_diagnostics,
-        )
-        store.persist_analysis_receipt(
-            operation_id=operation_id,
-            analysis_run_id=run_id,
-            status="completed",
-            provenance=candidate,
-            config_json=context.config_json,
-            diagnostics=receipt_diagnostics,
-        )
-        return AnalysisExecution(
-            operation_id,
-            run_id,
-            "completed",
-            snapshot_id,
-            analysis_definition_id,
-            result.model_maturity,
-            result_id,
-            receipt_diagnostics,
-            candidate,
-        )
     except _InsufficientData as error:
-        diagnostics = (str(error),)
-        failed_provenance = replace(candidate, result_id=None)
-        store.persist_analysis_receipt(
-            operation_id=operation_id,
-            analysis_run_id=run_id,
-            status="insufficient_data",
-            provenance=failed_provenance,
-            config_json=context.config_json,
-            diagnostics=diagnostics,
-        )
-        return AnalysisExecution(
-            operation_id,
-            run_id,
-            "insufficient_data",
-            snapshot_id,
-            analysis_definition_id,
-            None,
-            None,
-            diagnostics,
-            failed_provenance,
+        return _RestingHeartRateFitOutcome(
+            "insufficient_data", None, (str(error),), data_status, data_status_reasons
         )
     except _Unstable as error:
-        diagnostics = (str(error),)
-        failed_provenance = replace(candidate, result_id=None)
-        store.persist_analysis_receipt(
-            operation_id=operation_id,
-            analysis_run_id=run_id,
-            status="unstable",
-            provenance=failed_provenance,
-            config_json=context.config_json,
-            diagnostics=diagnostics,
+        return _RestingHeartRateFitOutcome(
+            "unstable", None, (str(error),), data_status, data_status_reasons
         )
-        return AnalysisExecution(
-            operation_id,
-            run_id,
-            "unstable",
-            snapshot_id,
-            analysis_definition_id,
-            None,
-            None,
-            diagnostics,
-            failed_provenance,
-        )
-    except AnalysisInputChanged:
-        raise
-    except Exception as error:
-        raise AnalysisError("Ruhepulsanalyse konnte nicht abgeschlossen werden.") from error
-    finally:
-        store.close()
+    result = _freeze_status_facts(
+        replace(result, provenance=provenance),
+        series,
+        start_date,
+        end_date,
+        open_review_case_ids,
+    )
+    return _RestingHeartRateFitOutcome(
+        "completed",
+        result,
+        (
+            f"model_readiness_{result.model_maturity}",
+            result.diagnostics.association_guardrail,
+        ),
+        result.data_status,
+        result.data_status_reasons,
+    )
 
 
 __all__ = [
@@ -738,5 +622,4 @@ __all__ = [
     "AnalysisProvenance",
     "AnalysisResultId",
     "AnalysisRunId",
-    "run_resting_hr_analysis",
 ]

@@ -23,6 +23,7 @@ from personal_health_lab.application import (
     WriteNotStartedStatus,
 )
 from personal_health_lab.application import _application as application_module
+from personal_health_lab.storage import AnalysisArtifactIntegrityError
 from personal_health_lab.synthetic_export import GenerationOptions, generate_export
 
 
@@ -117,9 +118,7 @@ def test_analysis_rechecks_the_snapshot_under_the_writer_lock(
 
     def execute() -> None:
         with HealthLab.open(runtime) as health_lab:
-            results.append(
-                health_lab.execute_write(request, expected_plan=plan.fingerprint).result
-            )
+            results.append(health_lab.execute_write(request, expected_plan=plan.fingerprint).result)
 
     thread = Thread(target=execute)
     thread.start()
@@ -226,7 +225,7 @@ def test_signal_scenario_runs_as_a_pinned_deterministic_lag_analysis(tmp_path: P
                 analysis_definition_id=analysis.analysis_definition_id,
                 start_date=provisional_selection.start_date,
                 end_date=provisional_selection.end_date,
-            )
+            ),
         )
         provisional_overview = health_lab.load_overview(provisional_selection)
         previous_snapshot_plan = health_lab.preview_write(analysis)
@@ -299,6 +298,28 @@ def test_null_scenario_does_not_present_a_stable_association(tmp_path: Path) -> 
         <= item.simultaneous_band.upper_per_100_kcal
         for item in result.lag_associations
     )
+
+
+def test_legacy_analysis_never_reads_a_tampered_result(tmp_path: Path) -> None:
+    package = generate_export("lag-signal-v1", 42, tmp_path / "fixture")
+    runtime = RuntimeConfig(
+        mode=DataMode.SYNTHETIC,
+        synthetic_store=tmp_path / "store",
+        real_store=tmp_path / "real-store",
+    )
+    with HealthLab.open(runtime) as health_lab:
+        _execute_import(health_lab, package.export_path)
+        receipt = _execute_analysis(
+            health_lab, RunRestingHeartRateAnalysis(AnalysisDefinitionId("lag-signal-v2"))
+        )
+    assert receipt.result_ref is not None
+    result_path = (
+        runtime.active_store / "parquet" / "analyses" / str(receipt.result_ref) / "result.parquet"
+    )
+    result_path.write_bytes(result_path.read_bytes() + b"tampered")
+
+    with HealthLab.open(runtime) as health_lab, pytest.raises(AnalysisArtifactIntegrityError):
+        health_lab.load_overview(OverviewSelection())
 
 
 def test_analysis_reports_insufficient_and_unstable_inputs_with_stable_diagnostics(
