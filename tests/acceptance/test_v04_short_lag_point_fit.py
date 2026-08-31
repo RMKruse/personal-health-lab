@@ -443,7 +443,23 @@ def test_long_lag_run_is_independent_and_projects_the_calibrated_30_day_profile(
     assert all(item.simultaneous_band is not None for item in result.contrasts)
     assert tuple(item.block_length for item in result.bootstrap_facts) == (10, 11)
     assert all(item.successful_refits == 2_000 for item in result.bootstrap_facts)
-    thresholds = {item.code.value: item.threshold for item in result.maturity_criteria}
+    assert all(item.attempts <= 2_020 for item in result.bootstrap_facts)
+    assert all(item.quantile_stability is not None for item in result.bootstrap_facts)
+    criteria = {item.code.value: item for item in result.maturity_criteria}
+    assert set(criteria) == {
+        "augmented_condition_number",
+        "context_sensitivity",
+        "effective_blocks",
+        "full_rank",
+        "input_completeness",
+        "ljung_box",
+        "maximum_gap_days",
+        "minimum_fit_rows",
+        "positive_training_days",
+        "residual_acf",
+        "unpenalized_condition_number",
+    }
+    thresholds = {code: item.threshold for code, item in criteria.items()}
     assert thresholds["minimum_fit_rows"] == 120.0
     assert thresholds["input_completeness"] == 0.65
     assert thresholds["effective_blocks"] == 11.0
@@ -453,6 +469,9 @@ def test_long_lag_run_is_independent_and_projects_the_calibrated_30_day_profile(
     assert thresholds["ljung_box"] == 28.0
     assert thresholds["context_sensitivity"] == 0.5
     assert thresholds["maximum_gap_days"] == 14.0
+    assert thresholds["positive_training_days"] == 10.0
+    assert criteria["full_rank"].observed_value == criteria["full_rank"].threshold
+    assert criteria["full_rank"].passed is True
     fit_facts = dict(result.diagnostics[0].facts)
     assert fit_facts["basis_nodes"] == 9
     assert fit_facts["smoothing_penalty"] == 300.0
@@ -466,6 +485,63 @@ def test_long_lag_run_is_independent_and_projects_the_calibrated_30_day_profile(
     assert active.estimate_bpm_per_personal_sd == pytest.approx(
         active.estimate_bpm_per_natural_scale * active_energy_sd / active.natural_scale
     )
+    bootstrap_facts = dict(
+        next(item for item in result.diagnostics if item.code.value == "bootstrap").facts
+    )
+    assert bootstrap_facts["simultaneous_critical_floor"] == 6.454
+    assert bootstrap_facts["primary_critical_value"] >= 6.454
+    assert active.simultaneous_band is not None
+    true_bpm_per_personal_sd = -0.006 * active_energy_sd
+    assert (
+        active.simultaneous_band.lower <= true_bpm_per_personal_sd <= active.simultaneous_band.upper
+    )
+
+
+def test_long_lag_null_and_missingness_close_the_fit_row_maturity_boundary(
+    tmp_path: Path,
+) -> None:
+    runtime = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    package, _ = _package(
+        tmp_path / "long-null-analysis.zip",
+        calendar_days=150,
+        horizon=30,
+        include_workouts=False,
+        lag_signal=False,
+        partial_sleep_day=40,
+    )
+    with HealthLab.open(runtime) as health_lab:
+        _write(health_lab, ImportHealthExport(package))
+        _add_baseline_context(health_lab, date(2024, 1, 1))
+        receipt = _write(health_lab, RunAnalysis(LONG_DEFINITION))
+        assert isinstance(receipt, AnalysisReceipt)
+        result = health_lab.load_analysis_result(AnalysisResultSelection(LONG_DEFINITION))
+
+    assert isinstance(result, RhrActivityLag1To30Result)
+    fit_rows = next(
+        item for item in result.maturity_criteria if item.code.value == "minimum_fit_rows"
+    )
+    assert (fit_rows.observed_value, fit_rows.threshold, fit_rows.passed) == (120.0, 120.0, True)
+    assert tuple(item.block_length for item in result.bootstrap_facts) == (10, 10)
+    assert all(
+        item.simultaneous_band is not None
+        and item.simultaneous_band.lower <= 0.0 <= item.simultaneous_band.upper
+        for item in (*result.lag_estimates, *result.contrasts)
+    )
+    missingness = dict(
+        next(item for item in result.diagnostics if item.code.value == "missingness").facts
+    )
+    sleep_missingness = dict(
+        dict(missingness["input_missingness"])[
+            "outcome_day_context:sleep_duration_minutes"
+        ]
+    )
+    assert sleep_missingness["partial"] == 1
+    expected_maturity = (
+        ModelMaturityStatus.ROBUST
+        if all(item.passed for item in result.maturity_criteria)
+        else ModelMaturityStatus.EXPLORATORY
+    )
+    assert receipt.model_maturity is result.model_maturity is expected_maturity
 
 
 def test_short_lag_run_closes_scaling_and_rank_failures_without_a_result(

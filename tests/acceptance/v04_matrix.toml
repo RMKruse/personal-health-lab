@@ -180,6 +180,21 @@ id = "V04-C-LONG-LAG-PROFILE-V1"
 source = "https://github.com/RMKruse/personal-health-lab/issues/122"
 statement = "The long lag model uses the calibrated 30-day nine-node basis, smoothing penalty 300, and ridge penalty 1 and publishes daily estimates plus day 1-7, 8-30, and 1-30 contrasts per feature in personal-SD and fixed natural units."
 
+[[contract]]
+id = "V04-C-LONG-LAG-BOOTSTRAP-UNCERTAINTY-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/123"
+statement = "The long lag result uses primary and factor-2 moving-block full-refit runs with 2,000 successes in at most 2,020 attempts, pointwise intervals, and one calibrated studentized simultaneous band over all displayed 30-day coefficients; underfulfillment is unstable."
+
+[[contract]]
+id = "V04-C-LONG-LAG-MATURITY-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/123"
+statement = "Every calibrated long lag completeness, block, rank, condition, residual, sensitivity, and gap criterion exposes its code, observed value, threshold, and verdict, and the complete criterion family determines exploratory or robust maturity."
+
+[[contract]]
+id = "V04-C-LONG-LAG-SYNTHETIC-CASES-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/123"
+statement = "The V0.4 delta registers long lag signal, null, missingness, maturity-boundary, and bootstrap-failure cases without personal health values."
+
 [[hash_reference]]
 id = "V04-H-ANALYSIS-DEFINITIONS-V1"
 artifact = "src/personal_health_lab/analysis/__init__.py"
@@ -569,3 +584,53 @@ level = "application"
 platform = "all"
 expected_result = "an independently failed then completed long run, independent short selection, strict long reuse, 30 daily estimates, three contrasts per feature, two complete bootstrap variants, and calibrated long-horizon maturity facts"
 forbidden_side_effects = "no extension or slicing of the short run, shared run or result identity, partial failed result, fallback selection, or data-dependent method choice"
+
+[[case]]
+id = "V04-A-LONG-LAG-UNCERTAINTY-SIGNAL-V1"
+contracts = ["V04-C-LONG-LAG-BOOTSTRAP-UNCERTAINTY-V1", "V04-C-LONG-LAG-SYNTHETIC-CASES-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1", "V04-H-LAG-CALIBRATION-V1"]
+runner = "tests/acceptance/test_v04_short_lag_point_fit.py::test_long_lag_run_is_independent_and_projects_the_calibrated_30_day_profile"
+level = "application"
+platform = "all"
+expected_result = "the calibrated long signal is covered by typed pointwise and simultaneous uncertainty with two complete horizon-specific bootstrap variants"
+forbidden_side_effects = "no partial bootstrap result, short-horizon block rule, uncalibrated critical value, or band over only part of the displayed coefficient family"
+
+[[case]]
+id = "V04-A-LONG-LAG-NULL-V1"
+contracts = ["V04-C-LONG-LAG-SYNTHETIC-CASES-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1", "V04-H-LAG-CALIBRATION-V1"]
+runner = "tests/acceptance/test_v04_short_lag_point_fit.py::test_long_lag_null_and_missingness_close_the_fit_row_maturity_boundary"
+level = "application"
+platform = "all"
+expected_result = "the long null signal remains inside every simultaneous lag and cumulative band"
+forbidden_side_effects = "no family-wide null false alarm"
+
+[[case]]
+id = "V04-A-LONG-LAG-MISSINGNESS-V1"
+contracts = ["V04-C-LONG-LAG-SYNTHETIC-CASES-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1", "V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1"]
+runner = "tests/acceptance/test_v04_short_lag_point_fit.py::test_long_lag_null_and_missingness_close_the_fit_row_maturity_boundary"
+level = "application"
+platform = "all"
+expected_result = "partial long-horizon context remains typed while all fixed complete-case variants and uncertainty complete"
+forbidden_side_effects = "no zero fill, imputation, carry-forward, or hidden row substitution"
+
+[[case]]
+id = "V04-A-LONG-LAG-MATURITY-BOUNDARY-V1"
+contracts = ["V04-C-LONG-LAG-MATURITY-V1", "V04-C-LONG-LAG-SYNTHETIC-CASES-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1", "V04-H-LAG-CALIBRATION-V1"]
+runner = "tests/acceptance/test_v04_short_lag_point_fit.py::test_long_lag_null_and_missingness_close_the_fit_row_maturity_boundary"
+level = "application"
+platform = "all"
+expected_result = "exactly 120 complete fit rows pass the inclusive long-lag row threshold and the complete criterion family determines maturity"
+forbidden_side_effects = "no hidden maturity criterion or window-level maturity override"
+
+[[case]]
+id = "V04-A-LONG-LAG-BOOTSTRAP-FAILURE-V1"
+contracts = ["V04-C-LONG-LAG-BOOTSTRAP-UNCERTAINTY-V1", "V04-C-LONG-LAG-SYNTHETIC-CASES-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1"]
+runner = "tests/test_analysis_point_fit.py::test_long_lag_bootstrap_classifies_underfulfillment"
+level = "meta"
+platform = "all"
+expected_result = "the shared long-horizon numerical seam classifies 2,020 failed attempts in each bootstrap as underfulfilled without estimates"
+forbidden_side_effects = "no underfilled interval, band, or partial estimate family"
