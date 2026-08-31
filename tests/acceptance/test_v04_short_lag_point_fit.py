@@ -42,6 +42,7 @@ from personal_health_lab.application import (
     ReviseMedicationDeviation,
     ReviseMedicationRegime,
     RhrActivityLag1To7Result,
+    RhrActivityLag1To30Result,
     RunAnalysis,
     RuntimeConfig,
     ScheduledDose,
@@ -50,6 +51,7 @@ from personal_health_lab.application import (
 )
 
 DEFINITION = AnalysisDefinitionId("rhr-activity-lag-1-7-v1")
+LONG_DEFINITION = AnalysisDefinitionId("rhr-activity-lag-1-30-v1")
 
 
 def _record(
@@ -77,6 +79,7 @@ def _package(
     calendar_days: int = 140,
     constant_steps: bool = False,
     duplicate_general: bool = False,
+    horizon: int = 7,
     include_workouts: bool = True,
     lag_signal: bool = True,
     missing_sleep_day: int | None = None,
@@ -191,8 +194,8 @@ def _package(
         archive.writestr("apple_health_export/export.xml", xml)
     fit_values = [
         active_energy[exposure_day]
-        for outcome_day in range(7, len(days))
-        for exposure_day in range(outcome_day - 7, outcome_day)
+        for outcome_day in range(horizon, len(days))
+        for exposure_day in range(outcome_day - horizon, outcome_day)
     ]
     return path, statistics.pstdev(fit_values)
 
@@ -373,6 +376,95 @@ def test_short_lag_run_projects_full_activity_point_estimates(tmp_path: Path) ->
     true_bpm_per_personal_sd = -0.006 * active_energy_sd
     assert (
         active.simultaneous_band.lower <= true_bpm_per_personal_sd <= active.simultaneous_band.upper
+    )
+
+
+def test_long_lag_run_is_independent_and_projects_the_calibrated_30_day_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = RuntimeConfig(DataMode.SYNTHETIC, tmp_path / "store", tmp_path / "real")
+    package, active_energy_sd = _package(
+        tmp_path / "long-analysis.zip",
+        calendar_days=180,
+        horizon=30,
+        include_workouts=False,
+    )
+    with HealthLab.open(runtime) as health_lab:
+        _write(health_lab, ImportHealthExport(package))
+        _add_baseline_context(health_lab, date(2024, 1, 1))
+        short_receipt = _write(health_lab, RunAnalysis(DEFINITION))
+        original = analysis_module._lag_coefficients
+
+        def fail_long_fit(*args):
+            raise analysis_module.np.linalg.LinAlgError("synthetic long-fit failure")
+
+        monkeypatch.setattr(analysis_module, "_lag_coefficients", fail_long_fit)
+        failed_long = _write(health_lab, RunAnalysis(LONG_DEFINITION))
+        monkeypatch.setattr(analysis_module, "_lag_coefficients", original)
+        long_receipt = _write(health_lab, RunAnalysis(LONG_DEFINITION))
+        reused = _write(health_lab, RunAnalysis(LONG_DEFINITION))
+        short_result = health_lab.load_analysis_result(AnalysisResultSelection(DEFINITION))
+        result = health_lab.load_analysis_result(AnalysisResultSelection(LONG_DEFINITION))
+
+    assert isinstance(short_receipt, AnalysisReceipt)
+    assert isinstance(failed_long, AnalysisReceipt)
+    assert isinstance(long_receipt, AnalysisReceipt)
+    assert isinstance(reused, AnalysisReceipt)
+    assert short_receipt.status is AnalysisStatus.COMPLETED
+    assert failed_long.status is AnalysisStatus.UNSTABLE
+    assert failed_long.result_ref is None
+    assert long_receipt.status is AnalysisStatus.COMPLETED
+    assert reused.status is AnalysisStatus.REUSED
+    assert short_receipt.analysis_run_id != long_receipt.analysis_run_id
+    assert failed_long.analysis_run_id != long_receipt.analysis_run_id
+    assert short_receipt.result_ref != long_receipt.result_ref
+    assert reused.analysis_run_id == long_receipt.analysis_run_id
+    assert reused.result_ref == long_receipt.result_ref
+    assert isinstance(short_result, RhrActivityLag1To7Result)
+    assert isinstance(result, RhrActivityLag1To30Result)
+
+    features = {estimate.feature_id for estimate in result.lag_estimates}
+    assert features == {
+        "active_energy",
+        "training_time",
+        "steps",
+        "walking_running_distance",
+    }
+    assert len(result.lag_estimates) == len(features) * 30
+    assert len(result.contrasts) == len(features) * 3
+    assert {(item.start_day, item.end_day) for item in result.contrasts} == {
+        (1, 7),
+        (8, 30),
+        (1, 30),
+    }
+    assert all(item.pointwise_interval is not None for item in result.lag_estimates)
+    assert all(item.simultaneous_band is not None for item in result.lag_estimates)
+    assert all(item.pointwise_interval is not None for item in result.contrasts)
+    assert all(item.simultaneous_band is not None for item in result.contrasts)
+    assert tuple(item.block_length for item in result.bootstrap_facts) == (10, 11)
+    assert all(item.successful_refits == 2_000 for item in result.bootstrap_facts)
+    thresholds = {item.code.value: item.threshold for item in result.maturity_criteria}
+    assert thresholds["minimum_fit_rows"] == 120.0
+    assert thresholds["input_completeness"] == 0.65
+    assert thresholds["effective_blocks"] == 11.0
+    assert thresholds["unpenalized_condition_number"] == 500.0
+    assert thresholds["augmented_condition_number"] == 450.0
+    assert thresholds["residual_acf"] == 0.60
+    assert thresholds["ljung_box"] == 28.0
+    assert thresholds["context_sensitivity"] == 0.5
+    assert thresholds["maximum_gap_days"] == 14.0
+    fit_facts = dict(result.diagnostics[0].facts)
+    assert fit_facts["basis_nodes"] == 9
+    assert fit_facts["smoothing_penalty"] == 300.0
+    assert fit_facts["ridge_penalty"] == 1.0
+    active = next(
+        item
+        for item in result.lag_estimates
+        if item.feature_id == "active_energy" and item.lag_day == 1
+    )
+    assert active.estimate_bpm_per_natural_scale < 0
+    assert active.estimate_bpm_per_personal_sd == pytest.approx(
+        active.estimate_bpm_per_natural_scale * active_energy_sd / active.natural_scale
     )
 
 

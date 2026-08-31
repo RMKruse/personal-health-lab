@@ -170,10 +170,20 @@ id = "V04-C-SHORT-LAG-SYNTHETIC-CASES-V1"
 source = "https://github.com/RMKruse/personal-health-lab/issues/120"
 statement = "The V0.4 delta registers short lag signal, null, missingness, maturity-boundary, and bootstrap-failure cases without personal health values."
 
+[[contract]]
+id = "V04-C-LONG-LAG-INDEPENDENCE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/122"
+statement = "The long lag definition starts and fits independently of the short lag definition and owns separate run, result, technical status, reuse, selection, and model maturity facts for the same snapshot."
+
+[[contract]]
+id = "V04-C-LONG-LAG-PROFILE-V1"
+source = "https://github.com/RMKruse/personal-health-lab/issues/122"
+statement = "The long lag model uses the calibrated 30-day nine-node basis, smoothing penalty 300, and ridge penalty 1 and publishes daily estimates plus day 1-7, 8-30, and 1-30 contrasts per feature in personal-SD and fixed natural units."
+
 [[hash_reference]]
 id = "V04-H-ANALYSIS-DEFINITIONS-V1"
 artifact = "src/personal_health_lab/analysis/__init__.py"
-sha256 = "3291dac453f95fb4a62b92c1ae3455d48cfb164e3ccb35484d232366536e5fd5"
+sha256 = "1151f22b0e9b02d8e8fef682b161c66100c6332e1f64849f2d0b3bd8b838beb8"
 
 [[hash_reference]]
 id = "V04-H-ANALYSIS-ARTIFACT-SCHEMAS-V1"
@@ -549,3 +559,13 @@ level = "application"
 platform = "all"
 expected_result = "2,020 classified failed attempts produce unstable without a result identity or maturity verdict"
 forbidden_side_effects = "no underfilled interval, band, result artifact, or fallback result"
+
+[[case]]
+id = "V04-A-LONG-LAG-PROFILE-V1"
+contracts = ["V04-C-LONG-LAG-INDEPENDENCE-V1", "V04-C-LONG-LAG-PROFILE-V1"]
+hash_references = ["V04-H-ANALYSIS-DEFINITIONS-V1", "V04-H-ANALYSIS-PROJECTIONS-V1", "V04-H-LAG-CALIBRATION-V1"]
+runner = "tests/acceptance/test_v04_short_lag_point_fit.py::test_long_lag_run_is_independent_and_projects_the_calibrated_30_day_profile"
+level = "application"
+platform = "all"
+expected_result = "an independently failed then completed long run, independent short selection, strict long reuse, 30 daily estimates, three contrasts per feature, two complete bootstrap variants, and calibrated long-horizon maturity facts"
+forbidden_side_effects = "no extension or slicing of the short run, shared run or result identity, partial failed result, fallback selection, or data-dependent method choice"

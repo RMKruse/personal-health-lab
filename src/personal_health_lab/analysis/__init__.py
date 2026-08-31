@@ -2997,14 +2997,15 @@ def _lag_residual_diagnostics(residuals: np.ndarray) -> tuple[float, float]:
     return float(np.max(np.abs(correlations))), float(statistic / maximum_lag)
 
 
-def _lag_block_length(rows: int, factor: int) -> int:
-    return int(max(math.ceil(7 / 3), math.ceil(factor * rows ** (1.0 / 3.0))))
+def _lag_block_length(rows: int, horizon: int, factor: int) -> int:
+    return int(max(math.ceil(horizon / 3), math.ceil(factor * rows ** (1.0 / 3.0))))
 
 
-def _short_lag_bootstrap(
+def _lag_bootstrap(
     fit: _LagVariantFit,
     method: LagProfileMethodFacts,
     analysis_definition_id: AnalysisDefinitionId,
+    horizon: int,
     variant: AnalysisBootstrapVariant,
 ) -> _LagBootstrapOutcome:
     assert (
@@ -3016,7 +3017,7 @@ def _short_lag_bootstrap(
         and fit.standard_errors is not None
     )
     factor = 1 if variant is AnalysisBootstrapVariant.PRIMARY else 2
-    block_length = _lag_block_length(len(fit.rows), factor)
+    block_length = _lag_block_length(len(fit.rows), horizon, factor)
     seed = int.from_bytes(
         hashlib.sha256(f"{analysis_definition_id}:{variant.value}".encode()).digest()[:8],
         "big",
@@ -3092,14 +3093,14 @@ def _short_lag_bootstrap(
     )
 
 
-def _short_lag_variant_fit(
+def _lag_variant_fit(
     bundle: AnalysisInputBundle,
     method: LagProfileMethodFacts,
+    horizon: int,
     context_lags: tuple[int, ...],
     *,
     prepare_only: bool = False,
 ) -> _LagVariantFit:
-    horizon = 7
     values = {(item.day, item.input_id, item.component): item for item in bundle.values}
     feature_keys = tuple(
         sorted(
@@ -3421,14 +3422,14 @@ def _short_lag_variant_fit(
     )
 
 
-_SHORT_LAG_VARIANTS = {
+_LAG_CONTEXT_VARIANTS = {
     "primary": (0,),
     "context_days_0_2": (0, 1, 2),
     "without_context": (),
 }
 
 
-def _with_short_lag_scalings(
+def _with_lag_scalings(
     bundle: AnalysisInputBundle, fits: dict[str, _LagVariantFit]
 ) -> AnalysisInputBundle:
     primary = fits["primary"]
@@ -3497,27 +3498,27 @@ def _with_short_lag_scalings(
     return scaled_bundle
 
 
-def _prepare_short_lag_input(
+def _prepare_lag_input(
     bundle: AnalysisInputBundle, method: LagProfileMethodFacts
 ) -> AnalysisInputBundle:
+    horizon = max(contrast.end_day for contrast in method.contrasts)
     fits = {
-        name: _short_lag_variant_fit(bundle, method, context_lags, prepare_only=True)
-        for name, context_lags in _SHORT_LAG_VARIANTS.items()
+        name: _lag_variant_fit(bundle, method, horizon, context_lags, prepare_only=True)
+        for name, context_lags in _LAG_CONTEXT_VARIANTS.items()
     }
-    return _with_short_lag_scalings(bundle, fits)
+    return _with_lag_scalings(bundle, fits)
 
 
-def _short_lag_point_fit(
+def _lag_point_fit(
     bundle: AnalysisInputBundle, method: LagProfileMethodFacts
 ) -> _LagPointOutcome:
-    if bundle.analysis_definition_id != AnalysisDefinitionId("rhr-activity-lag-1-7-v1"):
-        raise ValueError("Kurzfristiger Fit verlangt die 1-7-Definition.")
+    horizon = max(contrast.end_day for contrast in method.contrasts)
     fits = {
-        name: _short_lag_variant_fit(bundle, method, context_lags)
-        for name, context_lags in _SHORT_LAG_VARIANTS.items()
+        name: _lag_variant_fit(bundle, method, horizon, context_lags)
+        for name, context_lags in _LAG_CONTEXT_VARIANTS.items()
     }
     primary = fits["primary"]
-    scaled_bundle = _with_short_lag_scalings(bundle, fits)
+    scaled_bundle = _with_lag_scalings(bundle, fits)
     for name, fit in fits.items():
         if fit.status != "completed":
             diagnostics = (
@@ -3527,7 +3528,7 @@ def _short_lag_point_fit(
             )
             return _LagPointOutcome(scaled_bundle, fit.status, diagnostics)
     bootstrap_outcomes = tuple(
-        _short_lag_bootstrap(primary, method, bundle.analysis_definition_id, variant)
+        _lag_bootstrap(primary, method, bundle.analysis_definition_id, horizon, variant)
         for variant in (
             AnalysisBootstrapVariant.PRIMARY,
             AnalysisBootstrapVariant.SENSITIVITY,
@@ -3623,8 +3624,8 @@ def _short_lag_point_fit(
                 axis=1,
             )
             contrast_lower, contrast_upper = np.quantile(bootstrap_contrast, (alpha, 1.0 - alpha))
-            covariance_start = feature * 7 + contrast.start_day - 1
-            covariance_end = feature * 7 + contrast.end_day
+            covariance_start = feature * horizon + contrast.start_day - 1
+            covariance_end = feature * horizon + contrast.end_day
             contrast_variance = float(
                 np.sum(
                     primary.estimate_covariance[
@@ -3817,7 +3818,7 @@ def _short_lag_point_fit(
                     name: dict(zip(fit.context_columns, fit.context_deviations, strict=True))
                     for name, fit in fits.items()
                 },
-                "context_variants": tuple(_SHORT_LAG_VARIANTS),
+                "context_variants": tuple(_LAG_CONTEXT_VARIANTS),
             },
         },
         {
@@ -3981,9 +3982,8 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
         activity_derivation=store.load_activity_derivation_version(plan.base_snapshot_ref),
     )
     method = plan.analysis_definition.method_facts
-    if plan.analysis_definition.result_family is AnalysisResultFamily.RHR_ACTIVITY_LAG_1_7:
-        assert isinstance(method, LagProfileMethodFacts)
-        bundle = _prepare_short_lag_input(bundle, method)
+    if isinstance(method, LagProfileMethodFacts):
+        bundle = _prepare_lag_input(bundle, method)
     artifact_payload = (
         json.dumps(
             _bundle_payload(bundle, include_run_id=True), separators=(",", ":"), sort_keys=True
@@ -4036,9 +4036,8 @@ def execute_analysis_run(store: LocalStore, plan: RunAnalysisPlan) -> AnalysisEx
             reused_provenance.result_id,
             reusable.model_maturity,
         )
-    if plan.analysis_definition.result_family is AnalysisResultFamily.RHR_ACTIVITY_LAG_1_7:
-        assert isinstance(method, LagProfileMethodFacts)
-        point = _short_lag_point_fit(bundle, method)
+    if isinstance(method, LagProfileMethodFacts):
+        point = _lag_point_fit(bundle, method)
         if point.bundle != bundle:
             raise ValueError("Analyseeingang hat sich während des Modelllaufs geändert.")
         bundle = point.bundle

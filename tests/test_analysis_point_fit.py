@@ -91,7 +91,7 @@ def test_short_lag_fit_rejects_non_finite_cumulative_projection(
 
     monkeypatch.setattr(analysis_module.np.linalg, "lstsq", overflowing_lstsq)
 
-    result = analysis_module._short_lag_point_fit(bundle, method)
+    result = analysis_module._lag_point_fit(bundle, method)
 
     assert result.status == "unstable"
     assert result.diagnostics == ("non_finite_point_estimate",)
