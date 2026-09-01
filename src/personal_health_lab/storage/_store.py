@@ -47,7 +47,7 @@ from personal_health_lab.health_data import (
 _METADATA_FILE = "metadata.sqlite3"
 _PARQUET_DIRECTORY = "parquet"
 _QUERY_FILE = "query.duckdb"
-_STORE_SCHEMA_VERSION = 12
+_STORE_SCHEMA_VERSION = 13
 _WRITER_LOCK_FILE = ".writer.lock"
 
 
@@ -922,6 +922,13 @@ class SnapshotId(_OpaqueStoreId):
 
 
 @dataclass(frozen=True, slots=True)
+class NutritionDayConfirmationId(_OpaqueStoreId):
+    def __post_init__(self) -> None:
+        if not _is_lower_hex(self._value, 32):
+            raise ValueError("Ernährungstagsbestätigungs-ID ist ungültig.")
+
+
+@dataclass(frozen=True, slots=True)
 class StoreId(_OpaqueStoreId):
     def __post_init__(self) -> None:
         if len(self._value) != 32 or any(
@@ -1439,6 +1446,30 @@ class StoredMeasurement:
     original_value: float
     original_unit: str
     review_case_ids: tuple[ReviewCaseId, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StoredNutritionDayConfirmation:
+    confirmation_id: NutritionDayConfirmationId
+    day: date
+    content_fingerprint: str
+    rule_version: str
+    confirmed_at: datetime
+    is_valid: bool
+
+
+@dataclass(frozen=True, slots=True)
+class NutritionDayConfirmationPublication:
+    operation_id: OperationId
+    expected_snapshot_id: SnapshotId
+    targets: tuple[tuple[date, str], ...]
+    rule_version: str
+
+
+@dataclass(frozen=True, slots=True)
+class NutritionDayConfirmationPublicationResult:
+    confirmation_ids: tuple[NutritionDayConfirmationId, ...]
+    snapshot_id: SnapshotId
 
 
 @dataclass(frozen=True, slots=True)
@@ -2100,7 +2131,8 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
                                  'run_historical_review', 'migrate_store',
                                  'rollback_migration', 'revise_context_coverage_start',
                                  'revise_medication_regime', 'revise_medication_deviation',
-                                 'revise_as_needed_intake', 'revise_intake_reason_category')
+                                 'revise_as_needed_intake', 'revise_intake_reason_category',
+                                 'confirm_nutrition_days')
             ),
             started_at_utc TEXT NOT NULL CHECK (
                 length(started_at_utc) >= 20 AND substr(started_at_utc, 11, 1) = 'T'
@@ -2136,7 +2168,7 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             activation_kind TEXT NOT NULL CHECK (
                 activation_kind IN (
                     'import', 'data_review_decision', 'rule_version', 'historical',
-                    'migration', 'manual_context_revision'
+                    'migration', 'manual_context_revision', 'nutrition_day_confirmation'
                 )
             ),
             activated_at_utc TEXT NOT NULL CHECK (
@@ -2155,6 +2187,57 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
             snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(snapshot_id)
         ) STRICT;
+        CREATE TABLE IF NOT EXISTS nutrition_day_confirmations (
+            confirmation_id TEXT PRIMARY KEY CHECK (
+                length(confirmation_id) = 32
+                AND confirmation_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            day TEXT NOT NULL CHECK (length(day) = 10),
+            content_fingerprint TEXT NOT NULL CHECK (
+                length(content_fingerprint) = 64
+                AND content_fingerprint NOT GLOB '*[^0-9a-f]*'
+            ),
+            rule_version TEXT NOT NULL CHECK (rule_version = 'nutrition-day-v1'),
+            operation_id TEXT NOT NULL REFERENCES write_operations(operation_id),
+            confirmed_at_utc TEXT NOT NULL CHECK (
+                length(confirmed_at_utc) >= 20
+                AND substr(confirmed_at_utc, 11, 1) = 'T'
+            )
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS nutrition_day_confirmation_snapshot_bindings (
+            snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(snapshot_id),
+            day TEXT NOT NULL CHECK (length(day) = 10),
+            confirmation_id TEXT NOT NULL REFERENCES nutrition_day_confirmations(confirmation_id),
+            is_valid INTEGER NOT NULL CHECK (is_valid IN (0, 1)),
+            PRIMARY KEY (snapshot_id, day)
+        ) STRICT;
+        CREATE TABLE IF NOT EXISTS nutrition_day_confirmation_publications (
+            audit_event_id TEXT PRIMARY KEY REFERENCES audit_events(audit_event_id),
+            snapshot_id TEXT NOT NULL UNIQUE REFERENCES dataset_snapshots(snapshot_id)
+        ) STRICT;
+        CREATE TRIGGER IF NOT EXISTS nutrition_day_confirmations_no_update
+        BEFORE UPDATE ON nutrition_day_confirmations
+        BEGIN SELECT RAISE(ABORT, 'nutrition day confirmations are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS nutrition_day_confirmations_no_delete
+        BEFORE DELETE ON nutrition_day_confirmations
+        BEGIN SELECT RAISE(ABORT, 'nutrition day confirmations are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS nutrition_day_confirmation_bindings_no_update
+        BEFORE UPDATE ON nutrition_day_confirmation_snapshot_bindings
+        BEGIN SELECT RAISE(ABORT, 'nutrition day confirmation bindings are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS nutrition_day_confirmation_bindings_no_delete
+        BEFORE DELETE ON nutrition_day_confirmation_snapshot_bindings
+        BEGIN SELECT RAISE(ABORT, 'nutrition day confirmation bindings are immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS nutrition_day_confirmation_publications_no_update
+        BEFORE UPDATE ON nutrition_day_confirmation_publications
+        BEGIN SELECT RAISE(ABORT, 'audit payload is append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS nutrition_day_confirmation_publications_no_delete
+        BEFORE DELETE ON nutrition_day_confirmation_publications
+        BEGIN SELECT RAISE(ABORT, 'audit payload is append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS nutrition_day_confirmation_publications_kind
+        BEFORE INSERT ON nutrition_day_confirmation_publications
+        WHEN (SELECT event_kind FROM audit_events WHERE audit_event_id = NEW.audit_event_id)
+             != 'nutrition_day_confirmation'
+        BEGIN SELECT RAISE(ABORT, 'wrong audit payload type'); END;
         CREATE TABLE IF NOT EXISTS activity_derivation_versions (
             version_id TEXT PRIMARY KEY,
             coverage_gap_minutes INTEGER NOT NULL CHECK (
@@ -2311,7 +2394,8 @@ def _ensure_current_tables(metadata: sqlite3.Connection) -> None:
             event_kind TEXT NOT NULL CHECK (
                 event_kind IN (
                     'import_published', 'data_review_decision', 'metadata_tombstone',
-                    'store_migrated', 'manual_context_revision', 'manual_medication_revision'
+                    'store_migrated', 'manual_context_revision', 'manual_medication_revision',
+                    'nutrition_day_confirmation'
                 )
             ),
             occurred_at_utc TEXT NOT NULL CHECK (
@@ -3096,6 +3180,7 @@ def _upgrade_migration_event_constraints(metadata: sqlite3.Connection) -> None:
             "data_review_decisions_kind",
             "metadata_tombstones_kind",
             "metadata_tombstones_backward",
+            "nutrition_day_confirmation_publications_kind",
         ):
             metadata.execute(f"DROP TRIGGER IF EXISTS {trigger}")
     for table, temporary, definition in rebuilt:
@@ -3107,6 +3192,58 @@ def _upgrade_migration_event_constraints(metadata: sqlite3.Connection) -> None:
     violations = metadata.execute("PRAGMA foreign_key_check").fetchall()
     if violations:
         raise sqlite3.IntegrityError("foreign key violation after constraint upgrade")
+
+
+def _upgrade_nutrition_confirmation_constraints(metadata: sqlite3.Connection) -> None:
+    upgrades = (
+        (
+            "write_operations",
+            "'confirm_nutrition_days'",
+            "'revise_as_needed_intake', 'revise_intake_reason_category'",
+            "'revise_as_needed_intake', 'revise_intake_reason_category', "
+            "'confirm_nutrition_days'",
+        ),
+        (
+            "snapshot_activations",
+            "'nutrition_day_confirmation'",
+            "'migration', 'manual_context_revision'",
+            "'migration', 'manual_context_revision', 'nutrition_day_confirmation'",
+        ),
+        (
+            "audit_events",
+            "'nutrition_day_confirmation'",
+            "'store_migrated', 'manual_context_revision', 'manual_medication_revision'",
+            "'store_migrated', 'manual_context_revision', 'manual_medication_revision', "
+            "'nutrition_day_confirmation'",
+        ),
+    )
+    for table, marker, old, new in upgrades:
+        row = metadata.execute(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+        if row is None or not isinstance(row[0], str) or marker in row[0]:
+            continue
+        if old not in row[0]:
+            raise sqlite3.DatabaseError(f"unsupported {table} constraint")
+        if table == "audit_events":
+            for trigger in (
+                "import_publications_kind",
+                "migration_publications_kind",
+                "data_review_decisions_kind",
+                "metadata_tombstones_kind",
+                "metadata_tombstones_backward",
+                "nutrition_day_confirmation_publications_kind",
+            ):
+                metadata.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        temporary = f"{table}__nutrition_confirmation_upgrade"
+        definition = row[0].replace(old, new, 1).replace(
+            f"CREATE TABLE {table}", f"CREATE TABLE {temporary}", 1
+        )
+        metadata.execute(f"DROP TABLE IF EXISTS {temporary}")
+        metadata.execute(definition)
+        metadata.execute(f"INSERT INTO {temporary} SELECT * FROM {table}")
+        metadata.execute(f"DROP TABLE {table}")
+        metadata.execute(f"ALTER TABLE {temporary} RENAME TO {table}")
 
 
 def _upgrade_migration_publication_schema(metadata: sqlite3.Connection) -> None:
@@ -4059,6 +4196,7 @@ class LocalStore:
         try:
             with self._metadata:
                 _upgrade_migration_event_constraints(self._metadata)
+                _upgrade_nutrition_confirmation_constraints(self._metadata)
                 _upgrade_v03_constraints(self._metadata)
                 _upgrade_migration_publication_schema(self._metadata)
                 _ensure_current_tables(self._metadata)
@@ -4124,6 +4262,7 @@ class LocalStore:
                             f"SELECT ?, {columns} FROM {table} WHERE snapshot_id = ?",
                             (str(new_snapshot), str(active)),
                         )
+                    self._inherit_nutrition_day_confirmations(new_snapshot, active)
                     self._metadata.execute(
                         "INSERT INTO snapshot_activations VALUES (?, ?, ?, ?, 'migration', ?)",
                         (
@@ -5329,6 +5468,9 @@ class LocalStore:
                     "WHERE snapshot_id = ?",
                     (str(snapshot_id), str(active[0])),
                 )
+                self._inherit_nutrition_day_confirmations(
+                    snapshot_id, SnapshotId(str(active[0]))
+                )
             elif restore_overlay is not None:
                 self._bind_restored_snapshot(snapshot_id, restore_overlay)
             all_intervals: tuple[
@@ -5468,6 +5610,7 @@ class LocalStore:
                 "decision_refs",
                 "source_type_catalog",
                 "data_review_batch_actions",
+                "nutrition_day_confirmations",
             ):
                 copy(table)
             copy("rule_version_refs", ignore_existing=True)
@@ -5548,6 +5691,20 @@ class LocalStore:
                 self._metadata.execute(
                     f'INSERT INTO "{table}" VALUES (?, ?)',
                     (str(snapshot_id), str(revision_id)),
+                )
+            if "nutrition_day_confirmation_snapshot_bindings" in tables:
+                self._metadata.executemany(
+                    "INSERT INTO nutrition_day_confirmation_snapshot_bindings "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        (str(snapshot_id), str(day), str(confirmation_id), int(is_valid))
+                        for day, confirmation_id, is_valid in backup.execute(
+                            "SELECT day, confirmation_id, is_valid "
+                            "FROM nutrition_day_confirmation_snapshot_bindings "
+                            "WHERE snapshot_id = ? ORDER BY day",
+                            (str(origin[0]),),
+                        )
+                    ),
                 )
             self._metadata.execute(
                 "INSERT INTO snapshot_restore_origins VALUES (?, ?, ?)",
@@ -6257,6 +6414,16 @@ class LocalStore:
                 if "intake_reason_category_publications" in tables
                 else ""
             )
+            nutrition_confirmation_count = (
+                "+ count(nutrition_day_confirmation_publications.audit_event_id)"
+                if "nutrition_day_confirmation_publications" in tables
+                else ""
+            )
+            nutrition_confirmation_join = (
+                "LEFT JOIN nutrition_day_confirmation_publications USING (audit_event_id)"
+                if "nutrition_day_confirmation_publications" in tables
+                else ""
+            )
             audit = self._metadata.execute(
                 f"""
                 SELECT count(*), COALESCE(MIN(audit_position), 1),
@@ -6271,6 +6438,7 @@ class LocalStore:
                        {deviation_count}
                        {as_needed_count}
                        {reason_category_count}
+                       {nutrition_confirmation_count}
                 FROM audit_events
                 LEFT JOIN import_publications USING (audit_event_id)
                 LEFT JOIN data_review_decisions USING (audit_event_id)
@@ -6282,6 +6450,7 @@ class LocalStore:
                 {deviation_join}
                 {as_needed_join}
                 {reason_category_join}
+                {nutrition_confirmation_join}
                 """
             ).fetchone()
             assert audit is not None
@@ -8424,6 +8593,41 @@ class LocalStore:
         _allocation_checkpoint(self._root, "snapshot_staged")
         return digest
 
+    def _inherit_nutrition_day_confirmations(
+        self,
+        snapshot_id: SnapshotId,
+        previous_snapshot_id: SnapshotId,
+        *,
+        replaced_days: tuple[date, ...] = (),
+    ) -> None:
+        replaced = set(replaced_days)
+        rows = tuple(
+            row
+            for row in self._metadata.execute(
+                "SELECT binding.day, binding.confirmation_id, binding.is_valid, "
+                "confirmation.content_fingerprint "
+                "FROM nutrition_day_confirmation_snapshot_bindings binding "
+                "JOIN nutrition_day_confirmations confirmation USING (confirmation_id) "
+                "WHERE binding.snapshot_id = ? ORDER BY binding.day",
+                (str(previous_snapshot_id),),
+            )
+            if date.fromisoformat(str(row[0])) not in replaced
+        )
+        days = tuple(date.fromisoformat(str(row[0])) for row in rows)
+        fingerprints = dict(self.load_nutrition_day_content_fingerprints(snapshot_id, days))
+        self._metadata.executemany(
+            "INSERT INTO nutrition_day_confirmation_snapshot_bindings VALUES (?, ?, ?, ?)",
+            (
+                (
+                    str(snapshot_id),
+                    str(day),
+                    str(row[1]),
+                    int(bool(row[2]) and fingerprints[day] == str(row[3])),
+                )
+                for row, day in zip(rows, days, strict=True)
+            ),
+        )
+
     def _activate_review_snapshot(
         self,
         operation_id: OperationId,
@@ -8433,9 +8637,14 @@ class LocalStore:
         completed_at: str,
         *,
         activation_kind: Literal[
-            "data_review_decision", "rule_version", "historical", "manual_context_revision"
+            "data_review_decision",
+            "rule_version",
+            "historical",
+            "manual_context_revision",
+            "nutrition_day_confirmation",
         ] = ("data_review_decision"),
         replaced_context_logical_id: str | None = None,
+        replaced_nutrition_days: tuple[date, ...] = (),
     ) -> None:
         staging = self._root / "staging" / str(operation_id)
         snapshot = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
@@ -8511,6 +8720,11 @@ class LocalStore:
             "SELECT ?, revision_id FROM as_needed_intake_snapshot_bindings "
             "WHERE snapshot_id = ?",
             (str(snapshot_id), str(previous_snapshot_id)),
+        )
+        self._inherit_nutrition_day_confirmations(
+            snapshot_id,
+            previous_snapshot_id,
+            replaced_days=replaced_nutrition_days,
         )
         _allocation_checkpoint(self._root, "snapshot_activated")
         _publication_fault_point(self._root, "snapshot.before_sqlite_commit/v1")
@@ -9455,6 +9669,85 @@ class LocalStore:
             start_date,
             end_date,
             "(versions.canonical_type = 'body_mass' OR versions.canonical_type LIKE 'dietary_%')",
+        )
+
+    def load_nutrition_day_content_fingerprints(
+        self, snapshot_id: SnapshotId, days: tuple[date, ...]
+    ) -> tuple[tuple[date, str], ...]:
+        self._require_open()
+        if not days:
+            return ()
+        directory = self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id)
+        placeholders = ", ".join("?" for _ in days)
+        try:
+            rows = self._query.execute(
+                "SELECT versions.measurement_local_date, versions.identity_candidate_id, "
+                "versions.measurement_version_id, versions.payload_sha256, "
+                "resolved.selected_measurement_version_id, resolved.disposition, "
+                "resolved.effective_value, resolved.canonical_unit, "
+                "resolved.effective_value_source, resolved.effective_decision_id, "
+                "resolved.correction_decision_id, resolved.source_deletion_decision_id, "
+                "resolved.conflict_resolution_decision_id "
+                "FROM read_parquet(?) versions "
+                "LEFT JOIN read_parquet(?) resolved "
+                "ON resolved.logical_measurement_id = versions.identity_candidate_id "
+                "WHERE versions.canonical_type LIKE 'dietary_%' "
+                f"AND versions.measurement_local_date IN ({placeholders}) "
+                "ORDER BY versions.measurement_local_date, versions.identity_candidate_id, "
+                "versions.measurement_version_id",
+                (
+                    str(directory / "measurement_versions.parquet"),
+                    str(directory / "resolved_measurements.parquet"),
+                    *days,
+                ),
+            ).fetchall()
+        except duckdb.Error as error:
+            raise StoreError("Ernährungstagesinhalt ist nicht verfügbar.") from error
+        by_day: dict[date, list[list[object]]] = {day: [] for day in days}
+        for row in rows:
+            day = cast(date, row[0])
+            by_day[day].append([None if value is None else value for value in row[1:]])
+        return tuple(
+            (
+                day,
+                hashlib.sha256(
+                    json.dumps(
+                        {"day": day.isoformat(), "measurements": by_day[day]},
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode()
+                ).hexdigest(),
+            )
+            for day in days
+        )
+
+    def load_nutrition_day_confirmations(
+        self, snapshot_id: SnapshotId, start_date: date | None, end_date: date | None
+    ) -> tuple[StoredNutritionDayConfirmation, ...]:
+        self._require_open()
+        bounds = ""
+        parameters: list[object] = [str(snapshot_id)]
+        if start_date is not None and end_date is not None:
+            bounds = " AND binding.day BETWEEN ? AND ?"
+            parameters.extend((start_date.isoformat(), end_date.isoformat()))
+        return tuple(
+            StoredNutritionDayConfirmation(
+                NutritionDayConfirmationId(str(row[0])),
+                date.fromisoformat(str(row[1])),
+                str(row[2]),
+                str(row[3]),
+                datetime.fromisoformat(str(row[4])),
+                bool(row[5]),
+            )
+            for row in self._metadata.execute(
+                "SELECT confirmation.confirmation_id, binding.day, "
+                "confirmation.content_fingerprint, confirmation.rule_version, "
+                "confirmation.confirmed_at_utc, binding.is_valid "
+                "FROM nutrition_day_confirmation_snapshot_bindings binding "
+                "JOIN nutrition_day_confirmations confirmation USING (confirmation_id) "
+                "WHERE binding.snapshot_id = ?" + bounds + " ORDER BY binding.day",
+                parameters,
+            )
         )
 
     def load_analysis_measurements(
@@ -11464,6 +11757,107 @@ class LocalStore:
         if snapshot is None:
             raise StoreError("Snapshot fehlt.")
         return datetime.fromisoformat(str(snapshot[0])).date(), "Europe/Berlin"
+
+    def publish_nutrition_day_confirmations(
+        self, publication: NutritionDayConfirmationPublication
+    ) -> NutritionDayConfirmationPublicationResult:
+        self._require_open()
+        self._require_writer()
+        active = self.load_active_snapshot_id()
+        if active != publication.expected_snapshot_id or not publication.targets:
+            raise StoreError("Aktiver Snapshot oder Ernährungstage haben sich geändert.")
+        actual = dict(
+            self.load_nutrition_day_content_fingerprints(
+                active, tuple(day for day, _ in publication.targets)
+            )
+        )
+        if any(actual[day] != fingerprint for day, fingerprint in publication.targets):
+            raise StoreError("Ernährungstagesinhalt hat sich geändert.")
+
+        operation_id = publication.operation_id
+        snapshot_id = SnapshotId(uuid4().hex)
+        confirmation_ids = tuple(
+            NutritionDayConfirmationId(uuid4().hex) for _ in publication.targets
+        )
+        created_at = datetime.now(UTC).isoformat()
+        audit_position = int(
+            self._metadata.execute(
+                "SELECT COALESCE(MAX(audit_position), 0) + 1 FROM audit_events"
+            ).fetchone()[0]
+        )
+        try:
+            manifest = self._stage_review_snapshot(
+                parent_snapshot_id=active,
+                snapshot_id=snapshot_id,
+                operation_id=operation_id,
+                audit_position=audit_position,
+                review_case_id=None,
+                decision_id="",
+                action="manual_nutrition_confirmation",
+                selected_measurement_version_id=None,
+                candidate_version_ids=(),
+                replacement_plausibility_cases=(),
+            )
+            with self._metadata:
+                self._metadata.execute(
+                    "INSERT INTO write_operations VALUES "
+                    "(?, 'confirm_nutrition_days', ?, ?, 'committed', 1)",
+                    (str(operation_id), created_at, created_at),
+                )
+                self._metadata.executemany(
+                    "INSERT INTO nutrition_day_confirmations VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        (
+                            str(confirmation_id),
+                            day.isoformat(),
+                            fingerprint,
+                            publication.rule_version,
+                            str(operation_id),
+                            created_at,
+                        )
+                        for confirmation_id, (day, fingerprint) in zip(
+                            confirmation_ids, publication.targets, strict=True
+                        )
+                    ),
+                )
+                self._activate_review_snapshot(
+                    operation_id,
+                    snapshot_id,
+                    active,
+                    manifest,
+                    created_at,
+                    activation_kind="nutrition_day_confirmation",
+                    replaced_nutrition_days=tuple(day for day, _ in publication.targets),
+                )
+                self._metadata.executemany(
+                    "INSERT INTO nutrition_day_confirmation_snapshot_bindings "
+                    "VALUES (?, ?, ?, 1)",
+                    (
+                        (str(snapshot_id), day.isoformat(), str(confirmation_id))
+                        for confirmation_id, (day, _) in zip(
+                            confirmation_ids, publication.targets, strict=True
+                        )
+                    ),
+                )
+                audit_event_id = uuid4().hex
+                self._metadata.execute(
+                    "INSERT INTO audit_events VALUES "
+                    "(?, ?, ?, 'nutrition_day_confirmation', ?)",
+                    (audit_position, audit_event_id, str(operation_id), created_at),
+                )
+                self._metadata.execute(
+                    "INSERT INTO nutrition_day_confirmation_publications VALUES (?, ?)",
+                    (audit_event_id, str(snapshot_id)),
+                )
+        except Exception:
+            shutil.rmtree(self._root / "staging" / str(operation_id), ignore_errors=True)
+            shutil.rmtree(
+                self._root / _PARQUET_DIRECTORY / "snapshots" / str(snapshot_id),
+                ignore_errors=True,
+            )
+            raise
+        _publication_fault_point(self._root, "snapshot.after_sqlite_commit/v1")
+        return NutritionDayConfirmationPublicationResult(confirmation_ids, snapshot_id)
 
     def publish_context_coverage_start(
         self,

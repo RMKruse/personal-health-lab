@@ -18,9 +18,10 @@ _REGISTERED_STEPS = (
     (9, 10),
     (10, 11),
     (11, 12),
+    (12, 13),
 )
 _REGISTERED_SNAPSHOT_STEPS = ((1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7))
-_REGISTERED_BACKUP_STEPS = ((1, 2), (2, 3), (3, 4))
+_REGISTERED_BACKUP_STEPS = ((1, 2), (2, 3), (3, 4), (4, 5))
 
 
 def _plan_adjacent_migration(

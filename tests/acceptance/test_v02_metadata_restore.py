@@ -967,7 +967,7 @@ def test_supported_backup_schema_is_migrated_only_in_staging(tmp_path: Path) -> 
         request = BeginMetadataRestore(backup)
         plan = health_lab.preview_write(request)
         assert isinstance(plan.details, MetadataRestorePlan)
-        assert plan.details.migration_steps == ((1, 2), (2, 3), (3, 4))
+        assert plan.details.migration_steps == ((1, 2), (2, 3), (3, 4), (4, 5))
         receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
         recovery = health_lab.load_recovery_status()
 
@@ -977,7 +977,45 @@ def test_supported_backup_schema_is_migrated_only_in_staging(tmp_path: Path) -> 
     assert recovery.original_backup_sha256 == hashlib.sha256(legacy).hexdigest()
     assert recovery.working_copy_sha256 != recovery.original_backup_sha256
     assert recovery.source_schema_version == 1
-    assert recovery.target_schema_version == 4
+    assert recovery.target_schema_version == 5
+
+
+def test_v4_backup_is_recognized_and_migrated_to_v5(tmp_path: Path) -> None:
+    _, backup, _ = _backup(tmp_path)
+    with sqlite3.connect(backup) as metadata:
+        for table in recovery_module._NUTRITION_CONFIRMATION_BACKUP_TABLES:
+            metadata.execute(f"DROP TABLE {table}")
+        canonical_hash = recovery_module._canonical_hash(
+            metadata, recovery_module._V4_CONTENT_TABLES
+        )
+        metadata.execute(
+            "UPDATE backup_manifest SET backup_schema_version = 4, "
+            "canonical_content_sha256 = ?, table_row_counts = ? WHERE singleton = 1",
+            (
+                canonical_hash,
+                recovery_module._table_row_counts(
+                    metadata, recovery_module._V4_CONTENT_TABLES
+                ),
+            ),
+        )
+        metadata.execute(
+            "UPDATE backup_migration_provenance SET original_content_sha256 = ?, "
+            "source_schema_version = 4, target_schema_version = 4 WHERE singleton = 1",
+            (canonical_hash,),
+        )
+    legacy = backup.read_bytes()
+
+    target = _config(tmp_path / "target")
+    with HealthLab.open(target) as health_lab:
+        request = BeginMetadataRestore(backup)
+        plan = health_lab.preview_write(request)
+        assert isinstance(plan.details, MetadataRestorePlan)
+        assert plan.details.migration_steps == ((4, 5),)
+        receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
+
+    assert isinstance(receipt.result, MetadataRestoreReceipt)
+    assert receipt.result.status is MetadataRestoreStatus.PENDING
+    assert backup.read_bytes() == legacy
 
 
 def test_unknown_or_unregistered_backup_schema_is_blocked(
@@ -986,7 +1024,7 @@ def test_unknown_or_unregistered_backup_schema_is_blocked(
     _, backup, _ = _backup(tmp_path)
     target = _config(tmp_path / "target")
     with sqlite3.connect(backup) as metadata:
-        metadata.execute("UPDATE backup_manifest SET backup_schema_version = 5 WHERE singleton = 1")
+        metadata.execute("UPDATE backup_manifest SET backup_schema_version = 6 WHERE singleton = 1")
     with HealthLab.open(target) as health_lab:
         newer = health_lab.preview_write(BeginMetadataRestore(backup))
     assert newer.approval.status is WriteApprovalStatus.BLOCKED

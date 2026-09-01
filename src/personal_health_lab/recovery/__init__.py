@@ -43,7 +43,7 @@ from personal_health_lab.storage import (
     probe_capacity,
 )
 
-_BACKUP_SCHEMA_VERSION = 4
+_BACKUP_SCHEMA_VERSION = 5
 _METHOD_ID = CapacityMethodId.METADATA_BACKUP
 _RESTORE_START_METHOD_ID = CapacityMethodId.RESTORE_START
 _RESTORE_SOURCE_METHOD_ID = CapacityMethodId.RESTORE_SOURCE_IMPORT
@@ -113,7 +113,16 @@ _MANUAL_BACKUP_TABLES = (
     "as_needed_intake_publications",
     "manual_revision_intents",
 )
-_METADATA_TABLES = (*_V3_METADATA_TABLES, *_MANUAL_BACKUP_TABLES)
+_NUTRITION_CONFIRMATION_BACKUP_TABLES = (
+    "nutrition_day_confirmations",
+    "nutrition_day_confirmation_snapshot_bindings",
+    "nutrition_day_confirmation_publications",
+)
+_V4_METADATA_TABLES = (*_V3_METADATA_TABLES, *_MANUAL_BACKUP_TABLES)
+_METADATA_TABLES = (
+    *_V4_METADATA_TABLES,
+    *_NUTRITION_CONFIRMATION_BACKUP_TABLES,
+)
 _V3_CONTENT_TABLES = (
     *_V3_METADATA_TABLES,
     "import_refs",
@@ -126,6 +135,18 @@ _V3_CONTENT_TABLES = (
 )
 _CONTENT_TABLES = (
     *_METADATA_TABLES,
+    "import_refs",
+    "snapshot_refs",
+    "review_case_facts",
+    "review_case_reasons",
+    "required_source_refs",
+    "resolved_overlay_facts",
+    "open_review_overlay_facts",
+    "snapshot_origin",
+    "manual_revision_bindings",
+)
+_V4_CONTENT_TABLES = (
+    *_V4_METADATA_TABLES,
     "import_refs",
     "snapshot_refs",
     "review_case_facts",
@@ -320,6 +341,7 @@ def _audit_is_valid(connection: sqlite3.Connection, audit_max: int) -> bool:
             "medication_deviation_publications",
             "intake_reason_category_publications",
             "as_needed_intake_publications",
+            "nutrition_day_confirmation_publications",
         )
         if table in tables
     )
@@ -348,6 +370,21 @@ def _audit_is_valid(connection: sqlite3.Connection, audit_max: int) -> bool:
         "WHERE target.audit_position >= event.audit_position "
         "OR replacement.audit_position >= event.audit_position LIMIT 1"
     ).fetchone()
+    nutrition_references = (
+        "UNION ALL "
+        "SELECT 1 FROM nutrition_day_confirmation_publications publication "
+        "LEFT JOIN snapshot_refs snapshot_ref "
+        "ON snapshot_ref.snapshot_id = publication.snapshot_id "
+        "WHERE snapshot_ref.snapshot_id IS NULL "
+        "UNION ALL "
+        "SELECT 1 FROM nutrition_day_confirmation_snapshot_bindings binding "
+        "LEFT JOIN nutrition_day_confirmations confirmation "
+        "USING (confirmation_id) "
+        "LEFT JOIN snapshot_refs snapshot_ref USING (snapshot_id) "
+        "WHERE confirmation.confirmation_id IS NULL OR snapshot_ref.snapshot_id IS NULL "
+        if set(_NUTRITION_CONFIRMATION_BACKUP_TABLES) <= tables
+        else ""
+    )
     missing_reference = connection.execute(
         "SELECT 1 FROM import_publications publication "
         "LEFT JOIN import_refs import_ref ON import_ref.import_id = publication.import_id "
@@ -359,7 +396,8 @@ def _audit_is_valid(connection: sqlite3.Connection, audit_max: int) -> bool:
         "LEFT JOIN snapshot_refs snapshot_ref "
         "ON snapshot_ref.snapshot_id = publication.snapshot_id "
         "WHERE publication.snapshot_id IS NOT NULL AND snapshot_ref.snapshot_id IS NULL "
-        "UNION ALL "
+        + nutrition_references
+        + "UNION ALL "
         "SELECT 1 FROM review_cycle_cases cycle_case "
         "JOIN review_cycles cycle USING (cycle_id) "
         "LEFT JOIN review_case_facts fact "
@@ -377,7 +415,12 @@ def _content_tables(connection: sqlite3.Connection) -> tuple[str, ...]:
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
         )
     }
-    for candidate in (_CONTENT_TABLES, _V3_CONTENT_TABLES, _LEGACY_CONTENT_TABLES):
+    for candidate in (
+        _CONTENT_TABLES,
+        _V4_CONTENT_TABLES,
+        _V3_CONTENT_TABLES,
+        _LEGACY_CONTENT_TABLES,
+    ):
         if set(candidate) <= tables:
             return candidate
     return ()
@@ -1311,7 +1354,7 @@ def _read_restore_backup(path: Path) -> tuple[BackupId, StoreId, str, int, int]:
                     provenance is None
                     or str(provenance[0]) != str(backup_id)
                     or str(provenance[1]) != canonical_hash
-                    or int(provenance[2]) not in {1, 2, 3, 4}
+                    or int(provenance[2]) not in {1, 2, 3, 4, 5}
                     or int(provenance[3]) != schema_version
                 ):
                     raise StoreError("backup_integrity_conflict")
@@ -1809,6 +1852,40 @@ def _migrate_restore_working_copy(path: Path, inspection: MetadataRestoreInspect
                 )
                 working.execute(
                     "UPDATE backup_migration_provenance SET target_schema_version = 4 "
+                    "WHERE singleton = 1"
+                )
+            elif (source, target) == (4, 5):
+                manifest_columns = {
+                    str(row[1]) for row in working.execute("PRAGMA table_info(backup_manifest)")
+                }
+                if "source_snapshot_id" not in manifest_columns:
+                    working.execute(
+                        "ALTER TABLE backup_manifest ADD COLUMN source_snapshot_id TEXT"
+                    )
+                if "table_row_counts" not in manifest_columns:
+                    working.execute(
+                        "ALTER TABLE backup_manifest ADD COLUMN "
+                        "table_row_counts TEXT NOT NULL DEFAULT '{}'"
+                    )
+                for definition in (
+                    "CREATE TABLE nutrition_day_confirmations ("
+                    "confirmation_id TEXT, day TEXT, content_fingerprint TEXT, "
+                    "rule_version TEXT, operation_id TEXT, confirmed_at_utc TEXT) STRICT",
+                    "CREATE TABLE nutrition_day_confirmation_snapshot_bindings ("
+                    "snapshot_id TEXT, day TEXT, confirmation_id TEXT, is_valid INTEGER) STRICT",
+                    "CREATE TABLE nutrition_day_confirmation_publications ("
+                    "audit_event_id TEXT, snapshot_id TEXT) STRICT",
+                ):
+                    working.execute(definition)
+                content_tables = _content_tables(working)
+                migrated_hash = _canonical_hash(working, content_tables)
+                working.execute(
+                    "UPDATE backup_manifest SET canonical_content_sha256 = ?, "
+                    "table_row_counts = ? WHERE singleton = 1",
+                    (migrated_hash, _table_row_counts(working, content_tables)),
+                )
+                working.execute(
+                    "UPDATE backup_migration_provenance SET target_schema_version = 5 "
                     "WHERE singleton = 1"
                 )
             else:

@@ -1597,6 +1597,7 @@ def _write_receipt_json(
         assert isinstance(encoded_result, dict)
         result_json = {**encoded_result, "type": _v03_type(result)}
     else:
+        assert isinstance(result, WriteNotStarted)
         result_json = {
             "diagnostics": result.diagnostics,
             "status": result.status.value,

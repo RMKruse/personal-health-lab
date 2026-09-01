@@ -128,6 +128,8 @@ from personal_health_lab.storage import (
     LocalStore,
     MedicationDeviationPublication,
     MedicationRegimePublication,
+    NutritionDayConfirmationId,
+    NutritionDayConfirmationPublication,
     OpenDataReviewCase,
     PersonBindingStatus,
     PublishBatchDecisionResult,
@@ -180,6 +182,7 @@ class WorkspaceState(StrEnum):
 
 _READY_WRITES = (
     "import_health_export",
+    "confirm_nutrition_days",
     "resolve_data_review_case",
     "confirm_data_review_batch",
     "revoke_data_review_decision",
@@ -1544,6 +1547,39 @@ class DailyNutritionFeature:
     measurement_version_ids: tuple[MeasurementVersionId, ...] = ()
     review_case_ids: tuple[DataReviewCaseId, ...] = ()
     quality_status: DataQualityStatus = DataQualityStatus.REVIEWED
+    source_evidence: tuple[NutritionSourceEvidence, ...] = ()
+
+
+class NutritionObservationStatus(StrEnum):
+    MISSING = "missing"
+    PARTIAL = "partial"
+    COMPLETE = "complete"
+
+
+class NutritionObservationReason(StrEnum):
+    NO_NUTRITION_OBSERVATIONS = "no_nutrition_observations"
+    ENERGY_MISSING = "energy_missing"
+    PROTEIN_MISSING = "protein_missing"
+    CARBOHYDRATES_MISSING = "carbohydrates_missing"
+    TOTAL_FAT_MISSING = "total_fat_missing"
+    CONFIRMATION_MISSING = "confirmation_missing"
+    CONTENT_CHANGED_SINCE_CONFIRMATION = "content_changed_since_confirmation"
+
+
+@dataclass(frozen=True, slots=True)
+class NutritionSourceEvidence:
+    source_name: str
+    source_version: str
+    logical_measurement_id: LogicalMeasurementId
+    measurement_version_id: MeasurementVersionId
+
+
+@dataclass(frozen=True, slots=True)
+class NutritionDayConfirmationEvidence:
+    confirmation_id: NutritionDayConfirmationId
+    confirmed_at: datetime
+    content_fingerprint: str
+    is_valid: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -1553,6 +1589,12 @@ class DailyNutrition:
     protein: DailyNutritionFeature
     carbohydrates: DailyNutritionFeature
     total_fat: DailyNutritionFeature
+    rule_version: str = "nutrition-day-v1"
+    observation_status: NutritionObservationStatus = NutritionObservationStatus.MISSING
+    observation_reasons: tuple[NutritionObservationReason, ...] = ()
+    content_fingerprint: str = ""
+    confirmation: NutritionDayConfirmationEvidence | None = None
+    quality_status: DataQualityStatus = DataQualityStatus.REVIEWED
 
 
 @dataclass(frozen=True, slots=True)
@@ -2120,6 +2162,40 @@ class RunAnalysis:
 
 
 @dataclass(frozen=True, slots=True)
+class NutritionDayConfirmationTarget:
+    day: date
+    content_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if type(self.day) is not date:
+            raise ConfigurationError("Ernährungstag muss ein lokales Kalenderdatum sein.")
+        if len(self.content_fingerprint) != 64 or not set(self.content_fingerprint) <= set(
+            "0123456789abcdef"
+        ):
+            raise ConfigurationError("Ernährungstagesfingerprint ist ungültig.")
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmNutritionDays:
+    base_snapshot_ref: SnapshotRef
+    targets: tuple[NutritionDayConfirmationTarget, ...]
+    rule_version: str = "nutrition-day-v1"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.base_snapshot_ref, SnapshotId):
+            raise ConfigurationError("Ernährungstagsbestätigung verlangt einen Snapshot.")
+        if not isinstance(self.targets, tuple) or not self.targets or any(
+            not isinstance(target, NutritionDayConfirmationTarget) for target in self.targets
+        ):
+            raise ConfigurationError("Ernährungstagsbestätigung verlangt angezeigte Tage.")
+        days = tuple(target.day for target in self.targets)
+        if len(set(days)) != len(days) or days != tuple(sorted(days)):
+            raise ConfigurationError("Ernährungstage müssen eindeutig und sortiert sein.")
+        if self.rule_version != "nutrition-day-v1":
+            raise ConfigurationError("Unbekannte Ernährungstagesregelversion.")
+
+
+@dataclass(frozen=True, slots=True)
 class RunRestingHeartRateAnalysis:
     """JSON-3.0 compatibility request; not part of the canonical request union."""
 
@@ -2367,6 +2443,7 @@ WriteRequest = (
     | CreatePlausibilityRuleVersion
     | RunHistoricalReview
     | RunAnalysis
+    | ConfirmNutritionDays
     | CreateActivityDerivationVersion
     | ReviseContextCoverageStart
     | ReviseIllnessCategory
@@ -2528,6 +2605,13 @@ class HistoricalReviewPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class NutritionDayConfirmationPlan:
+    base_snapshot_ref: SnapshotRef
+    targets: tuple[NutritionDayConfirmationTarget, ...]
+    rule_version: str
+
+
+@dataclass(frozen=True, slots=True)
 class ManualContextRevisionPlan:
     intent: Literal["create", "revise", "withdraw", "restore"]
     object_kind: Literal[
@@ -2647,6 +2731,7 @@ WritePlanDetails = (
     | DataReviewBatchRevokePlan
     | PlausibilityRuleVersionPlan
     | HistoricalReviewPlan
+    | NutritionDayConfirmationPlan
     | RunAnalysisPlan
     | RestingHeartRateAnalysisPlan
     | ManualContextRevisionPlan
@@ -2922,6 +3007,14 @@ class WriteBatchDecisionReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class NutritionDayConfirmationReceipt:
+    operation_id: OperationId
+    confirmation_ids: tuple[NutritionDayConfirmationId, ...]
+    snapshot_ref: SnapshotRef
+    status: ImportStatus = ImportStatus.COMMITTED
+
+
+@dataclass(frozen=True, slots=True)
 class PlausibilityRuleVersionReceipt:
     operation_id: OperationId
     rule_version_id: str
@@ -3003,6 +3096,7 @@ WriteResult = (
     | RollbackMigrationReceipt
     | WriteDecisionReceipt
     | WriteBatchDecisionReceipt
+    | NutritionDayConfirmationReceipt
     | PlausibilityRuleVersionReceipt
     | HistoricalReviewReceipt
     | ManualContextRevisionReceipt
@@ -3117,6 +3211,11 @@ class HealthLab:
             return self._build_migration_rollback_plan()
         if isinstance(request, CreateMetadataBackup):
             return self._build_metadata_backup_plan(request)
+        if isinstance(request, ConfirmNutritionDays):
+            return self._with_snapshot_capacity(
+                self._build_nutrition_day_confirmation_plan(request),
+                CapacityMethodId.MANUAL_SNAPSHOT,
+            )
         if isinstance(request, ReviseContextCoverageStart):
             return self._with_snapshot_capacity(
                 self._build_context_coverage_start_plan(request), CapacityMethodId.MANUAL_SNAPSHOT
@@ -3830,6 +3929,56 @@ class HealthLab:
                 approval=approval,
                 diagnostics=diagnostics,
                 capacity=capacity,
+            ),
+        )
+
+    def _build_nutrition_day_confirmation_plan(
+        self, request: ConfirmNutritionDays
+    ) -> WritePlan:
+        if self._store is None:
+            raise HealthLabError("HealthLab muss als Context Manager geöffnet werden.")
+        active = self._store.load_active_snapshot_id()
+        diagnostics: tuple[str, ...] = ()
+        if active != request.base_snapshot_ref:
+            diagnostics = ("nutrition_snapshot_changed",)
+        else:
+            actual = dict(
+                self._store.load_nutrition_day_content_fingerprints(
+                    active, tuple(target.day for target in request.targets)
+                )
+            )
+            if any(
+                actual[target.day] != target.content_fingerprint for target in request.targets
+            ):
+                diagnostics = ("nutrition_day_content_changed",)
+        details = NutritionDayConfirmationPlan(
+            request.base_snapshot_ref, request.targets, request.rule_version
+        )
+        payload = {
+            "active_snapshot_ref": None if active is None else str(active),
+            "base_snapshot_ref": str(request.base_snapshot_ref),
+            "diagnostics": diagnostics,
+            "operation": "confirm_nutrition_days",
+            "rule_version": request.rule_version,
+            "targets": tuple(
+                (target.day.isoformat(), target.content_fingerprint)
+                for target in request.targets
+            ),
+        }
+        return WritePlan(
+            PlanFingerprint(
+                hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
+            ),
+            details,
+            WritePreflight(
+                WriteApproval(
+                    WriteApprovalStatus.BLOCKED
+                    if diagnostics
+                    else WriteApprovalStatus.READY
+                ),
+                diagnostics=diagnostics,
             ),
         )
 
@@ -5538,6 +5687,10 @@ class HealthLab:
             return self._execute_migration_rollback(authorization_plan, expected_plan)
         if isinstance(request, CreateMetadataBackup):
             return self._execute_metadata_backup(request, authorization_plan, expected_plan)
+        if isinstance(request, ConfirmNutritionDays):
+            return self._execute_nutrition_day_confirmation(
+                request, authorization_plan, expected_plan
+            )
         if isinstance(request, CreatePlausibilityRuleVersion):
             return self._execute_plausibility_rule_write(request, authorization_plan, expected_plan)
         if isinstance(request, CreateActivityDerivationVersion):
@@ -6225,6 +6378,55 @@ class HealthLab:
             operation_id,
             expected_plan,
             ActivityDerivationReceipt(plan.details.proposed_version_id, snapshot_ref),
+            plan.preflight,
+        )
+
+    def _execute_nutrition_day_confirmation(
+        self,
+        request: ConfirmNutritionDays,
+        plan: WritePlan,
+        expected_plan: PlanFingerprint,
+    ) -> WriteReceipt:
+        if not isinstance(plan.details, NutritionDayConfirmationPlan):
+            return self._not_started(
+                plan, WriteNotStartedStatus.PLAN_CHANGED, ("plan_changed",), expected_plan
+            )
+        try:
+            writer = LocalStore.open_writer(root=self._config.active_store, mode=self._config.mode)
+        except StoreBusyError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.STORE_BUSY, ("store_busy",), expected_plan
+            )
+        operation_id = OperationId(uuid4().hex)
+        try:
+            blocked = self._recheck_snapshot_capacity(
+                writer, plan, expected_plan, CapacityMethodId.MANUAL_SNAPSHOT
+            )
+            if blocked is not None:
+                return blocked
+            publication = writer.publish_nutrition_day_confirmations(
+                NutritionDayConfirmationPublication(
+                    operation_id,
+                    plan.details.base_snapshot_ref,
+                    tuple(
+                        (target.day, target.content_fingerprint)
+                        for target in request.targets
+                    ),
+                    plan.details.rule_version,
+                )
+            )
+        except StoreError:
+            return self._not_started(
+                plan, WriteNotStartedStatus.PLAN_CHANGED, ("plan_changed",), expected_plan
+            )
+        finally:
+            writer.close()
+        return WriteReceipt(
+            operation_id,
+            expected_plan,
+            NutritionDayConfirmationReceipt(
+                operation_id, publication.confirmation_ids, publication.snapshot_id
+            ),
             plan.preflight,
         )
 
@@ -7676,6 +7878,34 @@ class HealthLab:
         else:
             start_date = end_date = None
 
+        projection_days = (
+            ()
+            if start_date is None or end_date is None
+            else tuple(
+                start_date + timedelta(days=offset)
+                for offset in range((end_date - start_date).days + 1)
+            )
+        )
+        content_fingerprints = (
+            {}
+            if snapshot_ref is None
+            else dict(
+                self._store.load_nutrition_day_content_fingerprints(
+                    snapshot_ref, projection_days
+                )
+            )
+        )
+        confirmations = (
+            {}
+            if snapshot_ref is None
+            else {
+                item.day: item
+                for item in self._store.load_nutrition_day_confirmations(
+                    snapshot_ref, start_date, end_date
+                )
+            }
+        )
+
         by_day: dict[date, list[WeightMeasurement]] = {}
         for item in selected_weights:
             by_day.setdefault(item.measurement_local_day, []).append(item)
@@ -7755,15 +7985,83 @@ class HealthLab:
                         if review_case_ids
                         else DataQualityStatus.REVIEWED
                     ),
+                    source_evidence=tuple(
+                        NutritionSourceEvidence(
+                            item.source_name,
+                            item.source_version,
+                            item.logical_measurement_id,
+                            item.measurement_version_id,
+                        )
+                        for item in contributors
+                    ),
                 )
 
+            energy = feature(CanonicalHealthType.DIETARY_ENERGY_CONSUMED, current)
+            protein = feature(CanonicalHealthType.DIETARY_PROTEIN, current)
+            carbohydrates = feature(CanonicalHealthType.DIETARY_CARBOHYDRATES, current)
+            total_fat = feature(CanonicalHealthType.DIETARY_FAT_TOTAL, current)
+            features = (energy, protein, carbohydrates, total_fat)
+            stored_confirmation = confirmations.get(current)
+            confirmation = (
+                None
+                if stored_confirmation is None
+                else NutritionDayConfirmationEvidence(
+                    stored_confirmation.confirmation_id,
+                    stored_confirmation.confirmed_at,
+                    stored_confirmation.content_fingerprint,
+                    stored_confirmation.is_valid,
+                )
+            )
+            observed_count = sum(item.value is not None for item in features)
+            reasons: list[NutritionObservationReason] = []
+            if observed_count == 0:
+                reasons.append(NutritionObservationReason.NO_NUTRITION_OBSERVATIONS)
+                observation_status = NutritionObservationStatus.MISSING
+            else:
+                reasons.extend(
+                    reason
+                    for item, reason in zip(
+                        features,
+                        (
+                            NutritionObservationReason.ENERGY_MISSING,
+                            NutritionObservationReason.PROTEIN_MISSING,
+                            NutritionObservationReason.CARBOHYDRATES_MISSING,
+                            NutritionObservationReason.TOTAL_FAT_MISSING,
+                        ),
+                        strict=True,
+                    )
+                    if item.value is None
+                )
+                if confirmation is None:
+                    reasons.append(NutritionObservationReason.CONFIRMATION_MISSING)
+                elif not confirmation.is_valid:
+                    reasons.append(
+                        NutritionObservationReason.CONTENT_CHANGED_SINCE_CONFIRMATION
+                    )
+                observation_status = (
+                    NutritionObservationStatus.COMPLETE
+                    if not reasons
+                    else NutritionObservationStatus.PARTIAL
+                )
             nutrition_days.append(
                 DailyNutrition(
                     day=current,
-                    energy=feature(CanonicalHealthType.DIETARY_ENERGY_CONSUMED, current),
-                    protein=feature(CanonicalHealthType.DIETARY_PROTEIN, current),
-                    carbohydrates=feature(CanonicalHealthType.DIETARY_CARBOHYDRATES, current),
-                    total_fat=feature(CanonicalHealthType.DIETARY_FAT_TOTAL, current),
+                    energy=energy,
+                    protein=protein,
+                    carbohydrates=carbohydrates,
+                    total_fat=total_fat,
+                    observation_status=observation_status,
+                    observation_reasons=tuple(reasons),
+                    content_fingerprint=content_fingerprints.get(current, ""),
+                    confirmation=confirmation,
+                    quality_status=(
+                        DataQualityStatus.PROVISIONAL
+                        if any(
+                            item.quality_status is DataQualityStatus.PROVISIONAL
+                            for item in features
+                        )
+                        else DataQualityStatus.REVIEWED
+                    ),
                 )
             )
             current += timedelta(days=1)

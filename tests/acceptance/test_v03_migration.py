@@ -152,7 +152,7 @@ def test_v03_migration_plans_store_and_snapshot_versions_separately(tmp_path: Pa
         health_lab.execute_write(
             request, expected_plan=health_lab.preview_write(request).fingerprint
         )
-    _set_schema_versions(config, store=12, snapshot=6)
+    _set_schema_versions(config, store=13, snapshot=6)
 
     with HealthLab.open(config) as health_lab:
         workspace = health_lab.load_workspace_status()
@@ -162,8 +162,8 @@ def test_v03_migration_plans_store_and_snapshot_versions_separately(tmp_path: Pa
         receipt = health_lab.execute_write(request, expected_plan=plan.fingerprint)
 
     assert workspace.state is WorkspaceState.MIGRATION_REQUIRED
-    assert diagnostics.source_version == 12
-    assert diagnostics.target_version == 12
+    assert diagnostics.source_version == 13
+    assert diagnostics.target_version == 13
     assert diagnostics.steps == ()
     assert diagnostics.snapshot_source_version == 6
     assert diagnostics.snapshot_target_version == 7
@@ -205,7 +205,7 @@ def test_v02_store_migrates_to_one_complete_v03_snapshot(tmp_path: Path) -> None
     with sqlite3.connect(config.active_store / "metadata.sqlite3") as metadata:
         assert metadata.execute(
             "SELECT schema_version FROM store_identity WHERE singleton = 1"
-        ).fetchone() == (12,)
+        ).fetchone() == (13,)
         new_snapshot = str(
             metadata.execute(
                 "SELECT snapshot_id FROM active_snapshot WHERE singleton = 1"
@@ -282,7 +282,7 @@ def test_v02_store_migrates_to_one_complete_v03_snapshot(tmp_path: Path) -> None
 def test_v03_migration_rejects_newer_and_missing_registered_steps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    assert migration.plan_store_migration(13)[2] == ("newer_schema",)
+    assert migration.plan_store_migration(14)[2] == ("newer_schema",)
     assert migration.plan_snapshot_migration(8)[2] == ("newer_snapshot_schema",)
     assert migration.plan_backup_migration(5, 4) is None
 
@@ -335,7 +335,7 @@ def test_v03_migration_fault_quarantines_attempt_and_retry_starts_fresh(
         receipt = health_lab.execute_write(retry, expected_plan=retry_plan.fingerprint)
 
     assert isinstance(receipt.result, StoreMigrationReceipt)
-    assert retry_plan.details.backup_file == "metadata-v6-to-v12-2.sqlite3"
+    assert retry_plan.details.backup_file == "metadata-v6-to-v13-2.sqlite3"
     assert old_hashes == {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
         for path in old_snapshot_path.iterdir()

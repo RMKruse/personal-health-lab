@@ -66,7 +66,12 @@ _V03_VARIANTS |= {
     "LocalWorkoutExclusion",
 }
 _V04_APPLICATION_VARIANTS = {
+    "ConfirmNutritionDays",
     "HistoricalModeWritePlan",
+    "NutritionDayConfirmationPlan",
+    "NutritionDayConfirmationReceipt",
+    "NutritionObservationReason",
+    "NutritionObservationStatus",
     "RunAnalysis",
     "RunAnalysisPlan",
     "WeightTrendFailureReason",
